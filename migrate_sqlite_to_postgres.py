@@ -46,6 +46,9 @@ TABLE_ORDER = [
     "invitations",
     "folders",
     "diagrams",
+    # История версий — сразу за диаграммами: без неё восстановленный
+    # version_seq указывал бы на несуществующие снимки.
+    "diagram_versions",
     "share_tokens",
     "deleted_diagrams",
     "pending_improvements",

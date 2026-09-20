@@ -1,4 +1,6 @@
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -6,6 +8,37 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# --- Окружение тестового прогона: задаётся один раз и до импорта пакета app.
+#
+# app.config читает переменные на импорте, а app.db создаёт engine один раз на
+# процесс, так что все модули обязаны видеть одну базу (раньше каждый переопределял
+# DATABASE_URL у себя, и второй URL просто игнорировался). Рабочая база разработчика
+# не затрагивается: по умолчанию это временный SQLite-файл. Прогон на PostgreSQL
+# включается явной TEST_DATABASE_URL на отдельной (лучше чистой) базе.
+DATABASE_URL = os.getenv("TEST_DATABASE_URL") or (
+    f"sqlite:///{(Path(tempfile.mkdtemp(prefix='bpmn-test-')) / 'test.db').as_posix()}"
+)
+os.environ["DATABASE_URL"] = DATABASE_URL
+os.environ["SECRET_KEY"] = "test-secret-key"
+os.environ["SKIP_LLM_INIT"] = "1"
+# Почта заведомо недоступна: проверяем деградацию отправки, а не реальные письма.
+os.environ["MAIL_SERVER"] = "127.0.0.1"
+os.environ["MAIL_PORT"] = "1"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def test_database():
+    """Схема из миграций Alembic — один раз на прогон, как при реальном запуске.
+
+    На PostgreSQL здесь же проверяется, что миграции применимы к базе, где уже
+    есть данные прошлых прогонов.
+    """
+    from app.startup import prepare_database
+
+    prepare_database()
+    yield
+
 
 XML_DECL = '<?xml version="1.0" encoding="UTF-8"?>\n'
 

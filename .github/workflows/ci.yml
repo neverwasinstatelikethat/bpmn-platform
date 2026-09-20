@@ -19,11 +19,10 @@ jobs:
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 3s --health-retries 10
     env:
-      # Целевая СУБД проверяется уже на конвейере: SQLite остаётся легаси-режимом.
-      DATABASE_URL: postgresql+psycopg2://bpmn:bpmn@localhost:5432/bpmn
-      SECRET_KEY: ci-only-secret
-      SKIP_LLM_INIT: '1'
       PYTHONIOENCODING: utf-8
+      # Целевая СУБД проверяется уже на конвейере: SQLite остаётся легаси-режимом.
+      # Тестовая база отдельная — прогон не должен зависеть от состояния base `bpmn`.
+      TEST_DATABASE_URL: postgresql+psycopg2://bpmn:bpmn@localhost:5432/bpmn_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,6 +30,17 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Создать тестовую базу
+        run: psql -h localhost -U bpmn -d postgres -c 'CREATE DATABASE bpmn_test OWNER bpmn'
+        env:
+          PGPASSWORD: bpmn
+      # Тот же путь, что у администратора с CLI: проверено, что ini и env.py
+      # работают без питоновских фикстур.
+      - name: Применить миграции к тестовой базе
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+      # Дальше схема уже на месте, её только подтверждает фикстура conftest.py.
       - run: python -m pytest tests/ -q
 
   frontend:

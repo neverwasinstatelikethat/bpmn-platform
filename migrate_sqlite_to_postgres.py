@@ -1,22 +1,25 @@
 """Одноразовый перенос данных из SQLite (bpmn.db) в PostgreSQL.
 
-Запускать ПОСЛЕ создания схемы и ДО первого реального запуска приложения
-(на свежей базе, где ещё нет пользовательских данных). Схема создаётся
-импортом приложения (Base.metadata.create_all), поэтому скрипт использует
-переменную SKIP_LLM_INIT=1, чтобы не поднимать тяжёлый ИИ-контур.
+Запускать ПОСЛЕ подъёма СУБД и ДО первого реального запуска приложения
+(на свежей базе, где ещё нет пользовательских данных). Схема цели разворачивается
+миграциями Alembic этим же запуском.
 
-Локально (нужен psycopg2 и доступ к БД):
+Локально (нужен psycopg2, SECRET_KEY и доступ к БД):
     DATABASE_URL=postgresql+psycopg2://bpmn:<пароль>@127.0.0.1:5432/bpmn \
     python migrate_sqlite_to_postgres.py
 
 Через Docker-контур (бд должна быть поднята: `docker compose up -d db`;
 схема будет создана этим же запуском):
     docker compose run --rm -v "$(pwd -W)/bpmn.db:/app/bpmn.db:ro" \
-        -e SKIP_LLM_INIT=1 backend python migrate_sqlite_to_postgres.py
+        backend python migrate_sqlite_to_postgres.py
 
 На Windows/Git-Bash используй `$(pwd -W)` (даёт `C:/...`), а не `${PWD}`
 (`/c/...`): последний не монтируется в Docker Desktop, и скрипт сообщает
 «Исходная база ... не найдена или пуста». На Linux/macOS подойдёт `${PWD}`.
+
+Если база цели уже создана старым `create_all`, Alembic откажется угадывать —
+убедитесь, что схема совпадает с app/models.py, и выполните один раз
+`alembic stamp 0001` (см. сообщение об ошибке).
 
 Повторный запуск безопасен: уже существующие по первичному ключу строки
 пропускаются. Сидированные приложением роли удаляются только если на них
@@ -26,11 +29,11 @@
 import os
 import sys
 
-os.environ.setdefault("SKIP_LLM_INIT", "1")
+from sqlalchemy import MetaData, create_engine, inspect, text
 
-from sqlalchemy import MetaData, create_engine, inspect, text  # noqa: E402
-
-import main as app_module  # noqa: E402,F401 — импорт создаёт схему (create_all)
+from app.config import DATABASE_URL
+from app.db import engine
+from app.startup import run_migrations
 
 SQLITE_URL = os.getenv("SQLITE_URL", "sqlite:///./bpmn.db")
 
@@ -132,8 +135,7 @@ def copy_self_referencing(src_conn, dst_conn, src_table, dst_table):
 
 
 def main():
-    database_url = app_module.DATABASE_URL
-    if database_url.startswith("sqlite"):
+    if DATABASE_URL.startswith("sqlite"):
         print("DATABASE_URL указывает на SQLite. Задайте DATABASE_URL с PostgreSQL и повторите.")
         return 2
 
@@ -141,7 +143,9 @@ def main():
     if not inspect(src_engine).has_table("diagrams"):
         print(f"Исходная база {SQLITE_URL} не найдена или пуста.")
         return 2
-    dst_engine = app_module.engine
+    # Схема цели из миграций: без неё reflect ниже увидел бы пустую базу.
+    run_migrations()
+    dst_engine = engine
 
     src_meta = MetaData()
     src_meta.reflect(bind=src_engine)

@@ -8,10 +8,11 @@
 
 ## Быстрый контекст
 
-- Backend: FastAPI-монолит `main.py` (SQLAlchemy; БД задаётся
-  `DATABASE_URL`: SQLite — легаси-режим, PostgreSQL — цель),
-  локальный запуск на порту `8765` (`BACKEND_PORT`); статика и
-  экспортированные файлы в `static/`.
+- Backend: пакет `app/` (`main.py` — составной корень, `routers/` — домены,
+  модели/схемы/безопасность — отдельные модули; корневой `main.py` — шим),
+  SQLAlchemy. БД задаётся `DATABASE_URL`: SQLite — легаси-режим,
+  PostgreSQL — цель; локальный запуск на порту `8765` (`BACKEND_PORT`);
+  статика и экспортированные файлы в `static/`.
 - AI-ядро: `core/` — генерация BPMN, rule-based скоринг, улучшение через
   LLM с RAG по корпусу `core/bpmn_dataset/`. Улучшение работает пакетом
   операций над схемой (`core/bpmn_edits.py`), а не генерацией XML целиком.
@@ -19,9 +20,10 @@
   транспорт и разбор ответа — `core/llm_client.py`.
 - Frontend: React (CRA) + bpmn-js в `bpmn-constructor/`; dev-сервер на
   порту `3456`, ожидает backend на `http://localhost:8765`.
-- Автотесты: `python -m pytest tests/ -q` (77 тестов: разбор ответов LLM,
-  аплайер операций, скоринг, HTTP-контур улучшения и принятия). LLM в тестах
-  подставлен на уровне транспорта, сеть и ключ не нужны.
+- Автотесты: `python -m pytest tests/ -q` (99 тестов: разбор ответов LLM,
+  аплайер операций, скоринг, HTTP-контур улучшения и принятия, все маршруты,
+  миграции схемы). LLM в тестах подставлен на уровне транспорта, сеть и ключ
+  не нужны. Прогон на PostgreSQL — переменной `TEST_DATABASE_URL`.
   Docker Compose-контур обкатан (`docker-compose.yml`): `db` (PostgreSQL),
   `backend`, `frontend`; конфигурация через `.env` по шаблону `.env.example`.
 

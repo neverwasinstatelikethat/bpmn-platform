@@ -1,7 +1,8 @@
-# Backend: FastAPI + SQLAlchemy (+ драйвер PostgreSQL)
+# Backend: FastAPI + SQLAlchemy (+ драйвер PostgreSQL, миграции схемы — Alembic)
 fastapi
 uvicorn[standard]
 sqlalchemy
+alembic
 psycopg2-binary
 pydantic[email]
 fastapi-mail

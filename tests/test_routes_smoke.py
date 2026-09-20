@@ -4,28 +4,15 @@
 эндпоинтов (включая предсуществующие 404 в сценариях удаления), поэтому
 случайно изменённый контракт или потерянное при переносе имя видны сразу.
 """
-import os
-import pathlib
-import tempfile
 import uuid
 
 import pytest
-
-# Конфигурация читается на импорте пакета, поэтому окружение задаётся до него.
-_TMP_DIR = pathlib.Path(tempfile.mkdtemp(prefix="bpmn-routes-"))
-os.environ["DATABASE_URL"] = f"sqlite:///{(_TMP_DIR / 'routes.db').as_posix()}"
-os.environ["SECRET_KEY"] = "routes-test-secret"
-os.environ["SKIP_LLM_INIT"] = "1"
-# Почта заведомо недоступна: проверяем деградацию, а не реальные отправки.
-os.environ["MAIL_SERVER"] = "127.0.0.1"
-os.environ["MAIL_PORT"] = "1"
 
 pytest.importorskip("httpx", reason="TestClient работает поверх httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
-from app.startup import run_schema_bootstrap  # noqa: E402
 
 XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
@@ -37,7 +24,6 @@ XML = (
 
 @pytest.fixture(scope="module")
 def client():
-    run_schema_bootstrap()
     with TestClient(app) as test_client:
         yield test_client
 

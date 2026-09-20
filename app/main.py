@@ -14,14 +14,14 @@ from fastapi.staticfiles import StaticFiles
 from app.ai import init_orchestrator
 from app.config import BACKEND_PORT, SKIP_LLM_INIT
 from app.routers import ai, auth, diagrams, folders, sharing, teams
-from app.startup import run_schema_bootstrap
+from app.startup import prepare_database
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    run_schema_bootstrap()
+    prepare_database()
     if SKIP_LLM_INIT:
         # Служебный режим (например, перенос данных): ИИ-эндпоинты недоступны.
         logger.warning("Инициализация LLM-оркестратора пропущена (SKIP_LLM_INIT=1)")

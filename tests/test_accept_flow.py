@@ -4,23 +4,14 @@
 accept-improvement возвращал 500 всегда: после db.delete + db.commit SQLAlchemy
 сбрасывает атрибуты объекта (expire_on_commit), и чтение xml_content падало с
 DetachedInstanceError уже в момент формирования ответа."""
-import os
-import tempfile
 import uuid
 from pathlib import Path
 
 import pytest
 
-# Переменные окружения обязали задать ДО импорта main: конфигурация читается
-# на уровне модуля, а тесты не должны ни при каких условиях трогать рабочую БД.
-_TMP_DIR = Path(tempfile.mkdtemp(prefix="bpmn-test-"))
-os.environ["DATABASE_URL"] = f"sqlite:///{(_TMP_DIR / 'test.db').as_posix()}"
-os.environ["SECRET_KEY"] = "test-secret-key"
-os.environ["SKIP_LLM_INIT"] = "1"
-
 if not Path("static").is_dir():
     pytest.skip(
-        "main.py монтирует ./static — тесты запускают из корня проекта",
+        "app/main.py монтирует ./static — тесты запускают из корня проекта",
         allow_module_level=True,
     )
 
@@ -37,19 +28,9 @@ from app.models import (  # noqa: E402
     User,
 )
 from app.security import create_access_token  # noqa: E402
-from app.startup import run_schema_bootstrap  # noqa: E402
 
 ORIGINAL_XML = "<definitions>исходная схема</definitions>"
 IMPROVED_XML = "<definitions>схема с проверкой оплаты</definitions>"
-
-
-@pytest.fixture(scope="module", autouse=True)
-def schema():
-    """Создаёт схему в тестовой БД до первого обращения к ней.
-
-    Приложение делает это в lifespan, но фикстуры сеют данные и до клиента.
-    """
-    run_schema_bootstrap()
 
 
 @pytest.fixture(scope="module")

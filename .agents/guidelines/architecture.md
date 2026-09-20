@@ -7,12 +7,18 @@
 
 ## Актуальный контур
 
-- FastAPI-монолит `main.py`: API, модели, авторизация, почта, статика;
+- FastAPI-пакет `app/`: `main.py` — только составной корень (lifespan,
+  middleware, подключение роутеров), `routers/` — API по доменам,
+  `models.py`/`schemas.py`/`security.py`/`deps.py`/`db.py`/`config.py`/
+  `mailer.py`/`ai.py`/`startup.py` — соответствующие слои; корневой
+  `main.py` оставлен тонким шимом (`from app.main import app`), чтобы
+  `uvicorn main:app` и Dockerfile не менялись;
 - SQLAlchemy (declarative); БД задаётся `DATABASE_URL`: SQLite для
   легаси-разработки, PostgreSQL — целевой источник истины; секреты и
   настройки читаются из переменных окружения;
-- ad-hoc миграции `apply_migration()` через `PRAGMA table_info` +
-  `ALTER TABLE` — только для существующих SQLite-баз;
+- миграции схемы — Alembic (`alembic.ini`, `migrations/versions/`);
+  `run_migrations()` в `app/startup.py` доводит базу до `head` на старте
+  процесса, сидирование ролей — `seed_default_roles()`;
 - AI-ядро в `core/`: `bpmn_generator.py` (генерация), `bpmn_scoring.py`
   (скоринг), `llm_improve.py` (оркестратор улучшения: RAG + LLM → пакет
   операций), `bpmn_edits.py` (инвентарь схемы, детерминированный аплайер
@@ -31,14 +37,15 @@ Docker Compose-контур (`docker-compose.yml`, `Dockerfile`,
 `bpmn-constructor/Dockerfile`) обкатан: `db` (PostgreSQL), `backend` и
 `frontend` поднимаются `docker compose up -d`, backend доступен на
 `127.0.0.1:8765`, frontend — на `127.0.0.1:3456`. Данные перенесены из
-`bpmn.db` в PostgreSQL. Очередей задач и автотестов пока нет.
+`bpmn.db` в PostgreSQL. Очереди задач пока нет; автотесты — `pytest tests/`
+и конвейер `.github/workflows/ci.yml`.
 
 ## Целевой контур (дорожная карта)
 
 - Источник истины — PostgreSQL: подключение через `DATABASE_URL`
   реализовано, данные перенесены из `bpmn.db` скриптом
-  `migrate_sqlite_to_postgres.py`. Следующий шаг — версионируемые
-  диалект-независимые миграции (цель — Alembic) вместо `create_all`.
+  `migrate_sqlite_to_postgres.py`, схема ведётся миграциями Alembic
+  (`create_all` и ad-hoc `apply_migration()` убраны).
 - Docker Compose обкатан: `db` (postgres, volume, healthcheck, без
   публикации наружу), `backend` (uvicorn, healthcheck `/health`),
   `frontend` (сборка + раздача через nginx), секреты из `.env`.
@@ -82,10 +89,11 @@ Docker Compose-контур (`docker-compose.yml`, `Dockerfile`,
 ## Как анализировать изменения
 
 1. Начинай с этого файла, нужного guideline и фактической точки входа.
-2. Через `rg` проследи вызовы: в `main.py` endpoint → модели/хранилище →
+2. Через `rg` проследи вызовы: endpoint в `app/routers/*` → модели/хранилище →
    модули `core/` → потребители во фронтенде.
-3. Учитывай, что `main.py` — монолит: проверь, нет ли уже функции
-   с похожей ответственностью, прежде чем добавлять новую.
+3. Монолит разложен на `app/`, но общей папки `services/` пока нет:
+   проверь, нет ли уже функции с похожей ответственностью в другом
+   router-е, прежде чем дублировать её.
 4. Сначала оцени возможность расширить существующую границу. Выделяй новый
    модуль или router, когда это яснее разделяет ответственность, снижает
    связанность или упрощает тестирование.

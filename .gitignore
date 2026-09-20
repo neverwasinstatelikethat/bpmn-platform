@@ -44,3 +44,6 @@ npm-debug.log*
 
 # Служебное Visual Studio
 *.user
+
+# Временные базы проверок
+_tmp_alembic/

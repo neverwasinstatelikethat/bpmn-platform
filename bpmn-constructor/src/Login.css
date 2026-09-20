@@ -14,7 +14,7 @@
 .auth-panel__footer { margin-top: var(--space-xl); color: var(--color-muted); font-size: var(--text-sm); }
 .auth-panel__footer a { color: var(--color-primary-active); font-weight: 600; }
 .auth-alert { padding: var(--space-sm) var(--space-md); border-radius: var(--radius-md); font-size: var(--text-sm); }
-.auth-alert--error { background: var(--color-danger-soft); color: #8d2342; }
+.auth-alert--error { background: var(--color-danger-soft); color: var(--color-danger-text); }
 .auth-alert--success { background: var(--color-success-soft); color: var(--color-primary-active); }
 .auth-aside { display: grid; align-content: center; gap: var(--space-xl); padding: clamp(32px, 7vw, 96px); background: var(--color-surface-sage); overflow: hidden; }
 .auth-aside small { color: var(--color-primary-active); font: 1.15rem var(--font-hand); letter-spacing: .04em; text-transform: uppercase; }

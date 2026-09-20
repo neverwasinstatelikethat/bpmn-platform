@@ -3,7 +3,7 @@ import { useAuth } from './context/AuthContext';
 import WorkPage from './components/layout/WorkPage';
 import PageLoader from './components/layout/PageLoader';
 import { registryApi } from './api/registry';
-import { apiClient, toUserMessage } from './api/client';
+import { toUserMessage } from './api/client';
 import './Profile.css';
 
 const Profile = () => {
@@ -20,7 +20,8 @@ const Profile = () => {
     const [panel, setPanel] = useState(null);
     const [members, setMembers] = useState({});
     const [teamName, setTeamName] = useState('');
-    const [teamColor, setTeamColor] = useState('#00A550');
+    const [teamColor, setTeamColor] = useState(() =>
+        getComputedStyle(document.documentElement).getPropertyValue('--color-primary').trim());
     const [inviteEmail, setInviteEmail] = useState('');
     const [inviteRole, setInviteRole] = useState('');
     const [inviteLink, setInviteLink] = useState('');
@@ -36,7 +37,7 @@ const Profile = () => {
             const names = (data || []).map((role) => role.name);
             setRoles(names);
             setInviteRole(names[0] || '');
-        }).catch(() => {});
+        }).catch(() => { if (active) setError('Не удалось загрузить список ролей.'); });
         return () => { active = false; };
     }, []);
 

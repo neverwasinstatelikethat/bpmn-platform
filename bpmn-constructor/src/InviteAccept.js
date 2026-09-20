@@ -30,7 +30,7 @@ const InviteAccept = () => {
                     <p className="invite-accept-card__eyebrow">приглашение в команду</p>
                     <h1>Не получилось принять приглашение</h1>
                     <p>{error}</p>
-                    <button type="button" className="button-primary" onClick={() => navigate('/profile')}>
+                    <button type="button" className="ui-btn ui-btn--primary ui-btn--md" onClick={() => navigate('/profile')}>
                         Вернуться в профиль
                     </button>
                 </section>

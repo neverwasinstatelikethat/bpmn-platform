@@ -30,8 +30,11 @@ const SharedDiagram = () => {
         if (!data || !canvasRef.current) return undefined;
         const viewer = new BpmnViewer({ container: canvasRef.current });
         viewer.importXML(data.xml_content)
-            .then(() => viewer.get('canvas').zoomViewport(true))
-            .catch(() => setError('Не удалось отобразить схему.'));
+            .then(() => viewer.get('canvas').zoom('fit-viewport'))
+            .catch((importError) => {
+                console.error('Ошибка импорта схемы:', importError);
+                setError('Не удалось отобразить схему.');
+            });
         return () => viewer.destroy();
     }, [data]);
 

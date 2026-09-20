@@ -6,56 +6,106 @@ import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
 import './Guideline.css';
 import { guidelineExamples } from './guidelineExamples';
 import WorkPage from './components/layout/WorkPage';
+import PageLoader from './components/layout/PageLoader';
 
-// SVG иконки в стиле ВкусВилл
+// SVG иконки в стиле ВкусВилл: цвет задаётся классом в Guideline.css (токены), не хардкодом.
 const CheckIcon = () => (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M9 16.17L4.83 12L3.41 13.41L9 19L21 7L19.59 5.59L9 16.17Z" fill="#00A550" />
+        <path className="guideline-icon guideline-icon--good" d="M9 16.17L4.83 12L3.41 13.41L9 19L21 7L19.59 5.59L9 16.17Z" />
     </svg>
 );
 
 const WarningIcon = () => (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM13 17H11V15H13V17ZM13 13H11V7H13V13Z" fill="#F62369" />
+        <path className="guideline-icon guideline-icon--bad" d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM13 17H11V15H13V17ZM13 13H11V7H13V13Z" />
     </svg>
 );
 
+const DIAGRAM_ERROR_TEXT = 'Схему-пример не удалось отрисовать. Перезагрузите страницу или закройте и снова откройте этот раздел.';
+
+/**
+ * Теория приходит из guidelineExamples с markdown-акцентом **…** и переносами строк.
+ * Разбираем текст в React-узлы (без dangerouslySetInnerHTML): акцент — <strong>,
+ * перенос строки — <br />.
+ */
+const renderRichText = (text) => (text || '').split('\n').map((line, lineIndex) => (
+    <React.Fragment key={lineIndex}>
+        {lineIndex > 0 ? <br /> : null}
+        {line.split(/(\*\*[^*]+\*\*)/g).filter(Boolean).map((chunk, chunkIndex) => (
+            chunk.length > 4 && chunk.startsWith('**') && chunk.endsWith('**')
+                ? <strong key={chunkIndex} className="guideline-em">{chunk.slice(2, -2)}</strong>
+                : <React.Fragment key={chunkIndex}>{chunk}</React.Fragment>
+        ))}
+    </React.Fragment>
+));
+
 const GuidelineSection = ({ elementKey, data }) => {
     const [isOpen, setIsOpen] = useState(false);
-    const [incorrectDiagram, setIncorrectDiagram] = useState(null);
-    const [correctDiagram, setCorrectDiagram] = useState(null);
     const incorrectContainerRef = useRef(null);
     const correctContainerRef = useRef(null);
+    const [diagramLoading, setDiagramLoading] = useState(false);
+    const [diagramErrors, setDiagramErrors] = useState({});
     const [testCompleted, setTestCompleted] = useState(false);
     const [testAnswers, setTestAnswers] = useState({});
     const [testResult, setTestResult] = useState(null);
 
+    // Модели диаграмм живут только на время открытого раздела: при закрытии
+    // контейнеры размонтируются, поэтому bpmn-js пересоздаётся при каждом открытии.
     useEffect(() => {
-        if (isOpen) {
-            if (!incorrectDiagram) {
-                const modeler = new BpmnModeler({ container: incorrectContainerRef.current });
-                modeler.importXML(data.incorrectExample.xml).then(() => {
-                    const canvas = modeler.get('canvas');
-                    canvas.zoom('fit-viewport', 'auto');
-                }).catch(err => console.error('Ошибка загрузки неправильной диаграммы:', err));
-                setIncorrectDiagram(modeler);
-            }
-            if (!correctDiagram) {
-                const modeler = new BpmnModeler({ container: correctContainerRef.current });
-                modeler.importXML(data.correctExample.xml).then(() => {
-                    const canvas = modeler.get('canvas');
-                    canvas.zoom('fit-viewport', 'auto');
-                }).catch(err => console.error('Ошибка загрузки правильной диаграммы:', err));
-                setCorrectDiagram(modeler);
-            }
-        }
-    }, [isOpen, data.incorrectExample.xml, data.correctExample.xml, incorrectDiagram, correctDiagram]);
+        if (!isOpen) return undefined;
 
-    const highlightKeyPoints = (text) => {
-        return text
-            .replace(/\*\*(.*?)\*\*/g, '<strong style="color: #F62369">$1</strong>')
-            .replace(/\n/g, '<br />');
-    };
+        const diagrams = [
+            { key: 'incorrect', ref: incorrectContainerRef, xml: data.incorrectExample.xml, label: 'неправильный пример' },
+            { key: 'correct', ref: correctContainerRef, xml: data.correctExample.xml, label: 'правильный пример' },
+        ];
+        const created = [];
+        let cancelled = false;
+        let settled = 0;
+
+        const settle = () => {
+            settled += 1;
+            if (settled === diagrams.length && !cancelled) setDiagramLoading(false);
+        };
+
+        const fail = (key, err, stage) => {
+            console.error(`Ошибка bpmn-js (${stage}):`, err);
+            if (!cancelled) setDiagramErrors((current) => ({ ...current, [key]: DIAGRAM_ERROR_TEXT }));
+        };
+
+        setDiagramLoading(true);
+        setDiagramErrors({});
+
+        diagrams.forEach(({ key, ref, xml, label }) => {
+            try {
+                if (!ref.current) throw new Error('Контейнер диаграммы недоступен');
+                const modeler = new BpmnModeler({ container: ref.current });
+                created.push(modeler);
+
+                modeler.importXML(xml).then((result) => {
+                    if (result && result.warnings && result.warnings.length) {
+                        console.warn(`Предупреждения bpmn-js (${label}):`, result.warnings);
+                    }
+                    modeler.get('canvas').zoom('fit-viewport', 'auto');
+                }).catch((err) => {
+                    fail(key, err, `загрузка диаграммы (${label})`);
+                }).finally(settle);
+            } catch (err) {
+                fail(key, err, `инициализация bpmn-js (${label})`);
+                settle();
+            }
+        });
+
+        return () => {
+            cancelled = true;
+            created.forEach((modeler) => {
+                try {
+                    modeler.destroy();
+                } catch (err) {
+                    console.error('Ошибка очистки bpmn-js:', err);
+                }
+            });
+        };
+    }, [isOpen, data.incorrectExample.xml, data.correctExample.xml]);
 
     const testQuestions = [
         { id: 'required', text: `Элемент ${elementKey} обязателен в процессе`, correct: !!data.evaluationCriteria.requiredElements?.length },
@@ -129,29 +179,51 @@ const GuidelineSection = ({ elementKey, data }) => {
                             <motion.h3 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.1, duration: 0.2 }}>
                                 Теория
                             </motion.h3>
-                            <motion.p dangerouslySetInnerHTML={{ __html: highlightKeyPoints(data.description) }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2, duration: 0.2 }} />
+                            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2, duration: 0.2 }}>
+                                {renderRichText(data.description)}
+                            </motion.p>
                             <motion.h4 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.3, duration: 0.2 }}>
                                 Неправильный пример
                             </motion.h4>
-                            <motion.p dangerouslySetInnerHTML={{ __html: highlightKeyPoints(data.incorrectExample.description) }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4, duration: 0.2 }} />
+                            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4, duration: 0.2 }}>
+                                {renderRichText(data.incorrectExample.description)}
+                            </motion.p>
                             <motion.div className="diagram-container" initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.5, duration: 0.2 }}>
+                                {diagramLoading && (
+                                    <div className="diagram-container__overlay">
+                                        <PageLoader label="Рисуем пример схемы…" />
+                                    </div>
+                                )}
                                 <div ref={incorrectContainerRef} className="diagram" />
                             </motion.div>
+                            {diagramErrors.incorrect && (
+                                <p className="guideline-error" role="alert">{diagramErrors.incorrect}</p>
+                            )}
                             <motion.h4 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.6, duration: 0.2 }}>
                                 Правильный пример
                             </motion.h4>
-                            <motion.p dangerouslySetInnerHTML={{ __html: highlightKeyPoints(data.correctExample.description) }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.7, duration: 0.2 }} />
+                            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.7, duration: 0.2 }}>
+                                {renderRichText(data.correctExample.description)}
+                            </motion.p>
                             <motion.div className="diagram-container" initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.8, duration: 0.2 }}>
+                                {diagramLoading && (
+                                    <div className="diagram-container__overlay">
+                                        <PageLoader label="Рисуем пример схемы…" />
+                                    </div>
+                                )}
                                 <div ref={correctContainerRef} className="diagram" />
                             </motion.div>
+                            {diagramErrors.correct && (
+                                <p className="guideline-error" role="alert">{diagramErrors.correct}</p>
+                            )}
                         </div>
                         <div className="test">
                             <motion.h3 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.9, duration: 0.2 }}>
                                 Тест
                             </motion.h3>
                             <form onSubmit={handleTestSubmit}>
-                                {testQuestions.map(({ id, text }) => (
-                                    <motion.div key={id} initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 1.0 + 0.1 * testQuestions.indexOf({ id, text }), duration: 0.2 }}>
+                                {testQuestions.map(({ id, text }, index) => (
+                                    <motion.div key={id} initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 1.0 + 0.1 * index, duration: 0.2 }}>
                                         <label>
                                             <input type="checkbox" checked={testAnswers[id] || false} onChange={(e) => setTestAnswers({ ...testAnswers, [id]: e.target.checked })} /> {text}
                                         </label>

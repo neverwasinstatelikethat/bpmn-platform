@@ -3,51 +3,49 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faLightbulb, faChevronDown, faChevronUp } from '@fortawesome/free-solid-svg-icons';
 
-const ThinkBlock = ({ content, shouldAnimate = true }) => {
+/**
+ * Сворачиваемый блок размышлений ИИ.
+ * `isTyping` — идёт ли прямо сейчас генерация ответа (тогда показываем точки).
+ * Текст печатается один раз на экземпляр: повторные рендеры родителя и рост
+ * контента не перезапускают анимацию.
+ */
+const ThinkBlock = ({ content, isTyping = false }) => {
     const [isExpanded, setIsExpanded] = useState(true);
     const [displayContent, setDisplayContent] = useState('');
-    const [isTyping, setIsTyping] = useState(false);
-    const animationRef = useRef(null);
     const hasAnimatedRef = useRef(false);
+    const animationRef = useRef(null);
 
     useEffect(() => {
         if (!content) {
             setDisplayContent('');
-            setIsTyping(false);
             return;
         }
 
-        if (shouldAnimate) {
-            hasAnimatedRef.current = false;
-        }
-
-        if (!shouldAnimate || hasAnimatedRef.current) {
+        // Уже печатали — просто показываем актуальный текст целиком.
+        if (hasAnimatedRef.current) {
             setDisplayContent(content);
-            setIsTyping(false);
             return;
         }
-
-        setIsTyping(true);
-        setDisplayContent('');
         hasAnimatedRef.current = true;
 
+        setDisplayContent('');
         let i = 0;
         animationRef.current = setInterval(() => {
-            if (i < content.length) {
-                setDisplayContent(prev => prev + content.charAt(i));
-                i++;
-            } else {
+            i += 1;
+            setDisplayContent(content.slice(0, i));
+            if (i >= content.length) {
                 clearInterval(animationRef.current);
-                setIsTyping(false);
+                animationRef.current = null;
             }
         }, 20);
 
         return () => {
             if (animationRef.current) {
                 clearInterval(animationRef.current);
+                animationRef.current = null;
             }
         };
-    }, [content, shouldAnimate]);
+    }, [content]);
 
     if (!content) return null;
 
@@ -64,14 +62,11 @@ const ThinkBlock = ({ content, shouldAnimate = true }) => {
                 onClick={() => setIsExpanded(!isExpanded)}
                 aria-expanded={isExpanded}
             >
-                <FontAwesomeIcon
-                    icon={faLightbulb}
-                    className="text-warning mr-2"
-                />
+                <FontAwesomeIcon icon={faLightbulb} className="think-header__icon" />
                 <span>Размышления ИИ</span>
                 <FontAwesomeIcon
                     icon={isExpanded ? faChevronUp : faChevronDown}
-                    className="ml-auto text-sm"
+                    className="think-header__chevron"
                 />
             </button>
 
@@ -90,9 +85,9 @@ const ThinkBlock = ({ content, shouldAnimate = true }) => {
 
                         {isTyping && (
                             <div className="think-typing">
-                                <span></span>
-                                <span></span>
-                                <span></span>
+                                <span className="think-typing__dot"></span>
+                                <span className="think-typing__dot"></span>
+                                <span className="think-typing__dot"></span>
                             </div>
                         )}
                     </motion.div>

@@ -1,10 +1,10 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import BpmnModeler from 'bpmn-js/lib/Modeler';
 import { layoutProcess } from 'bpmn-auto-layout-feat-ivan-tulaev';
 import 'bpmn-js/dist/assets/diagram-js.css';
 import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
-import { apiClient } from './api/client';
+import { apiClient, toUserMessage } from './api/client';
 import { v4 as uuid } from 'uuid';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
@@ -12,11 +12,34 @@ import GenerateChat from './GenerateChat';
 import ImproveChat from './ImproveChat';
 import ScorePanel from './ScorePanel';
 import { getDi } from 'bpmn-js/lib/util/ModelUtil';
-import { motion } from 'framer-motion';
-import Header from './Header';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Button, Input } from './components/ui';
+import { PageLoader } from './components/layout';
 import './Editor.css';
 // Импортируем grid модуль
 import gridModule from 'diagram-js-grid';
+import RailPalette from './bpmnRailPalette';
+
+// diagram-js объявляет `palette: ['type', Palette]` + `__init__: ['palette']`;
+// подменяем тип, чтобы инструменты попали в рельс, а не в контейнер канваса.
+const railPaletteModule = { palette: ['type', RailPalette] };
+
+const cssVar = (name) => (typeof window === 'undefined'
+    ? ''
+    : getComputedStyle(document.documentElement).getPropertyValue(name).trim());
+
+/* Палитра заливок элементов схемы — фирменные цвета из токенов (styles/tokens.css). */
+const FILL_COLORS = [
+    { token: '--color-ink-deep', label: 'Графит' },
+    { token: '--color-primary', label: 'Зелёный ВкусВилл' },
+    { token: '--color-berry', label: 'Ягода' },
+    { token: '--color-info', label: 'Небо' },
+    { token: '--color-warn', label: 'Янтарь' },
+    { token: '--color-violet', label: 'Фиалка' },
+];
+
+/* Подсветка найденных элементов берёт цвет из дизайн-токена. */
+const HIGHLIGHT_TOKEN = '--color-primary-soft';
 
 class BPMNExporter {
     constructor(bpmnViewer) {
@@ -282,19 +305,19 @@ const Editor = () => {
     const modelerRef = useRef(null);
     const containerRef = useRef(null);
     const paletteRef = useRef(null);
-    const downloadButtonRef = useRef(null);
     const [diagramName, setDiagramName] = useState('Новая схема');
     const [diagramId, setDiagramId] = useState(null);
     const [validationResult, setValidationResult] = useState(null);
     const [score, setScore] = useState(0);
     const [showScorePanel, setShowScorePanel] = useState(false);
-    const [headerVisible] = useState(true);
+    const [scoreBusy, setScoreBusy] = useState(false);
     const [notification, setNotification] = useState(null);
+    const [canvasBusy, setCanvasBusy] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
     const [chatType, setChatType] = useState(null);
     const [showColorPicker, setShowColorPicker] = useState(false);
+    const [pendingDelete, setPendingDelete] = useState(false);
     const [, setCurrentXml] = useState(emptyBpmn);
-    const [, setPendingImprovementId] = useState(null);
     const location = useLocation();
     const navigate = useNavigate();
     const notificationTimeoutRef = useRef(null);
@@ -303,81 +326,34 @@ const Editor = () => {
     const [chatHeight] = useState('70vh');
     const [chatPosition, setChatPosition] = useState({ top: 120, right: 20 });
     const [showDownloadOptions, setShowDownloadOptions] = useState(false);
-    const [downloadPosition, setDownloadPosition] = useState({ top: 0, left: 0 });
     const [scoreExpanded, setScoreExpanded] = useState(false);
     const [scorePosition, setScorePosition] = useState({ top: 120, right: 20 });
     const [scoreHeight, setScoreHeight] = useState('70vh');
     const [messagesGenerate, setMessagesGenerate] = useState([]);
     const [messagesImprove, setMessagesImprove] = useState([]);
-    const [, setMessagesScore] = useState([]);
+    const [messagesScore, setMessagesScore] = useState([]);
+    // Последнее сообщение скоринга показывается в панели инструментов,
+    // чтобы ошибка /api/evaluate не оставалась невидимой.
+    const scoreMessage = messagesScore.length ? messagesScore[messagesScore.length - 1] : null;
+    // Цвета заливки резолвим из токенов: в компоненте нет ни одного хардкод-цвета.
+    const fillSwatches = useMemo(
+        () => FILL_COLORS.map(({ token, label }) => ({ color: cssVar(token), label }))
+            .filter((swatch) => swatch.color),
+        []
+    );
     // Оптимизация поиска
     const searchResults = useRef(new Map());
     const lastSearchQuery = useRef('');
     const searchTimeoutRef = useRef(null);
 
-    // Улучшенное центрирование канваса по центральному элементу
+    // Вписываем схему в видимую область канваса, не приближая больше 1:1.
     const autoFitDiagram = useCallback(() => {
-        console.log('Начало центрирования диаграммы');
-        if (!modelerRef.current) {
-            console.warn('Моделер не инициализирован');
-            return;
-        }
-        try {
-            const canvas = modelerRef.current.get('canvas');
-            const elementRegistry = modelerRef.current.get('elementRegistry');
-            if (!canvas.getRootElement()) {
-                console.warn('Корневой элемент не найден');
-                return;
-            }
-            // Получаем все элементы диаграммы
-            const elements = elementRegistry.getAll().filter(element =>
-                element.type !== 'label' &&
-                element.width && element.height &&
-                element.x !== undefined && element.y !== undefined
-            );
-            console.log('Найдено элементов:', elements.length);
-            if (elements.length === 0) {
-                console.log('Элементы не найдены, используем масштаб по умолчанию');
-                canvas.zoom(1.0);
-                return;
-            }
-            // Вычисляем границы диаграммы
-            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-            elements.forEach(element => {
-                minX = Math.min(minX, element.x);
-                minY = Math.min(minY, element.y);
-                maxX = Math.max(maxX, element.x + element.width);
-                maxY = Math.max(maxY, element.y + element.height);
-            });
-            console.log('Границы диаграммы:', { minX, minY, maxX, maxY });
-            // Получаем размеры контейнера
-            const container = containerRef.current;
-            if (!container || container.clientWidth === 0 || container.clientHeight === 0) {
-                console.warn('Контейнер еще не имеет размеров');
-                return;
-            }
-            const containerWidth = container.clientWidth;
-            const containerHeight = container.clientHeight;
-            console.log('Размеры контейнера:', { containerWidth, containerHeight });
-            // Вычисляем масштаб с учетом отступов
-            const padding = 100;
-            const scaleX = containerWidth / (maxX - minX + padding);
-            const scaleY = containerHeight / (maxY - minY + padding);
-            const scale = Math.min(scaleX, scaleY, 1.0);
-            console.log('Масштаб:', scale);
-            // Применяем масштаб
-            canvas.zoom(scale);
-            console.log('Масштаб применен');
-            console.log('Центрирование завершено');
-        } catch (error) {
-            console.error('Ошибка при центрировании:', error);
-            try {
-                const canvas = modelerRef.current.get('canvas');
-                canvas.zoom(1.0);
-            } catch (fallbackError) {
-                console.error('Критическая ошибка центрирования:', fallbackError);
-            }
-        }
+        const container = containerRef.current;
+        if (!modelerRef.current || !container?.clientWidth || !container?.clientHeight) return;
+        const canvas = modelerRef.current.get('canvas');
+        if (!canvas.getRootElement()) return;
+        canvas.zoom('fit-viewport');
+        if (canvas.zoom() > 1) canvas.zoom(1);
     }, []);
 
     // Оптимизированная функция поиска с debounce
@@ -407,6 +383,8 @@ const Editor = () => {
         if (lastSearchQuery.current === searchQuery) return;
         const query = searchQuery.toLowerCase();
         lastSearchQuery.current = searchQuery;
+        // Цвет подсветки берём из токена дизайн-системы (правила .highlight — в Editor.css)
+        const highlightFill = cssVar(HIGHLIGHT_TOKEN);
         // Создаем Set для хранения новых результатов
         const newResults = new Set();
         // Проходим по всем элементам
@@ -419,7 +397,9 @@ const Editor = () => {
                     const di = getDi(element);
                     if (di) {
                         canvas.addMarker(element.id, 'highlight');
-                        modeling.updateProperties(element, { 'di': { ...di, fill: '#2dbe64' } });
+                        if (highlightFill) {
+                            modeling.updateProperties(element, { 'di': { ...di, fill: highlightFill } });
+                        }
                     }
                 }
             } else if (searchResults.current.has(element.id)) {
@@ -482,14 +462,36 @@ const Editor = () => {
         }, 3000);
     }, []);
 
+    // Диалог подтверждения удаления закрывается по Escape.
+    useEffect(() => {
+        if (!pendingDelete) return undefined;
+        const onKeyDown = (event) => {
+            if (event.key === 'Escape') setPendingDelete(false);
+        };
+        document.addEventListener('keydown', onKeyDown);
+        return () => document.removeEventListener('keydown', onKeyDown);
+    }, [pendingDelete]);
+
+    // Escape закрывает плавающие панели: сначала чат, затем скоринг.
+    useEffect(() => {
+        if (!chatType && !showScorePanel) return undefined;
+        const onKeyDown = (event) => {
+            if (event.key !== 'Escape') return;
+            if (chatType) setChatType(null);
+            else setShowScorePanel(false);
+        };
+        document.addEventListener('keydown', onKeyDown);
+        return () => document.removeEventListener('keydown', onKeyDown);
+    }, [chatType, showScorePanel]);
+
     useEffect(() => {
         console.log('Инициализация BPMN редактора');
         // Создание модели с расширенными модулями
-        modelerRef.current = new BpmnModeler({
+        const modeler = new BpmnModeler({
             container: containerRef.current,
-            palette: { container: paletteRef.current },
             additionalModules: [
-                gridModule // Модуль для сетки
+                gridModule, // Модуль для сетки
+                railPaletteModule // Палитра — в левом рельсе
             ],
             grid: {
                 visible: true,
@@ -497,23 +499,29 @@ const Editor = () => {
                 size: 30
             }
         });
+        modelerRef.current = modeler;
+        // В StrictMode эффект отрабатывает дважды: загрузка устаревшего экземпляра
+        // должна остановиться, иначе два importXML спорят за один канвас.
+        let cancelled = false;
 
         const loadDiagram = async () => {
             console.log('Загрузка диаграммы');
+            setCanvasBusy(true);
             try {
                 let initialXML = emptyBpmn;
-                if (modelerRef.current) modelerRef.current.clear();
                 const urlParams = new URLSearchParams(location.search);
                 let loadedDiagramId = urlParams.get('load');
                 if (loadedDiagramId) {
                     console.log('Загрузка диаграммы по ID:', loadedDiagramId);
                     const response = await apiClient.get(`/api/diagrams/${loadedDiagramId}`);
+                    if (cancelled) return;
                     initialXML = response.data.xml_content;
                     setDiagramName(response.data.name || `Схема ${loadedDiagramId}`);
                     setDiagramId(loadedDiagramId);
                 } else if (location.state?.id) {
                     console.log('Загрузка диаграммы из состояния:', location.state.id);
                     const response = await apiClient.get(`/api/diagrams/${location.state.id}`);
+                    if (cancelled) return;
                     initialXML = response.data.xml_content;
                     setDiagramName(response.data.name || 'Новая схема');
                     setDiagramId(location.state.id);
@@ -539,48 +547,50 @@ const Editor = () => {
                         console.warn('Ошибка layoutProcess, загружаем без раскладки:', layoutErr);
                         layoutedXML = initialXML;
                     }
+                    if (cancelled) return;
                 }
-                if (modelerRef.current) {
-                    console.log('Импорт XML в модельер');
-                    await modelerRef.current.importXML(layoutedXML);
-                    const elementRegistry = modelerRef.current.get('elementRegistry');
-                    elementRegistry.forEach((element) => {
-                        const di = getDi(element);
-                        if (di && di.fill) elementsOriginalColors.current.set(element.id, di.fill);
-                    });
-                    setCurrentXml(layoutedXML);
-                    // Увеличиваем задержку для правильного центрирования
-                    console.log('Планирование центрирования после загрузки');
-                    setTimeout(() => {
-                        autoFitDiagram();
-                    }, 800);
-                }
+                console.log('Импорт XML в модельер');
+                await modeler.importXML(layoutedXML);
+                const elementRegistry = modeler.get('elementRegistry');
+                elementRegistry.forEach((element) => {
+                    const di = getDi(element);
+                    if (di && di.fill) elementsOriginalColors.current.set(element.id, di.fill);
+                });
+                setCurrentXml(layoutedXML);
+                // Увеличиваем задержку для правильного центрирования
+                console.log('Планирование центрирования после загрузки');
+                setTimeout(() => {
+                    autoFitDiagram();
+                }, 800);
             } catch (err) {
+                if (cancelled) return;
                 console.error('Ошибка загрузки диаграммы:', err);
-                if (modelerRef.current) {
-                    modelerRef.current.clear();
-                    await modelerRef.current.importXML(emptyBpmn);
-                    setCurrentXml(emptyBpmn);
-                    setTimeout(() => {
-                        if (modelerRef.current) {
-                            autoFitDiagram();
-                        }
-                    }, 800);
-                }
+                modeler.clear();
+                await modeler.importXML(emptyBpmn);
+                setCurrentXml(emptyBpmn);
+                setTimeout(() => {
+                    if (modelerRef.current === modeler) {
+                        autoFitDiagram();
+                    }
+                }, 800);
                 showNotification('Ошибка загрузки диаграммы, загружено начальное состояние.');
+            } finally {
+                if (!cancelled) setCanvasBusy(false);
             }
         };
 
         loadDiagram();
 
-        const eventBus = modelerRef.current.get('eventBus');
+        const eventBus = modeler.get('eventBus');
         eventBus.on('element.changed', async () => {
-            const { xml } = await modelerRef.current.saveXML({ format: true });
+            const { xml } = await modeler.saveXML({ format: true });
             setCurrentXml(xml);
         });
 
         return () => {
-            if (modelerRef.current) modelerRef.current.destroy();
+            cancelled = true;
+            modeler.destroy();
+            if (modelerRef.current === modeler) modelerRef.current = null;
         };
     }, [location.search, location.state, showNotification, autoFitDiagram]);
 
@@ -597,27 +607,30 @@ const Editor = () => {
             });
             if (response.data.status === 'success') {
                 const newBpmnXML = response.data.bpmn;
-                if (modelerRef.current) modelerRef.current.clear();
-                const layoutedXML = await layoutProcess(newBpmnXML);
-                await modelerRef.current.importXML(layoutedXML);
-                setDiagramName(`Сгенерировано: ${prompt?.slice(0, 20) || 'Новая схема'}`);
-                setMessagesGenerate(prev => [
-                    ...prev.slice(0, -1),
-                    { sender: 'AI', text: 'Диаграмма успешно сгенерирована.', id: Date.now() }
-                ]);
-                setCurrentXml(layoutedXML);
-                setTimeout(() => {
-                    if (modelerRef.current) {
-                        autoFitDiagram();
-                    }
-                }, 800);
+                setCanvasBusy(true);
+                try {
+                    if (modelerRef.current) modelerRef.current.clear();
+                    const layoutedXML = await layoutProcess(newBpmnXML);
+                    await modelerRef.current.importXML(layoutedXML);
+                    setDiagramName(`Сгенерировано: ${prompt?.slice(0, 20) || 'Новая схема'}`);
+                    setMessagesGenerate(prev => [
+                        ...prev.slice(0, -1),
+                        { sender: 'AI', text: 'Диаграмма успешно сгенерирована.', id: Date.now() }
+                    ]);
+                    setCurrentXml(layoutedXML);
+                    setTimeout(() => {
+                        if (modelerRef.current) {
+                            autoFitDiagram();
+                        }
+                    }, 800);
+                } finally {
+                    setCanvasBusy(false);
+                }
             }
         } catch (err) {
             console.error('Ошибка генерации:', err);
-            setMessagesGenerate(prev => [
-                ...prev.slice(0, -1),
-                { sender: 'AI', text: `Ошибка генерации: ${err.message}`, id: Date.now() }
-            ]);
+            setMessagesGenerate(prev => prev.slice(0, -1));
+            throw new Error(toUserMessage(err, 'Не удалось сгенерировать схему.'));
         }
     };
 
@@ -633,12 +646,18 @@ const Editor = () => {
                 console.warn('Layout failed, using original XML:', layoutError);
                 layoutedXML = fixedXML;
             }
-            const response = await apiClient.post('/api/evaluate', {
-                bpmn_xml: layoutedXML,
-            });
+            setShowScorePanel(true);
+            setScoreBusy(true);
+            let response;
+            try {
+                response = await apiClient.post('/api/evaluate', {
+                    bpmn_xml: layoutedXML,
+                });
+            } finally {
+                setScoreBusy(false);
+            }
             setValidationResult(response.data);
             setScore(response.data.score);
-            setShowScorePanel(true);
             setMessagesScore([{
                 sender: 'AI',
                 text: `Проверка завершена. Оценка: ${response.data.score}/100. ${response.data.recommendations?.join(' ') || ''}`,
@@ -646,6 +665,7 @@ const Editor = () => {
             }]);
             if (modelerRef.current && response.data.optimized_bpmn) {
                 console.log('Применение оптимизированной диаграммы');
+                setCanvasBusy(true);
                 try {
                     modelerRef.current.clear();
                     const fixedOptimizedXML = await fixXMLStructure(response.data.optimized_bpmn);
@@ -671,15 +691,20 @@ const Editor = () => {
                     setTimeout(() => {
                         autoFitDiagram();
                     }, 800);
+                } finally {
+                    setCanvasBusy(false);
                 }
             }
         } catch (err) {
             console.error('Ошибка проверки:', err);
+            const message = `Ошибка проверки: ${err.message}`;
             setMessagesScore([{
                 sender: 'AI',
-                text: `Ошибка проверки: ${err.message}`,
+                text: message,
+                isError: true,
                 id: Date.now()
             }]);
+            showNotification(message);
         }
     };
 
@@ -708,15 +733,10 @@ const Editor = () => {
                     id: Date.now()
                 }
             ]);
-            if (response.data.improvement_id) {
-                setPendingImprovementId(response.data.improvement_id);
-            }
         } catch (err) {
             console.error('Ошибка улучшения:', err);
-            setMessagesImprove(prev => [
-                ...prev.slice(0, -1),
-                { sender: 'AI', text: `Ошибка: ${err.message}`, id: Date.now() }
-            ]);
+            setMessagesImprove(prev => prev.slice(0, -1));
+            throw new Error(toUserMessage(err, 'Не удалось улучшить схему.'));
         }
     };
 
@@ -855,25 +875,29 @@ const Editor = () => {
                 layoutedXML = fixedXML;
             }
             if (modelerRef.current) {
-                modelerRef.current.clear();
-                await modelerRef.current.importXML(layoutedXML);
-                const elementRegistry = modelerRef.current.get('elementRegistry');
-                elementRegistry.forEach((element) => {
-                    const di = getDi(element);
-                    if (di && di.fill) {
-                        elementsOriginalColors.current.set(element.id, di.fill);
-                    }
-                });
-                setCurrentXml(layoutedXML);
-                setDiagramId(response.data.diagram_id);
-                setPendingImprovementId(null);
-                setMessagesImprove(prev => [...prev,
-                { sender: 'AI', text: 'Изменения успешно применены.', id: Date.now() }
-                ]);
-                // Центрируем после принятия улучшения
-                setTimeout(() => {
-                    autoFitDiagram();
-                }, 800);
+                setCanvasBusy(true);
+                try {
+                    modelerRef.current.clear();
+                    await modelerRef.current.importXML(layoutedXML);
+                    const elementRegistry = modelerRef.current.get('elementRegistry');
+                    elementRegistry.forEach((element) => {
+                        const di = getDi(element);
+                        if (di && di.fill) {
+                            elementsOriginalColors.current.set(element.id, di.fill);
+                        }
+                    });
+                    setCurrentXml(layoutedXML);
+                    setDiagramId(response.data.diagram_id);
+                    setMessagesImprove(prev => [...prev,
+                    { sender: 'AI', text: 'Изменения успешно применены.', id: Date.now() }
+                    ]);
+                    // Центрируем после принятия улучшения
+                    setTimeout(() => {
+                        autoFitDiagram();
+                    }, 800);
+                } finally {
+                    setCanvasBusy(false);
+                }
             }
         } catch (err) {
             console.error('Ошибка принятия изменений:', err);
@@ -912,8 +936,13 @@ const Editor = () => {
             }
             const response = await apiClient.post(`/api/share`, { diagram_id: diagramId });
             const shareLink = response.data.share_link;
-            navigator.clipboard.writeText(shareLink);
-            showNotification('Ссылка скопирована в буфер обмена!');
+            try {
+                await navigator.clipboard.writeText(shareLink);
+                showNotification('Ссылка скопирована в буфер обмена!');
+            } catch {
+                // Clipboard API недоступен без жеста/разрешения — показываем ссылку.
+                showNotification(`Ссылка для просмотра: ${shareLink}`);
+            }
         } catch (err) {
             console.error('Ошибка создания ссылки:', err);
             showNotification('Ошибка создания ссылки.');
@@ -931,6 +960,16 @@ const Editor = () => {
             console.error('Ошибка удаления:', err);
             showNotification('Ошибка удаления диаграммы.');
         }
+    };
+
+    // Удаление запускается только после подтверждения в диалоге.
+    const handleRequestDelete = () => setPendingDelete(true);
+
+    const handleCancelDelete = () => setPendingDelete(false);
+
+    const handleConfirmDelete = async () => {
+        setPendingDelete(false);
+        await handleDelete();
     };
 
     const handleDownload = async (format) => {
@@ -981,17 +1020,22 @@ const Editor = () => {
 
     const handleClearCanvas = async () => {
         console.log('Очистка канваса');
-        if (modelerRef.current) modelerRef.current.clear();
-        await modelerRef.current.importXML(emptyBpmn);
-        setDiagramName('Новая схема');
-        setDiagramId(null);
-        elementsOriginalColors.current.clear();
-        showNotification('Канвас очищен.');
-        setCurrentXml(emptyBpmn);
-        // Центрируем после очистки
-        setTimeout(() => {
-            autoFitDiagram();
-        }, 800);
+        setCanvasBusy(true);
+        try {
+            if (modelerRef.current) modelerRef.current.clear();
+            await modelerRef.current.importXML(emptyBpmn);
+            setDiagramName('Новая схема');
+            setDiagramId(null);
+            elementsOriginalColors.current.clear();
+            showNotification('Канвас очищен.');
+            setCurrentXml(emptyBpmn);
+            // Центрируем после очистки
+            setTimeout(() => {
+                autoFitDiagram();
+            }, 800);
+        } finally {
+            setCanvasBusy(false);
+        }
     };
 
     const handleColorChange = (color) => {
@@ -1030,176 +1074,274 @@ const Editor = () => {
         setShowColorPicker(false);
     };
 
-    const handleShowDownloadOptions = () => {
-        if (downloadButtonRef.current) {
-            const rect = downloadButtonRef.current.getBoundingClientRect();
-            setDownloadPosition({
-                top: rect.bottom + window.scrollY + 10,
-                left: rect.left + window.scrollX
-            });
-        }
-        setShowDownloadOptions(true);
-    };
+    // Позицию меню экспорта задаёт CSS: оно заякорено на блоке действий шапки.
+    const handleShowDownloadOptions = () => setShowDownloadOptions(true);
 
     return (
         <div className="editor-wrapper">
-            <Header />
             <div className="editor-container">
-                <div className="editor-left-panel">
-                    <div className="editor-palette-panel" ref={paletteRef} />
-                </div>
-                {headerVisible && (
-                    <motion.div className="editor-header" initial={{ y: -60 }} animate={{ y: 0 }} exit={{ y: -60 }} transition={{ type: 'spring', stiffness: 100 }}>
-                        <input
-                            type="text"
-                            value={diagramName}
-                            onChange={(e) => setDiagramName(e.target.value)}
-                            className="editor-diagram-name-input"
-                            placeholder="Название схемы"
-                        />
-                        <div className="editor-header-actions">
-                            <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={handleSave} className="editor-action-btn editor-save-btn">
-                                Сохранить
-                            </motion.button>
-                            <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={handleShare} className="editor-action-btn editor-share-btn">
-                                Поделиться
-                            </motion.button>
-                            <motion.button ref={downloadButtonRef} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={handleShowDownloadOptions} className="editor-action-btn editor-download-btn">
+                <motion.div
+                    className="editor-header"
+                    initial={{ y: -16, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    transition={{ type: 'spring', stiffness: 120, damping: 18 }}
+                >
+                    <Input
+                        type="text"
+                        value={diagramName}
+                        onChange={(e) => setDiagramName(e.target.value)}
+                        className="editor-diagram-name-input"
+                        placeholder="Название схемы"
+                        aria-label="Название схемы"
+                    />
+                    <div className="editor-header-actions">
+                        <Button variant="primary" size="sm" onClick={handleSave}>
+                            Сохранить
+                        </Button>
+                        <Button variant="dark" size="sm" onClick={handleShare}>
+                            Поделиться
+                        </Button>
+                        <div className="editor-download-group">
+                            <Button variant="dark" size="sm" onClick={handleShowDownloadOptions} aria-expanded={showDownloadOptions}>
                                 Скачать
-                            </motion.button>
-                            <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={handleDelete} className="editor-action-btn editor-delete-btn">
-                                Удалить
-                            </motion.button>
+                            </Button>
+                            <AnimatePresence>
+                                {showDownloadOptions && (
+                                    <motion.div
+                                        className="editor-download-options-modal"
+                                        initial={{ opacity: 0, y: -6 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        exit={{ opacity: 0, y: -6 }}
+                                        transition={{ duration: 0.2 }}
+                                    >
+                                        <Button variant="secondary" size="sm" onClick={() => handleDownload('bpmn')}>BPMN</Button>
+                                        <Button variant="secondary" size="sm" onClick={() => handleDownload('png')}>PNG</Button>
+                                        <Button variant="secondary" size="sm" onClick={() => handleDownload('pdf')}>PDF</Button>
+                                        <Button variant="ghost" size="sm" onClick={() => setShowDownloadOptions(false)}>Закрыть</Button>
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
                         </div>
-                    </motion.div>
-                )}
-                {showColorPicker && (
-                    <motion.div
-                        className="editor-color-picker"
-                        initial={{ opacity: 0, y: -10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -10 }}
-                        transition={{ duration: 0.2 }}
-                    >
-                        <div className="editor-color-option" style={{ backgroundColor: '#000000' }} onClick={() => handleColorChange('#000000')}></div>
-                        <div className="editor-color-option" style={{ backgroundColor: '#FF0000' }} onClick={() => handleColorChange('#FF0000')}></div>
-                        <div className="editor-color-option" style={{ backgroundColor: '#00FF00' }} onClick={() => handleColorChange('#00FF00')}></div>
-                        <div className="editor-color-option" style={{ backgroundColor: '#0000FF' }} onClick={() => handleColorChange('#0000FF')}></div>
-                        <div className="editor-color-option" style={{ backgroundColor: '#FFFF00' }} onClick={() => handleColorChange('#FFFF00')}></div>
-                        <div className="editor-color-option" style={{ backgroundColor: '#FF00FF' }} onClick={() => handleColorChange('#FF00FF')}></div>
-                        <div className="editor-color-option editor-reset-color" onClick={handleResetColor}>
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM12 20C7.59 20 4 16.41 4 12C4 7.59 7.59 4 12 4C16.41 4 20 7.59 20 12C20 16.41 16.41 20 12 20ZM12 6C9.79 6 8 7.79 8 10C8 12.21 9.79 14 12 14C14.21 14 16 12.21 16 10C16 7.79 14.21 6 12 6ZM12 12C10.9 12 10 11.1 10 10C10 8.9 10.9 8 12 8C13.1 8 14 8.9 14 10C14 11.1 13.1 12 12 12Z" fill="#ff4d4f" />
-                            </svg>
-                        </div>
-                    </motion.div>
-                )}
-                {notification && (
-                    <motion.div className="editor-notification" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} transition={{ duration: 0.3 }}>
-                        {notification}
-                    </motion.div>
-                )}
-                {showDownloadOptions && (
-                    <motion.div
-                        className="editor-download-options-modal"
-                        style={{ top: downloadPosition.top, left: downloadPosition.left }}
-                        initial={{ opacity: 0, scale: 0.9 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        exit={{ opacity: 0, scale: 0.9 }}
-                        transition={{ duration: 0.3 }}
-                    >
-                        <button onClick={() => handleDownload('bpmn')} className="editor-modal-btn">BPMN</button>
-                        <button onClick={() => handleDownload('png')} className="editor-modal-btn">PNG</button>
-                        <button onClick={() => handleDownload('pdf')} className="editor-modal-btn">PDF</button>
-                        <button onClick={() => setShowDownloadOptions(false)} className="editor-modal-btn editor-close-btn">Закрыть</button>
-                    </motion.div>
-                )}
+                        <Button variant="secondary" size="sm" className="editor-btn-danger" onClick={handleRequestDelete}>
+                            Удалить
+                        </Button>
+                    </div>
+                </motion.div>
                 <div className="editor-toolbar">
-                    <input
+                    <Input
                         type="text"
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                         placeholder="Поиск элемента..."
                         className="editor-search-input"
+                        aria-label="Поиск элемента по названию"
                     />
+                    {scoreMessage && (
+                        <div
+                            className={`editor-score-note${scoreMessage.isError ? ' is-error' : ''}`}
+                            role={scoreMessage.isError ? 'alert' : 'status'}
+                        >
+                            <span>{scoreMessage.text}</span>
+                            <button
+                                type="button"
+                                className="editor-score-note__close"
+                                onClick={() => setMessagesScore([])}
+                                aria-label="Скрыть результат проверки"
+                            >
+                                ×
+                            </button>
+                        </div>
+                    )}
                 </div>
                 <div className="editor-content">
-                    <div ref={containerRef} className="editor-bpmn-canvas" />
-                    <div className="editor-canvas-controls">
-                        <motion.button whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }} onClick={handleZoomIn} className="editor-control-btn">+</motion.button>
-                        <motion.button whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }} onClick={handleZoomOut} className="editor-control-btn">-</motion.button>
-                        <motion.button whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }} onClick={handleResetZoom} className="editor-control-btn">Сбросить</motion.button>
-                        <motion.button whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.9 }} onClick={handleClearCanvas} className="editor-control-btn">Очистить</motion.button>
+                    <div className="editor-left-panel">
+                        <div className="editor-palette-panel" ref={paletteRef} />
                     </div>
+                    <div className="editor-canvas-area">
+                        <div ref={containerRef} className="editor-bpmn-canvas" />
+                        <AnimatePresence>
+                            {canvasBusy && (
+                                <motion.div
+                                    className="editor-canvas-busy"
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    exit={{ opacity: 0 }}
+                                    transition={{ duration: 0.2 }}
+                                >
+                                    <PageLoader label="Открываем схему…" />
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+                        <AnimatePresence>
+                            {showColorPicker && (
+                                <motion.div
+                                    className="editor-color-picker"
+                                    initial={{ opacity: 0, y: -10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0, y: -10 }}
+                                    transition={{ duration: 0.2 }}
+                                    role="group"
+                                    aria-label="Цвет заливки элемента"
+                                >
+                                    {fillSwatches.map(({ color, label }) => (
+                                        <button
+                                            key={color}
+                                            type="button"
+                                            className="editor-swatch"
+                                            style={{ backgroundColor: color }}
+                                            onClick={() => handleColorChange(color)}
+                                            aria-label={`Залить элемент цветом «${label}»`}
+                                            title={label}
+                                        />
+                                    ))}
+                                    <button
+                                        type="button"
+                                        className="editor-swatch editor-reset-color"
+                                        onClick={handleResetColor}
+                                        aria-label="Сбросить цвет элемента"
+                                        title="Сбросить цвет"
+                                    >
+                                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM12 20C7.59 20 4 16.41 4 12C4 7.59 7.59 4 12 4C16.41 4 20 7.59 20 12C20 16.41 16.41 20 12 20ZM12 6C9.79 6 8 7.79 8 10C8 12.21 9.79 14 12 14C14.21 14 16 12.21 16 10C16 7.79 14.21 6 12 6ZM12 12C10.9 12 10 11.1 10 10C10 8.9 10.9 8 12 8C13.1 8 14 8.9 14 10C14 11.1 13.1 12 12 12Z" fill="currentColor" />
+                                        </svg>
+                                    </button>
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+                        <div className="editor-canvas-controls">
+                            <Button variant="ghost" size="sm" onClick={handleZoomIn} aria-label="Приблизить">+</Button>
+                            <Button variant="ghost" size="sm" onClick={handleZoomOut} aria-label="Отдалить">-</Button>
+                            <Button variant="ghost" size="sm" onClick={handleResetZoom}>Сбросить</Button>
+                            <Button variant="ghost" size="sm" onClick={handleClearCanvas}>Очистить</Button>
+                        </div>
+                    </div>
+                    <motion.div
+                        className="editor-right-panel"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        transition={{ duration: 0.3 }}
+                    >
+                        <div className="editor-panel-icons">
+                            <motion.button
+                                whileHover={{ y: -2 }}
+                                whileTap={{ scale: 0.94 }}
+                                onClick={() => {
+                                    if (chatType === 'improve') {
+                                        setChatType(null);
+                                    } else {
+                                        setChatType('improve');
+                                        setChatExpanded(false);
+                                    }
+                                }}
+                                className={`editor-icon-btn editor-chat-btn ${chatType === 'improve' ? 'is-active' : ''}`}
+                                aria-pressed={chatType === 'improve'}
+                                aria-label="Улучшить схему"
+                                data-tooltip="Улучшить"
+                            >
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                                    <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM15.69 16.37L13.69 14.37C13.26 13.94 12.59 13.94 12.16 14.37L10.16 16.37C9.73 16.8 9.73 17.47 10.16 17.9C10.59 18.33 11.26 18.33 11.69 17.9L12.5 17.09V13H13.5V17.09L14.31 17.9C14.74 18.33 15.41 18.33 15.84 17.9C16.27 17.47 16.27 16.8 15.84 16.37H15.69ZM12 4C15.31 4 18 6.69 18 10H16C16 7.79 14.21 6 12 6C9.79 6 8 7.79 8 10C8 12.21 9.79 14 12 14C12.55 14 13.08 13.9 13.58 13.71C13.96 13.86 14.39 14 14.84 14C16.26 14 17.5 12.76 17.5 11.34C17.5 10.12 16.58 9.1 15.46 8.91C15.17 6.86 13.66 5.26 12 5C11.42 5 10.85 5.14 10.34 5.41C10.95 4.92 11.72 4.61 12.5 4.5V4H12Z" fill="currentColor" />
+                                </svg>
+                            </motion.button>
+                            <motion.button
+                                whileHover={{ y: -2 }}
+                                whileTap={{ scale: 0.94 }}
+                                onClick={() => {
+                                    if (chatType === 'generate') {
+                                        setChatType(null);
+                                    } else {
+                                        setChatType('generate');
+                                        setChatExpanded(false);
+                                    }
+                                }}
+                                className={`editor-icon-btn editor-generate-btn ${chatType === 'generate' ? 'is-active' : ''}`}
+                                aria-pressed={chatType === 'generate'}
+                                aria-label="Сгенерировать схему"
+                                data-tooltip="Генерировать"
+                            >
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                                    <path d="M5 17H13V19H5C3.9 19 3 18.1 3 17V7C3 5.9 3.9 5 5 5H13V7H5V17ZM19 17H15V15H19C20.1 15 21 14.1 21 13V11C21 9.9 20.1 9 19 9H15V7H19C20.66 7 22 8.34 22 10V14C22 15.66 20.66 17 19 17Z" fill="currentColor" />
+                                </svg>
+                            </motion.button>
+                            <motion.button
+                                whileHover={{ y: -2 }}
+                                whileTap={{ scale: 0.94 }}
+                                onClick={handleValidate}
+                                className={`editor-icon-btn editor-score-btn ${showScorePanel ? 'is-active' : ''}`}
+                                aria-pressed={showScorePanel}
+                                aria-label="Проверить схему"
+                                data-tooltip="Проверить"
+                            >
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                                    <path d="M9 16.17L4.83 12L3.41 13.41L9 19L21 7L19.59 5.59L9 16.17Z" fill="currentColor" />
+                                </svg>
+                            </motion.button>
+                            <motion.button
+                                whileHover={{ y: -2 }}
+                                whileTap={{ scale: 0.94 }}
+                                onClick={() => setShowColorPicker(!showColorPicker)}
+                                className={`editor-icon-btn editor-color-btn ${showColorPicker ? 'is-active' : ''}`}
+                                aria-pressed={showColorPicker}
+                                aria-label="Изменить цвет элемента"
+                                data-tooltip="Изменить цвет"
+                            >
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                                    <path d="M12 3C7.03 3 3 7.03 3 12C3 16.97 7.03 21 12 21C12.83 21 13.5 20.33 13.5 19.5C13.5 19.11 13.41 18.74 13.25 18.41C13.09 18.07 12.83 17.83 12.5 17.73C12.17 17.63 11.83 17.67 11.53 17.83C10.54 18.37 9.37 18.5 8 18.5C5.24 18.5 3 16.26 3 13.5C3 10.74 5.24 8.5 8 8.5C9.37 8.5 10.54 8.63 11.53 9.17C11.83 9.33 12.17 9.37 12.5 9.27C12.83 9.17 13.09 8.93 13.25 8.59C13.41 8.26 13.5 7.89 13.5 7.5C13.5 6.67 12.83 6 12 6C7.03 6 3 10.03 3 15C3 19.97 7.03 24 12 24C16.97 24 21 19.97 21 15C21 10.03 16.97 6 12 6C11.17 6 10.5 6.67 10.5 7.5C10.5 7.89 10.59 8.26 10.75 8.59C10.91 8.93 11.17 9.17 11.5 9.27C11.83 9.37 12.17 9.33 12.47 9.17C13.46 8.63 14.63 8.5 16 8.5C18.76 8.5 21 10.74 21 13.5C21 16.26 18.76 18.5 16 18.5C14.63 18.5 13.46 18.37 12.47 17.83C12.17 17.67 11.83 17.63 11.5 17.73C11.17 17.83 10.91 18.07 10.75 18.41C10.59 18.74 10.5 19.11 10.5 19.5C10.5 20.33 11.17 21 12 21ZM8 10C7.45 10 7 10.45 7 11C7 11.55 7.45 12 8 12C8.55 12 9 11.55 9 11C9 10.45 8.55 10 8 10ZM16 10C15.45 10 15 10.45 15 11C15 11.55 15.45 12 16 12C16.55 12 17 11.55 17 11C17 10.45 16.55 10 16 10Z" fill="currentColor" />
+                                </svg>
+                            </motion.button>
+                        </div>
+                    </motion.div>
                 </div>
-                <motion.div
-                    className="editor-right-panel"
-                    initial={{ x: 0 }}
-                    animate={{ x: 0 }}
-                    transition={{ type: 'spring', damping: 25 }}
-                    style={{ width: '60px', position: 'fixed', right: 0, top: 120, bottom: 0 }}
-                >
-                    <div className="editor-panel-icons">
-                        <motion.button
-                            whileHover={{ scale: 1.1 }}
-                            whileTap={{ scale: 0.9 }}
-                            onClick={() => {
-                                if (chatType === 'improve') {
-                                    setChatType(null);
-                                } else {
-                                    setChatType('improve');
-                                    setChatExpanded(false);
-                                }
-                            }}
-                            className={`editor-icon-btn editor-chat-btn ${chatType === 'improve' ? 'active' : ''}`}
-                            data-tooltip="Улучшить"
+                <AnimatePresence>
+                    {notification && (
+                        <motion.div
+                            className="editor-notification"
+                            role="status"
+                            aria-live="polite"
+                            initial={{ opacity: 0, y: 20 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: 20 }}
+                            transition={{ duration: 0.3 }}
                         >
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM15.69 16.37L13.69 14.37C13.26 13.94 12.59 13.94 12.16 14.37L10.16 16.37C9.73 16.8 9.73 17.47 10.16 17.9C10.59 18.33 11.26 18.33 11.69 17.9L12.5 17.09V13H13.5V17.09L14.31 17.9C14.74 18.33 15.41 18.33 15.84 17.9C16.27 17.47 16.27 16.8 15.84 16.37H15.69ZM12 4C15.31 4 18 6.69 18 10H16C16 7.79 14.21 6 12 6C9.79 6 8 7.79 8 10C8 12.21 9.79 14 12 14C12.55 14 13.08 13.9 13.58 13.71C13.96 13.86 14.39 14 14.84 14C16.26 14 17.5 12.76 17.5 11.34C17.5 10.12 16.58 9.1 15.46 8.91C15.17 6.86 13.66 5.26 12 5C11.42 5 10.85 5.14 10.34 5.41C10.95 4.92 11.72 4.61 12.5 4.5V4H12Z" fill="#2dbe64" />
-                            </svg>
-                        </motion.button>
-                        <motion.button
-                            whileHover={{ scale: 1.1 }}
-                            whileTap={{ scale: 0.9 }}
-                            onClick={() => {
-                                if (chatType === 'generate') {
-                                    setChatType(null);
-                                } else {
-                                    setChatType('generate');
-                                    setChatExpanded(false);
-                                }
-                            }}
-                            className={`editor-icon-btn editor-generate-btn ${chatType === 'generate' ? 'active' : ''}`}
-                            data-tooltip="Генерировать"
+                            {notification}
+                        </motion.div>
+                    )}
+                </AnimatePresence>
+                <AnimatePresence>
+                    {pendingDelete && (
+                        <motion.div
+                            className="editor-dialog-backdrop"
+                            role="presentation"
+                            onClick={handleCancelDelete}
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            transition={{ duration: 0.2 }}
                         >
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M5 17H13V19H5C3.9 19 3 18.1 3 17V7C3 5.9 3.9 5 5 5H13V7H5V17ZM19 17H15V15H19C20.1 15 21 14.1 21 13V11C21 9.9 20.1 9 19 9H15V7H19C20.66 7 22 8.34 22 10V14C22 15.66 20.66 17 19 17Z" fill="#2dbe64" />
-                            </svg>
-                        </motion.button>
-                        <motion.button
-                            whileHover={{ scale: 1.1 }}
-                            whileTap={{ scale: 0.9 }}
-                            onClick={handleValidate}
-                            className={`editor-icon-btn editor-score-btn ${showScorePanel ? 'active' : ''}`}
-                            data-tooltip="Проверить"
-                        >
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M9 16.17L4.83 12L3.41 13.41L9 19L21 7L19.59 5.59L9 16.17Z" fill="#2dbe64" />
-                            </svg>
-                        </motion.button>
-                        <motion.button
-                            whileHover={{ scale: 1.1 }}
-                            whileTap={{ scale: 0.9 }}
-                            onClick={() => setShowColorPicker(!showColorPicker)}
-                            className={`editor-icon-btn editor-color-btn ${showColorPicker ? 'active' : ''}`}
-                            data-tooltip="Изменить цвет"
-                        >
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M12 3C7.03 3 3 7.03 3 12C3 16.97 7.03 21 12 21C12.83 21 13.5 20.33 13.5 19.5C13.5 19.11 13.41 18.74 13.25 18.41C13.09 18.07 12.83 17.83 12.5 17.73C12.17 17.63 11.83 17.67 11.53 17.83C10.54 18.37 9.37 18.5 8 18.5C5.24 18.5 3 16.26 3 13.5C3 10.74 5.24 8.5 8 8.5C9.37 8.5 10.54 8.63 11.53 9.17C11.83 9.33 12.17 9.37 12.5 9.27C12.83 9.17 13.09 8.93 13.25 8.59C13.41 8.26 13.5 7.89 13.5 7.5C13.5 6.67 12.83 6 12 6C7.03 6 3 10.03 3 15C3 19.97 7.03 24 12 24C16.97 24 21 19.97 21 15C21 10.03 16.97 6 12 6C11.17 6 10.5 6.67 10.5 7.5C10.5 7.89 10.59 8.26 10.75 8.59C10.91 8.93 11.17 9.17 11.5 9.27C11.83 9.37 12.17 9.33 12.47 9.17C13.46 8.63 14.63 8.5 16 8.5C18.76 8.5 21 10.74 21 13.5C21 16.26 18.76 18.5 16 18.5C14.63 18.5 13.46 18.37 12.47 17.83C12.17 17.67 11.83 17.63 11.5 17.73C11.17 17.83 10.91 18.07 10.75 18.41C10.59 18.74 10.5 19.11 10.5 19.5C10.5 20.33 11.17 21 12 21ZM8 10C7.45 10 7 10.45 7 11C7 11.55 7.45 12 8 12C8.55 12 9 11.55 9 11C9 10.45 8.55 10 8 10ZM16 10C15.45 10 15 10.45 15 11C15 11.55 15.45 12 16 12C16.55 12 17 11.55 17 11C17 10.45 16.55 10 16 10Z" fill="#2dbe64" />
-                            </svg>
-                        </motion.button>
-                    </div>
-                </motion.div>
+                            <motion.section
+                                className="editor-dialog"
+                                role="dialog"
+                                aria-modal="true"
+                                aria-labelledby="editor-delete-title"
+                                onClick={(e) => e.stopPropagation()}
+                                initial={{ opacity: 0, y: 16, scale: 0.98 }}
+                                animate={{ opacity: 1, y: 0, scale: 1 }}
+                                exit={{ opacity: 0, y: 16, scale: 0.98 }}
+                                transition={{ duration: 0.2, ease: [0.33, 1, 0.68, 1] }}
+                            >
+                                <h2 id="editor-delete-title">Удалить «{diagramName}»?</h2>
+                                <p>
+                                    {diagramId
+                                        ? 'Схема будет удалена из реестра — вернуть её не получится.'
+                                        : 'Схема ещё не сохранена: удаление станет доступно после сохранения.'}
+                                </p>
+                                <div className="editor-dialog__actions">
+                                    <Button variant="secondary" size="md" onClick={handleCancelDelete}>Отмена</Button>
+                                    <Button variant="primary" size="md" className="editor-btn-danger" onClick={handleConfirmDelete}>Удалить</Button>
+                                </div>
+                            </motion.section>
+                        </motion.div>
+                    )}
+                </AnimatePresence>
                 <GenerateChat
                     isOpen={chatType === 'generate'}
                     onClose={() => setChatType(null)}
@@ -1227,6 +1369,7 @@ const Editor = () => {
                         recommendations={validationResult?.recommendations || []}
                         errors={validationResult?.details || {}}
                         onClose={() => setShowScorePanel(false)}
+                        busy={scoreBusy}
                         isExpanded={scoreExpanded}
                         onToggleExpand={toggleScoreExpand}
                         position={scorePosition}

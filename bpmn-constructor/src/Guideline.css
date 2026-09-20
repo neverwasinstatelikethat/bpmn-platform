@@ -1,3 +1,9 @@
+/* Корень страницы: WorkPage подмешивает этот класс к <main class="work-page guideline">.
+   Здесь задаём локальные меры раздела, чтобы не дублировать их в media-запросах. */
+.guideline {
+    --guideline-diagram-height: 280px;
+}
+
 .guideline-content {
     display: grid;
     grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
@@ -37,6 +43,14 @@
 
 .guideline-sections { display: grid; gap: var(--space-md); }
 
+/* Правая колонка: столбец карточек выбранной группы, по виду — как .guideline-section */
+.guideline-main {
+    min-width: 0;
+    display: grid;
+    align-content: start;
+    gap: var(--space-md);
+}
+
 .guideline-section {
     overflow: clip;
     background: var(--color-surface);
@@ -67,8 +81,15 @@
 .theory h3, .test h3 { margin: 0 0 var(--space-sm); font-size: var(--text-h3); }
 .theory h4 { margin: var(--space-xl) 0 var(--space-xs); color: var(--color-ink); font-family: var(--font-sans); font-size: var(--text-body); }
 .theory p { margin: 0; color: var(--color-ink-soft); line-height: 1.65; }
-.diagram-container { height: 280px; margin-top: var(--space-md); overflow: hidden; border: 1px solid var(--color-hairline); border-radius: var(--radius-md); background: var(--color-surface-mist); }
+.theory strong.guideline-em { color: var(--color-berry); font-weight: 600; }
+.diagram-container { position: relative; height: var(--guideline-diagram-height, 280px); margin-top: var(--space-md); overflow: hidden; border: 1px solid var(--color-hairline); border-radius: var(--radius-md); background: var(--color-surface-mist); }
 .diagram { width: 100%; height: 100%; }
+/* Пока bpmn-js импортирует XML, поверх пустого холста — загрузочный индикатор. */
+.diagram-container__overlay { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; background: var(--color-surface-mist); }
+.diagram-container__overlay .page-loader { min-height: 0; font-size: var(--text-sm); }
+.theory p.guideline-error { margin-top: var(--space-xs); padding: var(--space-sm) var(--space-md); border: 1px solid var(--color-berry-soft); border-radius: var(--radius-md); background: var(--color-danger-soft); color: var(--color-danger); font-size: var(--text-sm); }
+.guideline-icon--good { fill: var(--color-primary); }
+.guideline-icon--bad { fill: var(--color-berry); }
 
 .test { align-self: start; padding: var(--space-lg); background: var(--color-surface-mist); border-radius: var(--radius-md); }
 .test form { display: grid; gap: var(--space-sm); }
@@ -87,9 +108,9 @@
 }
 
 @media (max-width: 560px) {
+    .guideline { --guideline-diagram-height: 220px; }
     .guideline-sidebar { grid-template-columns: 1fr; }
     .guideline-section__trigger, .guideline-section .content { padding-left: var(--space-md); padding-right: var(--space-md); }
-    .diagram-container { height: 220px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

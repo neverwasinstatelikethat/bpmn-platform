@@ -11,20 +11,25 @@ const ScorePanel = memo(({
     onClose,
     isExpanded,
     onToggleExpand,
-    position = { top: '20px', right: '20px' },
+    busy = false,
     chatHeight = '70vh'
 }) => {
     const scrollRef = useRef(null);
 
-    const getScoreColor = (score) => {
-        if (score >= 80) return '#00A550';
-        if (score >= 50) return '#FFD508';
-        return '#F62369';
+    // Проп position из Editor здесь намеренно не применяется: панель стоит
+    // в flex-потоке редактора, её место и наложение задаёт ScorePanel.css.
+
+    const value = Math.max(0, Math.min(100, Number(score) || 0));
+
+    const getScoreColor = (scoreValue) => {
+        if (scoreValue >= 80) return 'var(--score-good)';
+        if (scoreValue >= 50) return 'var(--score-warn)';
+        return 'var(--score-bad)';
     };
 
-    const getScoreLabel = (score) => {
-        if (score >= 80) return 'Отлично!';
-        if (score >= 50) return 'Неплохо';
+    const getScoreLabel = (scoreValue) => {
+        if (scoreValue >= 80) return 'Отлично!';
+        if (scoreValue >= 50) return 'Неплохо';
         return 'Требует доработки';
     };
 
@@ -50,6 +55,15 @@ const ScorePanel = memo(({
         }
     }, [recommendations, errors]);
 
+    const scoreColor = getScoreColor(value);
+    const errorEntries = Object.entries(errors || {})
+        .filter(([, isCorrect]) => !isCorrect)
+        .map(([key]) => ({ key, message: errorMessages[key] }))
+        .filter((entry) => entry.message);
+    const hasContent = value > 0
+        || (recommendations?.length || 0) > 0
+        || errorEntries.length > 0;
+
     return (
         <motion.div
             className={`ai-chat-container score ${isExpanded ? 'expanded' : ''}`}
@@ -57,12 +71,7 @@ const ScorePanel = memo(({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 20, scale: 0.95 }}
             transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-            style={{
-                height: chatHeight,
-                top: position.top,
-                right: position.right,
-                zIndex: 1000
-            }}
+            style={{ height: chatHeight }}
         >
             <div className="ai-chat-header">
                 <motion.h3
@@ -90,55 +99,74 @@ const ScorePanel = memo(({
                 </div>
             </div>
 
-            <div className="score-content">
-                <div className="score-fixed-section">
-                    <motion.div
-                        className="score-display"
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.2 }}
-                    >
-                        <div className="score-circle-container">
-                            <div
-                                className="score-circle"
-                                style={{
-                                    background: `conic-gradient(${getScoreColor(score)} ${score}%, #F0F2F5 ${score}% 100%)`
-                                }}
-                            >
-                                <div className="score-circle-inner">
-                                    <span>{score}</span>
+            {busy && (
+                <div className="score-busy" role="status">
+                    <span className="score-busy__dot"></span>
+                    <span className="score-busy__dot"></span>
+                    <span className="score-busy__dot"></span>
+                    <span className="score-busy__label">Считаем оценку схемы...</span>
+                </div>
+            )}
+
+            {!busy && !hasContent && (
+                <div className="score-hint">
+                    <p className="score-hint__title">Оценки пока нет</p>
+                    <p className="score-hint__text">
+                        Нажмите «Проверить» на панели инструментов — ИИ посчитает качество
+                        схемы и подскажет, что улучшить.
+                    </p>
+                </div>
+            )}
+
+            {!busy && hasContent && (
+                <div className="score-content">
+                    <div className="score-fixed-section">
+                        <motion.div
+                            className="score-display"
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ delay: 0.2 }}
+                        >
+                            <div className="score-circle-container">
+                                <div
+                                    className="score-circle"
+                                    style={{
+                                        background: `conic-gradient(${scoreColor} ${value}%, var(--score-track) ${value}% 100%)`
+                                    }}
+                                >
+                                    <div className="score-circle-inner">
+                                        <span>{value}</span>
+                                    </div>
+                                </div>
+                                <div className="score-labels">
+                                    <div className="score-value">{value}/100</div>
+                                    <div className="score-status">{getScoreLabel(value)}</div>
                                 </div>
                             </div>
-                            <div className="score-labels">
-                                <div className="score-value">{score}/100</div>
-                                <div className="score-status">{getScoreLabel(score)}</div>
-                            </div>
-                        </div>
-                    </motion.div>
-                </div>
+                        </motion.div>
+                    </div>
 
-                <div ref={scrollRef} className="score-scrollable-content">
-                    <motion.div
-                        className="sections-container"
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        transition={{ delay: 0.3 }}
-                    >
-                        {errors && Object.keys(errors).length > 0 && Object.values(errors).some(val => !val) && (
-                            <div className="errors-section">
-                                <motion.h4
-                                    className="score-section-title"
-                                    initial={{ opacity: 0 }}
-                                    animate={{ opacity: 1 }}
-                                    transition={{ delay: 0.35 }}
-                                >
-                                    Найденные ошибки
-                                </motion.h4>
-                                <ul>
-                                    {Object.entries(errors).map(([key, isCorrect], index) => (
-                                        !isCorrect && errorMessages[key] && (
+                    <div ref={scrollRef} className="score-scrollable-content">
+                        <motion.div
+                            className="sections-container"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            transition={{ delay: 0.3 }}
+                        >
+                            {errorEntries.length > 0 && (
+                                <div className="errors-section">
+                                    <motion.h4
+                                        className="score-section-title"
+                                        initial={{ opacity: 0 }}
+                                        animate={{ opacity: 1 }}
+                                        transition={{ delay: 0.35 }}
+                                    >
+                                        Найденные ошибки
+                                    </motion.h4>
+                                    <ul>
+                                        {errorEntries.map((entry, index) => (
                                             <motion.li
-                                                key={key}
+                                                key={entry.key}
                                                 initial={{ opacity: 0, y: 5 }}
                                                 animate={{ opacity: 1, y: 0 }}
                                                 transition={{ delay: 0.1 * index }}
@@ -146,9 +174,9 @@ const ScorePanel = memo(({
                                             >
                                                 <div className="error-icon">!</div>
                                                 <div>
-                                                    <div className="error-title">{errorMessages[key]}</div>
+                                                    <div className="error-title">{entry.message}</div>
                                                     <div className="error-solution">
-                                                        Как исправить: {errorMessages[key]
+                                                        Как исправить: {entry.message
                                                             .replace('Отсутствует', 'Добавьте')
                                                             .replace('без', 'с указанием')
                                                             .replace('Недостаточно', 'Добавьте больше')
@@ -158,60 +186,60 @@ const ScorePanel = memo(({
                                                     </div>
                                                 </div>
                                             </motion.li>
-                                        )
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
 
-                        {recommendations && recommendations.length > 0 && (
-                            <div className="recommendations-section">
-                                <motion.h4
-                                    className="score-section-title"
-                                    initial={{ opacity: 0 }}
-                                    animate={{ opacity: 1 }}
-                                    transition={{ delay: 0.4 }}
-                                >
-                                    Рекомендации по улучшению
-                                </motion.h4>
-                                <ul>
-                                    {recommendations.map((rec, index) => (
-                                        <motion.li
-                                            key={index}
-                                            initial={{ opacity: 0, y: 5 }}
-                                            animate={{ opacity: 1, y: 0 }}
-                                            transition={{ delay: 0.1 * index + 0.45 }}
-                                            whileHover={{ x: 5 }}
-                                        >
-                                            <div className="recommendation-icon">✓</div>
-                                            {rec}
-                                        </motion.li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-                    </motion.div>
+                            {recommendations?.length > 0 && (
+                                <div className="recommendations-section">
+                                    <motion.h4
+                                        className="score-section-title"
+                                        initial={{ opacity: 0 }}
+                                        animate={{ opacity: 1 }}
+                                        transition={{ delay: 0.4 }}
+                                    >
+                                        Рекомендации по улучшению
+                                    </motion.h4>
+                                    <ul>
+                                        {recommendations.map((rec, index) => (
+                                            <motion.li
+                                                key={index}
+                                                initial={{ opacity: 0, y: 5 }}
+                                                animate={{ opacity: 1, y: 0 }}
+                                                transition={{ delay: 0.1 * index + 0.45 }}
+                                                whileHover={{ x: 5 }}
+                                            >
+                                                <div className="recommendation-icon">✓</div>
+                                                {rec}
+                                            </motion.li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
+                        </motion.div>
 
-                    <motion.div
-                        className="score-footer"
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        transition={{ delay: 0.5 }}
-                    >
-                        <div className="score-progress">
-                            <div
-                                className="progress-bar"
-                                style={{ width: `${score}%`, background: getScoreColor(score) }}
-                            />
-                        </div>
-                        <div className="progress-labels">
-                            <span>0</span>
-                            <span>50</span>
-                            <span>100</span>
-                        </div>
-                    </motion.div>
+                        <motion.div
+                            className="score-footer"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            transition={{ delay: 0.5 }}
+                        >
+                            <div className="score-progress">
+                                <div
+                                    className="progress-bar"
+                                    style={{ width: `${value}%`, background: scoreColor }}
+                                />
+                            </div>
+                            <div className="progress-labels">
+                                <span>0</span>
+                                <span>50</span>
+                                <span>100</span>
+                            </div>
+                        </motion.div>
+                    </div>
                 </div>
-            </div>
+            )}
         </motion.div>
     );
 });

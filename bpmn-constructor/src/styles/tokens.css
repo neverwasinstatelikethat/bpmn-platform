@@ -15,19 +15,31 @@
     --color-berry: #F62369;            /* фирменная ягода — энергичный акцент и ошибки */
     --color-berry-soft: #FFB7B2;       /* компфи-коралл, мягкий акцент */
     --color-berry-blush: #FFE3E1;      /* румянец для блобов и подложек */
+    --color-berry-deep: #D61B5B;       /* нажатие опасных действий */
+
+    /* ---------- Цвета: инструменты и состояния записей ---------- */
+    --color-info: #54B3FF;             /* синяя маркировка (инструменты, подсказки) */
+    --color-warn: #E6B800;             /* янтарная маркировка (средний скоринг, внимание) */
+    --color-violet: #7C3AED;           /* фиолетовая маркировка (инструмент цвета) */
 
     /* ---------- Цвета: поверхности ---------- */
-    --color-canvas: #FFF9F2;           /* тёплый кремовый холст продукта */
+    --color-canvas: #FDFDFC;           /* почти белый холст продукта (пастельные фоны не используем) */
     --color-surface: #FFFFFF;
     --color-surface-sage: #E8EFE8;
     --color-surface-lavender: #EFEDF4;
     --color-surface-mist: #F7F4EE;     /* фон инпутов и мелких подложек */
     --color-ink: #292524;              /* тёплый мягкий чёрный (бывший графит #333) */
     --color-ink-soft: #57534E;
+    --color-ink-raised: #3A3532;       /* плашка поверх тёмной CTA-полосы (--color-ink) */
+    --color-ink-deep: #1C1917;         /* hover-затемнение тёмных поверхностей */
     --color-muted: #78716C;
     --color-faint: #A8A29E;
     --color-hairline: #E9E9E5;
     --color-hairline-soft: #F1F1EE;
+
+    /* Текст на тёмной CTA-полосе (фон --color-ink): всегда эти токены, не хардкод */
+    --color-on-ink: #FDFDFC;           /* основной текст и инверсные кнопки на полосе */
+    --color-on-ink-muted: #D6D3D1;     /* вторичный текст на полосе */
 
     /* ---------- Цвета: семантика ---------- */
     --color-success: #00A550;
@@ -36,6 +48,9 @@
     --color-danger-soft: #FFE3E1;
     --color-warning-soft: #FFF3DB;
     --color-success-soft: #E3F1E8;
+    /* читаемый текст поверх *_soft-подложек (всегда парами с ними) */
+    --color-danger-text: #8D2342;
+    --color-warning-text: #976516;
 
     /* ---------- Типографика ---------- */
     --font-sans: 'Euclid Circular A', system-ui, -apple-system, 'Segoe UI', sans-serif;

@@ -81,21 +81,21 @@
 
 .ui-btn--soft {
     background: var(--color-berry-soft);
-    color: #6B2A26;
+    color: var(--color-danger-text);
 }
 
     .ui-btn--soft:hover {
-        background: #FFA79F;
+        background: color-mix(in srgb, var(--color-berry-soft) 80%, var(--color-berry-deep));
         transform: translateY(-1px);
     }
 
 .ui-btn--dark {
     background: var(--color-ink);
-    color: var(--color-canvas);
+    color: var(--color-on-ink);
 }
 
     .ui-btn--dark:hover {
-        background: #1C1917;
+        background: var(--color-ink-deep);
         transform: translateY(-1px);
         box-shadow: var(--shadow-card);
     }

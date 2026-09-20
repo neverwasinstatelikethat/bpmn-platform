@@ -1,22 +1,78 @@
+/* ============================================================
+   Панель оценки схемы. Цвета корридок — локальные переменные
+   ниже; всё остальное берётся из ../styles/tokens.css.
+   ============================================================ */
+
 .ai-chat-container.score {
+    /* пороги оценки: отлично / приемаемо / требует доработки */
+    --score-good: var(--color-primary);
+    --score-warn: var(--color-warn);
+    --score-bad: var(--color-berry);
+    --score-track: var(--color-hairline-soft);
+
+    position: relative;
+    z-index: 1000;
     display: grid;
     grid-template-rows: auto minmax(0, 1fr);
+    flex: 0 0 auto;
     width: min(100vw - 2 * var(--page-gutter), 360px);
     overflow: hidden;
     background: var(--color-surface);
     border: 1px solid var(--color-hairline-soft);
     border-radius: var(--radius-card);
     box-shadow: var(--shadow-lift);
+    transition: width var(--duration-base) var(--ease-soft);
 }
 
 .ai-chat-container.score.expanded { width: min(100vw - 2 * var(--page-gutter), 480px); }
 .score .ai-chat-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); padding: var(--space-md) var(--space-lg); border-bottom: 1px solid var(--color-hairline-soft); }
-.score .ai-chat-header h3 { margin: 0; font-size: var(--text-h3); }
-.score .ai-chat-header-buttons { display: flex; gap: 2px; }
+.score .ai-chat-header h3 { margin: 0; font-size: var(--text-h3); color: var(--color-ink); letter-spacing: var(--tracking-tight); }
+.score .ai-chat-header-buttons { display: flex; flex: none; gap: var(--space-xxs); }
 .score .header-button { display: grid; place-items: center; width: 34px; height: 34px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--color-ink-soft); cursor: pointer; }
 .score .header-button:hover { background: var(--color-surface-mist); color: var(--color-ink); }
 .score .header-button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
+/* ---------- Идёт расчёт ---------- */
+.score-busy {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-xxs);
+    min-height: 120px;
+    padding: var(--space-lg);
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+}
+
+.score-busy__dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--color-primary);
+    animation: scoreDot 1s ease-in-out infinite;
+}
+
+    .score-busy__dot:nth-child(2) { animation-delay: .15s; }
+    .score-busy__dot:nth-child(3) { animation-delay: .3s; }
+
+.score-busy__label { margin-left: var(--space-xxs); }
+
+@keyframes scoreDot {
+    50% { opacity: .35; transform: translateY(-2px); }
+}
+
+/* ---------- Оценки нет ---------- */
+.score-hint {
+    display: grid;
+    gap: var(--space-xs);
+    align-content: center;
+    padding: var(--space-xl) var(--space-lg);
+}
+
+.score-hint__title { margin: 0; color: var(--color-ink); font-size: var(--text-body); font-weight: 600; }
+.score-hint__text { margin: 0; color: var(--color-muted); font-size: var(--text-sm); line-height: 1.55; }
+
+/* ---------- Оценка и разбор ---------- */
 .score-content { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; }
 .score-fixed-section { padding: var(--space-lg); border-bottom: 1px solid var(--color-hairline-soft); }
 .score-display { display: flex; justify-content: center; }
@@ -32,14 +88,15 @@
 .score-section-title { margin: 0 0 var(--space-sm); color: var(--color-ink); font-family: var(--font-sans); font-size: var(--text-body); }
 .errors-section ul, .recommendations-section ul { display: grid; gap: var(--space-sm); padding: 0; margin: 0; list-style: none; }
 .errors-section li, .recommendations-section li { display: grid; grid-template-columns: auto 1fr; gap: var(--space-sm); align-items: start; padding: var(--space-sm); border-radius: var(--radius-md); background: var(--color-surface-mist); color: var(--color-ink-soft); font-size: var(--text-sm); line-height: 1.45; }
-.error-icon, .recommendation-icon { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; font-size: .75rem; font-weight: 700; }
+.error-icon, .recommendation-icon { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; font-size: var(--text-xs); font-weight: 700; }
 .error-icon { background: var(--color-danger-soft); color: var(--color-danger); }
 .recommendation-icon { background: var(--color-success-soft); color: var(--color-primary-active); }
 .error-title { color: var(--color-ink); font-weight: 600; }
 .error-solution { margin-top: 3px; color: var(--color-muted); }
 .score-footer { margin-top: var(--space-xl); }
-.score-progress { height: 6px; overflow: hidden; border-radius: var(--radius-pill); background: var(--color-surface-mist); }
+.score-progress { height: 6px; overflow: hidden; border-radius: var(--radius-pill); background: var(--score-track); }
 .progress-bar { height: 100%; border-radius: inherit; }
-.progress-labels { display: flex; justify-content: space-between; margin-top: 4px; color: var(--color-muted); font-size: var(--text-xs); }
+.progress-labels { display: flex; justify-content: space-between; margin-top: var(--space-xxs); color: var(--color-muted); font-size: var(--text-xs); }
 
 @media (max-width: 640px) { .ai-chat-container.score, .ai-chat-container.score.expanded { width: calc(100vw - 2 * var(--space-md)); } }
+@media (prefers-reduced-motion: reduce) { .ai-chat-container.score { transition: none; }.score-busy__dot { animation: none; } }

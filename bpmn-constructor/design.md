@@ -19,7 +19,8 @@ quiet surfaces, thin dividers, and only semantic status colour.
 `src/styles/tokens.css` is the only source for colour, spacing, radius, shadow,
 and motion tokens. New UI uses semantic variables rather than raw hex values.
 
-- Canvas: warm cream; product surfaces: white and muted pastel states.
+- Canvas: near-white (#FDFDFC; pastel page backgrounds are not used); product
+  surfaces: white and muted pastel states on cards only.
 - Green is the action colour. Berry, amber, and green status colours describe
   errors, caution, and success respectively; text or icons accompany colour.
 - Working views use constrained content widths, one elevation level, and thin
@@ -46,10 +47,11 @@ user returns to the acceptance flow after sign-in.
 
 ## Known gaps
 
-- The legacy BPMN canvas integration still uses bpmn-js and PrimeReact widgets
-  internally. New shell, chat, and analysis styling is token-based; a future
-  isolated editor-controller extraction can remove those remaining dependency
-  details without changing process behaviour.
+- The BPMN canvas is the only widget library left: bpmn-js renders the palette
+  and the context toolbar with its own markup, so `Editor.css` restyles those
+  internals from tokens (the palette is moved into the left rail by
+  `bpmnRailPalette.js`). PrimeReact is fully removed; every control outside the
+  canvas comes from `components/ui`.
 - Personal and team folders are fully wired: the registry scopes folders by
   `team_id`, team members can move shared diagrams into team folders, and
   diagram rows offer a "В команду…" share action backed by

@@ -1,13 +1,12 @@
-// ImproveChat.js - Обновленная версия
+// ImproveChat.js — чат улучшения текущей BPMN-схемы
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Button } from 'primereact/button';
-import { InputTextarea } from 'primereact/inputtextarea';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
     faRobot, faUser, faTimes, faExpand, faCompress,
-    faMicrophone, faPaperPlane, faLightbulb, faCheckCircle
+    faMicrophone, faPaperPlane, faLightbulb, faCheckCircle, faRotateRight
 } from '@fortawesome/free-solid-svg-icons';
+import { Button } from './components/ui';
 import ThinkBlock from './ThinkBlock';
 import TypewriterMessage from './TypewriterMessage';
 import './AiChat.css';
@@ -20,14 +19,19 @@ const ImproveChat = ({
     onAcceptImprovement,
     isExpanded,
     onToggleExpand,
-    chatHeight
+    chatHeight = '70vh'
 }) => {
     const [input, setInput] = useState('');
     const [isListening, setIsListening] = useState(false);
     const [isProcessing, setIsProcessing] = useState(false);
+    const [lastPrompt, setLastPrompt] = useState('');
+    const [voiceLevel, setVoiceLevel] = useState(0);
+    // Локальное сообщение ИИ (ошибка запроса либо недоступный голосовой ввод):
+    // messages приходит из Editor пропсом, поэтому свои реплики чат держит у себя.
+    // canRetry — показывать кнопку «Повторить» с lastPrompt.
+    const [notice, setNotice] = useState(null);
     const messagesEndRef = useRef(null);
     const recognitionRef = useRef(null);
-    const [voiceLevel, setVoiceLevel] = useState(0);
 
     const examples = [
         "Добавь проверку платежа перед отправкой товара",
@@ -38,7 +42,7 @@ const ImproveChat = ({
 
     useEffect(() => {
         scrollToBottom();
-    }, [messages, input, isProcessing]);
+    }, [messages, input, isProcessing, notice]);
 
     useEffect(() => {
         // Сбрасываем состояние обработки при получении ответа
@@ -54,17 +58,40 @@ const ImproveChat = ({
         }, 100);
     };
 
-    const handleSend = () => {
-        if (input.trim()) {
-            setIsProcessing(true);
-            onImprove(input);
-            setInput('');
+    // Общий путь отправки: и для нового запроса, и для повтора после ошибки.
+    const sendPrompt = async (prompt) => {
+        const text = (prompt || '').trim();
+        if (!text) return;
+
+        setLastPrompt(text);
+        setNotice(null);
+        setIsProcessing(true);
+        try {
+            await onImprove(text);
+        } catch (err) {
+            setNotice({
+                text: `Не удалось улучшить схему: ${err.message}`,
+                canRetry: true
+            });
+        } finally {
+            setIsProcessing(false);
         }
     };
 
+    const handleSend = () => {
+        const text = input.trim();
+        if (!text) return;
+        setInput('');
+        sendPrompt(text);
+    };
+
+    const handleRetry = () => {
+        sendPrompt(lastPrompt);
+    };
+
     const handleExampleClick = (example) => {
-        setInput(example);
-        setTimeout(() => handleSend(), 300);
+        setInput('');
+        sendPrompt(example);
     };
 
     const handleKeyDown = (e) => {
@@ -104,7 +131,7 @@ const ImproveChat = ({
 
             recognitionRef.current.start();
         } else {
-            alert('Голосовой ввод не поддерживается в этом браузере.');
+            setNotice({ text: 'Голосовой ввод недоступен в этом браузере.', canRetry: false });
         }
     };
 
@@ -128,6 +155,17 @@ const ImproveChat = ({
         return { think: thinkContent, main: mainContent };
     };
 
+    const showWelcome = messages.length === 0 && !input && !isProcessing && !notice;
+
+    const renderTyping = (label) => (
+        <div className="typing-indicator">
+            <span className="typing-indicator__dot"></span>
+            <span className="typing-indicator__dot"></span>
+            <span className="typing-indicator__dot"></span>
+            <span className="typing-indicator__label">{label}</span>
+        </div>
+    );
+
     return (
         <AnimatePresence>
             {isOpen && (
@@ -141,11 +179,13 @@ const ImproveChat = ({
                         damping: 20,
                         stiffness: 300
                     }}
-                    style={{ height: chatHeight }}
+                    style={{ '--chat-height': chatHeight }}
                 >
                     <div className="ai-chat-header">
-                        <div className="flex align-items-center">
-                            <FontAwesomeIcon icon={faRobot} className="mr-3 text-2xl text-primary" />
+                        <div className="ai-chat-header__title">
+                            <span className="ai-chat-header__icon">
+                                <FontAwesomeIcon icon={faRobot} />
+                            </span>
                             <h3>Улучшение схемы</h3>
                         </div>
                         <div className="ai-chat-header-buttons">
@@ -167,11 +207,11 @@ const ImproveChat = ({
                     </div>
 
                     <div className="ai-chat-messages">
-                        {messages.length === 0 && !input && !isProcessing ? (
+                        {showWelcome ? (
                             <div className="welcome-message">
-                                <div className="text-center mb-5">
-                                    <div className="ai-icon mb-3">
-                                        <FontAwesomeIcon icon={faRobot} className="text-5xl text-primary" />
+                                <div className="welcome-message__hero">
+                                    <div className="ai-icon">
+                                        <FontAwesomeIcon icon={faRobot} />
                                     </div>
                                     <h3 className="welcome-title">Оптимизируйте вашу схему</h3>
                                     <p className="welcome-subtitle">Предложите улучшения или попросите ИИ проанализировать схему</p>
@@ -179,25 +219,26 @@ const ImproveChat = ({
 
                                 <div className="examples-container">
                                     {examples.map((example, index) => (
-                                        <motion.div
+                                        <motion.button
                                             key={index}
+                                            type="button"
                                             className="example-card"
                                             onClick={() => handleExampleClick(example)}
                                             whileHover={{ y: -5 }}
                                             whileTap={{ scale: 0.98 }}
                                         >
-                                            <div className="example-icon">
-                                                <FontAwesomeIcon icon={faLightbulb} className="text-warning" />
-                                            </div>
-                                            <p className="example-text">{example}</p>
-                                        </motion.div>
+                                            <span className="example-icon">
+                                                <FontAwesomeIcon icon={faLightbulb} />
+                                            </span>
+                                            <span className="example-text">{example}</span>
+                                        </motion.button>
                                     ))}
                                 </div>
                             </div>
                         ) : (
                             <>
                                 {messages.map((message) => {
-                                    const { think, main } = parseThinkBlock(message.text);
+                                    const { think, main } = parseThinkBlock(message.text || '');
 
                                     return (
                                         <motion.div
@@ -214,12 +255,7 @@ const ImproveChat = ({
                                             )}
                                             <div className="message-content">
                                                 {message.isLoading ? (
-                                                    <div className="typing-indicator">
-                                                        <span></span>
-                                                        <span></span>
-                                                        <span></span>
-                                                        <span>ИИ анализирует схему...</span>
-                                                    </div>
+                                                    renderTyping('ИИ анализирует схему...')
                                                 ) : (
                                                     <>
                                                         {think && (
@@ -238,11 +274,16 @@ const ImproveChat = ({
 
                                                         {message.improvementId && (
                                                             <Button
-                                                                label="Принять изменения"
-                                                                icon={<FontAwesomeIcon icon={faCheckCircle} className="mr-2" />}
-                                                                className="accept-improvement-btn mt-3"
+                                                                variant="primary"
+                                                                size="sm"
+                                                                className="accept-improvement-btn"
                                                                 onClick={() => onAcceptImprovement(message.improvementId)}
-                                                            />
+                                                            >
+                                                                <span className="chat-btn__icon">
+                                                                    <FontAwesomeIcon icon={faCheckCircle} />
+                                                                </span>
+                                                                Принять изменения
+                                                            </Button>
                                                         )}
                                                     </>
                                                 )}
@@ -267,12 +308,36 @@ const ImproveChat = ({
                                             <FontAwesomeIcon icon={faRobot} />
                                         </div>
                                         <div className="message-content">
-                                            <div className="typing-indicator">
-                                                <span></span>
-                                                <span></span>
-                                                <span></span>
-                                                <span>ИИ оптимизирует схему...</span>
-                                            </div>
+                                            {renderTyping('ИИ оптимизирует схему...')}
+                                        </div>
+                                    </motion.div>
+                                )}
+
+                                {notice && (
+                                    <motion.div
+                                        className="message AI message--alert"
+                                        initial={{ opacity: 0, y: 20 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        transition={{ duration: 0.4 }}
+                                    >
+                                        <div className="message-avatar">
+                                            <FontAwesomeIcon icon={faRobot} />
+                                        </div>
+                                        <div className="message-content">
+                                            <p>{notice.text}</p>
+                                            {notice.canRetry && (
+                                                <Button
+                                                    variant="secondary"
+                                                    size="sm"
+                                                    className="chat-retry-btn"
+                                                    onClick={handleRetry}
+                                                >
+                                                    <span className="chat-btn__icon">
+                                                        <FontAwesomeIcon icon={faRotateRight} />
+                                                    </span>
+                                                    Повторить
+                                                </Button>
+                                            )}
                                         </div>
                                     </motion.div>
                                 )}
@@ -306,30 +371,42 @@ const ImproveChat = ({
                                 transition={{ duration: 0.1 }}
                             />
                         )}
-                        <InputTextarea
-                            value={input}
-                            onChange={(e) => setInput(e.target.value)}
-                            onKeyDown={handleKeyDown}
-                            placeholder="Опишите, как улучшить текущую схему..."
-                            rows={1}
-                            autoResize
-                            className="w-full"
-                        />
-                        <div className="ai-chat-buttons">
-                            <Button
-                                label="Отправить"
-                                icon={<FontAwesomeIcon icon={faPaperPlane} className="mr-2" />}
-                                className="send-button"
-                                onClick={handleSend}
-                                disabled={!input.trim()}
+                        <div className="ai-chat-input__row">
+                            <textarea
+                                className="chat-input"
+                                value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                placeholder="Опишите, как улучшить текущую схему..."
+                                rows={2}
+                                aria-label="Запрос к ИИ"
                             />
-                            <Button
-                                icon={<FontAwesomeIcon icon={faMicrophone} />}
-                                className={`voice-button ${isListening ? 'active' : ''}`}
-                                onClick={isListening ? stopVoiceInput : startVoiceInput}
-                                tooltip={isListening ? "Остановить запись" : "Голосовой ввод"}
-                                tooltipOptions={{ position: 'top' }}
-                            />
+                            <div className="ai-chat-buttons">
+                                <Button
+                                    variant="primary"
+                                    size="sm"
+                                    className="chat-send-btn"
+                                    onClick={handleSend}
+                                    disabled={!input.trim() || isProcessing}
+                                >
+                                    <span className="chat-btn__icon">
+                                        <FontAwesomeIcon icon={faPaperPlane} />
+                                    </span>
+                                    Отправить
+                                </Button>
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className={`chat-voice-btn ${isListening ? 'is-active' : ''}`}
+                                    onClick={isListening ? stopVoiceInput : startVoiceInput}
+                                    title={isListening ? "Остановить запись" : "Голосовой ввод"}
+                                    aria-label={isListening ? "Остановить запись" : "Голосовой ввод"}
+                                >
+                                    <span className="chat-btn__icon">
+                                        <FontAwesomeIcon icon={faMicrophone} />
+                                    </span>
+                                </Button>
+                            </div>
                         </div>
                     </div>
                 </motion.div>

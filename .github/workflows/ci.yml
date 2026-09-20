@@ -40,6 +40,9 @@ jobs:
         run: alembic upgrade head
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+          # env.py импортирует app.db -> app.config, который требует SECRET_KEY
+          # на PostgreSQL. Значение фиктивное: JWT в этом шаге не подписывают.
+          SECRET_KEY: ci-only-secret
       # Дальше схема уже на месте, её только подтверждает фикстура conftest.py.
       - run: python -m pytest tests/ -q
 

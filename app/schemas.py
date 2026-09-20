@@ -79,7 +79,7 @@ class FolderDeleteRequest(BaseModel):
 
 class ShareRequest(BaseModel):
     diagram_id: str
-    can_edit: bool
+    can_edit: bool = False
 
 class ShareResponse(BaseModel):
     share_link: str

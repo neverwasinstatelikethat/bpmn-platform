@@ -38,6 +38,16 @@ def auth(client):
     return {"Authorization": f"Bearer {token}"}, email
 
 
+def register(client, label: str) -> dict:
+    """Заголовки второстепенного пользователя: чужие диаграммы и команды."""
+    email = f"{label}-{uuid.uuid4().hex[:8]}@example.com"
+    client.post("/api/register", json={"name": label, "email": email,
+                                       "password": "Passw0rd!"})
+    token = client.post("/api/login", json={"email": email,
+                                            "password": "Passw0rd!"}).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture(scope="module")
 def diagram(client, auth):
     headers, _ = auth
@@ -74,6 +84,17 @@ class TestPublicRoutes:
 
 
 class TestRegistryRoutes:
+    def test_foreign_diagram_is_not_overwritten_by_id(self, client, auth, diagram):
+        """Сохранение с чужим id — 404, а не тихая перезапись."""
+        headers, _ = auth
+        response = client.post("/api/diagrams", headers=register(client, "stranger"), json={
+            "id": diagram, "name": "Подменена", "xml": "<definitions>чужие правки</definitions>",
+            "score": 0,
+        })
+        assert response.status_code == 404
+        body = client.get(f"/api/diagrams/{diagram}", headers=headers)
+        assert body.json()["xml_content"] == XML
+
     def test_diagram_lifecycle(self, client, auth, diagram):
         headers, _ = auth
         assert client.get("/api/diagrams", headers=headers).status_code == 200
@@ -129,15 +150,9 @@ class TestTeamRoutes:
                            json={"domain": "vkusvill.ru", "role": "viewer"},
                            headers=headers).status_code == 200
 
-    def test_foreign_team_is_invisible(self, client, auth, team):
-        _, email = auth
-        other = f"other-{email}"
-        client.post("/api/register", json={"name": "Чужой", "email": other,
-                                           "password": "Passw0rd!"})
-        token = client.post("/api/login", json={"email": other,
-                                               "password": "Passw0rd!"}).json()["access_token"]
+    def test_foreign_team_is_invisible(self, client, team):
         assert client.get(f"/api/teams/{team}",
-                          headers={"Authorization": f"Bearer {token}"}).status_code == 404
+                          headers=register(client, "other")).status_code == 404
 
 
 class TestProfileAndMailRoutes:

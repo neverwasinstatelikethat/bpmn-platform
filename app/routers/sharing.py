@@ -38,6 +38,7 @@ from app.schemas import (AcceptImprovementRequest, DomainInviteCreate,
                          Token, UserCreate, UserResponse)
 from app.security import (create_access_token, get_password_hash, oauth2_scheme,
                           verify_password)
+from app.services.access import load_diagram
 from core.bpmn_generator import GenerationError
 from core.llm_improve import ImprovementError
 
@@ -51,23 +52,7 @@ def create_share_link(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    diagram = db.query(Diagram).filter(
-        Diagram.id == request.diagram_id,
-        or_(
-            Diagram.user_id == current_user.id,
-            and_(
-                Diagram.team_id.in_(
-                    db.query(TeamMember.team_id).filter(
-                        TeamMember.user_id == current_user.id,
-                        TeamMember.role.has(Role.permissions.contains(json.dumps({"editRegistry": True})))
-                    )
-                )
-            )
-        )
-    ).first()
-    
-    if not diagram:
-        raise HTTPException(404, detail="Diagram not found or access denied")
+    diagram = load_diagram(db, current_user, request.diagram_id, edit=True)
 
     token = str(uuid.uuid4())
     expires_at = datetime.utcnow() + timedelta(days=7)
@@ -120,23 +105,7 @@ def share_to_team(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    diagram = db.query(Diagram).filter(
-        Diagram.id == diagram_id,
-        or_(
-            Diagram.user_id == current_user.id,
-            and_(
-                Diagram.team_id.in_(
-                    db.query(TeamMember.team_id).filter(
-                        TeamMember.user_id == current_user.id,
-                        TeamMember.role.has(Role.permissions.contains(json.dumps({"editRegistry": True})))
-                    )
-                )
-            )
-        )
-    ).first()
-    
-    if not diagram:
-        raise HTTPException(404, "Diagram not found or access denied")
+    diagram = load_diagram(db, current_user, diagram_id, edit=True)
     
     team = db.query(Team).filter(Team.id == team_id).first()
     if not team:

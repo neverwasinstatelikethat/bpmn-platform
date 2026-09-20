@@ -38,6 +38,7 @@ from app.schemas import (AcceptImprovementRequest, DomainInviteCreate,
                          Token, UserCreate, UserResponse)
 from app.security import (create_access_token, get_password_hash, oauth2_scheme,
                           verify_password)
+from app.services.access import load_diagram
 from core.bpmn_generator import GenerationError
 from core.llm_improve import ImprovementError
 
@@ -171,22 +172,7 @@ async def accept_improvement(
         raise HTTPException(404, detail="Improvement not found")
     
     if improvement.diagram_id:
-        diagram = db.query(Diagram).filter(
-            Diagram.id == improvement.diagram_id,
-            or_(
-                Diagram.user_id == current_user.id,
-                and_(
-                    Diagram.team_id.in_(
-                        db.query(TeamMember.team_id).filter(
-                            TeamMember.user_id == current_user.id,
-                            TeamMember.role.has(Role.permissions.contains(json.dumps({"editRegistry": True})))
-                        )
-                    )
-                )
-            )
-        ).first()
-        if not diagram:
-            raise HTTPException(404, detail="Diagram not found or access denied")
+        diagram = load_diagram(db, current_user, improvement.diagram_id, edit=True)
         diagram.xml_content = improvement.xml_content
         diagram.updated_at = datetime.utcnow()
     else:

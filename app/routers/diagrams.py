@@ -38,6 +38,7 @@ from app.schemas import (AcceptImprovementRequest, DomainInviteCreate,
                          Token, UserCreate, UserResponse)
 from app.security import (create_access_token, get_password_hash, oauth2_scheme,
                           verify_password)
+from app.services.access import load_diagram
 from core.bpmn_generator import GenerationError
 from core.llm_improve import ImprovementError
 
@@ -53,25 +54,28 @@ def save_diagram(
     db: Session = Depends(get_db)
 ):
     diagram_id = diagram.id or str(uuid.uuid4())
-    existing_diagram = db.query(Diagram).filter(Diagram.id == diagram_id).first()
-    
-    if existing_diagram:
-        existing_diagram.name = diagram.name
-        existing_diagram.xml_content = diagram.xml
-        existing_diagram.score = diagram.score
-        existing_diagram.updated_at = datetime.utcnow()
+    exists = db.query(Diagram.id).filter(Diagram.id == diagram_id).first() is not None
+
+    if exists:
+        # Правка существующей диаграммы раньше не проверяла доступ вовсе:
+        # чужую схему можно было перезаписать, подставив её id.
+        target = load_diagram(db, current_user, diagram_id, edit=True)
+        target.name = diagram.name
+        target.xml_content = diagram.xml
+        target.score = diagram.score
+        target.updated_at = datetime.utcnow()
     else:
-        db_diagram = Diagram(
+        target = Diagram(
             id=diagram_id,
             name=diagram.name,
             xml_content=diagram.xml,
             score=diagram.score,
             user_id=current_user.id
         )
-        db.add(db_diagram)
-    
+        db.add(target)
+
     db.commit()
-    return {"status": "success", "diagram_id": diagram_id}
+    return {"status": "success", "diagram_id": target.id}
 
 @router.get("/api/diagrams")
 def get_user_diagrams(
@@ -94,19 +98,7 @@ def get_diagram(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    diagram = db.query(Diagram).filter(
-        Diagram.id == diagram_id,
-        or_(
-            Diagram.user_id == current_user.id,
-            Diagram.team_id.in_(
-                db.query(TeamMember.team_id).filter(TeamMember.user_id == current_user.id)
-            )
-        )
-    ).first()
-    
-    if not diagram:
-        raise HTTPException(404, detail="Diagram not found or access denied")
-    
+    diagram = load_diagram(db, current_user, diagram_id)
     return {
         "id": diagram.id,
         "name": diagram.name,
@@ -119,24 +111,7 @@ def delete_diagram(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    diagram = db.query(Diagram).filter(
-        Diagram.id == diagram_id,
-        or_(
-            Diagram.user_id == current_user.id,
-            and_(
-                Diagram.team_id.in_(
-                    db.query(TeamMember.team_id).filter(
-                        TeamMember.user_id == current_user.id,
-                        TeamMember.role.has(Role.permissions.contains(json.dumps({"editRegistry": True})))
-                    )
-                )
-            )
-        )
-    ).first()
-    
-    if not diagram:
-        raise HTTPException(404, detail="Diagram not found or access denied")
-    
+    diagram = load_diagram(db, current_user, diagram_id, edit=True)
     deleted_diagram = DeletedDiagram(
         id=str(uuid.uuid4()),
         diagram_id=diagram.id,
@@ -155,18 +130,8 @@ def move_to_folder(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    diagram = db.query(Diagram).filter(
-        Diagram.id == request.diagram_id,
-        or_(
-            Diagram.user_id == current_user.id,
-            Diagram.team_id.in_(
-                db.query(TeamMember.team_id).filter(TeamMember.user_id == current_user.id)
-            )
-        )
-    ).first()
-    
-    if not diagram:
-        raise HTTPException(404, detail="Diagram not found")
+    # Перемещение — запись, поэтому право на правку, а не на чтение.
+    diagram = load_diagram(db, current_user, request.diagram_id, edit=True)
     
     folder = db.query(Folder).filter(
         Folder.id == request.folder_id,

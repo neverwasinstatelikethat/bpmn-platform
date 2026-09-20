@@ -25,23 +25,42 @@ if not Path("static").is_dir():
     )
 
 pytest.importorskip("httpx", reason="TestClient работает поверх httpx")
-main = pytest.importorskip("main", reason="зависимости backend не установлены")
+pytest.importorskip("app.main", reason="зависимости backend не установлены")
 
 from fastapi.testclient import TestClient  # noqa: E402
+
+from app.db import SessionLocal  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models import (  # noqa: E402
+    Diagram,
+    PendingImprovement,
+    User,
+)
+from app.security import create_access_token  # noqa: E402
+from app.startup import run_schema_bootstrap  # noqa: E402
 
 ORIGINAL_XML = "<definitions>исходная схема</definitions>"
 IMPROVED_XML = "<definitions>схема с проверкой оплаты</definitions>"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def schema():
+    """Создаёт схему в тестовой БД до первого обращения к ней.
+
+    Приложение делает это в lifespan, но фикстуры сеют данные и до клиента.
+    """
+    run_schema_bootstrap()
+
+
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(main.app) as test_client:
+    with TestClient(app) as test_client:
         yield test_client
 
 
 @pytest.fixture
 def db():
-    session = main.SessionLocal()
+    session = SessionLocal()
     try:
         yield session
     finally:
@@ -50,7 +69,7 @@ def db():
 
 @pytest.fixture
 def user(db):
-    account = main.User(
+    account = User(
         name="Тестовый автор",
         email=f"owner-{uuid.uuid4().hex[:8]}@example.com",
         hashed_password="not-a-real-hash",
@@ -63,7 +82,7 @@ def user(db):
 
 @pytest.fixture
 def other_user(db):
-    account = main.User(
+    account = User(
         name="Чужой",
         email=f"other-{uuid.uuid4().hex[:8]}@example.com",
         hashed_password="not-a-real-hash",
@@ -75,12 +94,12 @@ def other_user(db):
 
 
 def _headers(account) -> dict:
-    token = main.create_access_token({"sub": account.email})
+    token = create_access_token({"sub": account.email})
     return {"Authorization": f"Bearer {token}"}
 
 
 def _diagram(db, owner_id, xml_content=ORIGINAL_XML):
-    diagram = main.Diagram(
+    diagram = Diagram(
         id=str(uuid.uuid4()),
         name="Тестовая схема",
         xml_content=xml_content,
@@ -92,7 +111,7 @@ def _diagram(db, owner_id, xml_content=ORIGINAL_XML):
 
 
 def _improvement(db, owner_id, diagram_id=None, xml_content=IMPROVED_XML):
-    improvement = main.PendingImprovement(
+    improvement = PendingImprovement(
         id=str(uuid.uuid4()),
         diagram_id=diagram_id,
         user_id=owner_id,
@@ -147,8 +166,8 @@ class TestAcceptImprovement:
         assert body["xml_content"] == IMPROVED_XML
         assert body["diagram_id"] == diagram_id
         db.expire_all()
-        assert db.query(main.Diagram).get(diagram_id).xml_content == IMPROVED_XML
-        assert db.query(main.PendingImprovement).get(improvement_id) is None
+        assert db.query(Diagram).get(diagram_id).xml_content == IMPROVED_XML
+        assert db.query(PendingImprovement).get(improvement_id) is None
 
     def test_repeated_accept_is_not_found(self, client, db, user):
         diagram = _diagram(db, user.id)
@@ -175,7 +194,7 @@ class TestAcceptImprovement:
         assert response.status_code == 200, response.text
         new_id = response.json()["diagram_id"]
         db.expire_all()
-        created = db.query(main.Diagram).get(new_id)
+        created = db.query(Diagram).get(new_id)
         assert created.user_id == user.id
         assert created.xml_content == IMPROVED_XML
 
@@ -191,7 +210,7 @@ class TestAcceptImprovement:
 
         assert response.status_code == 404
         db.expire_all()
-        assert db.query(main.Diagram).get(diagram.id).xml_content == ORIGINAL_XML
+        assert db.query(Diagram).get(diagram.id).xml_content == ORIGINAL_XML
 
     def test_denied_diagram_access_keeps_improvement(self, client, db, user, other_user):
         foreign_diagram = _diagram(db, other_user.id)
@@ -206,7 +225,7 @@ class TestAcceptImprovement:
         assert response.status_code == 404
         assert response.json()["detail"] == "Diagram not found or access denied"
         db.expire_all()
-        assert db.query(main.PendingImprovement).get(improvement.id) is not None
+        assert db.query(PendingImprovement).get(improvement.id) is not None
 
     def test_anonymous_is_unauthorized(self, client):
         response = client.post(

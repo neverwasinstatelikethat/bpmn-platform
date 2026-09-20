@@ -1,45 +1,19 @@
 """ИИ-контур: генерация, скоринг, улучшение и принятие изменений."""
 import asyncio
-import json
 import logging
-import os
-import re
-import secrets
-import tempfile
 import uuid
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-
-import jwt
-from fastapi import (APIRouter, BackgroundTasks, Body, Depends, File, Form,
-                     HTTPException, Query, UploadFile, status)
-from fastapi_mail import MessageSchema
-from sqlalchemy import and_, or_
-from sqlalchemy.orm import Session, joinedload
-
+from datetime import datetime
+from fastapi import APIRouter, Body, Depends, HTTPException
+from sqlalchemy.orm import Session
 from app.ai import generator, get_orchestrator, scorer
-from app.config import (ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM, BACKEND_PORT,
-                        DATABASE_URL, FRONTEND_URL, SECRET_KEY)
 from app.db import get_db
 from app.deps import get_current_user
-from app.mailer import email_conf, fast_mail
-from app.models import (DeletedDiagram, Diagram, Folder, Invitation,
-                        PasswordResetToken, PendingImprovement, Role,
-                        ShareToken, Team, TeamMember, User)
-from app.schemas import (AcceptImprovementRequest, DomainInviteCreate,
-                         DiagramCreate, FolderCreate, FolderDeleteRequest,
-                         FolderResponse, ImproveRequest, InvitationCreate,
-                         InvitationResponse, LoginRequest, MoveToFolderRequest,
-                         PasswordReset, PasswordResetRequest,
-                         PasswordResetResponse, RegisterRequest,
-                         RestoreDiagramRequest, RoleCreate, RoleResponse,
-                         ShareRequest, ShareResponse, TeamCreate, TeamResponse,
-                         Token, UserCreate, UserResponse)
-from app.security import (create_access_token, get_password_hash, oauth2_scheme,
-                          verify_password)
+from app.models import Diagram, Improvement, User
+from app.schemas import AcceptImprovementRequest, ImproveRequest
 from app.services.access import load_diagram
-from core.bpmn_generator import GenerationError
+from app.services.improvements import (APPROVED, PENDING, REJECTED,
+                                     record_proposal)
+from app.services.versions import record_version
 from core.llm_improve import ImprovementError
 
 logger = logging.getLogger(__name__)
@@ -138,22 +112,18 @@ async def improve_diagram_endpoint(
             "report": report,
         }
 
-    improvement_id = str(uuid.uuid4())
-    pending_improvement = PendingImprovement(
-        id=improvement_id,
-        diagram_id=request.diagram_id,
+    improvement = record_proposal(
+        db,
         user_id=current_user.id,
-        xml_content=improved_xml,
+        diagram_id=request.diagram_id,
+        improved_xml=improved_xml,
         recommendations=recommendations,
-        created_at=datetime.utcnow()
     )
-    db.add(pending_improvement)
-    db.commit()
-    logger.info("Диаграмма %s улучшена, улучшение %s", request.diagram_id, improvement_id)
+    logger.info("Диаграмма %s улучшена, улучшение %s", request.diagram_id, improvement.id)
 
     return {
         "status": "success",
-        "improvement_id": improvement_id,
+        "improvement_id": improvement.id,
         "recommendations": recommendations,
         "report": report,
     }
@@ -164,15 +134,23 @@ async def accept_improvement(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    improvement = db.query(PendingImprovement).filter(
-        PendingImprovement.id == request.improvement_id,
-        PendingImprovement.user_id == current_user.id
+    improvement = db.query(Improvement).filter(
+        Improvement.id == request.improvement_id,
+        Improvement.user_id == current_user.id,
+        Improvement.status == PENDING,
     ).first()
     if not improvement:
         raise HTTPException(404, detail="Improvement not found")
     
     if improvement.diagram_id:
         diagram = load_diagram(db, current_user, improvement.diagram_id, edit=True)
+        if improvement.base_seq is not None and diagram.version_seq != improvement.base_seq:
+            # Правки считались по другой версии: принятие молча затёрло бы то,
+            # что сохранилось после расчёта улучшения.
+            raise HTTPException(
+                409,
+                detail="Схема изменилась после расчёта улучшения — запросите его заново",
+            )
         diagram.xml_content = improvement.xml_content
         diagram.updated_at = datetime.utcnow()
     else:
@@ -187,15 +165,35 @@ async def accept_improvement(
         )
         db.add(diagram)
     
-    # Фиксируем значения до удаления: после delete+commit объект отцеплен
-    # от сессии (expire_on_commit), чтение атрибутов падает с DetachedInstanceError.
-    saved_xml = improvement.xml_content
-    saved_diagram_id = improvement.diagram_id
-    db.delete(improvement)
+    version = record_version(db, diagram, source="approved", author_id=current_user.id,
+                             note=f"улучшение {improvement.id}")
+    improvement.status = APPROVED
+    improvement.decided_at = datetime.utcnow()
     db.commit()
     return {
         "status": "success",
-        "diagram_id": saved_diagram_id or diagram.id,
-        "xml_content": saved_xml
+        "diagram_id": diagram.id,
+        "xml_content": diagram.xml_content,
+        "version_seq": version.seq if version else diagram.version_seq,
     }
+
+@router.post("/api/ai/reject-improvement")
+async def reject_improvement(
+    request: AcceptImprovementRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Отказ от предложения: решение остаётся в истории, строка не удаляется."""
+    improvement = db.query(Improvement).filter(
+        Improvement.id == request.improvement_id,
+        Improvement.user_id == current_user.id,
+        Improvement.status == PENDING,
+    ).first()
+    if not improvement:
+        raise HTTPException(404, detail="Improvement not found")
+
+    improvement.status = REJECTED
+    improvement.decided_at = datetime.utcnow()
+    db.commit()
+    return {"status": "success", "improvement_id": improvement.id}
 

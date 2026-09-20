@@ -3,7 +3,8 @@ import json
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (Boolean, Column, DateTime, ForeignKey, Integer, String,
+                        Text, UniqueConstraint)
 from sqlalchemy.orm import relationship
 
 from app.db import Base
@@ -71,7 +72,7 @@ class User(Base):
     diagrams = relationship("Diagram", back_populates="owner")
     folders = relationship("Folder", back_populates="owner")
     deleted_diagrams = relationship("DeletedDiagram", back_populates="owner")
-    pending_improvements = relationship("PendingImprovement", back_populates="owner")
+    improvements = relationship("Improvement", back_populates="owner")
     owned_teams = relationship("Team", back_populates="team_owner")
     team_memberships = relationship("TeamMember", back_populates="user")
 
@@ -85,12 +86,41 @@ class Diagram(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     folder_id = Column(String(36), ForeignKey("folders.id"), nullable=True)
+    team_id = Column(String(36), ForeignKey("teams.id"), nullable=True)
+    # Номер последней записанной версии: по нему улучшение понимает, что схема
+    # ушла вперёд и предложение пора пересчитать.
+    version_seq = Column(Integer, nullable=False, default=0)
+
     owner = relationship("User", back_populates="diagrams")
     folder = relationship("Folder", back_populates="diagrams")
-    share_tokens = relationship("ShareToken", back_populates="diagram")
-    pending_improvements = relationship("PendingImprovement", back_populates="diagram")
-    team_id = Column(String(36), ForeignKey("teams.id"), nullable=True)
     team = relationship("Team", back_populates="diagrams")
+    share_tokens = relationship("ShareToken", back_populates="diagram")
+    improvements = relationship("Improvement", back_populates="diagram")
+    versions = relationship(
+        "DiagramVersion", back_populates="diagram",
+        cascade="all, delete-orphan", order_by="DiagramVersion.seq",
+    )
+
+
+class DiagramVersion(Base):
+    """Снимок схемы. История не перезаписывается: откат — новая версия."""
+
+    __tablename__ = "diagram_versions"
+    __table_args__ = (UniqueConstraint("diagram_id", "seq", name="uq_diagram_versions_seq"),)
+
+    id = Column(String(36), primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
+    diagram_id = Column(String(36), ForeignKey("diagrams.id"), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    xml_content = Column(Text, nullable=False)
+    score = Column(Integer, default=0)
+    # created | saved | approved | restored
+    source = Column(String(32), nullable=False)
+    author_id = Column(Integer, ForeignKey("users.id"))
+    note = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    diagram = relationship("Diagram", back_populates="versions")
+    author = relationship("User")
 
 class ShareToken(Base):
     __tablename__ = "share_tokens"
@@ -125,7 +155,14 @@ class DeletedDiagram(Base):
     deleted_at = Column(DateTime, default=datetime.utcnow)
     owner = relationship("User", back_populates="deleted_diagrams")
 
-class PendingImprovement(Base):
+class Improvement(Base):
+    """Предложение улучшения и его судьба.
+
+    Таблица осталась `pending_improvements`: переименование переименованием
+    индексов в легаси-базах не сопровождается, а выгоды в запросах нет.
+    Статус: pending → approved | rejected | superseded (новое предложение по
+    той же диаграмме снимает с рассмотрения прежнее).
+    """
     __tablename__ = "pending_improvements"
     id = Column(String(36), primary_key=True, index=True)
     diagram_id = Column(String(36), ForeignKey("diagrams.id"), nullable=True)
@@ -133,8 +170,12 @@ class PendingImprovement(Base):
     xml_content = Column(Text)
     recommendations = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-    owner = relationship("User", back_populates="pending_improvements")
-    diagram = relationship("Diagram", back_populates="pending_improvements")
+    status = Column(String(20), nullable=False, default="pending")
+    # Версия схемы, к которой применимо предложение (см. Diagram.version_seq).
+    base_seq = Column(Integer)
+    decided_at = Column(DateTime)
+    owner = relationship("User", back_populates="improvements")
+    diagram = relationship("Diagram", back_populates="improvements")
 
 
 # Таблица для токенов сброса пароля

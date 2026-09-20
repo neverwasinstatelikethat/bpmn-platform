@@ -1,45 +1,20 @@
 """Аутентификация, профиль и сброс пароля."""
-import asyncio
-import json
 import logging
-import os
-import re
 import secrets
-import tempfile
-import uuid
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-
-import jwt
-from fastapi import (APIRouter, BackgroundTasks, Body, Depends, File, Form,
-                     HTTPException, Query, UploadFile, status)
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi_mail import MessageSchema
-from sqlalchemy import and_, or_
-from sqlalchemy.orm import Session, joinedload
-
-from app.ai import generator, get_orchestrator, scorer
-from app.config import (ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM, BACKEND_PORT,
-                        DATABASE_URL, FRONTEND_URL, SECRET_KEY)
+from sqlalchemy.orm import Session
+from app.config import FRONTEND_URL
 from app.db import get_db
 from app.deps import get_current_user
-from app.mailer import email_conf, fast_mail, send_email
-from app.models import (DeletedDiagram, Diagram, Folder, Invitation,
-                        PasswordResetToken, PendingImprovement, Role,
-                        ShareToken, Team, TeamMember, User)
-from app.schemas import (AcceptImprovementRequest, DomainInviteCreate,
-                         DiagramCreate, FolderCreate, FolderDeleteRequest,
-                         FolderResponse, ImproveRequest, InvitationCreate,
-                         InvitationResponse, LoginRequest, MoveToFolderRequest,
-                         PasswordReset, PasswordResetRequest,
-                         PasswordResetResponse, RegisterRequest,
-                         RestoreDiagramRequest, RoleCreate, RoleResponse,
-                         ShareRequest, ShareResponse, TeamCreate, TeamResponse,
-                         Token, UserCreate, UserResponse)
-from app.security import (create_access_token, get_password_hash, oauth2_scheme,
-                          verify_password)
-from core.bpmn_generator import GenerationError
-from core.llm_improve import ImprovementError
+from app.mailer import send_email
+from app.models import PasswordResetToken, User
+from app.schemas import (
+                        LoginRequest, PasswordReset, PasswordResetRequest,
+                        PasswordResetResponse, RegisterRequest, Token, UserResponse
+)
+from app.security import create_access_token, get_password_hash, verify_password
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +263,3 @@ async def verify_reset_token(
     except Exception as e:
         logger.error("Error verifying reset token: %s", e, exc_info=True)
         return {"valid": False}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=BACKEND_PORT)

@@ -1,6 +1,6 @@
 """Pydantic-контракты запросов и ответов API."""
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 from pydantic import BaseModel, EmailStr, validator
 

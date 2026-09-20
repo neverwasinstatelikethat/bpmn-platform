@@ -79,7 +79,11 @@ class TestPublicRoutes:
         paths = client.get("/openapi.json").json()["paths"]
         for route in ("/health", "/api/register", "/api/diagrams", "/api/folders",
                       "/api/teams", "/api/roles", "/api/evaluate", "/api/generate",
-                      "/api/ai/improve", "/api/ai/accept-improvement", "/api/share"):
+                      "/api/ai/improve", "/api/ai/accept-improvement",
+                      "/api/ai/reject-improvement", "/api/share",
+                      "/api/diagrams/{diagram_id}/versions",
+                      "/api/diagrams/{diagram_id}/versions/{seq}",
+                      "/api/diagrams/{diagram_id}/restore/{seq}"):
             assert route in paths, route
 
 
@@ -128,6 +132,65 @@ class TestRegistryRoutes:
         assert client.delete(f"/api/diagrams/{victim}", headers=headers).status_code == 200
         deleted = client.get("/api/deleted-diagrams", headers=headers).json()
         assert [d["diagram_id"] for d in deleted] == [victim]
+
+
+class TestDiagramHistory:
+    """Версии схемы: история растёт только на содержательную правку, откат — новая версия."""
+
+    def test_saving_grows_history_and_identical_save_does_not(self, client, auth):
+        headers, _ = auth
+        diagram_id = str(uuid.uuid4())
+        first = {"id": diagram_id, "name": "H", "xml": XML, "score": 5}
+        assert client.post("/api/diagrams", json=first,
+                           headers=headers).json()["version_seq"] == 1
+        assert client.post("/api/diagrams", json=first,
+                           headers=headers).json()["version_seq"] == 1
+
+        second = dict(first, xml=XML.replace('id="P"', 'id="P2"'), score=9)
+        assert client.post("/api/diagrams", json=second,
+                           headers=headers).json()["version_seq"] == 2
+
+        versions = client.get(f"/api/diagrams/{diagram_id}/versions", headers=headers).json()
+        assert [v["seq"] for v in versions] == [2, 1]
+        assert [v["source"] for v in versions] == ["saved", "created"]
+        assert versions[0]["score"] == 9
+
+        body = client.get(f"/api/diagrams/{diagram_id}/versions/1", headers=headers).json()
+        assert body["xml_content"] == XML
+
+    def test_restore_replays_history_without_losing_it(self, client, auth):
+        headers, _ = auth
+        diagram_id = str(uuid.uuid4())
+        client.post("/api/diagrams", json={"id": diagram_id, "name": "R", "xml": XML,
+                                           "score": 1}, headers=headers)
+        client.post("/api/diagrams", json={"id": diagram_id, "name": "R",
+                                           "xml": XML.replace('id="P"', 'id="P2"'),
+                                           "score": 2}, headers=headers)
+
+        response = client.post(f"/api/diagrams/{diagram_id}/restore/1", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["xml_content"] == XML
+        assert response.json()["version_seq"] == 3
+        assert client.get(f"/api/diagrams/{diagram_id}", headers=headers) \
+            .json()["xml_content"] == XML
+        sources = [v["source"] for v in
+                   client.get(f"/api/diagrams/{diagram_id}/versions", headers=headers).json()]
+        assert sources == ["restored", "saved", "created"]
+
+    def test_unknown_version_and_foreign_owner_are_not_found(self, client, auth):
+        headers, _ = auth
+        diagram_id = str(uuid.uuid4())
+        client.post("/api/diagrams", json={"id": diagram_id, "name": "V", "xml": XML,
+                                           "score": 0}, headers=headers)
+        stranger = register(client, "hist-stranger")
+        assert client.get(f"/api/diagrams/{diagram_id}/versions/77",
+                          headers=headers).status_code == 404
+        assert client.post(f"/api/diagrams/{diagram_id}/restore/77",
+                           headers=headers).status_code == 404
+        assert client.get(f"/api/diagrams/{diagram_id}/versions",
+                          headers=stranger).status_code == 404
+        assert client.post(f"/api/diagrams/{diagram_id}/restore/1",
+                           headers=stranger).status_code == 404
 
 
 class TestTeamRoutes:

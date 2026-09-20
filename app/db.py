@@ -3,8 +3,6 @@
 Модуль не создаёт схему и не пишет в базу: это задача app.startup, которую
 вызывает lifespan приложения.
 """
-import os
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 

@@ -10,7 +10,7 @@
 
 До правок бизнес-логики построй файловый трейс:
 
-1. Найди фактическую точку входа: endpoint в `main.py`.
+1. Найди фактическую точку входа: endpoint в `app/routers/<домен>.py`.
 2. Через `rg` определи вызываемые модели, зависимости и модули `core/`.
 3. Проверь схемы Pydantic, доступ (владелец/команда/роль), сохранение
    в БД и контракт, который ожидает `bpmn-constructor`.
@@ -34,9 +34,10 @@
    только на фронте?
 3. Как проходит полный путь данных от входа до результата: валидация →
    сервис/`core/` → БД → ответ?
-4. Монолит: есть ли уже похожая функция в `main.py`? Когда оправдано
-   вынести блок в отдельный модуль (размер, переиспользование,
-   тестируемость)?
+4. Есть ли уже похожая функция в другом router-е или в `app/services/`?
+   Общее правило доступа или истории выноси в `app/services/`, а не
+   копируй в очередной endpoint (см. `access.py`, `versions.py`,
+   `improvements.py`).
 5. Совместимо ли изменение с целью перехода на PostgreSQL? Не использует
    ли новый код `PRAGMA`, типы только SQLite или сырой диалект-специфичный
    SQL?
@@ -82,7 +83,9 @@
   `/api/import-bpmn`;
 - общий доступ: `/api/share`, `/api/share/{token}`;
 - ИИ: `/api/generate`, `/api/evaluate`, `/api/export`, `/api/ai/improve`,
-  `/api/ai/accept-improvement`;
+  `/api/ai/accept-improvement`, `/api/ai/reject-improvement`;
+- история схемы: `/api/diagrams/{id}/versions`,
+  `/api/diagrams/{id}/versions/{seq}`, `/api/diagrams/{id}/restore/{seq}`;
 - команды и роли: `/api/teams*`, `/api/roles`, `/api/invitations/*`,
   `/api/diagrams/share-to-team`;
 - служебное: `/health`.
@@ -93,11 +96,20 @@
 ## Модели и хранение
 
 Таблицы: `users`, `teams`, `team_members`, `roles`, `invitations`,
-`diagrams`, `folders`, `share_tokens`, `deleted_diagrams`,
-`pending_improvements`, `password_reset_tokens`.
+`diagrams`, `diagram_versions`, `folders`, `share_tokens`,
+`deleted_diagrams`, `pending_improvements` (модель `Improvement`),
+`password_reset_tokens`. В легаси-SQLite встречаются мёртвые таблицы
+`analysis_*`, `user_feedback`, `system_metrics` — в моделях их нет,
+новым кодом не расширяй.
 
-- Диаграмма хранит `xml_content` текстом, `score` и владельца; принадлежность
-  команде и папке — опциональные внешние ключи.
+- Диаграмма хранит `xml_content` текстом, `score`, владельца и `version_seq`;
+  принадлежность команде и папке — опциональные внешние ключи. Каждая
+  содержательная правка оставляет снимок в `diagram_versions`
+  (`app/services/versions.py:record_version`); откат — новый снимок, а не
+  стирание истории. Одна и та же транзакция пишет и диаграмму, и версию.
+- Предложение улучшения живёт в статусах `pending → approved | rejected |
+  superseded` и не удаляется; `base_seq` хранит версию, от которой считалось,
+  и принятие устаревшего предложения даёт 409, а не перезапись.
 - Роли предопределены (`admin`, `editor`, `viewer`); права — JSON-текст,
   читай только через `Role.get_permissions()`.
 - Приглашения и токены сброса пароля имеют `expires_at` и статус/флаг

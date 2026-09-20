@@ -38,50 +38,47 @@ def _alembic_config() -> Config:
     return config
 
 
-def _schema_gaps() -> tuple[list[str], dict[str, list[str]]]:
-    """Чего не хватает базе из моделей: таблицы и колонки.
-
-    Нужно, чтобы отличить «схема актуальна, просто без версий» (лечится одним
-    `alembic stamp`) от схемы старше базовой ревизии (тогда stamp соврёт).
-    """
+def _dead_tables() -> list[str]:
+    """Таблицы, которых нет в моделях: relic этого приложения или чужие объекты."""
     inspector = inspect(engine)
-    present = set(inspector.get_table_names())
-    missing_tables, missing_columns = [], {}
-    for table in Base.metadata.sorted_tables:
-        if table.name not in present:
-            missing_tables.append(table.name)
-            continue
-        have = {column["name"] for column in inspector.get_columns(table.name)}
-        gap = [column.name for column in table.columns if column.name not in have]
-        if gap:
-            missing_columns[table.name] = gap
-    return missing_tables, missing_columns
+    model_tables = {table.name for table in Base.metadata.sorted_tables}
+    return sorted(set(inspector.get_table_names()) - model_tables - {"alembic_version"})
 
 
 def run_migrations() -> None:
     config = _alembic_config()
-    head = ScriptDirectory.from_config(config).get_current_head()
+    script = ScriptDirectory.from_config(config)
+    head = script.get_current_head()
+    base = list(script.walk_revisions())[-1].revision
 
     with engine.connect() as connection:
         current = MigrationContext.configure(connection).get_current_revision()
 
     if current is None and inspect(engine).has_table("users"):
-        missing_tables, missing_columns = _schema_gaps()
-        if missing_tables or missing_columns:
-            raise RuntimeError(
-                "В базе есть таблицы без alembic_version, и они старше базовой "
-                f"ревизии: не хватает {missing_tables or 'таблиц'} и колонок "
-                f"{missing_columns or {}}. Довести такую схему миграциями нельзя — "
-                "перенесите данные в чистую базу (migrate_sqlite_to_postgres.py)."
-            )
+        # Разница между «базой до Alembic» и «базой старше базовой ревизии» на
+        # глаз не видна, поэтому подсказка одна: поставить базовую ревизию и
+        # догнать head. Если схема всё-таки старше, upgrade head не добавит
+        # колонки, и приложение честно упадёт на первом же запросе.
+        extras = ""
+        dead = _dead_tables()
+        if dead:
+            extras = f" Лишние таблицы {dead} останутся как есть: в app/models.py их нет."
         raise RuntimeError(
-            "В базе есть таблицы, но alembic_version отсутствует — это схема до "
-            f"перехода на Alembic. Она совпадает с моделями, поэтому выполните "
-            f"один раз: alembic stamp {head}"
+            "В базе есть таблицы, но alembic_version отсутствует — она создана до "
+            f"перехода на Alembic. Выполните один раз: alembic stamp {base} "
+            f"&& alembic upgrade head.{extras} Если база старше базовой ревизии, "
+            "вместо stamp перенесите данные в чистую (migrate_sqlite_to_postgres.py)."
         )
 
     command.upgrade(config, "head")
     logger.info("Схема БД приведена к ревизии %s", head)
+
+
+PREDEFINED_ROLES = [
+    ("admin", {"viewRegistry": True, "viewRoles": True, "editRegistry": True, "manageRoles": True}),
+    ("editor", {"viewRegistry": True, "viewRoles": True, "editRegistry": True, "manageRoles": False}),
+    ("viewer", {"viewRegistry": True, "viewRoles": True, "editRegistry": False, "manageRoles": False}),
+]
 
 
 def seed_default_roles():
@@ -94,13 +91,6 @@ def seed_default_roles():
             session.commit()
     finally:
         session.close()
-
-
-PREDEFINED_ROLES = [
-    ("admin", {"viewRegistry": True, "viewRoles": True, "editRegistry": True, "manageRoles": True}),
-    ("editor", {"viewRegistry": True, "viewRoles": True, "editRegistry": True, "manageRoles": False}),
-    ("viewer", {"viewRegistry": True, "viewRoles": True, "editRegistry": False, "manageRoles": False}),
-]
 
 
 def prepare_database() -> None:

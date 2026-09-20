@@ -1,46 +1,17 @@
 """Реестр диаграмм: сохранение, просмотр, удаление, импорт."""
-import asyncio
-import json
 import logging
-import os
-import re
-import secrets
-import tempfile
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-
-import jwt
-from fastapi import (APIRouter, BackgroundTasks, Body, Depends, File, Form,
-                     HTTPException, Query, UploadFile, status)
-from fastapi_mail import MessageSchema
+from datetime import datetime
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import and_, or_
-from sqlalchemy.orm import Session, joinedload
-
-from app.ai import generator, get_orchestrator, scorer
-from app.config import (ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM, BACKEND_PORT,
-                        DATABASE_URL, FRONTEND_URL, SECRET_KEY)
+from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import get_current_user
-from app.mailer import email_conf, fast_mail
-from app.models import (DeletedDiagram, Diagram, Folder, Invitation,
-                        PasswordResetToken, PendingImprovement, Role,
-                        ShareToken, Team, TeamMember, User)
-from app.schemas import (AcceptImprovementRequest, DomainInviteCreate,
-                         DiagramCreate, FolderCreate, FolderDeleteRequest,
-                         FolderResponse, ImproveRequest, InvitationCreate,
-                         InvitationResponse, LoginRequest, MoveToFolderRequest,
-                         PasswordReset, PasswordResetRequest,
-                         PasswordResetResponse, RegisterRequest,
-                         RestoreDiagramRequest, RoleCreate, RoleResponse,
-                         ShareRequest, ShareResponse, TeamCreate, TeamResponse,
-                         Token, UserCreate, UserResponse)
-from app.security import (create_access_token, get_password_hash, oauth2_scheme,
-                          verify_password)
+from app.models import DeletedDiagram, Diagram, DiagramVersion, Folder, User
+from app.schemas import DiagramCreate, MoveToFolderRequest, RestoreDiagramRequest
 from app.services.access import load_diagram
-from core.bpmn_generator import GenerationError
-from core.llm_improve import ImprovementError
+from app.services.versions import record_version
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +35,7 @@ def save_diagram(
         target.xml_content = diagram.xml
         target.score = diagram.score
         target.updated_at = datetime.utcnow()
+        source = "saved"
     else:
         target = Diagram(
             id=diagram_id,
@@ -73,9 +45,17 @@ def save_diagram(
             user_id=current_user.id
         )
         db.add(target)
+        source = "created"
 
+    # Версия пишется в той же транзакции: без неё commit диаграммы остался бы
+    # без истории, а следующий шаг улучшения не от чего было бы отсчитать.
+    version = record_version(db, target, source=source, author_id=current_user.id)
     db.commit()
-    return {"status": "success", "diagram_id": target.id}
+    return {
+        "status": "success",
+        "diagram_id": target.id,
+        "version_seq": version.seq if version else target.version_seq,
+    }
 
 @router.get("/api/diagrams")
 def get_user_diagrams(
@@ -103,6 +83,81 @@ def get_diagram(
         "id": diagram.id,
         "name": diagram.name,
         "xml_content": diagram.xml_content
+    }
+
+@router.get("/api/diagrams/{diagram_id}/versions")
+def list_diagram_versions(
+    diagram_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """История без тел схем — список нужен для выбора отката, а не для просмотра."""
+    diagram = load_diagram(db, current_user, diagram_id)
+    versions = db.query(DiagramVersion).filter(
+        DiagramVersion.diagram_id == diagram.id
+    ).order_by(DiagramVersion.seq.desc()).all()
+    return [{
+        "seq": v.seq,
+        "source": v.source,
+        "score": v.score,
+        "author_id": v.author_id,
+        "note": v.note,
+        "created_at": v.created_at,
+    } for v in versions]
+
+@router.get("/api/diagrams/{diagram_id}/versions/{seq}")
+def get_diagram_version(
+    diagram_id: str,
+    seq: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    diagram = load_diagram(db, current_user, diagram_id)
+    version = db.query(DiagramVersion).filter(
+        DiagramVersion.diagram_id == diagram.id,
+        DiagramVersion.seq == seq
+    ).first()
+    if not version:
+        raise HTTPException(404, detail="Version not found")
+    return {
+        "seq": version.seq,
+        "source": version.source,
+        "note": version.note,
+        "created_at": version.created_at,
+        "xml_content": version.xml_content,
+    }
+
+@router.post("/api/diagrams/{diagram_id}/restore/{seq}")
+def restore_diagram_version(
+    diagram_id: str,
+    seq: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Откат: содержимое выбранной версии становится текущим и записывается новым снимком.
+
+    История не стирается — «вернуть v3» выглядит в ней как v5, и из v5 можно
+    уйти обратно в v4.
+    """
+    diagram = load_diagram(db, current_user, diagram_id, edit=True)
+    version = db.query(DiagramVersion).filter(
+        DiagramVersion.diagram_id == diagram.id,
+        DiagramVersion.seq == seq
+    ).first()
+    if not version:
+        raise HTTPException(404, detail="Version not found")
+
+    diagram.xml_content = version.xml_content
+    diagram.score = version.score
+    diagram.updated_at = datetime.utcnow()
+    restored = record_version(db, diagram, source="restored",
+                              author_id=current_user.id, note=f"откат к v{seq}")
+    db.commit()
+    return {
+        "status": "success",
+        "diagram_id": diagram.id,
+        "xml_content": diagram.xml_content,
+        "version_seq": restored.seq if restored else diagram.version_seq,
     }
 
 @router.delete("/api/diagrams/{diagram_id}")
@@ -193,8 +248,10 @@ async def import_bpmn(
             updated_at=datetime.utcnow()
         )
         db.add(db_diagram)
+        record_version(db, db_diagram, source="created", author_id=current_user.id,
+                       note=f"импорт {file.filename}")
         db.commit()
-        
+
         logger.info(f"Successfully imported diagram: {diagram_id}")
         
         return {
@@ -248,7 +305,10 @@ def restore_diagram(
         updated_at=datetime.utcnow()
     )
     db.add(diagram)
-    
+    # Восстановление из корзины — это рождение схемы заново: прежнее id
+    # свободно, история у него пустая.
+    record_version(db, diagram, source="created", author_id=current_user.id,
+                   note="восстановлено из корзины")
     db.delete(deleted_diagram)
     db.commit()
     return {"status": "success"}

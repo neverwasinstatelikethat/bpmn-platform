@@ -10,7 +10,10 @@
 - FastAPI-пакет `app/`: `main.py` — только составной корень (lifespan,
   middleware, подключение роутеров), `routers/` — API по доменам,
   `models.py`/`schemas.py`/`security.py`/`deps.py`/`db.py`/`config.py`/
-  `mailer.py`/`ai.py`/`startup.py` — соответствующие слои; корневой
+  `mailer.py`/`ai.py`/`startup.py` — соответствующие слои;
+  `app/services/` — то, что должно совпадать во всех endpoint-ах:
+  `access.py` (объектный доступ), `versions.py` (история схемы),
+  `improvements.py` (статусы решений об улучшении); корневой
   `main.py` оставлен тонким шимом (`from app.main import app`), чтобы
   `uvicorn main:app` и Dockerfile не менялись;
 - SQLAlchemy (declarative); БД задаётся `DATABASE_URL`: SQLite для

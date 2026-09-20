@@ -1,45 +1,15 @@
 """Папки реестра: дерево, перемещение, удаление."""
-import asyncio
 import json
 import logging
-import os
-import re
-import secrets
-import tempfile
 import uuid
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-
-import jwt
-from fastapi import (APIRouter, BackgroundTasks, Body, Depends, File, Form,
-                     HTTPException, Query, UploadFile, status)
-from fastapi_mail import MessageSchema
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_
-from sqlalchemy.orm import Session, joinedload
-
-from app.ai import generator, get_orchestrator, scorer
-from app.config import (ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM, BACKEND_PORT,
-                        DATABASE_URL, FRONTEND_URL, SECRET_KEY)
+from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import get_current_user
-from app.mailer import email_conf, fast_mail
-from app.models import (DeletedDiagram, Diagram, Folder, Invitation,
-                        PasswordResetToken, PendingImprovement, Role,
-                        ShareToken, Team, TeamMember, User)
-from app.schemas import (AcceptImprovementRequest, DomainInviteCreate,
-                         DiagramCreate, FolderCreate, FolderDeleteRequest,
-                         FolderResponse, ImproveRequest, InvitationCreate,
-                         InvitationResponse, LoginRequest, MoveToFolderRequest,
-                         PasswordReset, PasswordResetRequest,
-                         PasswordResetResponse, RegisterRequest,
-                         RestoreDiagramRequest, RoleCreate, RoleResponse,
-                         ShareRequest, ShareResponse, TeamCreate, TeamResponse,
-                         Token, UserCreate, UserResponse)
-from app.security import (create_access_token, get_password_hash, oauth2_scheme,
-                          verify_password)
-from core.bpmn_generator import GenerationError
-from core.llm_improve import ImprovementError
+from app.models import Diagram, Folder, Role, Team, TeamMember, User
+from app.schemas import FolderCreate
 
 logger = logging.getLogger(__name__)
 

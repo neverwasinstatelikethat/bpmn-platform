@@ -7,7 +7,7 @@ import bcrypt
 import jwt
 from fastapi.security import OAuth2PasswordBearer
 
-from app.config import ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM, SECRET_KEY
+from app.config import ALGORITHM, SECRET_KEY
 
 logger = logging.getLogger(__name__)
 

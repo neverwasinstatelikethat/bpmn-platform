@@ -1,0 +1,8 @@
+.shared-diagram__canvas {
+    height: min(640px, 70vh);
+    background: var(--color-surface);
+    border: 1px solid var(--color-hairline-soft);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-soft);
+    overflow: hidden;
+}

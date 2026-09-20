@@ -1,0 +1,97 @@
+.guideline-content {
+    display: grid;
+    grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
+    gap: var(--space-xl);
+}
+
+.guideline-sidebar {
+    align-self: start;
+    display: grid;
+    gap: var(--space-xs);
+    padding: var(--space-sm);
+    background: var(--color-surface);
+    border: 1px solid var(--color-hairline-soft);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-soft);
+}
+
+.sidebar-item {
+    min-height: 42px;
+    width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    border: 0;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--color-ink-soft);
+    font: 500 var(--text-sm) var(--font-sans);
+    text-align: left;
+    cursor: pointer;
+}
+
+.sidebar-item:hover,
+.sidebar-item.active { color: var(--color-primary-active); }
+.sidebar-item.active { background: var(--color-primary-soft); }
+.sidebar-item:focus-visible,
+.guideline-section__trigger:focus-visible,
+.test input:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.guideline-sections { display: grid; gap: var(--space-md); }
+
+.guideline-section {
+    overflow: clip;
+    background: var(--color-surface);
+    border: 1px solid var(--color-hairline-soft);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-soft);
+}
+
+.guideline-section__trigger {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+    width: 100%;
+    min-height: 62px;
+    padding: var(--space-md) var(--space-lg);
+    border: 0;
+    background: var(--color-surface);
+    color: var(--color-ink);
+    font: 600 var(--text-body) var(--font-sans);
+    text-align: left;
+    cursor: pointer;
+}
+
+.guideline-section__trigger svg { flex: 0 0 auto; }
+.guideline-section .content { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(16rem, .9fr); gap: var(--space-lg); padding: 0 var(--space-lg) var(--space-lg); }
+.theory, .test { min-width: 0; padding-top: var(--space-sm); }
+.theory h3, .test h3 { margin: 0 0 var(--space-sm); font-size: var(--text-h3); }
+.theory h4 { margin: var(--space-xl) 0 var(--space-xs); color: var(--color-ink); font-family: var(--font-sans); font-size: var(--text-body); }
+.theory p { margin: 0; color: var(--color-ink-soft); line-height: 1.65; }
+.diagram-container { height: 280px; margin-top: var(--space-md); overflow: hidden; border: 1px solid var(--color-hairline); border-radius: var(--radius-md); background: var(--color-surface-mist); }
+.diagram { width: 100%; height: 100%; }
+
+.test { align-self: start; padding: var(--space-lg); background: var(--color-surface-mist); border-radius: var(--radius-md); }
+.test form { display: grid; gap: var(--space-sm); }
+.test form > div { display: block; }
+.test label { display: flex; gap: var(--space-xs); align-items: flex-start; color: var(--color-ink-soft); font-size: var(--text-sm); line-height: 1.4; }
+.test input[type='checkbox'] { width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--color-primary); }
+.test input[type='number'] { width: 72px; min-height: 36px; margin-left: var(--space-xs); padding: 0 var(--space-xs); border: 1px solid var(--color-hairline); border-radius: var(--radius-sm); font: inherit; }
+.test button { min-height: var(--control-min-height); margin-top: var(--space-sm); border: 0; border-radius: var(--radius-pill); background: var(--color-primary); color: var(--color-on-primary); font: 600 var(--text-body) var(--font-sans); cursor: pointer; }
+.result { margin-top: var(--space-md); padding: var(--space-sm) var(--space-md); border-radius: var(--radius-md); font-size: var(--text-sm); }
+.result.pass { background: var(--color-success-soft); color: var(--color-primary-active); }
+.result.fail { background: var(--color-danger-soft); color: var(--color-danger); }
+
+@media (max-width: 860px) {
+    .guideline-content, .guideline-section .content { grid-template-columns: 1fr; }
+    .guideline-sidebar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 560px) {
+    .guideline-sidebar { grid-template-columns: 1fr; }
+    .guideline-section__trigger, .guideline-section .content { padding-left: var(--space-md); padding-right: var(--space-md); }
+    .diagram-container { height: 220px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .guideline-section, .sidebar-item { transition: none; }
+}

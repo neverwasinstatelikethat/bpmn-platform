@@ -1,0 +1,2406 @@
+{
+  "aicoding.formatViewer.designMd": {
+    "schemaVersion": 1,
+    "parserVersion": 5,
+    "sourcePath": "C:\\Users\\hehehe\\Desktop\\scripts\\ML_challenge\\main\\bpmn-constructor/design.md",
+    "updatedAt": "2026-08-31T02:49:35.142Z",
+    "title": "Дизайн-система «ВкусВилл × Softly»",
+    "tokens": [
+      {
+        "group": "colors",
+        "count": 22,
+        "source": "frontmatter",
+        "entries": [
+          {
+            "name": "primary",
+            "value": "#00A550"
+          },
+          {
+            "name": "on-primary",
+            "value": "#FFFFFF"
+          },
+          {
+            "name": "primary-hover",
+            "value": "#008F44"
+          },
+          {
+            "name": "primary-active",
+            "value": "#007A3B"
+          },
+          {
+            "name": "primary-soft",
+            "value": "#E3F1E8"
+          },
+          {
+            "name": "berry",
+            "value": "#F62369"
+          },
+          {
+            "name": "berry-soft",
+            "value": "#FFB7B2"
+          },
+          {
+            "name": "berry-blush",
+            "value": "#FFE3E1"
+          },
+          {
+            "name": "canvas",
+            "value": "#FFF9F2"
+          },
+          {
+            "name": "surface",
+            "value": "#FFFFFF"
+          },
+          {
+            "name": "surface-sage",
+            "value": "#E8EFE8"
+          },
+          {
+            "name": "surface-lavender",
+            "value": "#EFEDF4"
+          },
+          {
+            "name": "surface-mist",
+            "value": "#F7F4EE"
+          },
+          {
+            "name": "ink",
+            "value": "#292524"
+          },
+          {
+            "name": "ink-soft",
+            "value": "#57534E"
+          },
+          {
+            "name": "muted",
+            "value": "#78716C"
+          },
+          {
+            "name": "faint",
+            "value": "#A8A29E"
+          },
+          {
+            "name": "hairline",
+            "value": "#ECE6DC"
+          },
+          {
+            "name": "hairline-soft",
+            "value": "#F4EFE7"
+          },
+          {
+            "name": "danger",
+            "value": "#F62369"
+          },
+          {
+            "name": "success",
+            "value": "#00A550"
+          },
+          {
+            "name": "warning",
+            "value": "#E9A23B"
+          }
+        ]
+      },
+      {
+        "group": "typography",
+        "count": 40,
+        "source": "frontmatter",
+        "entries": [
+          {
+            "name": "display.fontFamily",
+            "value": "Outfit, system-ui, sans-serif"
+          },
+          {
+            "name": "display.fontSize",
+            "value": "clamp(44px, 4.5vw + 16px, 72px)"
+          },
+          {
+            "name": "display.fontWeight",
+            "value": "600"
+          },
+          {
+            "name": "display.lineHeight",
+            "value": "1.08"
+          },
+          {
+            "name": "display.letterSpacing",
+            "value": "-0.025em"
+          },
+          {
+            "name": "heading-lg.fontFamily",
+            "value": "Outfit, system-ui, sans-serif"
+          },
+          {
+            "name": "heading-lg.fontSize",
+            "value": "clamp(32px, 2.6vw + 14px, 48px)"
+          },
+          {
+            "name": "heading-lg.fontWeight",
+            "value": "600"
+          },
+          {
+            "name": "heading-lg.lineHeight",
+            "value": "1.12"
+          },
+          {
+            "name": "heading-lg.letterSpacing",
+            "value": "-0.025em"
+          },
+          {
+            "name": "heading-md.fontFamily",
+            "value": "Outfit, system-ui, sans-serif"
+          },
+          {
+            "name": "heading-md.fontSize",
+            "value": "24px"
+          },
+          {
+            "name": "heading-md.fontWeight",
+            "value": "600"
+          },
+          {
+            "name": "heading-md.lineHeight",
+            "value": "1.2"
+          },
+          {
+            "name": "heading-md.letterSpacing",
+            "value": "-0.025em"
+          },
+          {
+            "name": "body-lg.fontFamily",
+            "value": "Outfit, system-ui, sans-serif"
+          },
+          {
+            "name": "body-lg.fontSize",
+            "value": "18px"
+          },
+          {
+            "name": "body-lg.fontWeight",
+            "value": "400"
+          },
+          {
+            "name": "body-lg.lineHeight",
+            "value": "1.6"
+          },
+          {
+            "name": "body-lg.letterSpacing",
+            "value": "0em"
+          },
+          {
+            "name": "body-md.fontFamily",
+            "value": "Outfit, system-ui, sans-serif"
+          },
+          {
+            "name": "body-md.fontSize",
+            "value": "16px"
+          },
+          {
+            "name": "body-md.fontWeight",
+            "value": "400"
+          },
+          {
+            "name": "body-md.lineHeight",
+            "value": "1.6"
+          }
+        ]
+      },
+      {
+        "group": "spacing",
+        "count": 9,
+        "source": "frontmatter",
+        "entries": [
+          {
+            "name": "xxs",
+            "value": "4px"
+          },
+          {
+            "name": "xs",
+            "value": "8px"
+          },
+          {
+            "name": "sm",
+            "value": "12px"
+          },
+          {
+            "name": "md",
+            "value": "16px"
+          },
+          {
+            "name": "lg",
+            "value": "24px"
+          },
+          {
+            "name": "xl",
+            "value": "32px"
+          },
+          {
+            "name": "xxl",
+            "value": "48px"
+          },
+          {
+            "name": "xxxl",
+            "value": "64px"
+          },
+          {
+            "name": "section",
+            "value": "clamp(80px, 10vw, 140px)"
+          }
+        ]
+      },
+      {
+        "group": "rounded",
+        "count": 8,
+        "source": "frontmatter",
+        "entries": [
+          {
+            "name": "none",
+            "value": "0px"
+          },
+          {
+            "name": "xs",
+            "value": "4px"
+          },
+          {
+            "name": "sm",
+            "value": "12px"
+          },
+          {
+            "name": "md",
+            "value": "16px"
+          },
+          {
+            "name": "card",
+            "value": "24px"
+          },
+          {
+            "name": "panel",
+            "value": "32px"
+          },
+          {
+            "name": "panel-lg",
+            "value": "40px"
+          },
+          {
+            "name": "full",
+            "value": "999px"
+          }
+        ]
+      },
+      {
+        "group": "Elevation & Depth",
+        "count": 6,
+        "source": "markdown",
+        "entries": [
+          {
+            "name": "{--shadow-soft}",
+            "value": "`0 4px 20px -2px rgba(41"
+          },
+          {
+            "name": "{components.grain}",
+            "value": "`GrainOverlay` в `App.js`."
+          },
+          {
+            "name": "Базовая тень `{--shadow-soft}`",
+            "value": "`0 4px 20px -2px rgba(41,37,36,0.05)` — почти всё лежит «на бумаге»."
+          },
+          {
+            "name": "Подъём при ховере",
+            "value": "`{--shadow-card}` → `{--shadow-lift}`. Смещение не больше 4–6px по Y."
+          },
+          {
+            "name": "Зелёное свечение `{--shadow-glow}` — только у главной кнопки.\n- Глубина фона",
+            "value": "большие блобы с `blur(90px)` и непрозрачностью ≤0.6, медленный дрейф ±10px за 6с."
+          },
+          {
+            "name": "Зерно",
+            "value": "`feTurbulence baseFrequency=0.65`, непрозрачность 0.35, `mix-blend-mode: overlay`, `z-index: 50`, `pointer-events: none` — компонент `{components.grain}` = `GrainOverlay` в `App.js`."
+          }
+        ]
+      }
+    ],
+    "sections": [
+      {
+        "level": 2,
+        "title": "overview",
+        "rawTitle": "Overview",
+        "excerpt": "Продукт — внутренний конструктор BPMN-процессов для ВкусВилла с ИИ-генерацией схем. Визуальный характер «комфи»: тёплый кремовый холст, мягкие пастельные поверхности, бумажное зерно поверх всего интерфейса и медленные, спокойные анимации. Лендинг ощущается как «цифровая гостиная», но говорит на языке ВкусВилла: честность, простота, ничего лишнего.\n\nФилософская связка: как ВкусВилл убирает лишнее из состава продуктов, конструктор убирает лишнее из процессов. Главный слоган — «Процессы без лишнего».\n\nИсточники истины (по приоритету):\n1. Этот файл (`design.md`) и его frontmatter — контракт для людей и ИИ.\n2. `src/styles/tokens.css` — единственная реализация токенов в коде.\n3. Компоненты `src/components/ui/*` — единственная реализация контролов.",
+        "wordCount": 95,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "colors",
+        "rawTitle": "Colors",
+        "excerpt": "Бренд сохранён полностью, но «причёсан» под компфи:\n\n- `{colors.primary}` `#00A550` — фирменный зелёный ВкусВилл. **Единственный** цвет действия: кнопки, активные состояния, акценты-точки. Не смешивать с градиентами.\n- `{colors.primary-hover}` / `{colors.primary-active}` — ступени наведения и нажатия.\n- `{colors.primary-soft}` `#E3F1E8` — пастельная зелёная поверхность (бейджи, аватары, пузырь пользователя в чате).\n- `{colors.berry}` `#F62369` — фирменная ягода. Только энергичные акценты и семантика ошибок (`{colors.danger}`). В компфи-окружении используется точечно.\n- `{colors.berry-soft}` `#FFB7B2` — компфи-коралл, производный от ягоды: мягкие акценты, кнопки `soft`.\n- `{colors.berry-blush}` `#FFE3E1` — румянец для фоновых блобов.\n- `{colors.canvas}` `#FFF9F2` — тёплый крем, фон всего продукта (исторический фон бренда, сохранён).\n- Пастели для глубины: `{colors.surface-sage}` `#E8EFE8`, `{colors.surface-lavender}` `#EFEDF4`, `{colors.surface-mist}` `#F7F4EE` (поля ввода).\n- Текст: `{colors.ink}` `#292524` (графит `#333333` смягчён до тёплого чёрного — **сознательная корректива**), `{colors.ink-soft}`, `{colors.muted}`, `{colors.faint}` для меток времени.\n- Обводки: `{colors.hairline}` и `{colors.hairline-soft}` — только тёплые, никаких `#E5E7EB`.\n\nПравило: на одной секции не больше одного акцентного цвета. Зелёный — действие, ягода — энергия/ошибка, коралл — мягкий акцент.",
+        "wordCount": 163,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "typography",
+        "rawTitle": "Typography",
+        "excerpt": "- Основной шрифт — **Outfit** (300–700). Заменяет «Euclid Circular A», которого нет в Google Fonts — старый импорт молча не работал и интерфейс рендерился системным шрифтом.\n- Рукописный акцент — **Villula** (локальный шрифт бренда, `src/fonts/`). Играет роль «живой руки» в заголовках-акцентах, подписях и «бровках» секций. Классы `.hand`, `.ui-section-heading__eyebrow`, `.note__sign-name`.\n- Заголовки только в sentence case, `letter-spacing: -0.025em`, вес 600. Без КАПСА и без градиентного текста.\n- Шкала: `display` 44–72px (hero), `heading-lg` 32–48px (секции), `heading-md` 24px, `body-lg` 18px, `body-md` 16px, `body-sm` 14px (навигация), `button-md` 15px/600.\n- Villula применяется дозированно: одно слово в заголовке, подпись, «бровь» секции. Целые абзацы рукописным шрифтом запрещены.",
+        "wordCount": 103,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "layout",
+        "rawTitle": "Layout",
+        "excerpt": "- Одна колонка, мобильный приоритет. Контейнер `{--container-max}` = 1120px.\n- Ритм секций — `{spacing.section}` (80–140px, clamp). Внутри секций — кратность `{spacing.lg}`/`{spacing.xl}`.\n- Порядок лендинга: hero → лента сценариев (горизонтальный скролл) → превью трёх экранов → заметки команды → тёмный конверсионный блок → FAQ → подвал.\n- Навигация — плавающая пилюля шириной `100% − 32px`, отступ сверху 12px; страницы должны учитывать занятые ~68px.",
+        "wordCount": 56,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "elevation & depth",
+        "rawTitle": "Elevation & Depth",
+        "excerpt": "- Базовая тень `{--shadow-soft}`: `0 4px 20px -2px rgba(41,37,36,0.05)` — почти всё лежит «на бумаге».\n- Подъём при ховере: `{--shadow-card}` → `{--shadow-lift}`. Смещение не больше 4–6px по Y.\n- Зелёное свечение `{--shadow-glow}` — только у главной кнопки.\n- Глубина фона: большие блобы с `blur(90px)` и непрозрачностью ≤0.6, медленный дрейф ±10px за 6с.\n- Зерно: `feTurbulence baseFrequency=0.65`, непрозрачность 0.35, `mix-blend-mode: overlay`, `z-index: 50`, `pointer-events: none` — компонент `{components.grain}` = `GrainOverlay` в `App.js`.",
+        "wordCount": 79,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "shapes",
+        "rawTitle": "Shapes",
+        "excerpt": "- Карточки: `{rounded.card}` (24px). Панели секций: `{rounded.panel}` (32px). Конверсионный блок: `{rounded.panel-lg}` (40px).\n- Кнопки, поля, бейджи, навигация: `{rounded.full}` (пилюля).\n- Аватары и точки-логотипы: круг. Иконка конверсии: `{rounded.md}` квадрат с зелёной точкой.\n- Острые углы (≤8px) в продукте не используются.",
+        "wordCount": 44,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "components",
+        "rawTitle": "Components",
+        "excerpt": "Все контролы живут в `src/components/ui/` и стилизуются через `ui.css`. Новые страницы обязаны использовать их, а не писать свои кнопки.\n\n- `{components.button-primary}` / `-hover` / `-disabled` — главное действие, один на экран. Ховер: `{colors.primary-hover}` + зелёное свечение, подъём на 1px. Дисейбл: 50% непрозрачности без тени.\n- `{components.button-secondary}` — вторичное действие: белая пилюля с обводкой `{colors.hairline}`; ховер красит текст и обводку в `{colors.primary}`.\n- `{components.button-dark}` — тёмная пилюля `{colors.ink}`; используется в навигации («Регистрация», «Выйти») и на тёмных панелях наоборот — светлой.\n- `{components.button-soft}` — коралловая пилюля для мягких акцентов, текст `#6B2A26`.\n- Размеры: `sm` 8/18, `md` 13/26, `lg` 17/34. Проп `to` превращает кнопку во внутреннюю ссылку, `href` — во внешнюю.\n- `{components.text-input}` / `-focused` — пилюля на `{colors.surface-mist}`; фокус: белый фон, обводка `{colors.primary}`, кольцо `4px {colors.primary-soft}`.\n- `{components.badge-green}` и тона `sage|lavender|peach`; проп `dot` добавляет фирменную точку.\n- `{components.scenario-card}` / `-hover` — 288×160, метка времени `{colors.faint}` 14px, текст 20px `{colors.ink-soft}`; ховер красит текст в `{colors.primary}` и поднимает карточку на 4px.\n- `{components.note-card}` — белые заметки с наклоном ±1°; при ховере выпрямляются. Подпись: линия 32px + Villula 24px `{colors.muted}`.\n- `{components.accordion-item}` / `-open` — белый блок `{rounded.md}` с обводкой `{colors.hairline-soft}`; раскрытие через `grid-template-rows: 0fr → 1fr` за 0.5с, иконка «+» поворачивается на 45°.\n- `{components.nav-pill}` — `rgba(255,255,255,0.7)` + `backdrop-blur(20px)`, ссылки 14px/500, CTA `{components.button-dark}`. Логотип: зелёный круг с белой точкой.\n- `{components.convert-panel}` — `{colors.ink}`-панель `{rounded.panel-lg}` с блуждающими свечениями `{colors.primary}`/`{colors.berry}` (≤0.3), форма «почта + светлая кнопка», кнопка растёт до 1.05 на ховер.\n- Пульсирующая кнопка превью (`Создать схему`): цикл 2.4с, масштаб 1→1.04, расходящееся зелёное кольцо.",
+        "wordCount": 279,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "dos and donts",
+        "rawTitle": "Do's and Don'ts",
+        "excerpt": "**Делайте:**\n- Берите значения только из `tokens.css` (`var(--color-…)`, `var(--space-…)`, `var(--radius-…)`).\n- Составляйте кнопки/поля/бейджи из компонентов `src/components/ui`.\n- Держите анимации медленными: раскрытие 0.8с, изинг `cubic-bezier(0.33,1,0.68,1)`, цикл дрейфа 6с.\n- Уважайте `prefers-reduced-motion` (глобально в `index.css`, framer через `MotionConfig`).\n\n**Не делайте:**\n- Градиентный текст и фоновые градиенты зелёный→ягода — стиль прошлой версии.\n- Новые синие/голубые акценты (`#3B82F6`) — вне палитры.\n- Тени темнее `rgba(41,37,36,0.16)`, свечения и «неон».\n- Радиусы меньше 12px у контейнеров и больше 40px у панелей.\n- Рукописный шрифт для телесного текста и для всего заголовка целиком.\n- Наследуйте легаси-переменные (`--primary-green`, `--gradient-primary`…) только в старых немодернизированных страницах.",
+        "wordCount": 117,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "motion",
+        "rawTitle": "Motion",
+        "excerpt": "- Появление при скролле (`Reveal`): `translateY(30px→0)`, `opacity 0→1`, 0.8с, один раз, изинг `--ease-soft`.\n- Дрейф блобов: 6с `ease-in-out` alternate, ±10px по Y.\n- Пульс кнопки: 2.4с, масштаб до 1.04, кольцо свечения до 12px.\n- Аккордеон: 0.5с `ease-in-out`.\n- Всё перечисленное отключается при `prefers-reduced-motion: reduce`.",
+        "wordCount": 51,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "responsive behavior",
+        "rawTitle": "Responsive Behavior",
+        "excerpt": "- ≤860px: ссылки навигации скрываются в бургер-меню (панель под пилюлей); боковые экраны превью сужаются.\n- ≤720px: заметки в одну колонку, наклон карточек отключается.\n- ≤640px: боковые экраны превью скрываются, конверсионная форма в столбик.\n- ≤420px: CTA героя и подвал в столбик.\n- Горизонтальная лента сценариев скроллится со снапом, скроллбар скрыт.",
+        "wordCount": 50,
+        "completeness": "ready"
+      },
+      {
+        "level": 2,
+        "title": "known gaps",
+        "rawTitle": "Known Gaps",
+        "excerpt": "- Страницы вне лендинга (редактор, обучение, профиль, логин) ещё на старых стилях и легаси-переменных — мигрировать постепенно, начиная с логина/регистрации. `needs-design-decision`: единый стиль внутренних рабочих экранов (плотность, таблицы).\n- `QuickStartPanel`, `FeatureCard`, `SchemaCarousel` больше не используются лендингом — удалить или переиспользовать после миграции остальных страниц.\n- Тёмная тема не предусмотрена; зерно и пастели рассчитаны на светлый холст.\n- Фейковые изображения-скриншоты в `public/static` для старого лендинга больше не подключаются.\n- Доступность: контраст `{colors.faint}` на белом ниже 4.5:1 — использовать только для декоративных меток (таймстампы), не для смыслового текста. `needs-design-decision`: замена на `{colors.muted}` при росте требований.",
+        "wordCount": 96,
+        "completeness": "ready"
+      }
+    ],
+    "components": [
+      {
+        "name": "button-primary",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.primary}",
+          "textColor: {colors.on-primary}",
+          "typography: {typography.button-md}",
+          "rounded: {rounded.full}",
+          "padding: 13px 26px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "button-primary-hover",
+        "variants": [],
+        "states": [
+          "hover"
+        ],
+        "rules": [
+          "backgroundColor: {colors.primary-hover}",
+          "textColor: {colors.on-primary}",
+          "typography: {typography.button-md}",
+          "rounded: {rounded.full}",
+          "padding: 13px 26px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "button-primary-disabled",
+        "variants": [],
+        "states": [
+          "disabled"
+        ],
+        "rules": [
+          "backgroundColor: {colors.primary}",
+          "textColor: {colors.on-primary}",
+          "typography: {typography.button-md}",
+          "rounded: {rounded.full}"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "button-secondary",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.ink}",
+          "typography: {typography.button-md}",
+          "rounded: {rounded.full}",
+          "padding: 13px 26px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "button-secondary-hover",
+        "variants": [],
+        "states": [
+          "hover"
+        ],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.primary}",
+          "typography: {typography.button-md}",
+          "rounded: {rounded.full}"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "button-dark",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.ink}",
+          "textColor: {colors.canvas}",
+          "typography: {typography.button-md}",
+          "rounded: {rounded.full}",
+          "padding: 8px 18px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "button-soft",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.berry-soft}",
+          "textColor: #6B2A26",
+          "typography: {typography.button-md}",
+          "rounded: {rounded.full}",
+          "padding: 13px 26px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "nav-pill",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: rgba(255,255,255,0.7)",
+          "textColor: {colors.ink-soft}",
+          "typography: {typography.body-sm}",
+          "rounded: {rounded.full}",
+          "padding: 8px 10px 8px 14px",
+          "height: 56px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "badge-green",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.primary-soft}",
+          "textColor: {colors.primary-active}",
+          "typography: {typography.body-sm}",
+          "rounded: {rounded.full}",
+          "padding: 7px 16px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "text-input",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.surface-mist}",
+          "textColor: {colors.ink}",
+          "typography: {typography.body-md}",
+          "rounded: {rounded.full}",
+          "padding: 14px 22px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "text-input-focused",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.ink}",
+          "typography: {typography.body-md}",
+          "rounded: {rounded.full}",
+          "padding: 14px 22px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "scenario-card",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.ink-soft}",
+          "typography: {typography.heading-md}",
+          "rounded: {rounded.card}",
+          "padding: 24px",
+          "width: 288px",
+          "height: 160px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "scenario-card-hover",
+        "variants": [],
+        "states": [
+          "hover"
+        ],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.primary}",
+          "typography: {typography.heading-md}",
+          "rounded: {rounded.card}",
+          "width: 288px",
+          "height: 160px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "note-card",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.ink-soft}",
+          "typography: {typography.body-md}",
+          "rounded: {rounded.card}",
+          "padding: 32px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "accordion-item",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.ink}",
+          "typography: {typography.body-md}",
+          "rounded: {rounded.md}",
+          "padding: 24px"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "accordion-item-open",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.surface}",
+          "textColor: {colors.ink}",
+          "typography: {typography.body-md}",
+          "rounded: {rounded.md}"
+        ],
+        "source": "frontmatter"
+      },
+      {
+        "name": "convert-panel",
+        "variants": [],
+        "states": [],
+        "rules": [
+          "backgroundColor: {colors.ink}",
+          "textColor: #FDFCF8",
+          "typography: {typography.heading-lg}",
+          "rounded: {rounded.panel-lg}",
+          "padding: clamp(56px, 8vw, 96px) 24px"
+        ],
+        "source": "frontmatter"
+      }
+    ],
+    "states": [
+      {
+        "name": "hover",
+        "components": [
+          "button-primary-hover",
+          "button-secondary-hover",
+          "scenario-card-hover"
+        ],
+        "requirement": "",
+        "source": "frontmatter"
+      },
+      {
+        "name": "disabled",
+        "components": [
+          "button-primary-disabled"
+        ],
+        "requirement": "",
+        "source": "frontmatter"
+      }
+    ],
+    "rules": [
+      {
+        "kind": "Do",
+        "text": "Берите значения только из `tokens.css` (`var(--color-…)`, `var(--space-…)`, `var(--radius-…)`).",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Составляйте кнопки/поля/бейджи из компонентов `src/components/ui`.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Держите анимации медленными: раскрытие 0.8с, изинг `cubic-bezier(0.33,1,0.68,1)`, цикл дрейфа 6с.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Уважайте `prefers-reduced-motion` (глобально в `index.css`, framer через `MotionConfig`).",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Градиентный текст и фоновые градиенты зелёный→ягода — стиль прошлой версии.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Новые синие/голубые акценты (`#3B82F6`) — вне палитры.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Тени темнее `rgba(41,37,36,0.16)`, свечения и «неон».",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Радиусы меньше 12px у контейнеров и больше 40px у панелей.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Рукописный шрифт для телесного текста и для всего заголовка целиком.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Do",
+        "text": "Наследуйте легаси-переменные (`--primary-green`, `--gradient-primary`…) только в старых немодернизированных страницах.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Motion",
+        "text": "Появление при скролле (`Reveal`): `translateY(30px→0)`, `opacity 0→1`, 0.8с, один раз, изинг `--ease-soft`.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Motion",
+        "text": "Дрейф блобов: 6с `ease-in-out` alternate, ±10px по Y.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Motion",
+        "text": "Пульс кнопки: 2.4с, масштаб до 1.04, кольцо свечения до 12px.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Motion",
+        "text": "Аккордеон: 0.5с `ease-in-out`.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Motion",
+        "text": "Всё перечисленное отключается при `prefers-reduced-motion: reduce`.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Rule",
+        "text": "≤860px: ссылки навигации скрываются в бургер-меню (панель под пилюлей); боковые экраны превью сужаются.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Rule",
+        "text": "≤720px: заметки в одну колонку, наклон карточек отключается.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Rule",
+        "text": "≤640px: боковые экраны превью скрываются, конверсионная форма в столбик.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Rule",
+        "text": "≤420px: CTA героя и подвал в столбик.",
+        "source": "markdown"
+      },
+      {
+        "kind": "Rule",
+        "text": "Горизонтальная лента сценариев скроллится со снапом, скроллбар скрыт.",
+        "source": "markdown"
+      }
+    ],
+    "openDecisions": [
+      {
+        "text": "Страницы вне лендинга (редактор, обучение, профиль, логин) ещё на старых стилях и легаси-переменных — мигрировать постепенно, начиная с логина/регистрации. `needs-design-decision`: единый стиль внутренних рабочих экранов (плотность, таблицы).",
+        "source": "markdown"
+      },
+      {
+        "text": "`QuickStartPanel`, `FeatureCard`, `SchemaCarousel` больше не используются лендингом — удалить или переиспользовать после миграции остальных страниц.",
+        "source": "markdown"
+      },
+      {
+        "text": "Тёмная тема не предусмотрена; зерно и пастели рассчитаны на светлый холст.",
+        "source": "markdown"
+      },
+      {
+        "text": "Фейковые изображения-скриншоты в `public/static` для старого лендинга больше не подключаются.",
+        "source": "markdown"
+      },
+      {
+        "text": "Доступность: контраст `{colors.faint}` на белом ниже 4.5:1 — использовать только для декоративных меток (таймстампы), не для смыслового текста. `needs-design-decision`: замена на `{colors.muted}` при росте требований.",
+        "source": "markdown"
+      }
+    ],
+    "designSystem": {
+      "schemaVersion": 1,
+      "schemaKeys": [
+        "version",
+        "name",
+        "description",
+        "colors",
+        "typography",
+        "rounded",
+        "spacing",
+        "components"
+      ],
+      "presentSchemaKeys": [
+        "version",
+        "name",
+        "description",
+        "colors",
+        "typography",
+        "rounded",
+        "spacing",
+        "components"
+      ],
+      "extensionKeys": [],
+      "unknownKeys": [],
+      "name": "VkusVill-Softly",
+      "description": "Дизайн-система конструктора BPMN-процессов ВкусВилла. Характер «комфи»-лендинга — тёплый крем, мягкие пастели, бумажное зерно и медленные анимации. Бренд держится на фирменном зелёном",
+      "version": "alpha",
+      "colors": [
+        {
+          "name": "primary",
+          "value": "#00A550",
+          "role": "primary",
+          "family": "other",
+          "luminance": 0.2749,
+          "contrastOnWhite": 3.23,
+          "contrastOnBlack": 6.5,
+          "isDisplayable": true
+        },
+        {
+          "name": "on-primary",
+          "value": "#FFFFFF",
+          "role": "primary",
+          "family": "other",
+          "luminance": 1,
+          "contrastOnWhite": 1,
+          "contrastOnBlack": 21,
+          "isDisplayable": true
+        },
+        {
+          "name": "primary-hover",
+          "value": "#008F44",
+          "role": "primary",
+          "family": "other",
+          "luminance": 0.2006,
+          "contrastOnWhite": 4.19,
+          "contrastOnBlack": 5.01,
+          "isDisplayable": true
+        },
+        {
+          "name": "primary-active",
+          "value": "#007A3B",
+          "role": "primary",
+          "family": "other",
+          "luminance": 0.1423,
+          "contrastOnWhite": 5.46,
+          "contrastOnBlack": 3.85,
+          "isDisplayable": true
+        },
+        {
+          "name": "primary-soft",
+          "value": "#E3F1E8",
+          "role": "primary",
+          "family": "other",
+          "luminance": 0.8507,
+          "contrastOnWhite": 1.17,
+          "contrastOnBlack": 18.01,
+          "isDisplayable": true
+        },
+        {
+          "name": "berry",
+          "value": "#F62369",
+          "role": "accent",
+          "family": "other",
+          "luminance": 0.2181,
+          "contrastOnWhite": 3.92,
+          "contrastOnBlack": 5.36,
+          "isDisplayable": true
+        },
+        {
+          "name": "berry-soft",
+          "value": "#FFB7B2",
+          "role": "accent",
+          "family": "other",
+          "luminance": 0.5834,
+          "contrastOnWhite": 1.66,
+          "contrastOnBlack": 12.67,
+          "isDisplayable": true
+        },
+        {
+          "name": "berry-blush",
+          "value": "#FFE3E1",
+          "role": "accent",
+          "family": "other",
+          "luminance": 0.8163,
+          "contrastOnWhite": 1.21,
+          "contrastOnBlack": 17.33,
+          "isDisplayable": true
+        },
+        {
+          "name": "canvas",
+          "value": "#FFF9F2",
+          "role": "surface",
+          "family": "light",
+          "luminance": 0.9542,
+          "contrastOnWhite": 1.05,
+          "contrastOnBlack": 20.08,
+          "isDisplayable": true
+        },
+        {
+          "name": "surface",
+          "value": "#FFFFFF",
+          "role": "surface",
+          "family": "other",
+          "luminance": 1,
+          "contrastOnWhite": 1,
+          "contrastOnBlack": 21,
+          "isDisplayable": true
+        },
+        {
+          "name": "surface-sage",
+          "value": "#E8EFE8",
+          "role": "surface",
+          "family": "other",
+          "luminance": 0.8472,
+          "contrastOnWhite": 1.17,
+          "contrastOnBlack": 17.94,
+          "isDisplayable": true
+        },
+        {
+          "name": "surface-lavender",
+          "value": "#EFEDF4",
+          "role": "surface",
+          "family": "other",
+          "luminance": 0.8545,
+          "contrastOnWhite": 1.16,
+          "contrastOnBlack": 18.09,
+          "isDisplayable": true
+        },
+        {
+          "name": "surface-mist",
+          "value": "#F7F4EE",
+          "role": "surface",
+          "family": "other",
+          "luminance": 0.9065,
+          "contrastOnWhite": 1.1,
+          "contrastOnBlack": 19.13,
+          "isDisplayable": true
+        },
+        {
+          "name": "ink",
+          "value": "#292524",
+          "role": "text",
+          "family": "dark",
+          "luminance": 0.0192,
+          "contrastOnWhite": 15.17,
+          "contrastOnBlack": 1.38,
+          "isDisplayable": true
+        },
+        {
+          "name": "ink-soft",
+          "value": "#57534E",
+          "role": "text",
+          "family": "dark",
+          "luminance": 0.0876,
+          "contrastOnWhite": 7.63,
+          "contrastOnBlack": 2.75,
+          "isDisplayable": true
+        },
+        {
+          "name": "muted",
+          "value": "#78716C",
+          "role": "neutral",
+          "family": "neutral",
+          "luminance": 0.1689,
+          "contrastOnWhite": 4.8,
+          "contrastOnBlack": 4.38,
+          "isDisplayable": true
+        },
+        {
+          "name": "faint",
+          "value": "#A8A29E",
+          "role": "accent",
+          "family": "other",
+          "luminance": 0.3663,
+          "contrastOnWhite": 2.52,
+          "contrastOnBlack": 8.33,
+          "isDisplayable": true
+        },
+        {
+          "name": "hairline",
+          "value": "#ECE6DC",
+          "role": "border",
+          "family": "other",
+          "luminance": 0.7959,
+          "contrastOnWhite": 1.24,
+          "contrastOnBlack": 16.92,
+          "isDisplayable": true
+        },
+        {
+          "name": "hairline-soft",
+          "value": "#F4EFE7",
+          "role": "border",
+          "family": "other",
+          "luminance": 0.8674,
+          "contrastOnWhite": 1.14,
+          "contrastOnBlack": 18.35,
+          "isDisplayable": true
+        },
+        {
+          "name": "danger",
+          "value": "#F62369",
+          "role": "semantic",
+          "family": "other",
+          "luminance": 0.2181,
+          "contrastOnWhite": 3.92,
+          "contrastOnBlack": 5.36,
+          "isDisplayable": true
+        },
+        {
+          "name": "success",
+          "value": "#00A550",
+          "role": "semantic",
+          "family": "other",
+          "luminance": 0.2749,
+          "contrastOnWhite": 3.23,
+          "contrastOnBlack": 6.5,
+          "isDisplayable": true
+        },
+        {
+          "name": "warning",
+          "value": "#E9A23B",
+          "role": "semantic",
+          "family": "other",
+          "luminance": 0.4348,
+          "contrastOnWhite": 2.17,
+          "contrastOnBlack": 9.7,
+          "isDisplayable": true
+        }
+      ],
+      "typography": [
+        {
+          "name": "display",
+          "fontFamily": "Outfit, system-ui, sans-serif",
+          "fontSize": "clamp(44px, 4.5vw + 16px, 72px)",
+          "fontWeight": "600",
+          "lineHeight": "1.08",
+          "letterSpacing": "-0.025em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Outfit, system-ui, sans-serif"
+            },
+            {
+              "property": "fontSize",
+              "value": "clamp(44px, 4.5vw + 16px, 72px)"
+            },
+            {
+              "property": "fontWeight",
+              "value": "600"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1.08"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "-0.025em"
+            }
+          ]
+        },
+        {
+          "name": "heading-lg",
+          "fontFamily": "Outfit, system-ui, sans-serif",
+          "fontSize": "clamp(32px, 2.6vw + 14px, 48px)",
+          "fontWeight": "600",
+          "lineHeight": "1.12",
+          "letterSpacing": "-0.025em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Outfit, system-ui, sans-serif"
+            },
+            {
+              "property": "fontSize",
+              "value": "clamp(32px, 2.6vw + 14px, 48px)"
+            },
+            {
+              "property": "fontWeight",
+              "value": "600"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1.12"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "-0.025em"
+            }
+          ]
+        },
+        {
+          "name": "heading-md",
+          "fontFamily": "Outfit, system-ui, sans-serif",
+          "fontSize": "24px",
+          "fontWeight": "600",
+          "lineHeight": "1.2",
+          "letterSpacing": "-0.025em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Outfit, system-ui, sans-serif"
+            },
+            {
+              "property": "fontSize",
+              "value": "24px"
+            },
+            {
+              "property": "fontWeight",
+              "value": "600"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1.2"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "-0.025em"
+            }
+          ]
+        },
+        {
+          "name": "body-lg",
+          "fontFamily": "Outfit, system-ui, sans-serif",
+          "fontSize": "18px",
+          "fontWeight": "400",
+          "lineHeight": "1.6",
+          "letterSpacing": "0em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Outfit, system-ui, sans-serif"
+            },
+            {
+              "property": "fontSize",
+              "value": "18px"
+            },
+            {
+              "property": "fontWeight",
+              "value": "400"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1.6"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "0em"
+            }
+          ]
+        },
+        {
+          "name": "body-md",
+          "fontFamily": "Outfit, system-ui, sans-serif",
+          "fontSize": "16px",
+          "fontWeight": "400",
+          "lineHeight": "1.6",
+          "letterSpacing": "0em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Outfit, system-ui, sans-serif"
+            },
+            {
+              "property": "fontSize",
+              "value": "16px"
+            },
+            {
+              "property": "fontWeight",
+              "value": "400"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1.6"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "0em"
+            }
+          ]
+        },
+        {
+          "name": "body-sm",
+          "fontFamily": "Outfit, system-ui, sans-serif",
+          "fontSize": "14px",
+          "fontWeight": "500",
+          "lineHeight": "1.5",
+          "letterSpacing": "0em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Outfit, system-ui, sans-serif"
+            },
+            {
+              "property": "fontSize",
+              "value": "14px"
+            },
+            {
+              "property": "fontWeight",
+              "value": "500"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1.5"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "0em"
+            }
+          ]
+        },
+        {
+          "name": "button-md",
+          "fontFamily": "Outfit, system-ui, sans-serif",
+          "fontSize": "15px",
+          "fontWeight": "600",
+          "lineHeight": "1.2",
+          "letterSpacing": "0em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Outfit, system-ui, sans-serif"
+            },
+            {
+              "property": "fontSize",
+              "value": "15px"
+            },
+            {
+              "property": "fontWeight",
+              "value": "600"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1.2"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "0em"
+            }
+          ]
+        },
+        {
+          "name": "hand-accent",
+          "fontFamily": "Villula, cursive",
+          "fontSize": "inherit",
+          "fontWeight": "400",
+          "lineHeight": "1",
+          "letterSpacing": "0em",
+          "properties": [
+            {
+              "property": "fontFamily",
+              "value": "Villula, cursive"
+            },
+            {
+              "property": "fontSize",
+              "value": "inherit"
+            },
+            {
+              "property": "fontWeight",
+              "value": "400"
+            },
+            {
+              "property": "lineHeight",
+              "value": "1"
+            },
+            {
+              "property": "letterSpacing",
+              "value": "0em"
+            }
+          ]
+        }
+      ],
+      "rounded": [
+        {
+          "name": "none",
+          "value": "0px",
+          "kind": "rounded",
+          "numericValue": 0,
+          "unit": "px"
+        },
+        {
+          "name": "xs",
+          "value": "4px",
+          "kind": "rounded",
+          "numericValue": 4,
+          "unit": "px"
+        },
+        {
+          "name": "sm",
+          "value": "12px",
+          "kind": "rounded",
+          "numericValue": 12,
+          "unit": "px"
+        },
+        {
+          "name": "md",
+          "value": "16px",
+          "kind": "rounded",
+          "numericValue": 16,
+          "unit": "px"
+        },
+        {
+          "name": "card",
+          "value": "24px",
+          "kind": "rounded",
+          "numericValue": 24,
+          "unit": "px"
+        },
+        {
+          "name": "panel",
+          "value": "32px",
+          "kind": "rounded",
+          "numericValue": 32,
+          "unit": "px"
+        },
+        {
+          "name": "panel-lg",
+          "value": "40px",
+          "kind": "rounded",
+          "numericValue": 40,
+          "unit": "px"
+        },
+        {
+          "name": "full",
+          "value": "999px",
+          "kind": "rounded",
+          "numericValue": 999,
+          "unit": "px"
+        }
+      ],
+      "spacing": [
+        {
+          "name": "xxs",
+          "value": "4px",
+          "kind": "spacing",
+          "numericValue": 4,
+          "unit": "px"
+        },
+        {
+          "name": "xs",
+          "value": "8px",
+          "kind": "spacing",
+          "numericValue": 8,
+          "unit": "px"
+        },
+        {
+          "name": "sm",
+          "value": "12px",
+          "kind": "spacing",
+          "numericValue": 12,
+          "unit": "px"
+        },
+        {
+          "name": "md",
+          "value": "16px",
+          "kind": "spacing",
+          "numericValue": 16,
+          "unit": "px"
+        },
+        {
+          "name": "lg",
+          "value": "24px",
+          "kind": "spacing",
+          "numericValue": 24,
+          "unit": "px"
+        },
+        {
+          "name": "xl",
+          "value": "32px",
+          "kind": "spacing",
+          "numericValue": 32,
+          "unit": "px"
+        },
+        {
+          "name": "xxl",
+          "value": "48px",
+          "kind": "spacing",
+          "numericValue": 48,
+          "unit": "px"
+        },
+        {
+          "name": "xxxl",
+          "value": "64px",
+          "kind": "spacing",
+          "numericValue": 64,
+          "unit": "px"
+        },
+        {
+          "name": "section",
+          "value": "clamp(80px, 10vw, 140px)",
+          "kind": "spacing",
+          "numericValue": null,
+          "unit": ""
+        }
+      ],
+      "layout": [],
+      "options": [],
+      "components": [
+        {
+          "name": "button-primary",
+          "category": "action",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.primary}",
+              "reference": "colors.primary",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.on-primary}",
+              "reference": "colors.on-primary",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.button-md}",
+              "reference": "typography.button-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "13px 26px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "button-primary-hover",
+          "category": "action",
+          "state": "hover",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.primary-hover}",
+              "reference": "colors.primary-hover",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.on-primary}",
+              "reference": "colors.on-primary",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.button-md}",
+              "reference": "typography.button-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "13px 26px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "button-primary-disabled",
+          "category": "action",
+          "state": "disabled",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.primary}",
+              "reference": "colors.primary",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.on-primary}",
+              "reference": "colors.on-primary",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.button-md}",
+              "reference": "typography.button-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            }
+          ]
+        },
+        {
+          "name": "button-secondary",
+          "category": "action",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink}",
+              "reference": "colors.ink",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.button-md}",
+              "reference": "typography.button-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "13px 26px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "button-secondary-hover",
+          "category": "action",
+          "state": "hover",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.primary}",
+              "reference": "colors.primary",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.button-md}",
+              "reference": "typography.button-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            }
+          ]
+        },
+        {
+          "name": "button-dark",
+          "category": "action",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.ink}",
+              "reference": "colors.ink",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.canvas}",
+              "reference": "colors.canvas",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.button-md}",
+              "reference": "typography.button-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "8px 18px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "button-soft",
+          "category": "action",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.berry-soft}",
+              "reference": "colors.berry-soft",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "#6B2A26",
+              "reference": "",
+              "resolvedGroup": ""
+            },
+            {
+              "property": "typography",
+              "value": "{typography.button-md}",
+              "reference": "typography.button-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "13px 26px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "nav-pill",
+          "category": "navigation",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "rgba(255,255,255,0.7)",
+              "reference": "",
+              "resolvedGroup": ""
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink-soft}",
+              "reference": "colors.ink-soft",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.body-sm}",
+              "reference": "typography.body-sm",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "8px 10px 8px 14px",
+              "reference": "",
+              "resolvedGroup": ""
+            },
+            {
+              "property": "height",
+              "value": "56px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "badge-green",
+          "category": "action",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.primary-soft}",
+              "reference": "colors.primary-soft",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.primary-active}",
+              "reference": "colors.primary-active",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.body-sm}",
+              "reference": "typography.body-sm",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "7px 16px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "text-input",
+          "category": "form",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface-mist}",
+              "reference": "colors.surface-mist",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink}",
+              "reference": "colors.ink",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.body-md}",
+              "reference": "typography.body-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "14px 22px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "text-input-focused",
+          "category": "form",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink}",
+              "reference": "colors.ink",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.body-md}",
+              "reference": "typography.body-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.full}",
+              "reference": "rounded.full",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "14px 22px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "scenario-card",
+          "category": "surface",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink-soft}",
+              "reference": "colors.ink-soft",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.heading-md}",
+              "reference": "typography.heading-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.card}",
+              "reference": "rounded.card",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "24px",
+              "reference": "",
+              "resolvedGroup": ""
+            },
+            {
+              "property": "width",
+              "value": "288px",
+              "reference": "",
+              "resolvedGroup": ""
+            },
+            {
+              "property": "height",
+              "value": "160px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "scenario-card-hover",
+          "category": "surface",
+          "state": "hover",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.primary}",
+              "reference": "colors.primary",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.heading-md}",
+              "reference": "typography.heading-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.card}",
+              "reference": "rounded.card",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "width",
+              "value": "288px",
+              "reference": "",
+              "resolvedGroup": ""
+            },
+            {
+              "property": "height",
+              "value": "160px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "note-card",
+          "category": "surface",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink-soft}",
+              "reference": "colors.ink-soft",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.body-md}",
+              "reference": "typography.body-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.card}",
+              "reference": "rounded.card",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "32px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "accordion-item",
+          "category": "surface",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink}",
+              "reference": "colors.ink",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.body-md}",
+              "reference": "typography.body-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.md}",
+              "reference": "rounded.md",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "24px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        },
+        {
+          "name": "accordion-item-open",
+          "category": "surface",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.surface}",
+              "reference": "colors.surface",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "{colors.ink}",
+              "reference": "colors.ink",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "typography",
+              "value": "{typography.body-md}",
+              "reference": "typography.body-md",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.md}",
+              "reference": "rounded.md",
+              "resolvedGroup": "rounded"
+            }
+          ]
+        },
+        {
+          "name": "convert-panel",
+          "category": "surface",
+          "state": "",
+          "properties": [
+            {
+              "property": "backgroundColor",
+              "value": "{colors.ink}",
+              "reference": "colors.ink",
+              "resolvedGroup": "colors"
+            },
+            {
+              "property": "textColor",
+              "value": "#FDFCF8",
+              "reference": "",
+              "resolvedGroup": ""
+            },
+            {
+              "property": "typography",
+              "value": "{typography.heading-lg}",
+              "reference": "typography.heading-lg",
+              "resolvedGroup": "typography"
+            },
+            {
+              "property": "rounded",
+              "value": "{rounded.panel-lg}",
+              "reference": "rounded.panel-lg",
+              "resolvedGroup": "rounded"
+            },
+            {
+              "property": "padding",
+              "value": "clamp(56px, 8vw, 96px) 24px",
+              "reference": "",
+              "resolvedGroup": ""
+            }
+          ]
+        }
+      ],
+      "references": [
+        {
+          "path": "rounded.full",
+          "group": "rounded",
+          "count": 12
+        },
+        {
+          "path": "colors.ink",
+          "group": "colors",
+          "count": 10
+        },
+        {
+          "path": "colors.primary",
+          "group": "colors",
+          "count": 9
+        },
+        {
+          "path": "colors.surface",
+          "group": "colors",
+          "count": 8
+        },
+        {
+          "path": "typography.button-md",
+          "group": "typography",
+          "count": 7
+        },
+        {
+          "path": "colors.ink-soft",
+          "group": "colors",
+          "count": 5
+        },
+        {
+          "path": "typography.body-md",
+          "group": "typography",
+          "count": 5
+        },
+        {
+          "path": "rounded.card",
+          "group": "rounded",
+          "count": 4
+        },
+        {
+          "path": "rounded.md",
+          "group": "rounded",
+          "count": 4
+        },
+        {
+          "path": "colors.faint",
+          "group": "colors",
+          "count": 3
+        },
+        {
+          "path": "colors.muted",
+          "group": "colors",
+          "count": 3
+        },
+        {
+          "path": "colors.on-primary",
+          "group": "colors",
+          "count": 3
+        },
+        {
+          "path": "colors.primary-hover",
+          "group": "colors",
+          "count": 3
+        },
+        {
+          "path": "colors.primary-soft",
+          "group": "colors",
+          "count": 3
+        },
+        {
+          "path": "colors.surface-mist",
+          "group": "colors",
+          "count": 3
+        },
+        {
+          "path": "rounded.panel-lg",
+          "group": "rounded",
+          "count": 3
+        },
+        {
+          "path": "colors.berry",
+          "group": "colors",
+          "count": 2
+        },
+        {
+          "path": "colors.berry-soft",
+          "group": "colors",
+          "count": 2
+        },
+        {
+          "path": "colors.canvas",
+          "group": "colors",
+          "count": 2
+        },
+        {
+          "path": "colors.hairline",
+          "group": "colors",
+          "count": 2
+        },
+        {
+          "path": "colors.hairline-soft",
+          "group": "colors",
+          "count": 2
+        },
+        {
+          "path": "colors.primary-active",
+          "group": "colors",
+          "count": 2
+        },
+        {
+          "path": "components.button-dark",
+          "group": "components",
+          "count": 2
+        },
+        {
+          "path": "typography.body-sm",
+          "group": "typography",
+          "count": 2
+        },
+        {
+          "path": "typography.heading-md",
+          "group": "typography",
+          "count": 2
+        },
+        {
+          "path": "--container-max",
+          "group": "--container-max",
+          "count": 1
+        },
+        {
+          "path": "--shadow-card",
+          "group": "--shadow-card",
+          "count": 1
+        },
+        {
+          "path": "--shadow-glow",
+          "group": "--shadow-glow",
+          "count": 1
+        },
+        {
+          "path": "--shadow-lift",
+          "group": "--shadow-lift",
+          "count": 1
+        },
+        {
+          "path": "--shadow-soft",
+          "group": "--shadow-soft",
+          "count": 1
+        },
+        {
+          "path": "colors.berry-blush",
+          "group": "colors",
+          "count": 1
+        },
+        {
+          "path": "colors.danger",
+          "group": "colors",
+          "count": 1
+        },
+        {
+          "path": "colors.surface-lavender",
+          "group": "colors",
+          "count": 1
+        },
+        {
+          "path": "colors.surface-sage",
+          "group": "colors",
+          "count": 1
+        },
+        {
+          "path": "components.accordion-item",
+          "group": "components",
+          "count": 1
+        },
+        {
+          "path": "components.badge-green",
+          "group": "components",
+          "count": 1
+        },
+        {
+          "path": "components.button-primary",
+          "group": "components",
+          "count": 1
+        },
+        {
+          "path": "components.button-secondary",
+          "group": "components",
+          "count": 1
+        },
+        {
+          "path": "components.button-soft",
+          "group": "components",
+          "count": 1
+        },
+        {
+          "path": "components.convert-panel",
+          "group": "components",
+          "count": 1
+        }
+      ],
+      "contrastPairs": [
+        {
+          "background": "surface",
+          "foreground": "ink",
+          "backgroundValue": "#FFFFFF",
+          "foregroundValue": "#292524",
+          "ratio": 15.17,
+          "grade": "AAA"
+        },
+        {
+          "background": "canvas",
+          "foreground": "ink",
+          "backgroundValue": "#FFF9F2",
+          "foregroundValue": "#292524",
+          "ratio": 14.51,
+          "grade": "AAA"
+        },
+        {
+          "background": "surface-mist",
+          "foreground": "ink",
+          "backgroundValue": "#F7F4EE",
+          "foregroundValue": "#292524",
+          "ratio": 13.82,
+          "grade": "AAA"
+        },
+        {
+          "background": "surface-lavender",
+          "foreground": "ink",
+          "backgroundValue": "#EFEDF4",
+          "foregroundValue": "#292524",
+          "ratio": 13.07,
+          "grade": "AAA"
+        },
+        {
+          "background": "surface-sage",
+          "foreground": "ink",
+          "backgroundValue": "#E8EFE8",
+          "foregroundValue": "#292524",
+          "ratio": 12.96,
+          "grade": "AAA"
+        },
+        {
+          "background": "surface",
+          "foreground": "ink-soft",
+          "backgroundValue": "#FFFFFF",
+          "foregroundValue": "#57534E",
+          "ratio": 7.63,
+          "grade": "AAA"
+        },
+        {
+          "background": "canvas",
+          "foreground": "ink-soft",
+          "backgroundValue": "#FFF9F2",
+          "foregroundValue": "#57534E",
+          "ratio": 7.3,
+          "grade": "AAA"
+        },
+        {
+          "background": "surface-mist",
+          "foreground": "ink-soft",
+          "backgroundValue": "#F7F4EE",
+          "foregroundValue": "#57534E",
+          "ratio": 6.95,
+          "grade": "AA"
+        },
+        {
+          "background": "surface-lavender",
+          "foreground": "ink-soft",
+          "backgroundValue": "#EFEDF4",
+          "foregroundValue": "#57534E",
+          "ratio": 6.57,
+          "grade": "AA"
+        },
+        {
+          "background": "surface-sage",
+          "foreground": "ink-soft",
+          "backgroundValue": "#E8EFE8",
+          "foregroundValue": "#57534E",
+          "ratio": 6.52,
+          "grade": "AA"
+        },
+        {
+          "background": "surface",
+          "foreground": "primary-active",
+          "backgroundValue": "#FFFFFF",
+          "foregroundValue": "#007A3B",
+          "ratio": 5.46,
+          "grade": "AA"
+        },
+        {
+          "background": "canvas",
+          "foreground": "primary-active",
+          "backgroundValue": "#FFF9F2",
+          "foregroundValue": "#007A3B",
+          "ratio": 5.22,
+          "grade": "AA"
+        },
+        {
+          "background": "surface-mist",
+          "foreground": "primary-active",
+          "backgroundValue": "#F7F4EE",
+          "foregroundValue": "#007A3B",
+          "ratio": 4.97,
+          "grade": "AA"
+        },
+        {
+          "background": "surface-lavender",
+          "foreground": "primary-active",
+          "backgroundValue": "#EFEDF4",
+          "foregroundValue": "#007A3B",
+          "ratio": 4.7,
+          "grade": "AA"
+        },
+        {
+          "background": "surface-sage",
+          "foreground": "primary-active",
+          "backgroundValue": "#E8EFE8",
+          "foregroundValue": "#007A3B",
+          "ratio": 4.66,
+          "grade": "AA"
+        },
+        {
+          "background": "surface",
+          "foreground": "primary-hover",
+          "backgroundValue": "#FFFFFF",
+          "foregroundValue": "#008F44",
+          "ratio": 4.19,
+          "grade": "Large"
+        }
+      ],
+      "componentPropertyCounts": [
+        {
+          "property": "backgroundColor",
+          "count": 17
+        },
+        {
+          "property": "rounded",
+          "count": 17
+        },
+        {
+          "property": "textColor",
+          "count": 17
+        },
+        {
+          "property": "typography",
+          "count": 17
+        },
+        {
+          "property": "padding",
+          "count": 13
+        },
+        {
+          "property": "height",
+          "count": 3
+        },
+        {
+          "property": "width",
+          "count": 2
+        }
+      ]
+    },
+    "warnings": [],
+    "error": null
+  }
+}

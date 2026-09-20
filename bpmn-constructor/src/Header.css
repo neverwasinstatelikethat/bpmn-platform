@@ -1,0 +1,242 @@
+/* ============================================================
+   Плавающая навигация-пилюля (ВкусВилл × Softly)
+   70% белого + 20px blur, ширина 100% − 32px
+   ============================================================ */
+
+.nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    padding: 0 var(--page-gutter);
+    background: var(--color-canvas);
+    pointer-events: none;
+}
+
+.nav__pill {
+    pointer-events: auto;
+    max-width: var(--container-max);
+    min-height: calc(var(--nav-height) - 6px);
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    gap: var(--space-xl);
+    padding: var(--space-sm) 0;
+    border-bottom: 1px solid var(--color-hairline-soft);
+}
+
+/* ---------- Бренд ---------- */
+
+.nav__brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    text-decoration: none;
+    margin-right: auto;
+}
+
+.nav__logo {
+    flex: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--color-primary);
+    display: grid;
+    place-items: center;
+}
+
+.nav__logo-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--color-surface);
+}
+
+.nav__brand-text {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    line-height: 1;
+}
+
+.nav__brand-name {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: var(--tracking-tight);
+    color: var(--color-ink);
+}
+
+.nav__brand-tag {
+    padding-left: 8px;
+    border-left: 1px solid var(--color-hairline);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--color-muted);
+}
+
+/* ---------- Ссылки ---------- */
+
+.nav__links {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xxs);
+}
+
+.nav__link {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--color-ink-soft);
+    text-decoration: none;
+    padding: 8px 10px;
+    border-radius: var(--radius-pill);
+    transition: background-color var(--duration-fast) var(--ease-soft), color var(--duration-fast) var(--ease-soft);
+}
+
+    .nav__link:hover {
+        background: var(--color-surface-mist);
+        color: var(--color-primary);
+    }
+
+.nav__link--static {
+    cursor: default;
+}
+
+/* ---------- Выпадающее меню «Обучение» ---------- */
+
+.nav__dropdown {
+    position: relative;
+}
+
+.nav__dropdown-menu {
+    position: absolute;
+    top: calc(100% + 10px);
+    left: 0;
+    min-width: 220px;
+    padding: var(--space-xs);
+    background: var(--color-surface);
+    border: 1px solid var(--color-hairline-soft);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lift);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 101;
+}
+
+    .nav__dropdown-menu .nav__link {
+        font-size: 14px;
+        color: var(--color-ink-soft);
+    }
+
+/* ---------- Правый блок ---------- */
+
+.nav__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.nav__avatar {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: var(--color-primary-soft);
+    color: var(--color-primary-active);
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+    transition: box-shadow var(--duration-fast) var(--ease-soft), transform var(--duration-fast) var(--ease-soft);
+}
+
+    .nav__avatar:hover {
+        box-shadow: 0 0 0 4px var(--color-primary-soft);
+        transform: translateY(-1px);
+    }
+
+/* ---------- Бургер ---------- */
+
+.nav__burger {
+    display: none;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+    width: 40px;
+    height: 40px;
+    padding: 10px;
+    background: var(--color-surface-mist);
+    border: none;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+}
+
+    .nav__burger span {
+        display: block;
+        height: 2px;
+        width: 100%;
+        border-radius: 2px;
+        background: var(--color-ink);
+        transition: transform var(--duration-base) var(--ease-soft);
+    }
+
+    .nav__burger--open span:first-child {
+        transform: translateY(4px) rotate(45deg);
+    }
+
+    .nav__burger--open span:last-child {
+        transform: translateY(-4px) rotate(-45deg);
+    }
+
+/* ---------- Мобильное меню ---------- */
+
+.nav__mobile {
+    pointer-events: auto;
+    max-width: var(--container-max);
+    margin: 0 auto;
+    padding: var(--space-md);
+    background: var(--color-surface);
+    border: 1px solid var(--color-hairline-soft);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--shadow-lift);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xxs);
+}
+
+    .nav__mobile .nav__link {
+        padding: 12px 16px;
+    }
+
+/* ---------- Адаптивность ---------- */
+
+@media (max-width: 860px) {
+    .nav__links {
+        display: none;
+    }
+
+    .nav__burger {
+        display: flex;
+    }
+
+    .nav__brand-tag {
+        display: none;
+    }
+}
+
+@media (max-width: 480px) {
+    .nav {
+        padding: 0 var(--space-md);
+    }
+
+    .nav__brand-name {
+        font-size: 15px;
+    }
+
+    .nav__brand-tag {
+        display: none;
+    }
+}

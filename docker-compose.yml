@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bpmn
+      POSTGRES_USER: bpmn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Задайте POSTGRES_PASSWORD в .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bpmn -d bpmn"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Порт намеренно не публикуется: доступ к БД только из внутренней сети.
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://bpmn:${POSTGRES_PASSWORD:?}@db:5432/bpmn
+      SECRET_KEY: ${SECRET_KEY:?Задайте SECRET_KEY в .env}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      # MAIL_FROM обязан быть валидным e-mail: ConnectionConfig валидирует
+      # формат при импорте main.py. Пустое значение ломает запуск, поэтому
+      # даём placeholder по умолчанию.
+      MAIL_FROM: ${MAIL_FROM:-no-reply@vkusvill.ru}
+      MAIL_PORT: ${MAIL_PORT:-465}
+      MAIL_SERVER: ${MAIL_SERVER:-imap.yandex.ru}
+      MAIL_STARTTLS: ${MAIL_STARTTLS:-true}
+      MAIL_SSL_TLS: ${MAIL_SSL_TLS:-false}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://foundation-models.api.cloud.ru/v1}
+      LLM_MODEL: ${LLM_MODEL:-openai/gpt-oss-120b}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+    ports:
+      # Хост-порты 8000/3000 заняты сторонними проектами; внутри сети контейнеров остаются 8000/80.
+      - "127.0.0.1:8765:8000"
+    volumes:
+      # Экспортированные файлы и статика живут на хосте.
+      - ./static:/app/static
+
+  frontend:
+    build:
+      context: ./bpmn-constructor
+      args:
+        # Адрес backend, доступный из браузера пользователя.
+        REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:8765}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:3456:80"
+
+volumes:
+  pgdata:

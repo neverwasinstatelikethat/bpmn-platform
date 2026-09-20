@@ -1,0 +1,46 @@
+# Секреты и локальная конфигурация — никогда не попадают в индекс
+.env
+*.pem
+*.key
+
+# База данных и артефакты переноса
+*.db
+*.db-journal
+bpmn.db;C
+*.sqlite*
+
+# Производные кэши (пересобираются: см. CACHE_METHOD в core/llm_improve.py)
+*.pkl
+
+# Артефакты прогонов: загрузки и экспорты пользователей живут в static/
+# (исходные ассеты возвращаем исключение ниже)
+static/*
+!static/vkusvill_logo.png
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Frontend
+node_modules/
+bpmn-constructor/build/
+bpmn-constructor/coverage/
+npm-debug.log*
+
+# Логи
+*.log
+
+# IDE / окружение агентов
+.vs/
+.vscode/
+.idea/
+.qoder/
+
+# Служебное Visual Studio
+*.user

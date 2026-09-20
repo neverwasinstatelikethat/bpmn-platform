@@ -1,0 +1,2 @@
+.not-found { display: grid; min-height: 100vh; place-items: center; padding: calc(var(--nav-height) + var(--space-xl)) var(--page-gutter) var(--space-xl); text-align: center; }
+.not-found > div { max-width: 32rem; }.not-found__eyebrow { margin: 0 0 var(--space-xs); color: var(--color-primary-active); font: 1.3rem var(--font-hand); }.not-found h1 { margin-bottom: var(--space-sm); font-size: var(--text-display); }.not-found p:not(.not-found__eyebrow) { margin: 0 0 var(--space-xl); color: var(--color-ink-soft); }

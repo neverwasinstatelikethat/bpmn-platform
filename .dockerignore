@@ -1,0 +1,14 @@
+.git
+.vs
+.qoder
+__pycache__/
+*.pyc
+bpmn.db
+*.pkl
+*.log
+.env
+bpmn-constructor/
+*.pyproj
+*.pyproj.user
+*.sln
+docs/

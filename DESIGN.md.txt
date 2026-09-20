@@ -1,0 +1,318 @@
+---
+version: alpha
+name: VkusVill-Softly
+description: Дизайн-система конструктора BPMN-процессов ВкусВилла. Характер «комфи»-лендинга — тёплый крем, мягкие пастели, бумажное зерно и медленные анимации. Бренд держится на фирменном зелёном #00A550 и ягодном #F62369; графит смягчён до тёплого чёрного #292524.
+colors:
+  primary: "#00A550"
+  on-primary: "#FFFFFF"
+  primary-hover: "#008F44"
+  primary-active: "#007A3B"
+  primary-soft: "#E3F1E8"
+  berry: "#F62369"
+  berry-soft: "#FFB7B2"
+  berry-blush: "#FFE3E1"
+  canvas: "#FFF9F2"
+  surface: "#FFFFFF"
+  surface-sage: "#E8EFE8"
+  surface-lavender: "#EFEDF4"
+  surface-mist: "#F7F4EE"
+  ink: "#292524"
+  ink-soft: "#57534E"
+  muted: "#78716C"
+  faint: "#A8A29E"
+  hairline: "#ECE6DC"
+  hairline-soft: "#F4EFE7"
+  danger: "#F62369"
+  success: "#00A550"
+  warning: "#E9A23B"
+typography:
+  display:
+    fontFamily: "Euclid Circular A, system-ui, sans-serif"
+    fontSize: clamp(44px, 4.5vw + 16px, 72px)
+    fontWeight: 600
+    lineHeight: 1.08
+    letterSpacing: -0.025em
+  heading-lg:
+    fontFamily: "Euclid Circular A, system-ui, sans-serif"
+    fontSize: clamp(32px, 2.6vw + 14px, 48px)
+    fontWeight: 600
+    lineHeight: 1.12
+    letterSpacing: -0.025em
+  heading-md:
+    fontFamily: "Euclid Circular A, system-ui, sans-serif"
+    fontSize: 24px
+    fontWeight: 600
+    lineHeight: 1.2
+    letterSpacing: -0.025em
+  body-lg:
+    fontFamily: "Euclid Circular A, system-ui, sans-serif"
+    fontSize: 18px
+    fontWeight: 400
+    lineHeight: 1.6
+    letterSpacing: 0em
+  body-md:
+    fontFamily: "Euclid Circular A, system-ui, sans-serif"
+    fontSize: 16px
+    fontWeight: 400
+    lineHeight: 1.6
+    letterSpacing: 0em
+  body-sm:
+    fontFamily: "Euclid Circular A, system-ui, sans-serif"
+    fontSize: 14px
+    fontWeight: 500
+    lineHeight: 1.5
+    letterSpacing: 0em
+  button-md:
+    fontFamily: "Euclid Circular A, system-ui, sans-serif"
+    fontSize: 15px
+    fontWeight: 600
+    lineHeight: 1.2
+    letterSpacing: 0em
+  hand-accent:
+    fontFamily: "Villula, cursive"
+    fontSize: inherit
+    fontWeight: 400
+    lineHeight: 1
+    letterSpacing: 0em
+rounded:
+  none: 0px
+  xs: 4px
+  sm: 12px
+  md: 16px
+  card: 24px
+  panel: 32px
+  panel-lg: 40px
+  full: 999px
+spacing:
+  xxs: 4px
+  xs: 8px
+  sm: 12px
+  md: 16px
+  lg: 24px
+  xl: 32px
+  xxl: 48px
+  xxxl: 64px
+  section: clamp(80px, 10vw, 140px)
+components:
+  button-primary:
+    backgroundColor: "{colors.primary}"
+    textColor: "{colors.on-primary}"
+    typography: "{typography.button-md}"
+    rounded: "{rounded.full}"
+    padding: "13px 26px"
+  button-primary-hover:
+    backgroundColor: "{colors.primary-hover}"
+    textColor: "{colors.on-primary}"
+    typography: "{typography.button-md}"
+    rounded: "{rounded.full}"
+    padding: "13px 26px"
+  button-primary-disabled:
+    backgroundColor: "{colors.primary}"
+    textColor: "{colors.on-primary}"
+    typography: "{typography.button-md}"
+    rounded: "{rounded.full}"
+  button-secondary:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.ink}"
+    typography: "{typography.button-md}"
+    rounded: "{rounded.full}"
+    padding: "13px 26px"
+  button-secondary-hover:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.primary}"
+    typography: "{typography.button-md}"
+    rounded: "{rounded.full}"
+  button-dark:
+    backgroundColor: "{colors.ink}"
+    textColor: "{colors.canvas}"
+    typography: "{typography.button-md}"
+    rounded: "{rounded.full}"
+    padding: "8px 18px"
+  button-soft:
+    backgroundColor: "{colors.berry-soft}"
+    textColor: "#6B2A26"
+    typography: "{typography.button-md}"
+    rounded: "{rounded.full}"
+    padding: "13px 26px"
+  nav-pill:
+    backgroundColor: "rgba(255,255,255,0.7)"
+    textColor: "{colors.ink-soft}"
+    typography: "{typography.body-sm}"
+    rounded: "{rounded.full}"
+    padding: "8px 10px 8px 14px"
+    height: 56px
+  badge-green:
+    backgroundColor: "{colors.primary-soft}"
+    textColor: "{colors.primary-active}"
+    typography: "{typography.body-sm}"
+    rounded: "{rounded.full}"
+    padding: "7px 16px"
+  text-input:
+    backgroundColor: "{colors.surface-mist}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body-md}"
+    rounded: "{rounded.full}"
+    padding: "14px 22px"
+  text-input-focused:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body-md}"
+    rounded: "{rounded.full}"
+    padding: "14px 22px"
+  scenario-card:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.ink-soft}"
+    typography: "{typography.heading-md}"
+    rounded: "{rounded.card}"
+    padding: 24px
+    width: 288px
+    height: 160px
+  scenario-card-hover:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.primary}"
+    typography: "{typography.heading-md}"
+    rounded: "{rounded.card}"
+    width: 288px
+    height: 160px
+  note-card:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.ink-soft}"
+    typography: "{typography.body-md}"
+    rounded: "{rounded.card}"
+    padding: 32px
+  accordion-item:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body-md}"
+    rounded: "{rounded.md}"
+    padding: 24px
+  accordion-item-open:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body-md}"
+    rounded: "{rounded.md}"
+  convert-panel:
+    backgroundColor: "{colors.ink}"
+    textColor: "#FDFCF8"
+    typography: "{typography.heading-lg}"
+    rounded: "{rounded.panel-lg}"
+    padding: "clamp(56px, 8vw, 96px) 24px"
+---
+
+# Дизайн-система «ВкусВилл × Softly»
+
+## Overview
+
+Продукт — внутренний конструктор BPMN-процессов для ВкусВилла с ИИ-генерацией схем. Визуальный характер «комфи»: тёплый кремовый холст, мягкие пастельные поверхности, бумажное зерно поверх всего интерфейса и медленные, спокойные анимации. Лендинг ощущается как «цифровая гостиная», но говорит на языке ВкусВилла: честность, простота, ничего лишнего.
+
+Философская связка: как ВкусВилл убирает лишнее из состава продуктов, конструктор убирает лишнее из процессов. Главный слоган — «Процессы без лишнего».
+
+Источники истины (по приоритету):
+1. Этот файл (`design.md`) и его frontmatter — контракт для людей и ИИ.
+2. `src/styles/tokens.css` — единственная реализация токенов в коде.
+3. Компоненты `src/components/ui/*` — единственная реализация контролов.
+
+## Colors
+
+Бренд сохранён полностью, но «причёсан» под компфи:
+
+- `{colors.primary}` `#00A550` — фирменный зелёный ВкусВилл. **Единственный** цвет действия: кнопки, активные состояния, акценты-точки. Не смешивать с градиентами.
+- `{colors.primary-hover}` / `{colors.primary-active}` — ступени наведения и нажатия.
+- `{colors.primary-soft}` `#E3F1E8` — пастельная зелёная поверхность (бейджи, аватары, пузырь пользователя в чате).
+- `{colors.berry}` `#F62369` — фирменная ягода. Только энергичные акценты и семантика ошибок (`{colors.danger}`). В компфи-окружении используется точечно.
+- `{colors.berry-soft}` `#FFB7B2` — компфи-коралл, производный от ягоды: мягкие акценты, кнопки `soft`.
+- `{colors.berry-blush}` `#FFE3E1` — румянец для фоновых блобов.
+- `{colors.canvas}` `#FFF9F2` — тёплый крем, фон всего продукта (исторический фон бренда, сохранён).
+- Пастели для глубины: `{colors.surface-sage}` `#E8EFE8`, `{colors.surface-lavender}` `#EFEDF4`, `{colors.surface-mist}` `#F7F4EE` (поля ввода).
+- Текст: `{colors.ink}` `#292524` (графит `#333333` смягчён до тёплого чёрного — **сознательная корректива**), `{colors.ink-soft}`, `{colors.muted}`, `{colors.faint}` для меток времени.
+- Обводки: `{colors.hairline}` и `{colors.hairline-soft}` — только тёплые, никаких `#E5E7EB`.
+
+Правило: на одной секции не больше одного акцентного цвета. Зелёный — действие, ягода — энергия/ошибка, коралл — мягкий акцент.
+
+## Typography
+
+- Основной шрифт — **Euclid Circular A** (локальные файлы, 300–700) для текста, форм и рабочих данных.
+- **Villula** (локальный шрифт бренда, `src/fonts/`) — шрифт заголовков и живых акцентов. Допустима выразительная смесь регистра в коротких заголовках, но не в длинном тексте или данных.
+- Заголовки только в sentence case, `letter-spacing: -0.025em`, вес 600. Без КАПСА и без градиентного текста.
+- Шкала: `display` 44–72px (hero), `heading-lg` 32–48px (секции), `heading-md` 24px, `body-lg` 18px, `body-md` 16px, `body-sm` 14px (навигация), `button-md` 15px/600.
+- Villula применяется дозированно: одно слово в заголовке, подпись, «бровь» секции. Целые абзацы рукописным шрифтом запрещены.
+
+## Layout
+
+- Одна колонка, мобильный приоритет. Контейнер `{--container-max}` = 1120px.
+- Ритм секций — `{spacing.section}` (80–140px, clamp). Внутри секций — кратность `{spacing.lg}`/`{spacing.xl}`.
+- Порядок лендинга: hero → лента сценариев (горизонтальный скролл) → превью трёх экранов → заметки команды → тёмный конверсионный блок → FAQ → подвал.
+- Навигация — плавающая пилюля шириной `100% − 32px`, отступ сверху 12px; страницы должны учитывать занятые ~68px.
+
+## Elevation & Depth
+
+- Базовая тень `{--shadow-soft}`: `0 4px 20px -2px rgba(41,37,36,0.05)` — почти всё лежит «на бумаге».
+- Подъём при ховере: `{--shadow-card}` → `{--shadow-lift}`. Смещение не больше 4–6px по Y.
+- Зелёное свечение `{--shadow-glow}` — только у главной кнопки.
+- Глубина фона: большие блобы с `blur(90px)` и непрозрачностью ≤0.6, медленный дрейф ±10px за 6с.
+- Зерно: `feTurbulence baseFrequency=0.65`, непрозрачность 0.35, `mix-blend-mode: overlay`, `z-index: 50`, `pointer-events: none` — компонент `{components.grain}` = `GrainOverlay` в `App.js`.
+
+## Shapes
+
+- Карточки: `{rounded.card}` (24px). Панели секций: `{rounded.panel}` (32px). Конверсионный блок: `{rounded.panel-lg}` (40px).
+- Кнопки, поля, бейджи, навигация: `{rounded.full}` (пилюля).
+- Аватары и точки-логотипы: круг. Иконка конверсии: `{rounded.md}` квадрат с зелёной точкой.
+- Острые углы (≤8px) в продукте не используются.
+
+## Components
+
+Все контролы живут в `src/components/ui/` и стилизуются через `ui.css`. Новые страницы обязаны использовать их, а не писать свои кнопки.
+
+- `{components.button-primary}` / `-hover` / `-disabled` — главное действие, один на экран. Ховер: `{colors.primary-hover}` + зелёное свечение, подъём на 1px. Дисейбл: 50% непрозрачности без тени.
+- `{components.button-secondary}` — вторичное действие: белая пилюля с обводкой `{colors.hairline}`; ховер красит текст и обводку в `{colors.primary}`.
+- `{components.button-dark}` — тёмная пилюля `{colors.ink}`; используется в навигации («Регистрация», «Выйти») и на тёмных панелях наоборот — светлой.
+- `{components.button-soft}` — коралловая пилюля для мягких акцентов, текст `#6B2A26`.
+- Размеры: `sm` 8/18, `md` 13/26, `lg` 17/34. Проп `to` превращает кнопку во внутреннюю ссылку, `href` — во внешнюю.
+- `{components.text-input}` / `-focused` — пилюля на `{colors.surface-mist}`; фокус: белый фон, обводка `{colors.primary}`, кольцо `4px {colors.primary-soft}`.
+- `{components.badge-green}` и тона `sage|lavender|peach`; проп `dot` добавляет фирменную точку.
+- `{components.scenario-card}` / `-hover` — 288×160, метка времени `{colors.faint}` 14px, текст 20px `{colors.ink-soft}`; ховер красит текст в `{colors.primary}` и поднимает карточку на 4px.
+- `{components.note-card}` — белые заметки с наклоном ±1°; при ховере выпрямляются. Подпись: линия 32px + Villula 24px `{colors.muted}`.
+- `{components.accordion-item}` / `-open` — белый блок `{rounded.md}` с обводкой `{colors.hairline-soft}`; раскрытие через `grid-template-rows: 0fr → 1fr` за 0.5с, иконка «+» поворачивается на 45°.
+- `{components.nav-pill}` — `rgba(255,255,255,0.7)` + `backdrop-blur(20px)`, ссылки 14px/500, CTA `{components.button-dark}`. Логотип: зелёный круг с белой точкой.
+- `{components.convert-panel}` — `{colors.ink}`-панель `{rounded.panel-lg}` с блуждающими свечениями `{colors.primary}`/`{colors.berry}` (≤0.3), форма «почта + светлая кнопка», кнопка растёт до 1.05 на ховер.
+- Пульсирующая кнопка превью (`Создать схему`): цикл 2.4с, масштаб 1→1.04, расходящееся зелёное кольцо.
+
+## Do's and Don'ts
+
+**Делайте:**
+- Берите значения только из `tokens.css` (`var(--color-…)`, `var(--space-…)`, `var(--radius-…)`).
+- Составляйте кнопки/поля/бейджи из компонентов `src/components/ui`.
+- Держите анимации медленными: раскрытие 0.8с, изинг `cubic-bezier(0.33,1,0.68,1)`, цикл дрейфа 6с.
+- Уважайте `prefers-reduced-motion` (глобально в `index.css`, framer через `MotionConfig`).
+
+**Не делайте:**
+- Градиентный текст и фоновые градиенты зелёный→ягода — стиль прошлой версии.
+- Новые синие/голубые акценты (`#3B82F6`) — вне палитры.
+- Тени темнее `rgba(41,37,36,0.16)`, свечения и «неон».
+- Радиусы меньше 12px у контейнеров и больше 40px у панелей.
+- Рукописный шрифт для телесного текста и для всего заголовка целиком.
+- Наследуйте легаси-переменные (`--primary-green`, `--gradient-primary`…) только в старых немодернизированных страницах.
+
+## Motion
+
+- Появление при скролле (`Reveal`): `translateY(30px→0)`, `opacity 0→1`, 0.8с, один раз, изинг `--ease-soft`.
+- Дрейф блобов: 6с `ease-in-out` alternate, ±10px по Y.
+- Пульс кнопки: 2.4с, масштаб до 1.04, кольцо свечения до 12px.
+- Аккордеон: 0.5с `ease-in-out`.
+- Всё перечисленное отключается при `prefers-reduced-motion: reduce`.
+
+## Responsive Behavior
+
+- ≤860px: ссылки навигации скрываются в бургер-меню (панель под пилюлей); боковые экраны превью сужаются.
+- ≤720px: заметки в одну колонку, наклон карточек отключается.
+- ≤640px: боковые экраны превью скрываются, конверсионная форма в столбик.
+- ≤420px: CTA героя и подвал в столбик.
+- Горизонтальная лента сценариев скроллится со снапом, скроллбар скрыт.
+
+## Known Gaps
+
+- Тёмная тема не предусмотрена; зерно и пастели рассчитаны на светлый холст.
+- Командные папки не выводятся в реестре, пока сервер не предоставит подтверждённый endpoint. Командные схемы остаются доступными в read-only режиме.
+- BPMN modeler сохранён как отдельное легаси-ядро; его визуальная оболочка уже использует общие токены, а внутренняя интеграция будет дробиться только при отдельном рефакторинге modeler.
+- Фейковые изображения-скриншоты в `public/static` для старого лендинга больше не подключаются.
+- Доступность: контраст `{colors.faint}` на белом ниже 4.5:1 — использовать только для декоративных меток (таймстампы), не для смыслового текста. `needs-design-decision`: замена на `{colors.muted}` при росте требований.

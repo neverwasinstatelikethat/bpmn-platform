@@ -1,0 +1,53 @@
+﻿:root {
+    --primary-green: #00A550; /* ВкусВилл зеленый */
+    --primary-berry: #F62369; /* ВкусВилл розовый */
+    --primary-graphite: #333333;
+    --background-light: #FFF9F2; /* ВкусВилл фон */
+    --text-dark: #333333;
+    --text-light: #FFF9F2;
+}
+
+body {
+    font-family: 'Euclid Circular A', sans-serif;
+    color: var(--primary-graphite);
+    margin: 0;
+    padding: 0;
+    background: var(--background-light);
+}
+
+.container {
+    padding: 20px;
+    max-width: 1440px;
+    margin: 0 auto;
+}
+
+h1, h2, h3, h4 {
+    font-family: 'Villula', cursive;
+    color: var(--primary-graphite);
+}
+
+button {
+    background-color: var(--primary-green);
+    color: var(--text-light);
+    border: none;
+    padding: 12px 24px;
+    cursor: pointer;
+    border-radius: 50px;
+    font-size: 1rem;
+    font-weight: 600;
+    transition: all 0.3s ease;
+}
+
+    button:hover {
+        background-color: #008F44;
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(0, 165, 80, 0.3);
+    }
+
+    button.secondary {
+        background-color: var(--primary-berry);
+    }
+
+        button.secondary:hover {
+            background-color: #D41F5B;
+        }

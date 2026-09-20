@@ -1,0 +1,117 @@
+/* ============================================================
+   ВкусВилл × Softly — дизайн-токены
+   Единственный источник правды для цветов, типографики,
+   радиусов, теней и движения. Контракт описан в design.md.
+   ============================================================ */
+
+:root {
+    /* ---------- Цвета: бренд ---------- */
+    --color-primary: #00A550;          /* фирменный зелёный ВкусВилл — единственный цвет действия */
+    --color-primary-hover: #008F44;
+    --color-primary-active: #007A3B;
+    --color-primary-soft: #E3F1E8;     /* пастельная зелёная поверхность */
+    --color-on-primary: #FFFFFF;
+
+    --color-berry: #F62369;            /* фирменная ягода — энергичный акцент и ошибки */
+    --color-berry-soft: #FFB7B2;       /* компфи-коралл, мягкий акцент */
+    --color-berry-blush: #FFE3E1;      /* румянец для блобов и подложек */
+
+    /* ---------- Цвета: поверхности ---------- */
+    --color-canvas: #FFF9F2;           /* тёплый кремовый холст продукта */
+    --color-surface: #FFFFFF;
+    --color-surface-sage: #E8EFE8;
+    --color-surface-lavender: #EFEDF4;
+    --color-surface-mist: #F7F4EE;     /* фон инпутов и мелких подложек */
+    --color-ink: #292524;              /* тёплый мягкий чёрный (бывший графит #333) */
+    --color-ink-soft: #57534E;
+    --color-muted: #78716C;
+    --color-faint: #A8A29E;
+    --color-hairline: #E9E9E5;
+    --color-hairline-soft: #F1F1EE;
+
+    /* ---------- Цвета: семантика ---------- */
+    --color-success: #00A550;
+    --color-warning: #E9A23B;
+    --color-danger: #F62369;
+    --color-danger-soft: #FFE3E1;
+    --color-warning-soft: #FFF3DB;
+    --color-success-soft: #E3F1E8;
+
+    /* ---------- Типографика ---------- */
+    --font-sans: 'Euclid Circular A', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-display: 'Villula', 'Euclid Circular A', cursive; /* заголовки */
+    --font-hand: var(--font-display);                        /* рукописные акценты */
+
+    --tracking-tight: -0.025em;
+    --tracking-normal: 0em;
+
+    --text-display: clamp(2.75rem, 4.5vw + 1rem, 4.5rem);   /* hero, 44–72px */
+    --text-h2: clamp(2rem, 2.6vw + 0.9rem, 3rem);           /* секции, 32–48px */
+    --text-h3: 1.5rem;                                       /* карточки, 24px */
+    --text-body-lg: 1.125rem;
+    --text-body: 1rem;
+    --text-sm: 0.875rem;
+    --text-xs: 0.75rem;
+
+    /* ---------- Радиусы ---------- */
+    --radius-sm: 12px;
+    --radius-md: 16px;
+    --radius-card: 24px;     /* карточки, как в спеке: rounded-3xl */
+    --radius-panel: 32px;    /* крупные секции-панели */
+    --radius-panel-lg: 40px; /* конверсионные блоки */
+    --radius-pill: 999px;
+
+    /* ---------- Тени и глубина ---------- */
+    --shadow-soft: 0 4px 20px -2px rgba(41, 37, 36, 0.05);
+    --shadow-card: 0 8px 28px -6px rgba(41, 37, 36, 0.08);
+    --shadow-lift: 0 18px 44px -14px rgba(41, 37, 36, 0.16);
+    --shadow-glow: 0 10px 30px -6px rgba(0, 165, 80, 0.35);
+    --blur-nav: 20px;
+    --blur-blob: 90px;
+
+    /* ---------- Движение ---------- */
+    --ease-soft: cubic-bezier(0.33, 1, 0.68, 1);
+    --duration-fast: 0.25s;
+    --duration-base: 0.4s;
+    --duration-reveal: 0.8s;
+    --duration-accordion: 0.5s;
+
+    /* ---------- Отступы ---------- */
+    --space-xxs: 4px;
+    --space-xs: 8px;
+    --space-sm: 12px;
+    --space-md: 16px;
+    --space-lg: 24px;
+    --space-xl: 32px;
+    --space-2xl: 48px;
+    --space-3xl: 64px;
+    --space-section: clamp(80px, 10vw, 140px);
+
+    /* ---------- Раскладка ---------- */
+    --container-max: 1120px;
+    --nav-height: 56px;
+    --page-gutter: clamp(16px, 4vw, 32px);
+    --work-content-max: 1280px;
+    --work-sidebar-width: 300px;
+    --control-min-height: 44px;
+    --table-row-height: 56px;
+    --focus-ring: 0 0 0 3px rgba(0, 165, 80, 0.22);
+    --disabled-opacity: 0.54;
+
+    /* ============================================================
+       Легаси-алиасы: старые страницы (редактор, логин и т.д.)
+       используют эти имена. Не применять в новом коде.
+       ============================================================ */
+    --primary-green: var(--color-primary);
+    --primary-berry: var(--color-berry);
+    --primary-pink: var(--color-berry);
+    --primary-graphite: var(--color-ink);
+    --background-light: var(--color-canvas);
+    --background-cream: var(--color-canvas);
+    --text-dark: var(--color-ink);
+    --text-light: var(--color-on-primary);
+    --shadow-primary: 0 15px 35px rgba(0, 165, 80, 0.15);
+    --shadow-secondary: 0 25px 50px rgba(246, 35, 105, 0.15);
+    --gradient-primary: linear-gradient(135deg, #00A550 0%, #F62369 100%);
+    --gradient-soft: linear-gradient(135deg, #FFFFFF 0%, var(--color-canvas) 100%);
+}

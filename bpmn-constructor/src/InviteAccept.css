@@ -1,0 +1,31 @@
+.invite-accept-container {
+    min-height: 100vh;
+    padding: calc(var(--nav-height) + var(--space-3xl)) var(--page-gutter) var(--space-section);
+}
+
+.invite-accept-card {
+    width: min(100%, 34rem);
+    margin: 12vh auto 0;
+    padding: var(--space-2xl);
+    background: var(--color-surface);
+    border: 1px solid var(--color-hairline-soft);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--shadow-soft);
+}
+
+.invite-accept-card__eyebrow {
+    margin: 0 0 var(--space-xs);
+    color: var(--color-primary-active);
+    font-family: var(--font-hand);
+    font-size: 1.1rem;
+}
+
+.invite-accept-card h1 {
+    margin-bottom: var(--space-sm);
+    font-size: var(--text-h2);
+}
+
+.invite-accept-card p:not(.invite-accept-card__eyebrow) {
+    margin: 0 0 var(--space-xl);
+    color: var(--color-ink-soft);
+}

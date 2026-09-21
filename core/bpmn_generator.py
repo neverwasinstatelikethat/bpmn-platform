@@ -12,16 +12,24 @@
 # постфактум невозможно — поэтому промпт задаёт его явно, а repair не даёт
 # ошибке модели превратиться в «валидную» схему молча.
 #
+# Ветвление и ожидания — те же грабли: модель рисует развилку без схождения и
+# «ждёт два часа» как задачу. Для генератора это не косметика, а нарушение,
+# которое скоринг правомерно считает, поэтому шлюзы и события проверяются
+# детерминированно, а план с нарушениями один раз переизляется с перечнем того,
+# что модель обязана исправить.
+#
 # XML генерируется только семантический: координаты не выдаются — фронтенд
 # всегда прогоняет схему через bpmn-auto-layout, ему достаточно пустого
 # скелета BPMNDiagram/BPMNPlane.
 import difflib
+import json
 import logging
 import re
 import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .bpmn_edits import DEFAULT_TIMER_DURATION, EVENT_DEFINITIONS
 from .llm_client import LLMError, LLMTruncatedError, call_json
 
 logger = logging.getLogger(__name__)
@@ -40,9 +48,17 @@ TASK_KINDS = {
 GATEWAY_KINDS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway"}
 EVENT_KINDS = {
     "startEvent", "endEvent",
-    "intermediateCatchEvent", "intermediateThrowEvent",
+    "intermediateCatchEvent", "intermediateThrowEvent", "boundaryEvent",
 }
 ALL_KINDS = TASK_KINDS | GATEWAY_KINDS | EVENT_KINDS
+# «Шаг» пула: то, что отличает живой процесс от нарисованных кружков входа и
+# выхода. Пул без шага — не участник, а артефакт модели.
+STEP_KINDS = TASK_KINDS | GATEWAY_KINDS | {"intermediateCatchEvent",
+                                           "intermediateThrowEvent"}
+# События, обязанные иметь определение: без него bpmn-js рисует пустой кружок,
+# и «промежуточное событие» остаётся декларацией.
+TYPED_EVENT_KINDS = {"intermediateCatchEvent", "intermediateThrowEvent",
+                     "boundaryEvent"}
 
 MAX_TEXT_CHARS = 10_000
 MAX_PARTICIPANTS = 10
@@ -50,12 +66,27 @@ MAX_LANES = 30
 MAX_ELEMENTS = 60
 MAX_FLOWS = 120
 NAME_LIMIT = 120
+DOCUMENTATION_LIMIT = 400
 # Исправлений достижимости не больше, чем элементов: иначе генератор
 # дорисует связи туда, где модель их не описала, и схема «починится» сама.
 MAX_REACH_FLOWS = 2 * MAX_ELEMENTS
+# Вставляемых шлюзов схождения — не больше четверти элементов: слияние потоков
+# правит маршрут, и невозбранный аппетит здесь превратил бы схему в решето.
+MAX_MERGE_GATEWAYS = MAX_ELEMENTS // 4
 # Порог схожести названий пулов: ниже — слишком разные сущности, выше —
 # опечатки и падежи («Бухгалтерия» / «Бухгалтерией»).
 POOL_MATCH_CUTOFF = 0.6
+# Вторая попытка одна: при тарифе GigaChat с одним одновременным запросом
+# каждая лишняя итерация удваивает пользовательскую задержку, а переспрос по
+# нарушениям дешевле, чем принятая пользователем битая схема.
+MAX_RETRY_PLAN_CHARS = 12_000
+
+# ISO-8601 для хронометража таймера: длительность (PT2H), повтор (R3/PT10M).
+# Модель пишет их уверенно, но «2 часа» тоже пробует — поэтому форма
+# проверяется, а не подставляется молча.
+_TIMER_RE = re.compile(
+    r"^(?:R\d+/)?P(?:\d+[YMWD])*(?:T(?:\d+(?:\.\d+)?[HMS])*)?$"
+)
 
 _SYSTEM_PROMPT = """Ты — аналитик бизнес-процессов. По текстовому описанию \
 построй структуру BPMN 2.0 процесса.
@@ -63,29 +94,56 @@ _SYSTEM_PROMPT = """Ты — аналитик бизнес-процессов. �
 Верни СТРОГО ОДИН JSON-объект без пояснений и без блоков кода:
 {
   "participants": ["название пула", ...],
-  "lanes": [
-    {"id": "L1", "name": "название дорожки", "participant": "название пула"}
-  ],
-  "elements": [
-    {"id": "A1", "kind": "task", "name": "Название шага", \
-"participant": "название пула", "lane": "L1"}
-  ],
-  "flows": [
-    {"id": "F1", "source": "A1", "target": "A2", "kind": "sequence", \
-"condition": ""}
-  ]
+  "lanes": [{"id": "L1", "name": "название дорожки", "participant": "название пула"}],
+  "elements": [{"id": "A1", "kind": "userTask", "name": "Название шага", \
+"participant": "название пула", "lane": "L1"}],
+  "flows": [{"id": "F1", "source": "A1", "target": "A2", "kind": "sequence", \
+"condition": "", "default": false}]
 }
 
+Поля элемента: `participant` и `lane` обязательны для всех, кроме шагов \
+однопольного процесса; `attached_to` и `event_definition` — для граничного \
+события; `timer` — для таймера; `documentation` — текст описания шага.
+
 Пулы и дорожки:
-- Пул (participant) — независимый участник процесса: организация, внешний \
-контрагент или внешняя система. Один пул содержит ровно один процесс.
+- Пул (participant) — независимый участник: организация, внешний контрагент \
+или внешняя система (WMS, перевозчик, получатель). Один пул — один процесс.
 - Роли сотрудников, отделы и подсистемы одной организации — это ДОРОЖКИ \
 (lanes) внутри одного пула, а не отдельные пулы.
-- Если все шаги выполняют сотрудники одной организации — один пул и дорожки \
-по ролям. Заводи второй пул только когда действует другая организация или \
-внешняя система.
+- В пуле обязан быть хотя бы один шаг (задача, шлюз или промежуточное \
+событие). Пул, где только «Старт → Завершение», недопустим: либо это дорожка \
+основного пула, либо такого участника в процессе нет.
 - participant у элемента и у дорожки — название пула из "participants"; \
 lane у элемента — id дорожки из "lanes". Элемент стоит в дорожке своего пула.
+
+Развилки:
+- exclusiveGateway рисуй там, где поток действительно раздваивается: у \
+расходящегося шлюза минимум два исходящих потока. Шлюз с одним входящим и \
+одним исходящим — не развилка, а обычный шаг (task).
+- Сходящийся шлюз, наоборот, принимает две и более ветки и имеет один \
+исходящий: ставь его туда, где развилка снова сходится в один маршрут.
+- У каждой расходящейся ветки exclusiveGateway заполни condition; ветку, \
+которая идёт «во всех остальных случаях», помечай default=true и оставляй без \
+условия. Ветка с default ровно одна; у сходящегося шлюза условий нет.
+- Ветки обязаны сходиться: либо каждая ветка приводит к своему endEvent, либо \
+перед общим последующим шагом нарисуй второй шлюз того же типа и пропусти \
+через него все ветки. Развилка без схождения — битая схема.
+- parallelGateway служит одновременно и для расщепления, и для слияния: \
+у него минимум два потока хотя бы с одной стороны.
+
+События:
+- kind элемента: один из """ + ", ".join(sorted(ALL_KINDS)) + """.
+- У промежуточного (intermediateCatchEvent, intermediateThrowEvent) и \
+граничного (boundaryEvent) события заполни event_definition: один из \
+""" + ", ".join(sorted(EVENT_DEFINITIONS)) + """.
+- Ожидание, дедлайн и SLA — это boundaryEvent с event_definition="timer", \
+attached_to=id задачи, на которую навешано ожидание, и timer в формате \
+ISO-8601 (PT2H, PT15M, R3/PT10M). У такого события обязательна ветка \
+обработки: поток в шаг-эскалацию, а не обратно в ту же задачу.
+- Пока процесс ждёт ответа внешней системы — intermediateCatchEvent с \
+event_definition="message".
+- Используй userTask для действий людей, serviceTask для систем и сервисов.
+- У каждого пула должны быть хотя бы один startEvent и один endEvent.
 
 Потоки:
 - kind="sequence" — только внутри одного пула, в том числе между его \
@@ -94,49 +152,94 @@ lane у элемента — id дорожки из "lanes". Элемент ст
 - kind="message" — только между элементами РАЗНЫХ пулов. Покажи им \
 взаимодействие организаций, а не передачу работы между сотрудниками: \
 бизнес-поток внутри одной организации ведётся sequence-потоками.
-- exclusiveGateway рисуй там, где поток действительно раздваивается: \
-у него должно быть минимум два исходящих потока. Иначе это обычный шаг (task).
-- Каждый элемент, кроме startEvent, должен быть достижим: на него входит \
-хотя бы один sequence-поток.
+- Каждый элемент, кроме startEvent и boundaryEvent, должен быть достижим: \
+на него входит хотя бы один sequence-поток.
 - Каждый элемент, кроме endEvent, должен иметь исходящий sequence-поток \
 (внутри своего пула) — иначе процесс в этом пуле обрывается.
 
-Пример. «Инициатор заводит заявку, бухгалтерия согласует и выдаёт деньги» — \
-это роли одной организации, поэтому пул один, а роли стали дорожками \
-(L1 и L2); передача работы между дорожками идёт sequence-потоком:
-{"participants": ["ВкусВилл"],
- "lanes": [{"id": "L1", "name": "Инициатор", "participant": "ВкусВилл"},
-           {"id": "L2", "name": "Бухгалтерия", "participant": "ВкусВилл"}],
+Пример. «Кладовщик собирает заказ, при нехватке товара заказывает остаток; \
+сборка длится не более четырёх часов, при просрочке — эскалация руководителю; \
+после сборки служба логистики передаёт груз перевозчику»:
+{"participants": ["ВкусВилл", "Перевозчик"],
+ "lanes": [{"id": "L_w", "name": "Кладовщик", "participant": "ВкусВилл"}, \
+{"id": "L_h", "name": "Руководитель смены", "participant": "ВкусВилл"}, \
+{"id": "L_l", "name": "Служба логистики", "participant": "ВкусВилл"}],
  "elements": [
-   {"id": "S1", "kind": "startEvent", "name": "Потребность в деньгах", \
-"participant": "ВкусВилл", "lane": "L1"},
-   {"id": "A1", "kind": "userTask", "name": "Завести заявку", \
-"participant": "ВкусВилл", "lane": "L1"},
-   {"id": "A2", "kind": "userTask", "name": "Согласовать заявку", \
-"participant": "ВкусВилл", "lane": "L2"},
-   {"id": "A3", "kind": "userTask", "name": "Выдать деньги", \
-"participant": "ВкусВилл", "lane": "L2"},
-   {"id": "E1", "kind": "endEvent", "name": "Деньги выданы", \
-"participant": "ВкусВилл", "lane": "L2"}
+   {"id": "S1", "kind": "startEvent", "name": "Заказ на отгрузку", "participant": "ВкусВилл", "lane": "L_w"},
+   {"id": "A1", "kind": "userTask", "name": "Проверить остатки", "participant": "ВкусВилл", "lane": "L_w", "documentation": "Сверка остатков в WMS до сборки"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Товара хватает?", "participant": "ВкусВилл", "lane": "L_w"},
+   {"id": "A2", "kind": "userTask", "name": "Собрать заказ", "participant": "ВкусВилл", "lane": "L_w"},
+   {"id": "A3", "kind": "userTask", "name": "Заказать остаток", "participant": "ВкусВилл", "lane": "L_w"},
+   {"id": "T1", "kind": "boundaryEvent", "name": "Прошло 4 часа", "participant": "ВкусВилл", "lane": "L_w", "attached_to": "A2", "event_definition": "timer", "timer": "PT4H"},
+   {"id": "A4", "kind": "userTask", "name": "Эскалировать руководителю", "participant": "ВкусВилл", "lane": "L_h"},
+   {"id": "G2", "kind": "exclusiveGateway", "name": "Заказ собран", "participant": "ВкусВилл", "lane": "L_w"},
+   {"id": "A5", "kind": "serviceTask", "name": "Передать груз перевозчику", "participant": "ВкусВилл", "lane": "L_l"},
+   {"id": "E1", "kind": "endEvent", "name": "Груз передан", "participant": "ВкусВилл", "lane": "L_l"},
+   {"id": "S2", "kind": "startEvent", "name": "Заявка на приёмку", "participant": "Перевозчик", "lane": ""},
+   {"id": "A6", "kind": "task", "name": "Принять груз", "participant": "Перевозчик", "lane": ""},
+   {"id": "E2", "kind": "endEvent", "name": "Груз принят", "participant": "Перевозчик", "lane": ""}
  ],
  "flows": [
    {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
-   {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence", "condition": ""},
-   {"id": "F3", "source": "A2", "target": "A3", "kind": "sequence", "condition": ""},
-   {"id": "F4", "source": "A3", "target": "E1", "kind": "sequence", "condition": ""}
+   {"id": "F2", "source": "A1", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "G1", "target": "A2", "kind": "sequence", "condition": "Хватает"},
+   {"id": "F4", "source": "G1", "target": "A3", "kind": "sequence", "condition": "", "default": true},
+   {"id": "F5", "source": "A3", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F6", "source": "T1", "target": "A4", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "A2", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A4", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "G2", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "A5", "target": "E1", "kind": "sequence", "condition": ""},
+   {"id": "M1", "source": "A5", "target": "A6", "kind": "message", "condition": ""},
+   {"id": "F11", "source": "S2", "target": "A6", "kind": "sequence", "condition": ""},
+   {"id": "F12", "source": "A6", "target": "E2", "kind": "sequence", "condition": ""}
  ]}
 
+Здесь «Кладовщик», «Руководитель смены» и «Служба логистики» — дорожки одного \
+пула, потому что роли одной организации не бывают отдельными пулами; перевозчик \
+— отдельный пул, и связь с ним идёт потоком-сообщением. G1 расщепляет маршрут, \
+G2 его снова сливает, T1 — таймер-ожидание на задаче сборки с веткой эскалации.
+
 Прочее:
-- kind элемента: один из """ + ", ".join(sorted(ALL_KINDS)) + """.
-- Используй userTask для действий людей, serviceTask для систем и сервисов.
-- У каждого пула должны быть хотя бы один startEvent и один endEvent.
 - Отвечай на языке описания процесса (названия шагов, пулов и дорожек — как \
 в тексте).
+"""
+
+# Переспрос идёт с тем же системным промптом: правила моделирования обязаны
+# жить в одном месте, иначе второй вызов начнёт соблюдать другие правила.
+# Формулировка ниже — только про то, что править нельзя содержание.
+_RETRY_TEMPLATE = """Ты уже построил структуру BPMN по описанию ниже, но в ней \
+найдены нарушения методологии. Исправь план, верни СТРОГО ОДИН JSON-объект той \
+же формы, что и присланный план, без пояснений и без блоков кода.
+
+Не выдумывай новые шаги и не выбрасывай существующие: перестраивай пулы, \
+дорожки, шлюзы, события и потоки так, чтобы перечисленные нарушения исчезли. \
+Если нарушение неустранимо без выдумывания содержания процесса — оставь \
+элементы как есть и исправь остальное.
+
+Нарушения в текущем плане:
+{gaps}
+
+Описание процесса:
+{text}
+
+План, который нужно исправить:
+{plan}
 """
 
 
 def _q(local: str) -> str:
     return f"{{{BPMN_NS}}}{local}"
+
+
+def _event_definitions(element: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """(тег определения, тег хронометража) события. Пусто для событий без типа
+    и для стартовых/конечных: у них тип по умолчанию «none» и определение не
+    требуется."""
+    if element.get("kind") not in TYPED_EVENT_KINDS:
+        return []
+    spec = EVENT_DEFINITIONS.get(element.get("event_definition") or "")
+    return [spec] if spec else []
 
 
 class GenerationError(RuntimeError):
@@ -160,7 +263,27 @@ class BPMNGenerator:
                 )
 
             structure = self._extract_structure(text)
+            gaps = plan_gaps(structure)
+            attempts, retry_note = 1, ""
+            if gaps:
+                attempts = 2
+                retry = self._retry_structure(text, structure, gaps)
+                if retry is None:
+                    retry_note = "Повторный запрос модели не выполнен"
+                else:
+                    candidate_gaps = plan_gaps(retry)
+                    # Первый план остаётся при равенстве: второй вызов обязан
+                    # улучшать, а не просто менять местами те же ошибки.
+                    if len(candidate_gaps) < len(gaps):
+                        retry_note = (f"Повторный запрос модели: нарушений было "
+                                      f"{len(gaps)}, стало {len(candidate_gaps)}")
+                        structure, gaps = retry, candidate_gaps
+                    else:
+                        retry_note = (f"Повторный запрос модели не улучшил план "
+                                      f"({len(gaps)} нарушений) — оставлен первый")
             repaired, notes = repair_structure(structure)
+            if retry_note:
+                notes.append(retry_note)
             for note in notes:
                 logger.info("Починка структуры: %s", note)
             bpmn_xml = self._generate_bpmn_xml(repaired)
@@ -170,6 +293,8 @@ class BPMNGenerator:
                 "bpmn": bpmn_xml,
                 "structure": repaired,
                 "notes": notes,
+                "gaps": gaps,
+                "attempts": attempts,
                 "time_elapsed": time.time() - start_time,
             }
         except GenerationError as e:
@@ -225,6 +350,28 @@ class BPMNGenerator:
         if not isinstance(data, dict):
             raise ValueError("ответ модели не объект")
         return data
+
+    def _retry_structure(self, text: str, structure: Dict[str, Any],
+                         gaps: List[str]) -> Optional[Dict[str, Any]]:
+        """Один переспрос по нарушениям. None — если повтор не мог ничего дать
+        (план не влезает в контекст) или модель недоступна: план с нарушениями
+        честнее отказа генерации, а починка и так отработает."""
+        payload = json.dumps(structure, ensure_ascii=False, default=str)
+        if len(payload) > MAX_RETRY_PLAN_CHARS:
+            logger.info("Повтор генерации пропущен: план %d символов, лимит %d",
+                        len(payload), MAX_RETRY_PLAN_CHARS)
+            return None
+        try:
+            data = call_json(
+                _SYSTEM_PROMPT,
+                _RETRY_TEMPLATE.format(
+                    gaps="\n".join(f"- {g}" for g in gaps),
+                    text=text, plan=payload),
+                temperature=0.1, max_tokens=8000)
+        except (LLMError, ValueError) as e:
+            logger.warning("Повтор генерации не удался, остаётся первый план: %s", e)
+            return None
+        return data if isinstance(data, dict) else None
 
     # --- шаг 2: XML ---
 
@@ -287,10 +434,25 @@ class BPMNGenerator:
 
         for e in elements:
             process = processes[e["participant"]]
-            elem = ET.SubElement(process, _q(e["kind"]), {
-                "id": e["id"],
-                "name": e["name"],
-            })
+            attrs = {"id": e["id"], "name": e["name"]}
+            if e["kind"] == "boundaryEvent" and e.get("attached_to"):
+                # Граничное событие без хозяина не существует: bpmn-js рисует
+                # его отдельным кружком, который никто не запускает.
+                attrs["attachedToRef"] = e["attached_to"]
+                attrs["cancelActivity"] = "true"
+            elif e["kind"] in GATEWAY_KINDS and e.get("default"):
+                attrs["default"] = e["default"]
+            elem = ET.SubElement(process, _q(e["kind"]), attrs)
+            # Порядок детей по XSD: documentation, затем определения событий,
+            # и только потом incoming/outgoing — иначе bpmn-js не видит тип
+            # события и рисует пустой кружок.
+            if e.get("documentation"):
+                ET.SubElement(elem, _q("documentation")).text = e["documentation"]
+            for tag, timing in _event_definitions(e):
+                definition = ET.SubElement(elem, _q(tag))
+                if timing:
+                    ET.SubElement(definition, _q(timing)).text = (
+                        e.get("timer") or DEFAULT_TIMER_DURATION)
             for flow_id in incoming.get(e["id"], []):
                 ET.SubElement(elem, _q("incoming")).text = flow_id
             for flow_id in outgoing.get(e["id"], []):
@@ -339,6 +501,116 @@ class BPMNGenerator:
         })
 
         return XML_DECLARATION + ET.tostring(definitions, encoding="unicode")
+
+
+# --- что в плане модели противоречит методологии ---
+#
+# Проверки работают по сырому ответу, потому что чинить эти нарушения
+# детерминированно честно нельзя: пустой пул можно удалить, но нельзя
+# угадать, куда модель хотела положить шаги; у события можно выдумать таймер,
+# но не факт, что там таймер. Такие нарушения — повод один раз переспросить
+# модель, а не «доводить» схему эвристикой. Каждая проверка терпима к мусору:
+# план недоверенный, и падать на нём нельзя.
+
+def _raw_dicts(value: Any) -> List[Dict[str, Any]]:
+    return [i for i in (value or []) if isinstance(i, dict)] if isinstance(
+        value, list) else []
+
+
+def _raw_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def plan_gaps(raw: Dict[str, Any]) -> List[str]:
+    """Нарушения методологии в ответе модели, читаемые без починки."""
+    gaps: List[str] = []
+    if not isinstance(raw, dict):
+        return ["план не является JSON-объектом"]
+
+    pools = [_raw_text(i.get("name") if isinstance(i, dict) else i)
+             for i in (raw.get("participants") or [])]
+    pools = [p for p in pools if p]
+    lanes = _raw_dicts(raw.get("lanes"))
+    elements = _raw_dicts(raw.get("elements"))
+    flows = _raw_dicts(raw.get("flows"))
+
+    # Пустой пул: ни одного шага у участника. Стартовое и конечное событие
+    # шагом не считаются — тип неизвестного элементу модели узла трактуем как
+    # шаг: без починки мы не знаем, чем он оказался, и выдумывать не будем.
+    claimed = {_norm_name(_raw_text(e.get("participant"))) for e in elements
+               if _raw_text(e.get("kind") or e.get("type"))
+               not in ("startEvent", "endEvent")}
+    for pool in pools:
+        if _norm_name(pool) not in claimed:
+            gaps.append(f"пул «{pool}» без единого шага — в нём только старт и "
+                        "финиш; либо это дорожка основного пула, либо такого "
+                        "участника нет")
+
+    # Роль, раздутая в пул: имя участника совпадает с именем дорожки в другом
+    # пуле. Сильный признак — модель сама объявила эту сущность дорожкой.
+    for pool in pools:
+        for lane in lanes:
+            lane_pool = _norm_name(_raw_text(lane.get("participant")))
+            if lane_pool and lane_pool != _norm_name(pool) \
+                    and _norm_name(_raw_text(lane.get("name"))) == _norm_name(pool):
+                gaps.append(f"«{pool}» объявлен пулом и одновременно дорожкой в "
+                            f"пуле «{_raw_text(lane.get('participant'))}» — "
+                            "роли одной организации живут дорожками одного пула")
+                break
+
+    out_count: Dict[str, int] = {}
+    in_count: Dict[str, int] = {}
+    for flow in flows:
+        source, target = _raw_text(flow.get("source")), _raw_text(flow.get("target"))
+        if _raw_text(flow.get("kind")).lower() == "message":
+            continue
+        out_count[source] = out_count.get(source, 0) + 1
+        in_count[target] = in_count.get(target, 0) + 1
+
+    defaults = {_raw_text(f.get("source")) for f in flows if f.get("default")}
+    for elem in elements:
+        kind = _raw_text(elem.get("kind") or elem.get("type"))
+        elem_id = _raw_text(elem.get("id")) or "?"
+        if kind in TYPED_EVENT_KINDS:
+            definition = _raw_text(elem.get("event_definition")
+                                   or elem.get("event_type")).lower()
+            if definition not in EVENT_DEFINITIONS:
+                gaps.append(f"у события {elem_id} ({_raw_text(elem.get('name'))}) "
+                            f"нет определения: нужно одно из "
+                            f"{', '.join(sorted(EVENT_DEFINITIONS))}")
+            elif definition == "timer" and not _valid_timer(
+                    _raw_text(elem.get("timer") or elem.get("duration"))):
+                gaps.append(f"таймер события {elem_id} не в формате ISO-8601 "
+                            "(PT2H, PT15M, R3/PT10M)")
+            if kind == "boundaryEvent" and not _raw_text(elem.get("attached_to")):
+                gaps.append(f"граничное событие {elem_id} не прикреплено к задаче "
+                            "(нет attached_to)")
+        if kind in GATEWAY_KINDS:
+            incoming, outgoing = in_count.get(elem_id, 0), out_count.get(elem_id, 0)
+            if incoming < 2 and outgoing < 2:
+                gaps.append(f"шлюз {elem_id} ({_raw_text(elem.get('name'))}) "
+                            "не раздваивает и не сливает маршруты — это обычный "
+                            "шаг")
+            if kind == "exclusiveGateway" and outgoing >= 2:
+                unconditioned = [
+                    _raw_text(f.get("id")) for f in flows
+                    if _raw_text(f.get("source")) == elem_id
+                    and _raw_text(f.get("kind")).lower() != "message"
+                    and not _raw_text(f.get("condition"))
+                    and not f.get("default")
+                ]
+                if len(unconditioned) > 1 and elem_id not in defaults:
+                    gaps.append(f"у шлюза {elem_id} {len(unconditioned)} веток без "
+                                "условия: заполни condition или пометь одну "
+                                "default=true")
+    return gaps
+
+
+def _valid_timer(value: str) -> bool:
+    """Хронометраж таймера: ISO-8601 с хотя бы одним числом («P» само по себе
+    — не длительность)."""
+    return bool(value) and bool(_TIMER_RE.match(value)) and any(c.isdigit()
+                                                                for c in value)
 
 
 # --- детерминированная починка структуры ---
@@ -512,14 +784,21 @@ def repair_structure(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         )
     flows = _repair_flows(raw, elements, used_ids, notes)
 
+    _resolve_boundary_hosts(elements, notes)
+    # Слияние «ролей-пулов» — до отбрасывания пустых: у пула, который оказался
+    # дорожкой, шаги никуда не деваются, и удалять его не за что.
+    _merge_role_pools(elements, flows, participants, lanes, notes)
+    _drop_vacant_pools(elements, flows, participants, lanes, notes)
     _ensure_pool_events(elements, flows, participants, used_ids, notes)
     _link_dead_starts(elements, flows, participants, used_ids, notes)
     _close_pool_paths(elements, flows, participants, used_ids, notes)
     _ensure_reachability(elements, flows, used_ids, notes)
-    # Понижение шлюза — последним шагом: добавленные старт/финиш и рёбра
+    # Понижение шлюза — после связности и до вставки слияний: добавленные
     # достижности меняют число исходящих потоков, и «развилка» с одной веткой
     # могла получиться уже после основной починки.
     _demote_single_branch_gateways(elements, flows, notes)
+    _ensure_gateway_default(elements, flows, notes)
+    _explicit_merge_gateways(elements, flows, used_ids, notes)
 
     repaired = {
         "participants": participants,
@@ -645,15 +924,60 @@ def _repair_elements(raw: Dict[str, Any], participants: List[Dict[str, Any]],
             name = kind
             notes.append(f"Элемент {elem_id} без названия — подписан типом «{kind}»")
 
-        elements.append({
+        element: Dict[str, Any] = {
             "id": elem_id,
             "kind": kind,
             "name": name,
             "participant": participant,
             "lane": _resolve_lane(declared_lane, participant, lanes, used_ids,
                                   elem_id, notes),
-        })
+        }
+        description = str(item.get("documentation") or "").strip()
+        if description:
+            element["documentation"] = _clip(description, DOCUMENTATION_LIMIT,
+                                             notes, f"Описание элемента {elem_id}")
+        if kind in TYPED_EVENT_KINDS:
+            _repair_event_type(item, kind, elem_id, element, notes)
+        if kind == "boundaryEvent":
+            declared_host = _raw_text(item.get("attached_to"))
+            if declared_host:
+                element["attached_to"] = _sanitize_id(declared_host, declared_host)
+        elements.append(element)
     return elements
+
+
+def _repair_event_type(item: Dict[str, Any], kind: str, elem_id: str,
+                       element: Dict[str, Any], notes: List[str]) -> None:
+    """Определение события и хронометраж таймера.
+
+    Событие без определения — это пустой кружок на схеме: пользователь видит
+    «промежуточное событие» и не понимает, чего процесс ждёт. Выдумывать тип
+    нельзя (таймер это или сообщение — знает только модель), поэтому отсутствие
+    определения остаётся заметкой и нарушением в плане, а не «чинится» молча.
+    """
+    declared = _raw_text(item.get("event_definition")
+                         or item.get("event_type")).lower()
+    if declared not in EVENT_DEFINITIONS:
+        if declared:
+            notes.append(f"Неизвестное определение «{declared}» события {elem_id} "
+                         "снято")
+        else:
+            notes.append(f"У события {elem_id} («{element['name']}») нет "
+                         f"определения: нужно одно из "
+                         f"{', '.join(sorted(EVENT_DEFINITIONS))}")
+        return
+    element["event_definition"] = declared
+    if declared != "timer":
+        return
+    declared_timer = _raw_text(item.get("timer") or item.get("duration"))
+    if _valid_timer(declared_timer):
+        element["timer"] = declared_timer
+        return
+    # Для таймера отсутствие хронометража хуже, чем типовой SLA: событие без
+    # duration не сработает никогда. Значение видно в заметке.
+    element["timer"] = DEFAULT_TIMER_DURATION
+    notes.append(f"Хронометраж таймера {elem_id} «{declared_timer or 'не указан'}»"
+                 f" не ISO-8601 — взят {DEFAULT_TIMER_DURATION}")
 
 
 def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
@@ -722,45 +1046,322 @@ def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
             notes.append(f"Идентификатор потока {declared_id} приведён к «{flow_id}»")
         used_ids.add(flow_id)
 
-        flows.append({
-            "id": flow_id,
-            "kind": kind,
-            "source": source,
-            "target": target,
-            "condition": condition,
-        })
+        flow: Dict[str, Any] = {"id": flow_id, "kind": kind, "source": source,
+                                "target": target, "condition": condition}
+        if item.get("default"):
+            # Выход по умолчанию бывает только у шлюза: иначе атрибут уедет в
+            # XML, и bpmn-js нарисует default там, где его нет.
+            if kind == "sequence" \
+                    and element_by_id[source]["kind"] in GATEWAY_KINDS:
+                flow["default"] = True
+            else:
+                notes.append(f"Флаг default у потока {flow_id} снят: источник "
+                             f"{source} — не шлюз")
+        flows.append(flow)
     return flows
+
+
+def _resolve_boundary_hosts(elements: List[Dict[str, Any]],
+                            notes: List[str]) -> None:
+    """Хозяин граничного события — существующая задача того же пула.
+
+    `attachedToRef` на несуществующий элемент или на шлюз bpmn-js не рисует
+    никак, и событие повисает отдельным кружком. Определять тип события
+    генератор не вправе, поэтому без хозяина событие либо становится
+    промежуточным в потоке (определение есть — смысл сохранён), либо задачей.
+    """
+    by_id = {e["id"]: e for e in elements}
+    for element in elements:
+        if element["kind"] != "boundaryEvent":
+            continue
+        host = by_id.get(element.get("attached_to") or "")
+        if (host is not None and host["kind"] in TASK_KINDS
+                and host["participant"] == element["participant"]):
+            continue
+        reason = ("не указано, к какой задаче оно прицеплено"
+                  if not element.get("attached_to")
+                  else f"прицеплено к «{element.get('attached_to')}», а это не "
+                       "задача своего пула")
+        element.pop("attached_to", None)
+        if element.get("event_definition"):
+            element["kind"] = "intermediateCatchEvent"
+            notes.append(f"Граничное событие {element['id']}: {reason} — "
+                         "переведено в промежуточное событие маршрута")
+        else:
+            element["kind"] = "task"
+            notes.append(f"Граничное событие {element['id']}: {reason} и "
+                         "определения нет — понижено до задачи")
+
+
+def _lane_named_like_pool(pool_name: str,
+                          lanes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Дорожка в другом пуле с тем же названием, что и пул.
+
+    Точное совпадение ищется отдельно: близкое имя — эвристика, и она не должна
+    перетянуть пул в дорожку «похожую на него» там, рядом есть та же самая.
+    """
+    norm = _norm_name(pool_name)
+    if not norm:
+        return None
+    close = None
+    for lane in lanes:
+        if lane["participant"] == pool_name:
+            continue
+        lane_norm = _norm_name(lane["name"])
+        if lane_norm == norm:
+            return lane
+        if close is None and difflib.SequenceMatcher(
+                None, lane_norm, norm).ratio() >= POOL_MATCH_CUTOFF:
+            close = lane
+    return close
+
+
+def _merge_role_pools(elements: List[Dict[str, Any]],
+                      flows: List[Dict[str, Any]],
+                      participants: List[Dict[str, Any]],
+                      lanes: List[Dict[str, Any]],
+                      notes: List[str]) -> None:
+    """Пул, который модель сама объявила дорожкой, — дорожка и есть.
+
+    Признак без догадок: имя участника совпадает с именем дорожки в другом
+    пуле. После слияния линейный маршрут перестаёт быть цепочкой messageFlow:
+    потоки между дорожками одного пула — обычные sequence.
+    """
+    for pool in list(participants):
+        lane = _lane_named_like_pool(pool["name"], lanes)
+        if lane is None:
+            continue
+        target = lane["participant"]
+        moved = [e for e in elements if e["participant"] == pool["name"]]
+        for element in moved:
+            element["participant"] = target
+            element["lane"] = lane["id"]
+        by_id = {e["id"]: e for e in elements}
+        pairs = {(f["source"], f["target"]) for f in flows
+                 if f["kind"] == "sequence"}
+        for flow in list(flows):
+            if flow["kind"] != "message":
+                continue
+            src, dst = by_id.get(flow["source"]), by_id.get(flow["target"])
+            if src is None or dst is None or src["participant"] != dst["participant"]:
+                continue
+            if (flow["source"], flow["target"]) in pairs:
+                flows.remove(flow)
+                notes.append(f"Поток-сообщение {flow['source']} → "
+                             f"{flow['target']} удалён: такой поток уже есть")
+            else:
+                flow["kind"] = "sequence"
+                notes.append(f"Поток-сообщение {flow['source']} → "
+                             f"{flow['target']} стал sequence-потоком: пулы слиты")
+        for lane_own in [own for own in lanes
+                         if own["participant"] == pool["name"]]:
+            lanes.remove(lane_own)
+        participants.remove(pool)
+        notes.append(f"Пул «{pool['name']}» слит в «{target}» дорожкой "
+                     f"«{lane['name']}» — перенесено {len(moved)} шаг(ов): "
+                     "роли одной организации не бывают отдельными пулами")
+
+
+def _drop_vacant_pools(elements: List[Dict[str, Any]],
+                       flows: List[Dict[str, Any]],
+                       participants: List[Dict[str, Any]],
+                       lanes: List[Dict[str, Any]],
+                       notes: List[str]) -> None:
+    """Пул без единого шага — артефакт, а не участник.
+
+    Модель заводит «Кладовщика» пулом, но все его шаги оставляет в другом
+    процессе: внутри пула остаются «Старт» и «Завершение». Дорисовать туда
+    шаги нельзя — это выдуманное содержание, а оставить — раздуть коллаборацию
+    пустыми прямоугольниками, за которые скоринг правомерно снимает балл.
+    """
+    live = [pool for pool in participants
+            if any(e["kind"] in STEP_KINDS for e in elements
+                   if e["participant"] == pool["name"])]
+    if not live or len(live) == len(participants):
+        return
+    for pool in list(participants):
+        if pool in live:
+            continue
+        own = [e for e in elements if e["participant"] == pool["name"]]
+        ids = {e["id"] for e in own}
+        for element in own:
+            elements.remove(element)
+        for flow in list(flows):
+            if flow["source"] in ids or flow["target"] in ids:
+                flows.remove(flow)
+        for lane in [own for own in lanes if own["participant"] == pool["name"]]:
+            lanes.remove(lane)
+        participants.remove(pool)
+        notes.append(f"Пул «{pool['name']}» удалён: в нём не было ни одного "
+                     "шага, только события «Старт» и «Завершение»")
+
+
+def _ensure_gateway_default(elements: List[Dict[str, Any]],
+                            flows: List[Dict[str, Any]],
+                            notes: List[str]) -> None:
+    """Ветки исключающего шлюза обязаны различаться однозначно.
+
+    Если без условия осталась ровно одна ветка — она и есть «во всех остальных
+    случаях», это единственное возможное прочтение, а не выдумка. Когда
+    безусловных несколько, выбирать нельзя: нарушение остаётся видимым.
+    """
+    by_id = {e["id"]: e for e in elements}
+    for flow in flows:
+        if not flow.get("default"):
+            continue
+        source = by_id.get(flow["source"])
+        if source is None or source["kind"] != "exclusiveGateway":
+            flow.pop("default", None)
+            notes.append(f"Выход по умолчанию снят с потока {flow['id']}: "
+                         "у неэксклюзивного шлюза его не бывает")
+
+    for gateway in elements:
+        if gateway["kind"] != "exclusiveGateway":
+            continue
+        branches = [f for f in flows if f["kind"] == "sequence"
+                    and f["source"] == gateway["id"]]
+        if len(branches) < 2:
+            continue
+        flagged = [f for f in branches if f.get("default")]
+        if len(flagged) > 1:
+            for extra in flagged[1:]:
+                extra.pop("default", None)
+            notes.append(f"У шлюза {gateway['id']} несколько выходов по "
+                         f"умолчанию — оставлен {flagged[0]['id']}")
+        if flagged:
+            gateway["default"] = flagged[0]["id"]
+            continue
+        unconditioned = [f for f in branches if not f.get("condition")]
+        if len(unconditioned) == 1:
+            unconditioned[0]["default"] = True
+            gateway["default"] = unconditioned[0]["id"]
+            notes.append(f"Ветка {unconditioned[0]['id']} шлюза {gateway['id']} "
+                         "объявлена выходом по умолчанию: она единственная без "
+                         "условия")
+        elif len(unconditioned) > 1:
+            notes.append(f"У шлюза {gateway['id']} {len(unconditioned)} веток без "
+                         "условия — выход по умолчанию не выбран: выбрать одну "
+                         "было бы выдумкой")
+
+
+def _splitting_gateway(before: Dict[str, List[str]],
+                       by_id: Dict[str, Dict[str, Any]],
+                       start: str) -> Optional[str]:
+    """Тип ближайшего шлюза-предка узла (None — шлюза выше по маршруту нет)."""
+    seen: Set[str] = set()
+    queue = [start]
+    while queue:
+        node_id = queue.pop(0)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        element = by_id.get(node_id)
+        if element is None:
+            continue
+        if element["kind"] in GATEWAY_KINDS:
+            return element["kind"]
+        queue.extend(before.get(node_id, []))
+    return None
+
+
+def _explicit_merge_gateways(elements: List[Dict[str, Any]],
+                             flows: List[Dict[str, Any]],
+                             used_ids: Set[str],
+                             notes: List[str]) -> None:
+    """Узел, в который сходится две и более ветки, получает явный шлюз схождения.
+
+    BPMN допускает неявное слияние, но на схеме оно читается как перепутанные
+    ветки, а пользователь просил пару к каждой развилке. Тип шлюза берётся из
+    того, что ветки расщепляет: параллельный ждёт все ветки, исключительный —
+    любую. Если предки расходятся в выводах, вставка остановлена — угаданный
+    параллельный шлюз меняет семантику процесса.
+    """
+    by_id = {e["id"]: e for e in elements}
+    incoming: Dict[str, List[Dict[str, Any]]] = {}
+    before: Dict[str, List[str]] = {}
+    for flow in flows:
+        if flow["kind"] != "sequence":
+            continue
+        incoming.setdefault(flow["target"], []).append(flow)
+        before.setdefault(flow["target"], []).append(flow["source"])
+
+    budget = MAX_MERGE_GATEWAYS
+    for elem_id, branches in list(incoming.items()):
+        node = by_id.get(elem_id)
+        if node is None or len(branches) < 2:
+            continue
+        if node["kind"] in GATEWAY_KINDS or node["kind"] in ("startEvent",
+                                                             "endEvent",
+                                                             "boundaryEvent"):
+            # Конечное событие с двумя входящими — норма BPMN, а не слитая
+            # развилка: вставлять шлюз перед «Завершением» значит добавлять
+            # элемент, который ничего не значит.
+            continue
+        if budget <= 0:
+            notes.append(f"Узел {elem_id} принимает {len(branches)} веток без "
+                         f"шлюза схождения: исчерпан лимит вставок "
+                         f"({MAX_MERGE_GATEWAYS})")
+            continue
+        kinds = {_splitting_gateway(before, by_id, b["source"])
+                 for b in branches}
+        if len(kinds) != 1 or None in kinds:
+            notes.append(f"Узел {elem_id} принимает ветки, у которых нет общего "
+                         "шлюза-расщепителя — шлюз схождения не вставлен")
+            continue
+        gateway_id = _unique_id(used_ids, f"Gateway_merge_{elem_id}")
+        used_ids.add(gateway_id)
+        elements.append({
+            "id": gateway_id,
+            "kind": kinds.pop(),
+            "name": "Схождение веток",
+            "participant": node["participant"],
+            "lane": node.get("lane", ""),
+        })
+        for branch in branches:
+            branch["target"] = gateway_id
+        flows.append(_new_flow(used_ids, gateway_id, elem_id))
+        budget -= 1
+        notes.append(f"Перед «{node['name']}» ({elem_id}) вставлен шлюз "
+                     f"схождения {gateway_id}: в узел ведёт {len(branches)} веток")
 
 
 def _demote_single_branch_gateways(elements: List[Dict[str, Any]],
                                    flows: List[Dict[str, Any]],
                                    notes: List[str]) -> None:
-    """Исключающий шлюз с единственной веткой — не развилка, а обычный шаг.
+    """Шлюз, который ни расщепляет, ни сливает, — не шлюз, а обычный шаг.
 
     Вторую ветку дорисовывать нельзя: выдуманное условие хуже, чем честная
-    задача. Условие с исходящего потока снимается — на потоке от задачи оно
-    перестаёт быть решением ветвления.
+    задача. Шлюз с одним исходящим и двумя входящими остаётся валидным
+    сходящимся шлюзом — его понижать нельзя, иначе из схемы исчезнут все
+    слияния маршрутов. Условие с исходящего потока снимается: на потоке от
+    задачи оно перестаёт быть решением ветвления.
     """
-    counts: Dict[str, int] = {}
+    out_count: Dict[str, int] = {}
+    in_count: Dict[str, int] = {}
     for f in flows:
         if f["kind"] == "sequence":
-            counts[f["source"]] = counts.get(f["source"], 0) + 1
+            out_count[f["source"]] = out_count.get(f["source"], 0) + 1
+            in_count[f["target"]] = in_count.get(f["target"], 0) + 1
 
     for gateway in elements:
-        if gateway["kind"] != "exclusiveGateway" or counts.get(gateway["id"]) != 1:
+        if gateway["kind"] not in GATEWAY_KINDS:
             continue
+        if out_count.get(gateway["id"], 0) >= 2 or in_count.get(gateway["id"], 0) >= 2:
+            continue
+        kind = gateway["kind"]
         gateway["kind"] = "task"
         name = gateway["name"]
-        if name == "exclusiveGateway":
-            gateway["name"] = name = "task"
-        notes.append(f"Шлюз {gateway['id']} («{name}») с единственной "
-                     "исходящей веткой понижен до задачи")
+        if name == kind:
+            gateway["name"] = "task"
+        notes.append(f"Шлюз {gateway['id']} («{name}») с одним потоком с каждой "
+                     "стороны понижен до задачи")
         for f in flows:
-            if f["kind"] == "sequence" and f["source"] == gateway["id"] \
-                    and f["condition"]:
-                notes.append(f"Условие «{f['condition']}» снято с потока "
-                             f"{f['id']}: источник больше не шлюз")
-                f["condition"] = ""
+            if f["kind"] == "sequence" and f["source"] == gateway["id"]:
+                f.pop("default", None)
+                if f["condition"]:
+                    notes.append(f"Условие «{f['condition']}» снято с потока "
+                                 f"{f['id']}: источник больше не шлюз")
+                    f["condition"] = ""
 
 
 def _ensure_pool_events(elements: List[Dict[str, Any]],
@@ -917,7 +1518,10 @@ def _ensure_reachability(elements: List[Dict[str, Any]],
 
     added = 0
     for e in elements:
-        if e["kind"] == "startEvent" or e["id"] in has_incoming:
+        if e["kind"] in ("startEvent", "boundaryEvent") \
+                or e["id"] in has_incoming:
+            # Граничное событие запускается хозяином: подводить к нему поток от
+            # старта — значит нарисовать второй несуществующий триггер.
             continue
         start = start_by_pool.get(e["participant"])
         if start is None or start == e["id"]:

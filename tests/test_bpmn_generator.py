@@ -78,19 +78,22 @@ def _plan_dict(**overrides) -> dict:
     return base
 
 
+def _fence(plan: dict) -> str:
+    return "```json\n" + json.dumps(plan, ensure_ascii=False) + "\n```"
+
+
 def _plan(**overrides) -> str:
-    return "```json\n" + json.dumps(_plan_dict(**overrides),
-                                    ensure_ascii=False) + "\n```"
+    return _fence(_plan_dict(**overrides))
 
 
-def _e(elem_id, kind, name, lane, participant="ВкусВилл"):
+def _e(elem_id, kind, name, lane, participant="ВкусВилл", **extra):
     return {"id": elem_id, "kind": kind, "name": name,
-            "participant": participant, "lane": lane}
+            "participant": participant, "lane": lane, **extra}
 
 
-def _f(flow_id, source, target, kind="sequence", condition=""):
+def _f(flow_id, source, target, kind="sequence", condition="", **extra):
     return {"id": flow_id, "source": source, "target": target,
-            "kind": kind, "condition": condition}
+            "kind": kind, "condition": condition, **extra}
 
 
 def _generate(monkeypatch, *responses) -> dict:
@@ -161,8 +164,10 @@ class TestRolesAreLanesNotPools:
         BPMNGenerator().generate("описание")
         prompt = fake.system_prompt
         assert 'Пример' in prompt
-        assert '"participants": ["ВкусВилл"]' in prompt
+        assert '"participants": ["ВкусВилл", "Перевозчик"]' in prompt
         assert "роли одной организации" in prompt
+        # В примере развилка имеет пару: G1 расщепляет, G2 сливает.
+        assert '"id": "G2", "kind": "exclusiveGateway"' in prompt
         # Зеркало правила достижимости: у шага должен быть и выход.
         assert "кроме endEvent" in prompt
 
@@ -174,10 +179,11 @@ class TestUnknownParticipant:
             lanes=[],
             elements=[
                 _e("Z1", "startEvent", "Заявка", "", "Сайт"),
-                _e("Z2", "userTask", "Отгрузить", "", "Склад"),
+                _e("Z4", "userTask", "Принять заявку", "", "Сайт"),
                 _e("Z3", "endEvent", "Товар выдан", "", "Сайт"),
+                _e("Z2", "userTask", "Отгрузить", "", "Склад"),
             ],
-            flows=[_f("F1", "Z1", "Z3")],
+            flows=[_f("F1", "Z1", "Z4"), _f("F2", "Z4", "Z3")],
         )
         result = _generate(monkeypatch, plan)
         pools = [p["name"] for p in result["structure"]["participants"]]
@@ -594,6 +600,39 @@ class TestOutputIsApplierClean:
                 {"id": "F3", "source": "E1", "target": "E1", "kind": "sequence"},
             ],
         },
+        # Конструкции, которые генератор научился выдавать: граничный таймер,
+        # выход по умолчанию и шлюз, который и расщепляет, и сливает.
+        "таймер, default и схождение веток": {
+            "participants": ["ВкусВилл"],
+            "lanes": [],
+            "elements": [
+                {"id": "S1", "kind": "startEvent", "name": "Заказ",
+                 "participant": "ВкусВилл"},
+                {"id": "A1", "kind": "userTask", "name": "Собрать заказ",
+                 "participant": "ВкусВилл"},
+                {"id": "B1", "kind": "boundaryEvent", "name": "Прошло 4 часа",
+                 "participant": "ВкусВилл", "attached_to": "A1",
+                 "event_definition": "timer", "timer": "PT4H"},
+                {"id": "A2", "kind": "userTask", "name": "Эскалировать",
+                 "participant": "ВкусВилл"},
+                {"id": "G1", "kind": "exclusiveGateway", "name": "Успели?",
+                 "participant": "ВкусВилл"},
+                {"id": "A3", "kind": "userTask", "name": "Отгрузить",
+                 "participant": "ВкусВилл"},
+                {"id": "E1", "kind": "endEvent", "name": "Готово",
+                 "participant": "ВкусВилл"},
+            ],
+            "flows": [
+                {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence"},
+                {"id": "F2", "source": "A1", "target": "G1", "kind": "sequence"},
+                {"id": "F3", "source": "B1", "target": "A2", "kind": "sequence"},
+                {"id": "F4", "source": "A2", "target": "G1", "kind": "sequence"},
+                {"id": "F5", "source": "G1", "target": "A3", "kind": "sequence",
+                 "condition": "Успели"},
+                {"id": "F6", "source": "G1", "target": "E1", "kind": "sequence"},
+                {"id": "F7", "source": "A3", "target": "E1", "kind": "sequence"},
+            ],
+        },
     }
 
     @pytest.mark.parametrize("label", list(PLANS))
@@ -723,8 +762,11 @@ class TestEmittedXml:
 
     def test_result_contract(self, monkeypatch):
         result = _generate(monkeypatch, _plan())
-        assert set(result) == {"status", "bpmn", "structure", "notes",
-                               "time_elapsed"}
+        assert set(result) == {"status", "bpmn", "structure", "notes", "gaps",
+                               "attempts", "time_elapsed"}
+        assert result["attempts"] == 1
+        assert isinstance(result["gaps"], list)
+        assert all(isinstance(g, str) for g in result["gaps"])
         assert isinstance(result["notes"], list)
         assert all(isinstance(n, str) for n in result["notes"])
         assert set(result["structure"]) == {"participants", "lanes", "elements",
@@ -776,8 +818,372 @@ class TestSilentRepairsAreNarrated:
         long_name = "О" * 200
         result = _generate(monkeypatch, _plan(
             participants=[long_name],
+            lanes=[{"id": "L1", "name": long_name, "participant": long_name}],
+            elements=[
+                _e("S1", "startEvent", "Заявка", "L1", long_name),
+                _e("T1", "userTask", "Проверить", "L1", long_name),
+                _e("E1", "endEvent", "Готово", "L1", long_name),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1")],
         ))
         assert _note(result["notes"], "укорочен")
         assert len(result["structure"]["participants"][0]["name"]) == \
             bpmn_generator.NAME_LIMIT
+
+
+class TestVacantPools:
+    """Пул «только Старт и Завершение» — артефакт модели, а не участник:
+    дорисовать ему шаги нельзя, значит пустой процесс в схему не попадает."""
+
+    @staticmethod
+    def _vacant():
+        return _plan(
+            participants=["ВкусВилл", "Кладовщик"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ", "L_m"),
+                _e("T1", "userTask", "Проверить остатки", "L_m"),
+                _e("E1", "endEvent", "Осмотрен", "L_m"),
+                _e("S2", "startEvent", "Старт", "", "Кладовщик"),
+                _e("E2", "endEvent", "Завершение", "", "Кладовщик"),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1"),
+                   _f("F3", "S2", "E2")],
+        )
+
+    def test_pool_without_steps_removed_with_its_events(self, monkeypatch):
+        result = _generate(monkeypatch, self._vacant())
+        assert [p["name"] for p in result["structure"]["participants"]] == \
+            ["ВкусВилл"]
+        ids = {e["id"] for e in result["structure"]["elements"]}
+        assert not {"S2", "E2"} & ids
+        assert _note(result["notes"], "Пул «Кладовщик» удалён")
+
+    def test_flows_of_removed_pool_do_not_survive(self, monkeypatch):
+        result = _generate(monkeypatch, self._vacant())
+        pairs = {(f["source"], f["target"]) for f in result["structure"]["flows"]}
+        assert ("S2", "E2") not in pairs
+        assert "S2" not in {f["source"] for f in result["structure"]["flows"]}
+
+    def test_only_pool_survives_even_without_steps(self, monkeypatch):
+        result = _generate(monkeypatch, _plan(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[_e("S1", "startEvent", "Сигнал", ""),
+                      _e("E1", "endEvent", "Готово", "")],
+            flows=[_f("F1", "S1", "E1")]))
+        assert [p["name"] for p in result["structure"]["participants"]] == \
+            ["ВкусВилл"]
+
+
+class TestRolePoolBecomesLane:
+    def test_pool_named_like_a_lane_of_another_pool_is_merged(self, monkeypatch):
+        """Модель объявила «Кладовщика» и пулом, и дорожкой — это дорожка."""
+        result = _generate(monkeypatch, _plan(
+            participants=["ВкусВилл", "Кладовщик"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"},
+                   {"id": "L_k", "name": "Кладовщик", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ", "L_m"),
+                _e("T1", "userTask", "Проверить остатки", "L_m"),
+                _e("T2", "userTask", "Собрать заказ", "L_k", "Кладовщик"),
+                _e("E1", "endEvent", "Собран", "L_m"),
+            ],
+            flows=[_f("F1", "S1", "T1"),
+                   _f("M1", "T1", "T2", kind="message"),
+                   _f("F2", "T2", "E1")],
+        ))
+        assert [p["name"] for p in result["structure"]["participants"]] == \
+            ["ВкусВилл"]
+        assert _note(result["notes"], "слит в «ВкусВилл» дорожкой «Кладовщик»")
+        by_pair = {(f["source"], f["target"]): f["kind"]
+                   for f in result["structure"]["flows"]}
+        # Межпуловое сообщение внутри одного пула — передача работы между
+        # дорожками, то есть обычный sequence-поток.
+        assert by_pair[("T1", "T2")] == "sequence"
+        moved = next(e for e in result["structure"]["elements"]
+                     if e["id"] == "T2")
+        assert moved["lane"] == "L_k"
+
+
+class TestEventLogic:
+    """Определение события и хозяин граничного — то, чего в генерации не было:
+    без этого «промежуточное событие» остаётся пустым кружком."""
+
+    @staticmethod
+    def _timer_on_task(**override):
+        element = _e("B1", "boundaryEvent", "Прошло 4 часа", "",
+                     attached_to="T1", event_definition="timer", timer="PT4H")
+        element.update(override)
+        return _plan(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заказ", ""),
+                _e("T1", "userTask", "Собрать заказ", ""),
+                element,
+                _e("T2", "userTask", "Эскалация руководителю", ""),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1"),
+                   _f("F3", "B1", "T2"), _f("F4", "T2", "E1")],
+        )
+
+    def test_boundary_timer_emits_definition_and_host(self, monkeypatch):
+        result = _generate(monkeypatch, self._timer_on_task())
+        xml = result["bpmn"]
+        assert 'attachedToRef="T1"' in xml
+        assert "bpmn:timerEventDefinition" in xml
+        assert ">PT4H<" in xml
+        assert result["gaps"] == []
+
+    def test_boundary_event_is_not_wired_to_the_start(self, monkeypatch):
+        """Граничное событие запускает хозяин: поток от старта к нему —
+        второй, выдуманный триггер."""
+        result = _generate(monkeypatch, self._timer_on_task())
+        flows = [(f["source"], f["target"]) for f in result["structure"]["flows"]]
+        assert ("S1", "B1") not in flows
+
+    def test_timer_order_is_documentation_definition_refs(self, monkeypatch):
+        result = _generate(monkeypatch, self._timer_on_task(
+            documentation="Контроль SLA сборки"))
+        event = next(e for e in ET.fromstring(result["bpmn"])
+                     .iter(f"{BPMN}boundaryEvent"))
+        order = [c.tag.replace(BPMN, "") for c in event]
+        assert order == ["documentation", "timerEventDefinition", "outgoing"]
+
+    def test_unparsable_timer_falls_back_to_default_with_note(self, monkeypatch):
+        result = _generate(monkeypatch, self._timer_on_task(timer="4 часа"))
+        assert _note(result["notes"], "не ISO-8601")
+        assert f">{bpmn_generator.DEFAULT_TIMER_DURATION}<" in result["bpmn"]
+
+    def test_unknown_definition_is_dropped_and_reported(self, monkeypatch):
+        result = _generate(monkeypatch, self._timer_on_task(
+            event_definition="push"))
+        assert _note(result["notes"], "Неизвестное определение")
+        assert "timerEventDefinition" not in result["bpmn"]
+
+    def test_boundary_without_host_becomes_intermediate(self, monkeypatch):
+        result = _generate(monkeypatch, self._timer_on_task(attached_to="ghost"))
+        kinds = _kinds(result["structure"])
+        assert kinds["B1"] == "intermediateCatchEvent"
+        assert _note(result["notes"], "переведено в промежуточное")
+        assert "attachedToRef" not in result["bpmn"]
+
+    def test_event_without_definition_stays_a_reported_gap(self, monkeypatch):
+        result = _generate(monkeypatch, self._timer_on_task(
+            kind="intermediateCatchEvent", event_definition=None, timer=None,
+            attached_to=None))
+        assert _note(result["notes"], "нет определения")
+        assert any("B1" in gap for gap in result["gaps"])
+
+    def test_boundary_event_with_blank_host_does_not_crash(self):
+        """`attached_to: "   "` — модель отдаёт и такое: пустой id после
+        санитизации не должен ронять генерацию на срезе индекса."""
+        repaired, notes = repair_structure(_plan_dict(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Старт", ""),
+                _e("A1", "userTask", "Собрать", ""),
+                _e("B1", "boundaryEvent", "Просрочка", "", attached_to="   ",
+                   event_definition="timer"),
+                _e("E1", "endEvent", "Готово", ""),
+            ],
+            flows=[_f("F1", "S1", "A1"), _f("F2", "A1", "E1"),
+                   _f("F3", "B1", "E1")],
+        ))
+        assert _kinds(repaired)["B1"] == "intermediateCatchEvent"
+        assert "attached_to" not in next(e for e in repaired["elements"]
+                                         if e["id"] == "B1")
+        assert _note(notes, "не указано, к какой задаче")
+
+
+class TestGatewayConditionsAndMerge:
+    @staticmethod
+    def _branching(gateway="exclusiveGateway", first="Да", second="Нет"):
+        return _plan(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заказ", ""),
+                _e("G1", gateway, "Хватает товара?", ""),
+                _e("T2", "userTask", "Собрать", ""),
+                _e("T3", "userTask", "Заказать остаток", ""),
+                _e("T4", "userTask", "Отгрузить", ""),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "G1"),
+                   _f("F2", "G1", "T2", condition=first),
+                   _f("F6", "G1", "T3", condition=second),
+                   _f("F3", "T2", "T4"), _f("F4", "T3", "T4"),
+                   _f("F5", "T4", "E1")],
+        )
+
+    def test_single_unconditioned_branch_becomes_default(self, monkeypatch):
+        result = _generate(monkeypatch, self._branching(second=""))
+        gateway = next(e for e in ET.fromstring(result["bpmn"])
+                       .iter(f"{BPMN}exclusiveGateway"))
+        assert gateway.get("default")
+        assert _note(result["notes"], "объявлена выходом по умолчанию")
+
+    def test_two_unconditioned_branches_are_not_resolved_by_force(self, monkeypatch):
+        result = _generate(monkeypatch, self._branching(first="", second=""))
+        assert _note(result["notes"], "не выбран")
+        assert any("G1" in gap for gap in result["gaps"])
+
+    def test_default_flag_from_model_reaches_the_gateway(self, monkeypatch):
+        plan = _plan_dict(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заказ", ""),
+                _e("G1", "exclusiveGateway", "Хватает товара?", ""),
+                _e("T2", "userTask", "Собрать", ""),
+                _e("T3", "userTask", "Заказать остаток", ""),
+                _e("T4", "userTask", "Отгрузить", ""),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "G1"), _f("F2", "G1", "T2", condition="Да"),
+                   _f("F6", "G1", "T3", condition="", default=True),
+                   _f("F3", "T2", "T4"), _f("F4", "T3", "T4"),
+                   _f("F5", "T4", "E1")],
+        )
+        result = _generate(monkeypatch, _fence(plan))
+        gateway = next(e for e in ET.fromstring(result["bpmn"])
+                       .iter(f"{BPMN}exclusiveGateway"))
+        assert gateway.get("default") == next(
+            f["id"] for f in result["structure"]["flows"]
+            if f["source"] == "G1" and f.get("default"))
+
+    def test_merge_gateway_inserted_before_converging_task(self, monkeypatch):
+        result = _generate(monkeypatch, self._branching())
+        merges = [e for e in result["structure"]["elements"]
+                  if e["name"] == "Схождение веток"]
+        assert [m["kind"] for m in merges] == ["exclusiveGateway"]
+        flows = [(f["source"], f["target"]) for f in result["structure"]["flows"]]
+        assert ("T2", "T4") not in flows and ("T3", "T4") not in flows
+        assert [flows.count((m["id"], "T4")) for m in merges] == [1]
+        assert _note(result["notes"], "вставлен шлюз схождения")
+
+    def test_inserted_merge_gateway_is_not_demoted(self, monkeypatch):
+        """У сходящегося шлюза один исходящий — это норма, а не повод понижать."""
+        result = _generate(monkeypatch, self._branching())
+        merge = next(e for e in result["structure"]["elements"]
+                     if e["name"] == "Схождение веток")
+        assert _kinds(result["structure"])[merge["id"]] == "exclusiveGateway"
+        assert not _note(result["notes"], "понижен до задачи")
+
+    def test_parallel_split_gets_parallel_merge(self, monkeypatch):
+        result = _generate(monkeypatch, self._branching(
+            gateway="parallelGateway", first="", second=""))
+        merges = [e for e in result["structure"]["elements"]
+                  if e["name"] == "Схождение веток"]
+        assert [m["kind"] for m in merges] == ["parallelGateway"]
+
+    def test_branches_without_common_gateway_are_left_alone(self, monkeypatch):
+        plan = _plan(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заказ", ""),
+                _e("T2", "userTask", "Собрать", ""),
+                _e("T3", "userTask", "Заказать остаток", ""),
+                _e("T4", "userTask", "Отгрузить", ""),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "T2"), _f("F2", "S1", "T3"),
+                   _f("F3", "T2", "T4"), _f("F4", "T3", "T4"),
+                   _f("F5", "T4", "E1")],
+        )
+        result = _generate(monkeypatch, plan)
+        assert not [e for e in result["structure"]["elements"]
+                    if e["name"] == "Схождение веток"]
+        assert _note(result["notes"], "нет общего шлюза-расщепителя")
+
+    def test_end_event_with_two_branches_needs_no_merge(self, monkeypatch):
+        result = _generate(monkeypatch, _plan(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заказ", ""),
+                _e("G1", "exclusiveGateway", "Хватает?", ""),
+                _e("T2", "userTask", "Собрать", ""),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "G1"), _f("F2", "G1", "T2", condition="Да"),
+                   _f("F3", "G1", "E1", condition="Нет"), _f("F4", "T2", "E1")],
+        ))
+        assert not [e for e in result["structure"]["elements"]
+                    if e["name"] == "Схождение веток"]
+
+
+class TestPlanGapsAndRetry:
+    """Нарушения, которые нельзя починить без выдумывания содержания, — повод
+    один раз переспросить модель, а не рисовать схему по своему усмотрению."""
+
+    def test_gaps_list_names_every_unfixable_defect(self):
+        gaps = bpmn_generator.plan_gaps({
+            "participants": ["ВкусВилл", "Кладовщик"],
+            "lanes": [{"id": "L1", "name": "Кладовщик", "participant": "ВкусВилл"}],
+            "elements": [
+                {"id": "S1", "kind": "startEvent", "name": "а",
+                 "participant": "ВкусВилл"},
+                {"id": "A1", "kind": "userTask", "name": "Собрать",
+                 "participant": "ВкусВилл"},
+                {"id": "B1", "kind": "boundaryEvent", "name": "Срок",
+                 "participant": "ВкусВилл"},
+                {"id": "G1", "kind": "exclusiveGateway", "name": "Ветка",
+                 "participant": "ВкусВилл"},
+            ],
+            "flows": [{"id": "F1", "source": "G1", "target": "A1",
+                       "kind": "sequence", "condition": ""},
+                      {"id": "F2", "source": "G1", "target": "S1",
+                       "kind": "sequence", "condition": ""}],
+        })
+        assert any("Кладовщик" in g and "без единого шага" in g for g in gaps)
+        assert any("объявлен пулом и одновременно дорожкой" in g for g in gaps)
+        assert any("B1" in g and "нет определения" in g for g in gaps)
+        assert any("B1" in g and "attached_to" in g for g in gaps)
+        assert any("G1" in g and "2 веток без условия" in g for g in gaps)
+
+    def test_gaps_survive_junk_and_non_objects(self):
+        assert bpmn_generator.plan_gaps("не объект") == ["план не является JSON-объектом"]
+        assert isinstance(bpmn_generator.plan_gaps({"elements": [1, None, "x"]}),
+                          list)
+
+    def test_clean_plan_is_not_asked_twice(self, monkeypatch):
+        fake = FakeLLM(monkeypatch, _plan())
+        result = BPMNGenerator().generate("описание")
+        assert result["attempts"] == 1 and len(fake.calls) == 1
+
+    def test_retry_carries_violations_and_better_plan_wins(self, monkeypatch):
+        bad = TestVacantPools._vacant()
+        fake = FakeLLM(monkeypatch, bad, _plan())
+        result = BPMNGenerator().generate("описание процесса")
+        assert result["attempts"] == 2 and len(fake.calls) == 2
+        # Второй вызов идёт с тем же системным промптом: правила моделирования
+        # не должны разъезжаться между попытками.
+        assert fake.calls[1][0]["content"] == fake.calls[0][0]["content"]
+        user_prompt = fake.calls[1][1]["content"]
+        assert "Нарушения в текущем плане" in user_prompt
+        assert "без единого шага" in user_prompt
+        assert _note(result["notes"], "Повторный запрос модели: нарушений было")
+        assert result["gaps"] == []
+        assert [p["name"] for p in result["structure"]["participants"]] == \
+            ["ВкусВилл"]
+
+    def test_retry_that_did_not_improve_keeps_first_plan(self, monkeypatch):
+        bad = TestVacantPools._vacant()
+        FakeLLM(monkeypatch, bad, bad)
+        result = BPMNGenerator().generate("описание")
+        assert _note(result["notes"], "не улучшил план")
+        assert not _note(result["notes"], "план пересобран")
+
+    def test_retry_failure_degrades_to_first_plan(self, monkeypatch):
+        FakeLLM(monkeypatch, TestVacantPools._vacant(),
+                llm_client.LLMError("503"))
+        result = BPMNGenerator().generate("описание")
+        assert result["status"] == "success"
+        assert _note(result["notes"], "Повторный запрос модели не выполнен")
+
+    def test_oversized_plan_is_not_sent_again(self, monkeypatch):
+        monkeypatch.setattr(bpmn_generator, "MAX_RETRY_PLAN_CHARS", 10)
+        fake = FakeLLM(monkeypatch, TestVacantPools._vacant(), _plan())
+        result = BPMNGenerator().generate("описание")
+        assert len(fake.calls) == 1
+        assert _note(result["notes"], "Повторный запрос модели не выполнен")
 

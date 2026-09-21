@@ -2,7 +2,7 @@
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.config import FRONTEND_URL
@@ -11,6 +11,7 @@ from app.deps import get_current_user
 from app.models import Diagram, Role, ShareToken, Team, TeamMember, User
 from app.schemas import ShareRequest, ShareResponse
 from app.services.access import load_diagram
+from app.timeutils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,12 @@ def create_share_link(
     diagram = load_diagram(db, current_user, request.diagram_id, edit=True)
 
     token = str(uuid.uuid4())
-    expires_at = datetime.utcnow() + timedelta(days=7)
+    expires_at = utc_now() + timedelta(days=7)
     share_token = ShareToken(
         id=str(uuid.uuid4()),
         token=token,
         diagram_id=diagram.id,
-        created_at=datetime.utcnow(),
+        created_at=utc_now(),
         expires_at=expires_at,
         can_edit=request.can_edit
     )
@@ -50,7 +51,7 @@ def get_shared_diagram(
 ):
     token = db.query(ShareToken).filter(
         ShareToken.token == share_token,
-        ShareToken.expires_at > datetime.utcnow()
+        ShareToken.expires_at > utc_now()
     ).first()
     
     if not token:

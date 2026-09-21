@@ -2,16 +2,19 @@
 import logging
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
+from app.config import MAX_UPLOAD_BYTES
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import DeletedDiagram, Diagram, DiagramVersion, Folder, User
 from app.schemas import DiagramCreate, MoveToFolderRequest, RestoreDiagramRequest
 from app.services.access import load_diagram
+from app.services.improvements import supersede_pending
 from app.services.versions import record_version
+from app.timeutils import utc_now
+from core.bpmn_edits import parse_xml
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +37,7 @@ def save_diagram(
         target.name = diagram.name
         target.xml_content = diagram.xml
         target.score = diagram.score
-        target.updated_at = datetime.utcnow()
+        target.updated_at = utc_now()
         source = "saved"
     else:
         target = Diagram(
@@ -149,7 +152,7 @@ def restore_diagram_version(
 
     diagram.xml_content = version.xml_content
     diagram.score = version.score
-    diagram.updated_at = datetime.utcnow()
+    diagram.updated_at = utc_now()
     restored = record_version(db, diagram, source="restored",
                               author_id=current_user.id, note=f"откат к v{seq}")
     db.commit()
@@ -175,6 +178,14 @@ def delete_diagram(
         user_id=current_user.id
     )
     db.add(deleted_diagram)
+    # Пока диаграмма не исчезла из FK: висящее pending-предложение после
+    # удаления принимается в ветке «создать с нуля» и возрождает схему.
+    supersede_pending(db, diagram.id)
+    # Ссылки совместного использования переживают схему как мёртвые строки:
+    # у отношения нет cascade, и ORM лишь обнуляет FK. Удаляем объекты через
+    # связь — bulk-delete оставил бы сессию рассогласованной с каскадом.
+    for token in diagram.share_tokens:
+        db.delete(token)
     db.delete(diagram)
     db.commit()
     return {"status": "success"}
@@ -217,9 +228,18 @@ async def import_bpmn(
             logger.warning(error_msg)
             raise HTTPException(status_code=400, detail=error_msg)
 
-        contents = await file.read()
+        # Читаем не более чем лимит+1 байт, а не весь файл: иначе один запрос
+        # материализует в памяти столько, сколько в него загрузили.
+        contents = await file.read(MAX_UPLOAD_BYTES + 1)
         logger.info(f"File size: {len(contents)} bytes")
-        
+        if len(contents) > MAX_UPLOAD_BYTES:
+            # Файл идёт в БД и потом в парсер — без размера на входе один
+            # запрос съедает память процесса.
+            raise HTTPException(
+                status_code=413,
+                detail=f"Файл больше {MAX_UPLOAD_BYTES / 1_000_000:g} МБ",
+            )
+
         try:
             xml_content = contents.decode('utf-8')
         except UnicodeDecodeError:
@@ -228,28 +248,36 @@ async def import_bpmn(
             raise HTTPException(status_code=400, detail=error_msg)
         
         try:
-            root = ET.fromstring(xml_content)
+            # Загруженный файл — недоверенный XML: разбираем так же, как весь
+            # пользовательский XML (defusedxml), иначе внешние сущности
+            # раскрутят файл в память.
+            root = parse_xml(xml_content)
             if not root.tag.endswith('}definitions'):
                 error_msg = "Файл не содержит BPMN definitions"
                 logger.warning(error_msg)
                 raise HTTPException(status_code=400, detail=error_msg)
-        except ET.ParseError as e:
+        except HTTPException:
+            raise
+        except (ET.ParseError, ValueError) as e:
             error_msg = f"Ошибка парсинга XML: {str(e)}"
             logger.warning(error_msg)
             raise HTTPException(status_code=400, detail=error_msg)
 
         diagram_id = str(uuid.uuid4())
+        # Имя файла приходит от клиента, а колонки отмеряны VARCHAR: длинное
+        # имя на PostgreSQL дало бы 500 вместо загруженной схемы.
+        name = file.filename.replace('.bpmn', '').replace('.xml', '')[:100]
         db_diagram = Diagram(
             id=diagram_id,
-            name=file.filename.replace('.bpmn', '').replace('.xml', ''),
+            name=name,
             xml_content=xml_content,
             user_id=current_user.id,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
+            created_at=utc_now(),
+            updated_at=utc_now()
         )
         db.add(db_diagram)
         record_version(db, db_diagram, source="created", author_id=current_user.id,
-                       note=f"импорт {file.filename}")
+                       note=f"импорт {name}"[:200])
         db.commit()
 
         logger.info(f"Successfully imported diagram: {diagram_id}")
@@ -301,8 +329,8 @@ def restore_diagram(
         name=deleted_diagram.name,
         xml_content=deleted_diagram.xml_content,
         user_id=current_user.id,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
+        created_at=utc_now(),
+        updated_at=utc_now()
     )
     db.add(diagram)
     # Восстановление из корзины — это рождение схемы заново: прежнее id

@@ -26,6 +26,7 @@ from app.models import (  # noqa: E402
     Diagram,
     DiagramVersion,
     Improvement,
+    ShareToken,
     User,
 )
 from app.security import create_access_token  # noqa: E402
@@ -118,6 +119,34 @@ def _improvement(db, owner_id, diagram_id=None, xml_content=IMPROVED_XML, base_s
 
 class TestImprovementStateMachine:
     """pending → approved | rejected | superseded: решение остаётся в истории."""
+
+    def test_trashed_diagram_supersedes_pending_proposal(self, client, db, user):
+        """Удаление схемы обязано снять её незакрытые предложения. Пока строка
+        висит в pending, принятие уходит в ветку «создать диаграмму с нуля» и
+        возрождает то, что пользователь выбросил."""
+        diagram = _diagram(db, user.id)
+        diagram_id = diagram.id          # после удаления объект не прочитать
+        improvement = _improvement(db, user.id, diagram_id)
+        # Ссылка совместного использования обязана умереть со схемой: FK
+        # обнуляется молча, и доступ по token'у висел бы в списке вечно.
+        share = ShareToken(id=str(uuid.uuid4()), token=str(uuid.uuid4()),
+                           diagram_id=diagram_id)
+        db.add(share)
+        share_id = share.id              # после удаления атрибут не прочитать
+        db.commit()
+
+        response = client.delete(f"/api/diagrams/{diagram_id}", headers=_headers(user))
+        assert response.status_code == 200
+
+        accept = client.post("/api/ai/accept-improvement", headers=_headers(user),
+                             json={"improvement_id": improvement.id})
+        assert accept.status_code == 404
+        db.expire_all()
+        assert db.get(Improvement, improvement.id).status == "superseded"
+        # запрос, а не db.get: объект ещё лежит в identity map, и get поднял бы
+        # ObjectDeletedError вместо None
+        assert db.query(ShareToken).filter_by(id=share_id).first() is None
+        assert db.query(Diagram).filter_by(id=diagram_id).first() is None
 
     def test_proposal_is_counted_from_current_version(self, db, user):
         from app.services.improvements import PENDING, record_proposal
@@ -237,12 +266,45 @@ class TestAcceptImprovement:
         assert body["xml_content"] == IMPROVED_XML
         assert body["diagram_id"] == diagram_id
         db.expire_all()
-        assert db.query(Diagram).get(diagram_id).xml_content == IMPROVED_XML
+        assert db.get(Diagram, diagram_id).xml_content == IMPROVED_XML
         # Предложение не удаляется: оно остаётся в истории со статусом решения.
         assert db.get(Improvement, improvement_id).status == "approved"
         assert db.get(Improvement, improvement_id).decided_at is not None
         version = db.query(DiagramVersion).filter_by(diagram_id=diagram_id).one()
         assert (version.seq, version.source, version.xml_content) == (1, "approved", IMPROVED_XML)
+
+    def test_accept_recomputes_score_of_accepted_xml(self, client, db, user):
+        """Клиентский балл протухает в момент, когда XML заменили: принятая
+        схема обязана получить собственную оценку, иначе реестр и история версий
+        хранят качество, которого уже нет (ухудшающее улучшение выглядит как
+        улучшение)."""
+        from core.bpmn_scoring import BPMNScorer
+
+        dead_end_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="http://bpmn.io/schema/bpmn">
+  <process id="P" name="П" isExecutable="true">
+    <startEvent id="S" name="Старт"/>
+    <userTask id="T" name="Шаг без связей"/>
+  </process>
+</definitions>"""
+        diagram = _diagram(db, user.id)
+        diagram.score = 100
+        db.commit()
+        improvement = _improvement(db, user.id, diagram.id,
+                                   xml_content=dead_end_xml)
+
+        response = client.post("/api/ai/accept-improvement",
+                               json={"improvement_id": improvement.id},
+                               headers=_headers(user))
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        expected = BPMNScorer().evaluate(dead_end_xml)["score"]
+        assert body["score"] == expected < body["score_before"] == 100
+        db.expire_all()
+        assert db.get(Diagram, diagram.id).score == expected
+        version = db.query(DiagramVersion).filter_by(diagram_id=diagram.id).one()
+        assert version.score == expected
 
     def test_repeated_accept_is_not_found(self, client, db, user):
         diagram = _diagram(db, user.id)
@@ -269,7 +331,7 @@ class TestAcceptImprovement:
         assert response.status_code == 200, response.text
         new_id = response.json()["diagram_id"]
         db.expire_all()
-        created = db.query(Diagram).get(new_id)
+        created = db.get(Diagram, new_id)
         assert created.user_id == user.id
         assert created.xml_content == IMPROVED_XML
 
@@ -285,7 +347,7 @@ class TestAcceptImprovement:
 
         assert response.status_code == 404
         db.expire_all()
-        assert db.query(Diagram).get(diagram.id).xml_content == ORIGINAL_XML
+        assert db.get(Diagram, diagram.id).xml_content == ORIGINAL_XML
 
     def test_denied_diagram_access_keeps_improvement(self, client, db, user, other_user):
         foreign_diagram = _diagram(db, other_user.id)

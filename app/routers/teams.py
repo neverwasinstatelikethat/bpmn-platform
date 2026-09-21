@@ -3,7 +3,6 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import and_, or_
@@ -16,6 +15,7 @@ from app.schemas import (
                         DomainInviteCreate, InvitationCreate, InvitationResponse,
                         RoleCreate, RoleResponse, TeamCreate, TeamResponse
 )
+from app.timeutils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +165,23 @@ def domain_invite(
     db.commit()
     return {"status": "success", "users_added": len(users)}
 
+def _invitation_payload(invitation: Invitation, role_name: str) -> dict:
+    """Ответ по приглашению.
+
+    Возвращать ORM-объект под `InvitationResponse` нельзя: поле `role` в схеме
+    — строка, а у модели это связывание с Role, и валидация ответа падала уже
+    после commit (участность начислена, а клиент видит 500).
+    """
+    return {
+        "id": invitation.id,
+        "email": invitation.email,
+        "role": role_name,
+        "status": invitation.status,
+        "created_at": invitation.created_at,
+        "accept_link": f"{FRONTEND_URL}/invite/{invitation.token}",
+    }
+
+
 @router.get("/api/invitations/accept/{token}", response_model=InvitationResponse)
 def accept_invitation(
     token: str,
@@ -174,12 +191,20 @@ def accept_invitation(
     invitation = db.query(Invitation).filter(
         Invitation.token == token,
         Invitation.status == "pending",
-        Invitation.expires_at > datetime.utcnow()
+        Invitation.expires_at > utc_now()
     ).first()
     
     if not invitation:
         raise HTTPException(404, "Invitation not found or expired")
-    
+
+    # Ссылка приглашения не передаётся третьим: роль в команде (нередко admin)
+    # назначается конкретному адресату. Без сверки адреса любая пересланная или
+    # утекаящая ссылка выдаёт доступ чужому аккаунту.
+    if (invitation.email or "").strip().lower() != (current_user.email or "").strip().lower():
+        raise HTTPException(403, "Приглашение адресовано другому аккаунту")
+
+    role_name = invitation.role.name if invitation.role is not None else ""
+
     existing = db.query(TeamMember).filter(
         TeamMember.team_id == invitation.team_id,
         TeamMember.user_id == current_user.id
@@ -188,7 +213,7 @@ def accept_invitation(
     if existing:
         invitation.status = "accepted"
         db.commit()
-        return invitation
+        return _invitation_payload(invitation, role_name)
     
     member = TeamMember(
         team_id=invitation.team_id,
@@ -200,7 +225,7 @@ def accept_invitation(
     invitation.status = "accepted"
     db.commit()
     
-    return invitation
+    return _invitation_payload(invitation, role_name)
 
 @router.post("/api/roles", response_model=RoleResponse)
 def create_role(

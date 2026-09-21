@@ -1,7 +1,7 @@
 """Аутентификация, профиль и сброс пароля."""
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import timedelta
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi_mail import MessageSchema
 from sqlalchemy.orm import Session
@@ -15,6 +15,7 @@ from app.schemas import (
                         PasswordResetResponse, RegisterRequest, Token, UserResponse
 )
 from app.security import create_access_token, get_password_hash, verify_password
+from app.timeutils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ async def request_password_reset(
         # Удаляем предыдущие неиспользованные токены для этого email
         db.query(PasswordResetToken).filter(
             PasswordResetToken.email == request.email.lower(),
-            PasswordResetToken.used == False
+            PasswordResetToken.used.is_(False)
         ).delete()
         
         # Генерируем новый токен
@@ -117,7 +118,7 @@ async def request_password_reset(
         reset_token = PasswordResetToken(
             email=request.email.lower(),
             token=token,
-            expires_at=datetime.utcnow() + timedelta(hours=1)
+            expires_at=utc_now() + timedelta(hours=1)
         )
         db.add(reset_token)
         db.commit()
@@ -194,8 +195,8 @@ async def reset_password(
         # Ищем токен в базе данных
         reset_token = db.query(PasswordResetToken).filter(
             PasswordResetToken.token == request.token,
-            PasswordResetToken.used == False,
-            PasswordResetToken.expires_at > datetime.utcnow()
+            PasswordResetToken.used.is_(False),
+            PasswordResetToken.expires_at > utc_now()
         ).first()
         
         if not reset_token:
@@ -251,8 +252,8 @@ async def verify_reset_token(
     try:
         reset_token = db.query(PasswordResetToken).filter(
             PasswordResetToken.token == token,
-            PasswordResetToken.used == False,
-            PasswordResetToken.expires_at > datetime.utcnow()
+            PasswordResetToken.used.is_(False),
+            PasswordResetToken.expires_at > utc_now()
         ).first()
         
         if not reset_token:

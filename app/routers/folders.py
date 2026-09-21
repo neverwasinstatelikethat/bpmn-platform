@@ -2,14 +2,14 @@
 import json
 import logging
 import uuid
-from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import get_current_user
-from app.models import Diagram, Folder, Role, Team, TeamMember, User
+from app.models import Diagram, Folder, Improvement, Role, ShareToken, Team, TeamMember, User
 from app.schemas import FolderCreate
+from app.timeutils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ def create_folder(
         user_id=current_user.id if not folder.team_id else None,
         team_id=folder.team_id,
         parent_id=folder.parent_id,
-        created_at=datetime.utcnow()
+        created_at=utc_now()
     )
     db.add(db_folder)
     db.commit()
@@ -110,13 +110,48 @@ def delete_folder(
     if not folder:
         raise HTTPException(404, detail="Folder not found")
     
-    if delete_contents:
-        db.query(Diagram).filter(
-            Diagram.folder_id == folder_id
-        ).delete()
-    
-    db.query(Folder).filter(Folder.parent_id == folder_id).delete()
-    db.delete(folder)
+    # Поддерево собираем итеративно, а не рекурсией по children: parent_id —
+    # самоссылка, и цикл в нём (ручная правка в базе) иначе уводит обход в
+    # бесконечность.
+    subtree = [folder]
+    seen = {folder.id}
+    cursor = 0
+    while cursor < len(subtree):
+        parent = subtree[cursor]
+        cursor += 1
+        for child in db.query(Folder).filter(Folder.parent_id == parent.id).all():
+            if child.id not in seen:
+                seen.add(child.id)
+                subtree.append(child)
+
+    # Ссылки внутри поддерева обрываем заранее: сортировка удалений SQLAlchemy
+    # на цикле в parent_id падает с CircularDependencyError, а UPDATE объекта,
+    # уже помеченного на удаление, сессия не отдаёт — отсюда отдельный flush.
+    for node in subtree:
+        if node.parent_id in seen:
+            node.parent_id = None
+    db.flush()
+
+    # Диаграмму нельзя снять bulk-delete'ом: FK у diagram_versions, share_tokens
+    # и pending_improvements объявлены без ondelete, и на них PostgreSQL
+    # отклоняет весь запрос. Через ORM снимки истории убирает каскад связи
+    # Diagram.versions, а токены и предложения удаляем явно — иначе ORM лишь
+    # обнулит diagram_id и оставит строки-призраки.
+    for node in reversed(subtree):
+        for diagram in db.query(Diagram).filter(Diagram.folder_id == node.id).all():
+            if not delete_contents:
+                diagram.folder_id = None
+                continue
+            for token in db.query(ShareToken).filter(
+                ShareToken.diagram_id == diagram.id
+            ).all():
+                db.delete(token)
+            for proposal in db.query(Improvement).filter(
+                Improvement.diagram_id == diagram.id
+            ).all():
+                db.delete(proposal)
+            db.delete(diagram)
+        db.delete(node)
     db.commit()
     return {"status": "success"}
 

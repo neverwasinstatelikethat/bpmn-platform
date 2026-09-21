@@ -1,6 +1,6 @@
 """Хэширование паролей, выпуск JWT и схема OAuth2 для Swagger."""
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 import bcrypt
@@ -8,6 +8,7 @@ import jwt
 from fastapi.security import OAuth2PasswordBearer
 
 from app.config import ALGORITHM, SECRET_KEY
+from app.timeutils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +21,9 @@ def get_password_hash(password: str):
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = utc_now() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = utc_now() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt

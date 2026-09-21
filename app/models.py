@@ -1,13 +1,14 @@
 """ORM-модели предметной области — единое описание схемы для Alembic."""
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from sqlalchemy import (Boolean, Column, DateTime, ForeignKey, Integer, String,
                         Text, UniqueConstraint)
 from sqlalchemy.orm import relationship
 
 from app.db import Base
+from app.timeutils import utc_now
 
 class Team(Base):
     __tablename__ = "teams"
@@ -15,7 +16,7 @@ class Team(Base):
     name = Column(String(100))
     color = Column(String(7))
     owner_id = Column(Integer, ForeignKey("users.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     team_owner = relationship("User", back_populates="owned_teams")
     members = relationship("TeamMember", back_populates="team")
@@ -50,8 +51,8 @@ class Invitation(Base):
     email = Column(String(100))
     token = Column(String(100), unique=True, index=True, default=lambda: str(uuid.uuid4()))
     role_id = Column(String(36), ForeignKey("roles.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime, default=lambda: datetime.utcnow() + timedelta(days=7))
+    created_at = Column(DateTime, default=utc_now)
+    expires_at = Column(DateTime, default=lambda: utc_now() + timedelta(days=7))
     status = Column(String(20), default='pending')
 
     team = relationship("Team", back_populates="invitations")
@@ -83,8 +84,8 @@ class Diagram(Base):
     xml_content = Column(Text)
     score = Column(Integer, default=0)
     user_id = Column(Integer, ForeignKey("users.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     folder_id = Column(String(36), ForeignKey("folders.id"), nullable=True)
     team_id = Column(String(36), ForeignKey("teams.id"), nullable=True)
     # Номер последней записанной версии: по нему улучшение понимает, что схема
@@ -117,7 +118,7 @@ class DiagramVersion(Base):
     source = Column(String(32), nullable=False)
     author_id = Column(Integer, ForeignKey("users.id"))
     note = Column(String(200))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     diagram = relationship("Diagram", back_populates="versions")
     author = relationship("User")
@@ -127,7 +128,7 @@ class ShareToken(Base):
     id = Column(String(36), primary_key=True, index=True)
     token = Column(String(36), unique=True, index=True)
     diagram_id = Column(String(36), ForeignKey("diagrams.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     can_edit = Column(Boolean, default=False)
     expires_at = Column(DateTime)
     diagram = relationship("Diagram", back_populates="share_tokens")
@@ -139,7 +140,7 @@ class Folder(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     team_id = Column(String(36), ForeignKey("teams.id"), nullable=True)
     parent_id = Column(String(36), ForeignKey("folders.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     owner = relationship("User", back_populates="folders")
     team = relationship("Team", back_populates="folders")
     diagrams = relationship("Diagram", back_populates="folder")
@@ -152,7 +153,7 @@ class DeletedDiagram(Base):
     name = Column(String(100))
     xml_content = Column(Text)
     user_id = Column(Integer, ForeignKey("users.id"))
-    deleted_at = Column(DateTime, default=datetime.utcnow)
+    deleted_at = Column(DateTime, default=utc_now)
     owner = relationship("User", back_populates="deleted_diagrams")
 
 class Improvement(Base):
@@ -169,7 +170,7 @@ class Improvement(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     xml_content = Column(Text)
     recommendations = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     status = Column(String(20), nullable=False, default="pending")
     # Версия схемы, к которой применимо предложение (см. Diagram.version_seq).
     base_seq = Column(Integer)
@@ -184,6 +185,6 @@ class PasswordResetToken(Base):
     id = Column(String(36), primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
     email = Column(String(100), index=True)
     token = Column(String(100), unique=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime, default=lambda: datetime.utcnow() + timedelta(hours=1))
+    created_at = Column(DateTime, default=utc_now)
+    expires_at = Column(DateTime, default=lambda: utc_now() + timedelta(hours=1))
     used = Column(Boolean, default=False)

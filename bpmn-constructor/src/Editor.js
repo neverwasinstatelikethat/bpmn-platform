@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import BpmnModeler from 'bpmn-js/lib/Modeler';
-import { layoutProcess } from 'bpmn-auto-layout-feat-ivan-tulaev';
+import { layoutDiagram } from './bpmnLayout';
 import 'bpmn-js/dist/assets/diagram-js.css';
 import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
 import { apiClient, toUserMessage } from './api/client';
@@ -542,9 +542,9 @@ const Editor = () => {
                 if (participants.length > 0) {
                     console.log('Применение автоматической раскладки');
                     try {
-                        layoutedXML = await layoutProcess(initialXML);
+                        layoutedXML = await layoutDiagram(initialXML);
                     } catch (layoutErr) {
-                        console.warn('Ошибка layoutProcess, загружаем без раскладки:', layoutErr);
+                        console.warn('Ошибка раскладки, загружаем без координат:', layoutErr);
                         layoutedXML = initialXML;
                     }
                     if (cancelled) return;
@@ -610,12 +610,23 @@ const Editor = () => {
                 setCanvasBusy(true);
                 try {
                     if (modelerRef.current) modelerRef.current.clear();
-                    const layoutedXML = await layoutProcess(newBpmnXML);
+                    const layoutedXML = await layoutDiagram(newBpmnXML);
                     await modelerRef.current.importXML(layoutedXML);
                     setDiagramName(`Сгенерировано: ${prompt?.slice(0, 20) || 'Новая схема'}`);
+                    // Модель часто возвращает структуру, которую сервер чинит
+                    // детерминированно (перенос шага в другой пул, удалённый
+                    // поток, добавленное событие). Пользователь обязан видеть,
+                    // что схему поправили за него.
+                    const notes = response.data.notes || [];
                     setMessagesGenerate(prev => [
                         ...prev.slice(0, -1),
-                        { sender: 'AI', text: 'Диаграмма успешно сгенерирована.', id: Date.now() }
+                        {
+                            sender: 'AI',
+                            text: notes.length
+                                ? `Диаграмма сгенерирована. Исправлено автоматикой (${notes.length}): ${notes.slice(0, 3).join(' ')}`
+                                : 'Диаграмма успешно сгенерирована.',
+                            id: Date.now()
+                        }
                     ]);
                     setCurrentXml(layoutedXML);
                     setTimeout(() => {
@@ -641,7 +652,7 @@ const Editor = () => {
             const fixedXML = await fixXMLStructure(xml);
             let layoutedXML;
             try {
-                layoutedXML = await layoutProcess(fixedXML);
+                layoutedXML = await layoutDiagram(fixedXML);
             } catch (layoutError) {
                 console.warn('Layout failed, using original XML:', layoutError);
                 layoutedXML = fixedXML;
@@ -663,38 +674,6 @@ const Editor = () => {
                 text: `Проверка завершена. Оценка: ${response.data.score}/100. ${response.data.recommendations?.join(' ') || ''}`,
                 id: Date.now()
             }]);
-            if (modelerRef.current && response.data.optimized_bpmn) {
-                console.log('Применение оптимизированной диаграммы');
-                setCanvasBusy(true);
-                try {
-                    modelerRef.current.clear();
-                    const fixedOptimizedXML = await fixXMLStructure(response.data.optimized_bpmn);
-                    let optimizedLayoutedXML;
-                    try {
-                        optimizedLayoutedXML = await layoutProcess(fixedOptimizedXML);
-                    } catch (layoutError) {
-                        console.warn('Optimized layout failed, using fixed XML:', layoutError);
-                        optimizedLayoutedXML = fixedOptimizedXML;
-                    }
-                    await modelerRef.current.importXML(optimizedLayoutedXML);
-                    setCurrentXml(optimizedLayoutedXML);
-                    // Увеличиваем задержку после оптимизации
-                    setTimeout(() => {
-                        if (modelerRef.current) {
-                            autoFitDiagram();
-                        }
-                    }, 800);
-                } catch (importError) {
-                    console.warn('Failed to import optimized XML:', importError);
-                    await modelerRef.current.importXML(layoutedXML);
-                    setCurrentXml(layoutedXML);
-                    setTimeout(() => {
-                        autoFitDiagram();
-                    }, 800);
-                } finally {
-                    setCanvasBusy(false);
-                }
-            }
         } catch (err) {
             console.error('Ошибка проверки:', err);
             const message = `Ошибка проверки: ${err.message}`;
@@ -869,7 +848,7 @@ const Editor = () => {
             const fixedXML = await fixXMLStructure(response.data.xml_content);
             let layoutedXML;
             try {
-                layoutedXML = await layoutProcess(fixedXML);
+                layoutedXML = await layoutDiagram(fixedXML);
             } catch (layoutError) {
                 console.warn('Layout failed for accepted improvement, using fixed XML:', layoutError);
                 layoutedXML = fixedXML;
@@ -888,8 +867,16 @@ const Editor = () => {
                     });
                     setCurrentXml(layoutedXML);
                     setDiagramId(response.data.diagram_id);
+                    // Балл пересчитывает backend по уже принятому XML: без этого
+                    // панель остаётся с оценкой прежней схемы.
+                    setScore(response.data.score);
+                    const dropped = response.data.score_before != null
+                        && response.data.score < response.data.score_before;
                     setMessagesImprove(prev => [...prev,
-                    { sender: 'AI', text: 'Изменения успешно применены.', id: Date.now() }
+                    { sender: 'AI', text: 'Изменения успешно применены.'
+                        + (dropped ? ` Оценка схемы снизилась: ${response.data.score_before} → ${response.data.score}.` : ''),
+                        id: Date.now()
+                    }
                     ]);
                     // Центрируем после принятия улучшения
                     setTimeout(() => {
@@ -909,6 +896,11 @@ const Editor = () => {
 
     const handleSave = async () => {
         console.log('Сохранение диаграммы');
+        if (!diagramName.trim()) {
+            // Пустое имя отвергнет бэкенд (422); предупреждаем до запроса.
+            showNotification('Назовите схему перед сохранением.');
+            return;
+        }
         try {
             const { xml } = await modelerRef.current.saveXML({ format: true });
             const urlParams = new URLSearchParams(location.search);
@@ -1089,6 +1081,7 @@ const Editor = () => {
                     <Input
                         type="text"
                         value={diagramName}
+                        maxLength={100}
                         onChange={(e) => setDiagramName(e.target.value)}
                         className="editor-diagram-name-input"
                         placeholder="Название схемы"
@@ -1368,6 +1361,7 @@ const Editor = () => {
                         score={score}
                         recommendations={validationResult?.recommendations || []}
                         errors={validationResult?.details || {}}
+                        detailsMeta={validationResult?.details_meta || {}}
                         onClose={() => setShowScorePanel(false)}
                         busy={scoreBusy}
                         isExpanded={scoreExpanded}

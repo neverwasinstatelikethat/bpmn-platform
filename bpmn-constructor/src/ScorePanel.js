@@ -8,6 +8,7 @@ const ScorePanel = memo(({
     score = 0,
     recommendations = [],
     errors = {},
+    detailsMeta = {},
     onClose,
     isExpanded,
     onToggleExpand,
@@ -33,20 +34,21 @@ const ScorePanel = memo(({
         return 'Требует доработки';
     };
 
-    const errorMessages = {
-        'start_event': 'Количество стартовых событий не соответствует числу участников',
-        'end_event': 'Отсутствует конечное событие',
-        'gateway_conditions': 'Эксклюзивные шлюзы без условий на выходах',
-        'sequence_flows': 'Элементы не связаны последовательностями',
-        'direction': 'Некорректное направление процесса',
-        'naming': 'Элементы без осмысленных названий',
-        'no_loops': 'Обнаружены бесконечные циклы',
-        'element_count': 'Слишком много элементов в схеме',
-        'no_isolated': 'Обнаружены изолированные элементы',
-        'task_types': 'Недостаточное разнообразие типов задач',
-        'pool_lanes': 'Отсутствуют или некорректно используются пулы и дорожки',
-        'event_types': 'Отсутствуют промежуточные события',
-        'documentation': 'Недостаточно документации у элементов'
+    // Ключи совпадают с core/bpmn_scoring.py: расхождение молча убирает
+    // проверенное правило из панели.
+    const ruleMessages = {
+        'start_event': { title: 'Стартовых событий не по числу участников', fix: 'Добавьте стартовое событие в каждый пул.' },
+        'end_event': { title: 'Нет конечного события', fix: 'Добавьте событие завершения в каждый процесс.' },
+        'gateway_conditions': { title: 'Эксклюзивные шлюзы без условий на выходах', fix: 'Опишите условие на каждой ветке шлюза и добавьте вторую ветку — одна необусловленная ветка не считается развилкой.' },
+        'sequence_flows': { title: 'Есть несвязанные задачи', fix: 'Соедините задачи последовательными потоками: у шага должны быть вход и выход.' },
+        'naming': { title: 'Элементы без осмысленных названий', fix: 'Называйте шаг глаголом: «Согласовать заявку», а не «Task 3».' },
+        'guarded_cycles': { title: 'Цикл без защищённого выхода', fix: 'Поставьте на пути цикла исключительный шлюз — одна ветка должна завершать повтор.' },
+        'element_count': { title: 'В схеме больше 50 элементов', fix: 'Вынесите фрагменты в подпроцессы или разбейте схему.' },
+        'no_isolated': { title: 'Есть изолированные элементы и тупики', fix: 'У каждого шага должны быть входящий и исходящий поток; у старта — только исходящий, у финала — только входящий.' },
+        'task_types': { title: 'Все шаги одного типа', fix: 'Различайте типовые шаги: пользовательские для людей, сервисные — для систем.' },
+        'pool_lanes': { title: 'Нет дорожек с закреплёнными шагами', fix: 'Добавьте дорожки по ролям внутри пула и распределите по ним шаги.' },
+        'event_types': { title: 'Нет промежуточных событий с типом', fix: 'Отметьте сроки и сигналы таймером, ошибки — граничным событием.' },
+        'documentation': { title: 'Мало документации у элементов', fix: 'Дополните ключевые шаги описанием: вход, выход, ответственный.' },
     };
 
     useEffect(() => {
@@ -58,8 +60,14 @@ const ScorePanel = memo(({
     const scoreColor = getScoreColor(value);
     const errorEntries = Object.entries(errors || {})
         .filter(([, isCorrect]) => !isCorrect)
-        .map(([key]) => ({ key, message: errorMessages[key] }))
-        .filter((entry) => entry.message);
+        .map(([key]) => ruleMessages[key] && ({
+            key,
+            title: ruleMessages[key].title,
+            fix: ruleMessages[key].fix,
+            weight: detailsMeta[key]?.weight,
+            elements: (detailsMeta[key]?.elements || []).slice(0, 6),
+        }))
+        .filter(Boolean);
     const hasContent = value > 0
         || (recommendations?.length || 0) > 0
         || errorEntries.length > 0;
@@ -174,16 +182,18 @@ const ScorePanel = memo(({
                                             >
                                                 <div className="error-icon">!</div>
                                                 <div>
-                                                    <div className="error-title">{entry.message}</div>
-                                                    <div className="error-solution">
-                                                        Как исправить: {entry.message
-                                                            .replace('Отсутствует', 'Добавьте')
-                                                            .replace('без', 'с указанием')
-                                                            .replace('Недостаточно', 'Добавьте больше')
-                                                            .replace('Недостаточное', 'Увеличьте')
-                                                            .replace('Обнаружены', 'Удалите')
-                                                            .replace('не соответствует числу участников', 'согласуйте с количеством участников')}
+                                                    <div className="error-title">
+                                                        {entry.title}
+                                                        {entry.weight ? ` −${entry.weight}` : ''}
                                                     </div>
+                                                    <div className="error-solution">
+                                                        Как исправить: {entry.fix}
+                                                    </div>
+                                                    {entry.elements.length > 0 && (
+                                                        <div className="error-elements">
+                                                            Элементы: {entry.elements.join(', ')}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             </motion.li>
                                         ))}

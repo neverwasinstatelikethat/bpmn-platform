@@ -93,6 +93,7 @@
 .recommendation-icon { background: var(--color-success-soft); color: var(--color-primary-active); }
 .error-title { color: var(--color-ink); font-weight: 600; }
 .error-solution { margin-top: 3px; color: var(--color-muted); }
+.error-elements { margin-top: var(--space-xxs); color: var(--color-muted); font-size: var(--text-xs); word-break: break-word; }
 .score-footer { margin-top: var(--space-xl); }
 .score-progress { height: 6px; overflow: hidden; border-radius: var(--radius-pill); background: var(--score-track); }
 .progress-bar { height: 100%; border-radius: inherit; }

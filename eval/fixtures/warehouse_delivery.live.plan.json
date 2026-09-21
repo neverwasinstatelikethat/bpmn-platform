@@ -1,0 +1,51 @@
+{
+ "id": "warehouse_delivery.live.plan",
+ "kind": "plan",
+ "scenario": "warehouse_delivery",
+ "label": "дословный ответ модели из живого прогона 21.09.2026",
+ "quality": "real",
+ "source": "reports/warehouse-delivery/run.json + reports/warehouse-delivery/process.bpmn",
+ "provenance": "В отчёте прогона сохранены итоговая схема и пометки починки, а не сырой план модели. План восстановлен по ним: те же id, типы и названия элементов, пустые пулы ролей, не указанные у A5 и A11 участники, шлюз A5 с единственной веткой, отсутствие определения у A11 и все двенадцать потоков kind=sequence. Сверка — по итоговой схеме process.bpmn: 27 узлов, 5 messageFlow и те же правки структуры.",
+ "plan": {
+  "participants": ["Склад", "WMS", "Комплектатор", "Кладовщик", "Контролёр качества", "Служба логистики", "Перевозчик", "Экспедитор"],
+  "lanes": [
+   {"id": "L1", "name": "Оператор склада", "participant": "Склад"},
+   {"id": "L2", "name": "Система WMS", "participant": "WMS"},
+   {"id": "L3", "name": "Комплектатор", "participant": "Комплектатор"},
+   {"id": "L4", "name": "Кладовщик", "participant": "Склад"},
+   {"id": "L5", "name": "Контролёр качества", "participant": "Склад"},
+   {"id": "L6", "name": "Служба логистики", "participant": "Склад"},
+   {"id": "L7", "name": "Водитель", "participant": "Перевозчик"},
+   {"id": "L8", "name": "Экспедитор", "participant": "Склад"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Формирование заявки оператором склада", "participant": "Склад", "lane": "L1"},
+   {"id": "A1", "kind": "serviceTask", "name": "Бронирование паллеты и проверка остатков в WMS", "participant": "WMS", "lane": "L2"},
+   {"id": "A2", "kind": "userTask", "name": "Сборка частичной отгрузки комплектатором", "participant": "Комплектатор", "lane": "L3"},
+   {"id": "A3", "kind": "userTask", "name": "Сборка груза кладовщиком", "participant": "Склад", "lane": "L4"},
+   {"id": "A4", "kind": "userTask", "name": "Проверка целостности упаковки и пломб контролёром качества", "participant": "Склад", "lane": "L5"},
+   {"id": "A5", "kind": "exclusiveGateway", "name": "Условие прохождения проверки", "lane": "L5"},
+   {"id": "A6", "kind": "userTask", "name": "Пересборка груза", "participant": "Склад", "lane": "L5"},
+   {"id": "A7", "kind": "userTask", "name": "Заказ транспорта службой логистики", "participant": "Склад", "lane": "L6"},
+   {"id": "A8", "kind": "sendTask", "name": "Получение путевого листа водителем", "participant": "Перевозчик", "lane": "L7"},
+   {"id": "A9", "kind": "scriptTask", "name": "Забор груза водителем", "participant": "Перевозчик", "lane": "L7"},
+   {"id": "A10", "kind": "receiveTask", "name": "Фиксация подписи экспедитором", "participant": "Склад", "lane": "L8"},
+   {"id": "A11", "kind": "intermediateCatchEvent", "name": "Отсутствие подписи получателя", "lane": "L8"},
+   {"id": "A12", "kind": "endEvent", "name": "Закрытие заявки в WMS", "participant": "Склад", "lane": "L8"}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "A2", "target": "A3", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "A3", "target": "A4", "kind": "sequence", "condition": ""},
+   {"id": "F5", "source": "A4", "target": "A5", "kind": "sequence", "condition": "прошла проверка"},
+   {"id": "F6", "source": "A4", "target": "A6", "kind": "sequence", "condition": "не прошла проверка"},
+   {"id": "F7", "source": "A5", "target": "A7", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A7", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "A8", "target": "A9", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "A9", "target": "A10", "kind": "sequence", "condition": ""},
+   {"id": "F11", "source": "A10", "target": "A11", "kind": "sequence", "condition": "нет подписи получателя"},
+   {"id": "F12", "source": "A11", "target": "A12", "kind": "sequence", "condition": ""}
+  ]
+ }
+}

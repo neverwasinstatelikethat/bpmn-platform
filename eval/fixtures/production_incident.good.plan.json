@@ -1,0 +1,58 @@
+{
+ "id": "production_incident.good.plan",
+ "kind": "plan",
+ "scenario": "production_incident",
+ "label": "эталон: дежурство с таймером эскалации и внешней командой шлюза",
+ "quality": "good",
+ "plan": {
+  "participants": ["ВкусВилл", "Система мониторинга", "Платёжный шлюз"],
+  "lanes": [
+   {"id": "L_dev", "name": "Дежурный инженер", "participant": "ВкусВилл"},
+   {"id": "L_sre", "name": "Дежурный инженер SRE", "participant": "ВкусВилл"},
+   {"id": "L_lead", "name": "Руководитель дежурства", "participant": "ВкусВилл"},
+   {"id": "L_desk", "name": "Сервис-деск", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Инцидент зарегистрирован", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A1", "kind": "userTask", "name": "Классифицировать тяжесть инцидента", "participant": "ВкусВилл", "lane": "L_dev", "documentation": "По матрице тяжести: потеря оплаты, деградация, косметика"},
+   {"id": "T1", "kind": "boundaryEvent", "name": "Прошло 15 минут", "participant": "ВкусВилл", "lane": "L_dev", "attached_to": "A1", "event_definition": "timer", "timer": "PT15M"},
+   {"id": "A2", "kind": "userTask", "name": "Эскалировать руководителю дежурства", "participant": "ВкусВилл", "lane": "L_lead"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Затронут приём оплаты?", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A3", "kind": "userTask", "name": "Согласовать действия с внешней командой", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A4", "kind": "userTask", "name": "Откатить релиз", "participant": "ВкусВилл", "lane": "L_sre"},
+   {"id": "G2", "kind": "exclusiveGateway", "name": "Сервис восстановлен?", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A5", "kind": "userTask", "name": "Применить обходное решение", "participant": "ВкусВилл", "lane": "L_sre"},
+   {"id": "A6", "kind": "userTask", "name": "Проверить сторону платёжного шлюза", "participant": "Платёжный шлюз", "lane": ""},
+   {"id": "A7", "kind": "userTask", "name": "Информировать подразделения", "participant": "ВкусВилл", "lane": "L_desk"},
+   {"id": "A8", "kind": "userTask", "name": "Провести разбор с корневыми причинами", "participant": "ВкусВилл", "lane": "L_dev", "documentation": "Постмортем заводится задачей в бэклоге в течение суток"},
+   {"id": "E1", "kind": "endEvent", "name": "Инцидент закрыт", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "S2", "kind": "startEvent", "name": "Алерт сработал", "participant": "Система мониторинга", "lane": ""},
+   {"id": "C1", "kind": "serviceTask", "name": "Создать инцидент в трекере", "participant": "Система мониторинга", "lane": ""},
+   {"id": "C2", "kind": "endEvent", "name": "Инцидент открыт", "participant": "Система мониторинга", "lane": ""},
+   {"id": "S3", "kind": "startEvent", "name": "Запрос от дежурного поступил", "participant": "Платёжный шлюз", "lane": ""},
+   {"id": "E2", "kind": "endEvent", "name": "Заключение передано", "participant": "Платёжный шлюз", "lane": ""}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "T1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "G1", "target": "A3", "kind": "sequence", "condition": "затронут приём оплаты"},
+   {"id": "F5", "source": "G1", "target": "A4", "kind": "sequence", "condition": "деградация без потери данных"},
+   {"id": "F6", "source": "A3", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "A4", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A2", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "G2", "target": "A5", "kind": "sequence", "condition": "нужен обход"},
+   {"id": "F10", "source": "G2", "target": "A7", "kind": "sequence", "condition": "сервис восстановлен"},
+   {"id": "F11", "source": "A5", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F12", "source": "A7", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F13", "source": "A8", "target": "E1", "kind": "sequence", "condition": ""},
+   {"id": "F14", "source": "S2", "target": "C1", "kind": "sequence", "condition": ""},
+   {"id": "F15", "source": "C1", "target": "C2", "kind": "sequence", "condition": ""},
+   {"id": "F16", "source": "S3", "target": "A6", "kind": "sequence", "condition": ""},
+   {"id": "F17", "source": "A6", "target": "E2", "kind": "sequence", "condition": ""},
+   {"id": "MSG1", "source": "C1", "target": "S1", "kind": "message", "condition": "алерт инцидента"},
+   {"id": "MSG2", "source": "A3", "target": "S3", "kind": "message", "condition": "запрос проверки шлюза"},
+   {"id": "MSG3", "source": "A6", "target": "A7", "kind": "message", "condition": "заключение по стороне шлюза"}
+  ]
+ }
+}

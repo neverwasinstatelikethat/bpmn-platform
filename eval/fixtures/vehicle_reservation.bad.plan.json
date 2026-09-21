@@ -1,0 +1,55 @@
+{
+ "id": "vehicle_reservation.bad.plan",
+ "kind": "plan",
+ "scenario": "vehicle_reservation",
+ "label": "таймер ожидания забыт, ветки без условий, граничное событие не обработано",
+ "quality": "bad",
+ "provenance": "Комбинация дефектов, которые живой контур показывает чаще всего: развилка без condition на обеих ветках и без схождения, ожидание ответа перевозчика оформлено «задачей-ожиданием» без таймера, граничное событие пристегнуто к шлюзу и без ветки обработки, шаг службы логистики остался вне маршрута.",
+ "plan": {
+  "participants": ["ВкусВилл", "Перевозчик", "Клиент"],
+  "lanes": [
+   {"id": "L_disp", "name": "Диспетчер", "participant": "ВкусВилл"},
+   {"id": "L_log", "name": "Логист парка", "participant": "ВкусВилл"},
+   {"id": "L_store", "name": "Кладовщик", "participant": "ВкусВилл"},
+   {"id": "L_acc", "name": "Бухгалтерия", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Заявка на перевозку", "participant": "ВкусВилл", "lane": "L_disp"},
+   {"id": "A1", "kind": "userTask", "name": "Проверить наличие машины в парке", "participant": "ВкусВилл", "lane": "L_disp"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Свободный транспорт есть?", "participant": "ВкусВилл", "lane": "L_disp"},
+   {"id": "A2", "kind": "userTask", "name": "Зарезервировать автомобиль", "participant": "ВкусВилл", "lane": "L_log"},
+   {"id": "A3", "kind": "userTask", "name": "Запросить машину у перевозчика", "participant": "ВкусВилл", "lane": "L_disp"},
+   {"id": "A4", "kind": "intermediateThrowEvent", "name": "Ожидание подтверждения", "participant": "ВкусВилл", "lane": "L_disp"},
+   {"id": "T1", "kind": "boundaryEvent", "name": "Просрочка подтверждения", "participant": "ВкусВилл", "lane": "L_disp", "attached_to": "G1"},
+   {"id": "A5", "kind": "userTask", "name": "Оформить путевой лист", "participant": "ВкусВилл", "lane": "L_log"},
+   {"id": "A6", "kind": "userTask", "name": "Сверить документы рейса", "participant": "ВкусВилл", "lane": "L_acc"},
+   {"id": "A7", "kind": "userTask", "name": "Передать документы в бухгалтерию", "participant": "ВкусВилл", "lane": "L_acc"},
+   {"id": "A8", "kind": "userTask", "name": "Оформить отгрузочные документы", "participant": "ВкусВилл", "lane": "L_store"},
+   {"id": "E1", "kind": "endEvent", "name": "Рейс закрыт", "participant": "ВкусВилл", "lane": "L_disp"},
+   {"id": "S2", "kind": "startEvent", "name": "Заявка получена", "participant": "Перевозчик", "lane": ""},
+   {"id": "R1", "kind": "userTask", "name": "Подтвердить машину", "participant": "Перевозчик", "lane": ""},
+   {"id": "R2", "kind": "endEvent", "name": "Машина подтверждена", "participant": "Перевозчик", "lane": ""},
+   {"id": "S3", "kind": "startEvent", "name": "Дата погрузки согласована", "participant": "Клиент", "lane": ""},
+   {"id": "C1", "kind": "userTask", "name": "Подписать накладную", "participant": "Клиент", "lane": ""},
+   {"id": "C2", "kind": "endEvent", "name": "Груз принят", "participant": "Клиент", "lane": ""}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "G1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "G1", "target": "A3", "kind": "sequence", "condition": ""},
+   {"id": "F5", "source": "A2", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F6", "source": "A3", "target": "A4", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "A4", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A5", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "A8", "target": "E1", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "S2", "target": "R1", "kind": "sequence", "condition": ""},
+   {"id": "F11", "source": "R1", "target": "R2", "kind": "sequence", "condition": ""},
+   {"id": "F12", "source": "S3", "target": "C1", "kind": "sequence", "condition": ""},
+   {"id": "F13", "source": "C1", "target": "C2", "kind": "sequence", "condition": ""},
+   {"id": "M1", "source": "A3", "target": "R1", "kind": "message", "condition": "запрос на машину"},
+   {"id": "M2", "source": "R1", "target": "A4", "kind": "message", "condition": "подтверждение"},
+   {"id": "M3", "source": "A8", "target": "C1", "kind": "message", "condition": "прибытие на погрузку"}
+  ]
+ }
+}

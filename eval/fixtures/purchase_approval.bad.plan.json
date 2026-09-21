@@ -1,0 +1,40 @@
+{
+ "id": "purchase_approval.bad.plan",
+ "kind": "plan",
+ "scenario": "purchase_approval",
+ "label": "типовые болячки модели: роли-пулы, пустые пулы, развилка без условий и без схождения",
+ "quality": "bad",
+ "provenance": "Набрана вручную по мотивам живых прогонов: второй и третий пулы — сотрудники, которых модель объявила участниками; шлюз без condition на обеих ветках и без схождения; шаг, брошенный вне маршрута.",
+ "plan": {
+  "participants": ["ВкусВилл", "Инициатор", "Бухгалтерия", "Поставщик"],
+  "lanes": [
+   {"id": "L_buy", "name": "Менеджер закупочного отдела", "participant": "ВкусВилл"},
+   {"id": "L_store", "name": "Кладовщик", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Потребность в закупке", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A1", "kind": "userTask", "name": "Завести заявку", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A2", "kind": "userTask", "name": "Проверить комплектность", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A3", "kind": "serviceTask", "name": "Сравнить цены с договорами", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Согласование", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A4", "kind": "userTask", "name": "Согласовать с руководителем", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A5", "kind": "userTask", "name": "Согласовать с финансовым директором", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A6", "kind": "userTask", "name": "Оформить контракт", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A7", "kind": "manualTask", "name": "Архивировать заявку", "participant": "ВкусВилл", "lane": "L_store"},
+   {"id": "A8", "kind": "userTask", "name": "Приемлить товар", "participant": "ВкусВилл", "lane": "L_store"},
+   {"id": "E1", "kind": "endEvent", "name": "Закупка закрыта", "participant": "ВкусВилл", "lane": "L_store"}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "A2", "target": "A3", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "A3", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F5", "source": "G1", "target": "A4", "kind": "sequence", "condition": ""},
+   {"id": "F6", "source": "G1", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "A4", "target": "A6", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A5", "target": "A6", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "A6", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "A8", "target": "E1", "kind": "sequence", "condition": ""}
+  ]
+ }
+}

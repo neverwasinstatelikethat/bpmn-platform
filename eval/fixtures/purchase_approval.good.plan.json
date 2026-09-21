@@ -1,0 +1,58 @@
+{
+ "id": "purchase_approval.good.plan",
+ "kind": "plan",
+ "scenario": "purchase_approval",
+ "label": "эталон: роли — дорожки, трёхступенчатое согласование со схождениями",
+ "quality": "good",
+ "plan": {
+  "participants": ["ВкусВилл", "Поставщик"],
+  "lanes": [
+   {"id": "L_init", "name": "Инициатор", "participant": "ВкусВилл"},
+   {"id": "L_buy", "name": "Менеджер закупочного отдела", "participant": "ВкусВилл"},
+   {"id": "L_head", "name": "Руководитель направления", "participant": "ВкусВилл"},
+   {"id": "L_fin", "name": "Финансовый директор", "participant": "ВкусВилл"},
+   {"id": "L_ctl", "name": "Бюджетный контролёр", "participant": "ВкусВилл"},
+   {"id": "L_store", "name": "Кладовщик", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Потребность в закупке", "participant": "ВкусВилл", "lane": "L_init"},
+   {"id": "A1", "kind": "userTask", "name": "Завести заявку с обоснованием", "participant": "ВкусВилл", "lane": "L_init"},
+   {"id": "A2", "kind": "userTask", "name": "Проверить комплектность и цены", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Сумма до 100 000 рублей?", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A3", "kind": "userTask", "name": "Согласовать с руководителем направления", "participant": "ВкусВилл", "lane": "L_head"},
+   {"id": "G2", "kind": "exclusiveGateway", "name": "Сумма свыше 500 000 рублей?", "participant": "ВкусВилл", "lane": "L_head"},
+   {"id": "A4", "kind": "userTask", "name": "Согласовать с финансовым директором", "participant": "ВкусВилл", "lane": "L_fin"},
+   {"id": "A5", "kind": "userTask", "name": "Сверить расход со сметой", "participant": "ВкусВилл", "lane": "L_ctl"},
+   {"id": "G3", "kind": "exclusiveGateway", "name": "Лимит сметы не превышен?", "participant": "ВкусВилл", "lane": "L_ctl"},
+   {"id": "A6", "kind": "userTask", "name": "Вернуть заявку инициатору", "participant": "ВкусВилл", "lane": "L_init"},
+   {"id": "A7", "kind": "userTask", "name": "Оформить контракт", "participant": "ВкусВилл", "lane": "L_buy"},
+   {"id": "A8", "kind": "userTask", "name": "Приемлить товар по накладной", "participant": "ВкусВилл", "lane": "L_store"},
+   {"id": "E1", "kind": "endEvent", "name": "Закупка закрыта", "participant": "ВкусВилл", "lane": "L_store"},
+   {"id": "E2", "kind": "endEvent", "name": "Заявка отклонена", "participant": "ВкусВилл", "lane": "L_init"},
+   {"id": "S2", "kind": "startEvent", "name": "Контракт получен", "participant": "Поставщик", "lane": ""},
+   {"id": "B1", "kind": "userTask", "name": "Подтвердить отгрузку", "participant": "Поставщик", "lane": ""},
+   {"id": "B2", "kind": "endEvent", "name": "Товар отгружен", "participant": "Поставщик", "lane": ""}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "A2", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "G1", "target": "A3", "kind": "sequence", "condition": "свыше 100 000 рублей"},
+   {"id": "F5", "source": "G1", "target": "A5", "kind": "sequence", "condition": "до 100 000 рублей"},
+   {"id": "F6", "source": "A3", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "G2", "target": "A4", "kind": "sequence", "condition": "свыше 500 000 рублей"},
+   {"id": "F8", "source": "G2", "target": "A5", "kind": "sequence", "condition": "не выше 500 000 рублей"},
+   {"id": "F9", "source": "A4", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "A5", "target": "G3", "kind": "sequence", "condition": ""},
+   {"id": "F11", "source": "G3", "target": "A7", "kind": "sequence", "condition": "в лимите сметы"},
+   {"id": "F12", "source": "G3", "target": "A6", "kind": "sequence", "condition": "лимит превышен"},
+   {"id": "F13", "source": "A6", "target": "E2", "kind": "sequence", "condition": ""},
+   {"id": "F14", "source": "A7", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F15", "source": "A8", "target": "E1", "kind": "sequence", "condition": ""},
+   {"id": "F16", "source": "S2", "target": "B1", "kind": "sequence", "condition": ""},
+   {"id": "F17", "source": "B1", "target": "B2", "kind": "sequence", "condition": ""},
+   {"id": "M1", "source": "A7", "target": "B1", "kind": "message", "condition": "контракт на поставку"},
+   {"id": "M2", "source": "B1", "target": "A8", "kind": "message", "condition": "подтверждение отгрузки"}
+  ]
+ }
+}

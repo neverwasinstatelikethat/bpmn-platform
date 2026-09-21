@@ -1,0 +1,19 @@
+{
+ "id": "production_incident.good.improve",
+ "kind": "improve",
+ "scenario": "production_incident",
+ "base_plan": "production_incident.good.plan",
+ "label": "чистый пакет: документация, таймер постмортема и ветка внепланового сообщения",
+ "quality": "good",
+ "provenance": "Написан вручную как «хороший» ориентир для улучшения: каждая операция опирается на id из инвентаря, новый шаг связан с двух сторон, новых пулов нет. Харнесс обязан посчитать долю применённых операций равной 1, дельту балла — неотрицательной и не потребовать корректирующего повтора.",
+ "prompt": "Добавь контроль срока разбора постмортема (два часа) с веткой внепланового сообщения подразделениям и описание к шагам, где есть ветвление.",
+ "operations": [
+  {"op": "add_documentation", "id": "A1", "text": "Тяжесть по матрице: потеря оплаты — критичный, деградация — значимый."},
+  {"op": "add_documentation", "id": "G1", "text": "Ветка «да» обязывает подключить внешнюю команду платёжного шлюза."},
+  {"op": "add_documentation", "id": "A8", "text": "Постмортем заводится задачей в бэклоге в течение суток."},
+  {"op": "add_boundary_event", "id": "new_timer_postmortem", "name": "Прошло 2 часа разбора", "attached_to": "A8", "event_type": "timer", "duration": "PT2H"},
+  {"op": "add_task", "id": "new_report_task", "name": "Подготовить внеплановое сообщение", "task_type": "userTask", "participant": "ВкусВилл"},
+  {"op": "connect", "source": "new_timer_postmortem", "target": "new_report_task", "flow_type": "sequence"},
+  {"op": "connect", "source": "new_report_task", "target": "A7", "flow_type": "sequence"}
+ ]
+}

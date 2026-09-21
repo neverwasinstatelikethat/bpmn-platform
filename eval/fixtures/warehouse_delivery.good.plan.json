@@ -1,0 +1,61 @@
+{
+ "id": "warehouse_delivery.good.plan",
+ "kind": "plan",
+ "scenario": "warehouse_delivery",
+ "label": "эталон: роли — дорожки одного пула, развилки со схождением",
+ "quality": "good",
+ "provenance": "Написана вручную как ориентир: то, что должен выдавать контур после правок промпта и починки. Обязана проходить все заявленные инварианты.",
+ "plan": {
+  "participants": ["ВкусВилл", "Перевозчик"],
+  "lanes": [
+   {"id": "L_op", "name": "Оператор склада", "participant": "ВкусВилл"},
+   {"id": "L_wms", "name": "Система WMS", "participant": "ВкусВилл"},
+   {"id": "L_pick", "name": "Комплектатор", "participant": "ВкусВилл"},
+   {"id": "L_store", "name": "Кладовщик", "participant": "ВкусВилл"},
+   {"id": "L_qc", "name": "Контролёр качества", "participant": "ВкусВилл"},
+   {"id": "L_log", "name": "Служба логистики", "participant": "ВкусВилл"},
+   {"id": "L_exp", "name": "Экспедитор", "participant": "ВкусВилл"},
+   {"id": "L_drv", "name": "Водитель", "participant": "Перевозчик"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Поступила заявка на отгрузку", "participant": "ВкусВилл", "lane": "L_op"},
+   {"id": "A1", "kind": "userTask", "name": "Сформировать заявку в WMS", "participant": "ВкусВилл", "lane": "L_op"},
+   {"id": "A2", "kind": "serviceTask", "name": "Забронировать паллету и проверить остатки", "participant": "ВкусВилл", "lane": "L_wms"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Товара хватает?", "participant": "ВкусВилл", "lane": "L_wms"},
+   {"id": "A3", "kind": "userTask", "name": "Собрать частичную отгрузку", "participant": "ВкусВилл", "lane": "L_pick"},
+   {"id": "A4", "kind": "userTask", "name": "Собрать груз", "participant": "ВкусВилл", "lane": "L_store"},
+   {"id": "A5", "kind": "userTask", "name": "Проверить целостность упаковки и пломбы", "participant": "ВкусВилл", "lane": "L_qc"},
+   {"id": "G2", "kind": "exclusiveGateway", "name": "Проверка пройдена?", "participant": "ВкусВилл", "lane": "L_qc"},
+   {"id": "A6", "kind": "userTask", "name": "Пересобрать груз", "participant": "ВкусВилл", "lane": "L_store"},
+   {"id": "A7", "kind": "userTask", "name": "Заказать транспорт у перевозчика", "participant": "ВкусВилл", "lane": "L_log"},
+   {"id": "A8", "kind": "receiveTask", "name": "Зафиксировать подпись получателя", "participant": "ВкусВилл", "lane": "L_exp"},
+   {"id": "A9", "kind": "userTask", "name": "Закрыть заявку в WMS", "participant": "ВкусВилл", "lane": "L_op"},
+   {"id": "E1", "kind": "endEvent", "name": "Груз отгружен", "participant": "ВкусВилл", "lane": "L_op"},
+   {"id": "S2", "kind": "startEvent", "name": "Заявка на перевозку получена", "participant": "Перевозчик", "lane": "L_drv"},
+   {"id": "B1", "kind": "userTask", "name": "Получить путевой и маршрутный лист", "participant": "Перевозчик", "lane": "L_drv"},
+   {"id": "B2", "kind": "userTask", "name": "Забрать груз и доставить получателю", "participant": "Перевозчик", "lane": "L_drv"},
+   {"id": "E2", "kind": "endEvent", "name": "Груз доставлен", "participant": "Перевозчик", "lane": "L_drv"}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "A2", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "G1", "target": "A3", "kind": "sequence", "condition": "товара не хватает"},
+   {"id": "F5", "source": "G1", "target": "A4", "kind": "sequence", "condition": "товара достаточно"},
+   {"id": "F6", "source": "A3", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "A4", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A5", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "G2", "target": "A7", "kind": "sequence", "condition": "упаковка и пломбы целы"},
+   {"id": "F10", "source": "G2", "target": "A6", "kind": "sequence", "condition": "проверка не пройдена"},
+   {"id": "F11", "source": "A6", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F12", "source": "A7", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F13", "source": "A8", "target": "A9", "kind": "sequence", "condition": ""},
+   {"id": "F14", "source": "A9", "target": "E1", "kind": "sequence", "condition": ""},
+   {"id": "F15", "source": "S2", "target": "B1", "kind": "sequence", "condition": ""},
+   {"id": "F16", "source": "B1", "target": "B2", "kind": "sequence", "condition": ""},
+   {"id": "F17", "source": "B2", "target": "E2", "kind": "sequence", "condition": ""},
+   {"id": "M1", "source": "A7", "target": "B1", "kind": "message", "condition": "заявка на транспорт"},
+   {"id": "M2", "source": "B2", "target": "A8", "kind": "message", "condition": "подпись получателя"}
+  ]
+ }
+}

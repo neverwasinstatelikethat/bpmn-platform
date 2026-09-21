@@ -1,0 +1,62 @@
+{
+ "id": "support_ticket.good.plan",
+ "kind": "plan",
+ "scenario": "support_ticket",
+ "label": "эталон: классификация, параллельная рекламация и анкета внешней системы опросов",
+ "quality": "good",
+ "plan": {
+  "participants": ["ВкусВилл", "Система опросов", "Клиент"],
+  "lanes": [
+   {"id": "L1", "name": "Оператор первой линии поддержки", "participant": "ВкусВилл"},
+   {"id": "L2", "name": "Специалист второй линии", "participant": "ВкусВилл"},
+   {"id": "L3", "name": "Бухгалтерия", "participant": "ВкусВилл"},
+   {"id": "L4", "name": "Отдел качества", "participant": "ВкусВилл"},
+   {"id": "L5", "name": "Руководитель поддержки", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Обращение создано", "participant": "ВкусВилл", "lane": "L1"},
+   {"id": "A1", "kind": "userTask", "name": "Классифицировать обращение", "participant": "ВкусВилл", "lane": "L1", "documentation": "Категории: типовое, сложное, начисления, качество товара"},
+   {"id": "T1", "kind": "boundaryEvent", "name": "Прошло 4 часа", "participant": "ВкусВилл", "lane": "L1", "attached_to": "A1", "event_definition": "timer", "timer": "PT4H"},
+   {"id": "A2", "kind": "userTask", "name": "Закрыть по базе знаний", "participant": "ВкусВилл", "lane": "L1"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Обращение типовое?", "participant": "ВкусВилл", "lane": "L1"},
+   {"id": "P1", "kind": "parallelGateway", "name": "Разобрать параллельно", "participant": "ВкусВилл", "lane": "L1"},
+   {"id": "A3", "kind": "userTask", "name": "Решить обращение второй линией", "participant": "ВкусВилл", "lane": "L2"},
+   {"id": "A4", "kind": "userTask", "name": "Проверить начисления", "participant": "ВкусВилл", "lane": "L3"},
+   {"id": "A5", "kind": "userTask", "name": "Завести рекламацию в отделе качества", "participant": "ВкусВилл", "lane": "L4"},
+   {"id": "P2", "kind": "parallelGateway", "name": "Слить ветки", "participant": "ВкусВилл", "lane": "L1"},
+   {"id": "A6", "kind": "userTask", "name": "Эскалировать руководителю поддержки", "participant": "ВкусВилл", "lane": "L5"},
+   {"id": "A7", "kind": "userTask", "name": "Зафиксировать решение и закрыть обращение", "participant": "ВкусВилл", "lane": "L1"},
+   {"id": "E1", "kind": "endEvent", "name": "Обращение закрыто", "participant": "ВкусВилл", "lane": "L1"},
+   {"id": "S2", "kind": "startEvent", "name": "Анкета получена", "participant": "Система опросов", "lane": ""},
+   {"id": "Q1", "kind": "serviceTask", "name": "Отправить анкету клиенту", "participant": "Система опросов", "lane": ""},
+   {"id": "Q2", "kind": "endEvent", "name": "Анкета отправлена", "participant": "Система опросов", "lane": ""},
+   {"id": "S3", "kind": "startEvent", "name": "Клиент получил анкету", "participant": "Клиент", "lane": ""},
+   {"id": "C1", "kind": "userTask", "name": "Оценить качество ответа", "participant": "Клиент", "lane": ""},
+   {"id": "C2", "kind": "endEvent", "name": "Оценка отправлена", "participant": "Клиент", "lane": ""}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "T1", "target": "A6", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "G1", "target": "A2", "kind": "sequence", "condition": "вопрос есть в базе знаний"},
+   {"id": "F5", "source": "G1", "target": "P1", "kind": "sequence", "condition": "нужна проработка"},
+   {"id": "F6", "source": "P1", "target": "A3", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "P1", "target": "A4", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "P1", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "A3", "target": "P2", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "A4", "target": "P2", "kind": "sequence", "condition": ""},
+   {"id": "F11", "source": "A5", "target": "P2", "kind": "sequence", "condition": ""},
+   {"id": "F12", "source": "P2", "target": "A7", "kind": "sequence", "condition": ""},
+   {"id": "F13", "source": "A2", "target": "A7", "kind": "sequence", "condition": ""},
+   {"id": "F14", "source": "A6", "target": "A7", "kind": "sequence", "condition": ""},
+   {"id": "F15", "source": "A7", "target": "E1", "kind": "sequence", "condition": ""},
+   {"id": "F16", "source": "S2", "target": "Q1", "kind": "sequence", "condition": ""},
+   {"id": "F17", "source": "Q1", "target": "Q2", "kind": "sequence", "condition": ""},
+   {"id": "F18", "source": "S3", "target": "C1", "kind": "sequence", "condition": ""},
+   {"id": "F19", "source": "C1", "target": "C2", "kind": "sequence", "condition": ""},
+   {"id": "M1", "source": "A7", "target": "Q1", "kind": "message", "condition": "запрос анкеты"},
+   {"id": "M2", "source": "Q1", "target": "C1", "kind": "message", "condition": "анкета клиенту"},
+   {"id": "M3", "source": "C1", "target": "A7", "kind": "message", "condition": "оценка в карточку обращения"}
+  ]
+ }
+}

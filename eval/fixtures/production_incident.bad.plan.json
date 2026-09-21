@@ -1,0 +1,38 @@
+{
+ "id": "production_incident.bad.plan",
+ "kind": "plan",
+ "scenario": "production_incident",
+ "label": "разрывные болячки: событие без определения, развилка без схождения, необработанный таймер",
+ "quality": "bad",
+ "provenance": "Собрана вручную как «плохой» ориентир. Теряются сразу несколько свойств: промежуточное событие без event_definition, граничное событие прикреплено к шагу, но не ведёт ни в какую ветку обработки, вторая ветка развилки ни к чему не приводит, пул внешней команды не связан ни одним messageFlow, ожидаемой системы мониторинга в схеме нет, SLA-таймера нет.",
+ "plan": {
+  "participants": ["ВкусВилл", "Платёжный шлюз"],
+  "lanes": [
+   {"id": "L_dev", "name": "Дежурный инженер", "participant": "ВкусВилл"},
+   {"id": "L_lead", "name": "Руководитель дежурства", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Алерт сработал", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A1", "kind": "userTask", "name": "Классифицировать инцидент", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A2", "kind": "intermediateCatchEvent", "name": "Ожидание действий внешней команды", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "T1", "kind": "boundaryEvent", "name": "Просрочка SLA", "participant": "ВкусВилл", "lane": "L_lead", "attached_to": "A3"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Критичный инцидент?", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A3", "kind": "userTask", "name": "Откатить релиз", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A4", "kind": "userTask", "name": "Применить обходное решение", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "A5", "kind": "userTask", "name": "Информировать подразделения", "participant": "ВкусВилл", "lane": "L_lead"},
+   {"id": "A6", "kind": "userTask", "name": "Проверить сторону шлюза", "participant": "Платёжный шлюз", "lane": ""},
+   {"id": "A7", "kind": "userTask", "name": "Провести разбор причин", "participant": "ВкусВилл", "lane": "L_dev"},
+   {"id": "E1", "kind": "endEvent", "name": "Инцидент закрыт", "participant": "ВкусВилл", "lane": "L_dev"}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "A2", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "G1", "target": "A3", "kind": "sequence", "condition": "критичный"},
+   {"id": "F5", "source": "G1", "target": "A4", "kind": "sequence", "condition": "не критичный"},
+   {"id": "F6", "source": "A3", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "A5", "target": "A7", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A7", "target": "E1", "kind": "sequence", "condition": ""}
+  ]
+ }
+}

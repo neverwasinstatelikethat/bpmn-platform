@@ -1,0 +1,40 @@
+{
+ "id": "employee_onboarding.bad.plan",
+ "kind": "plan",
+ "scenario": "employee_onboarding",
+ "label": "роли раздуты в пулы, развилка спрятана в подпись потока",
+ "quality": "bad",
+ "provenance": "Та же болезнь, что в живом прогоне «доставки груза»: сотрудников модель заводит отдельными участниками, из-за чего половина пулов остаётся без шагов, а ветвление проверки безопасности оформляется подписью на потоке вместо шлюза.",
+ "plan": {
+  "participants": ["ВкусВилл", "HR-партнёр", "Служба безопасности", "ИТ-отдел", "Руководитель подразделения", "Внешний сервис проверки"],
+  "lanes": [
+   {"id": "L_hr", "name": "HR-партнёр", "participant": "ВкусВилл"},
+   {"id": "L_it", "name": "ИТ-специалист", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Оффер подписан", "participant": "ВкусВилл", "lane": "L_hr"},
+   {"id": "A1", "kind": "userTask", "name": "Завести карточку сотрудника", "participant": "ВкусВилл", "lane": "L_hr"},
+   {"id": "A2", "kind": "userTask", "name": "Направить данные в ИТ и безопасность", "participant": "ВкусВилл", "lane": "L_hr"},
+   {"id": "A3", "kind": "serviceTask", "name": "Проверить кандидата во внешнем сервисе", "participant": "ВкусВилл", "lane": "L_hr"},
+   {"id": "A4", "kind": "userTask", "name": "Заказать оборудование", "participant": "ВкусВилл", "lane": "L_it"},
+   {"id": "A5", "kind": "userTask", "name": "Создать учётные записи", "participant": "ВкусВилл", "lane": "L_it"},
+   {"id": "A6", "kind": "userTask", "name": "Изготовить пропуск", "participant": "ВкусВилл", "lane": "L_it"},
+   {"id": "A7", "kind": "userTask", "name": "Провести вводную встречу", "participant": "ВкусВилл", "lane": "L_hr"},
+   {"id": "A8", "kind": "userTask", "name": "Поставить план испытательного срока", "participant": "ВкусВилл", "lane": "L_hr"},
+   {"id": "A9", "kind": "userTask", "name": "Зафиксировать завершение адаптации", "participant": "ВкусВилл", "lane": "L_hr"},
+   {"id": "E1", "kind": "endEvent", "name": "Сотрудник адаптирован", "participant": "ВкусВилл", "lane": "L_hr"}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "A2", "target": "A3", "kind": "sequence", "condition": ""},
+   {"id": "F4", "source": "A3", "target": "A4", "kind": "sequence", "condition": "проверка пройдена"},
+   {"id": "F5", "source": "A4", "target": "A5", "kind": "sequence", "condition": ""},
+   {"id": "F6", "source": "A5", "target": "A6", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "A6", "target": "A7", "kind": "sequence", "condition": ""},
+   {"id": "F8", "source": "A7", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "A8", "target": "A9", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "A9", "target": "E1", "kind": "sequence", "condition": ""}
+  ]
+ }
+}

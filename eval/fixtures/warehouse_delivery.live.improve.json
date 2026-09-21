@@ -1,0 +1,32 @@
+{
+ "id": "warehouse_delivery.live.improve",
+ "kind": "improve",
+ "scenario": "warehouse_delivery",
+ "base_plan": "warehouse_delivery.live.plan",
+ "label": "пакет операций из живого прогона (частично применён, повтор откатился)",
+ "quality": "real",
+ "source": "reports/warehouse-delivery/improve_response.json",
+ "provenance": "Операции восстановлены по отчёту применения: семь применённых правок, четыре пропуска первого раунда (дубль потока, шлюз без имени, две выдуманные операции add_flow) и три правки корректирующего раунда, которые аплайер откатил как узлы вне маршрута. В live-режиме тот же пакет отдаёт модель, в replay — этот файл.",
+ "prompt": "Схема сырая по качеству: добавь контроль срока отгрузки (таймер SLA) на шаге сбора груза с веткой эскалации руководителю смены и документацию к шагам, где есть ветвление. Новые шаги встраивай в маршрут существующего пула, новых пулов не заводи.",
+ "operations": [
+  {"op": "connect", "source": "A3", "target": "A4", "flow_type": "sequence"},
+  {"op": "add_task", "id": "new_timer_task", "name": "Таймер SLA сбора груза", "task_type": "userTask", "participant": "Склад", "after": "A3"},
+  {"op": "add_task", "id": "new_escalation_task", "name": "Эскалация руководителю смены", "task_type": "userTask", "participant": "Склад", "after": "new_timer_task"},
+  {"op": "add_gateway", "id": "new_gateway_unnamed", "name": "", "gateway_type": "exclusive", "participant": "Склад", "after": "new_escalation_task"},
+  {"op": "add_documentation", "id": "A3", "text": "Сборка выполняется по листу отгрузки; отклонения фиксируются в WMS до передачи контролёру."},
+  {"op": "add_documentation", "id": "A4", "text": "Проверяются целостность упаковки, номер пломбы и вес места по заявке."},
+  {"op": "add_flow", "source": "new_timer_task", "target": "A4"},
+  {"op": "add_flow", "source": "A4", "target": "new_escalation_task"},
+  {"op": "add_gateway", "id": "new_gateway", "name": "Выбор дальнейшего действия", "gateway_type": "exclusive", "participant": "Склад", "after": "new_escalation_task"},
+  {"op": "connect", "source": "new_timer_task", "target": "new_gateway", "flow_type": "sequence"},
+  {"op": "connect", "source": "new_gateway", "target": "A7", "flow_type": "sequence", "condition": "срок не нарушен"}
+ ],
+ "retry_operations": [
+  {"op": "add_task", "id": "new_timer_task_2", "name": "Таймер SLA проверки упаковки", "task_type": "userTask", "participant": "Склад"},
+  {"op": "connect", "source": "new_timer_task_2", "target": "A4", "flow_type": "sequence"},
+  {"op": "add_event", "id": "new_intermediate_catch", "name": "Ожидание поступления остатка", "event_type": "intermediateCatch", "participant": "Склад"},
+  {"op": "connect", "source": "new_intermediate_catch", "target": "A6", "flow_type": "sequence"},
+  {"op": "add_task", "id": "new_escalation_task_2", "name": "Отчёт руководителю смены", "task_type": "userTask", "participant": "Склад"},
+  {"op": "connect", "source": "A4", "target": "new_escalation_task_2", "flow_type": "sequence"}
+ ]
+}

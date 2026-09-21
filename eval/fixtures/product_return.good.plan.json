@@ -1,0 +1,63 @@
+{
+ "id": "product_return.good.plan",
+ "kind": "plan",
+ "scenario": "product_return",
+ "label": "эталон: возврат с экспертизой во внешнем центре",
+ "quality": "good",
+ "plan": {
+  "participants": ["ВкусВилл", "Покупатель", "Сервисный центр"],
+  "lanes": [
+   {"id": "L_cash", "name": "Продавец-кассир", "participant": "ВкусВилл"},
+   {"id": "L_qc", "name": "Контролёр отдела качества", "participant": "ВкусВилл"},
+   {"id": "L_acc", "name": "Бухгалтерия", "participant": "ВкусВилл"},
+   {"id": "L_del", "name": "Курьер службы доставки", "participant": "ВкусВилл"}
+  ],
+  "elements": [
+   {"id": "S1", "kind": "startEvent", "name": "Заявление на возврат получено", "participant": "ВкусВилл", "lane": "L_cash"},
+   {"id": "A1", "kind": "userTask", "name": "Оформить заявку на возврат", "participant": "ВкусВилл", "lane": "L_cash"},
+   {"id": "G2", "kind": "exclusiveGateway", "name": "Товар крупногабаритный?", "participant": "ВкусВилл", "lane": "L_cash"},
+   {"id": "A4", "kind": "userTask", "name": "Забрать товар у покупателя на дому", "participant": "ВкусВилл", "lane": "L_del"},
+   {"id": "A2", "kind": "userTask", "name": "Проверить товар и чек", "participant": "ВкусВилл", "lane": "L_qc"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Товар надлежащего качества?", "participant": "ВкусВилл", "lane": "L_qc"},
+   {"id": "A3", "kind": "userTask", "name": "Возвратить деньги тем же способом", "participant": "ВкусВилл", "lane": "L_cash"},
+   {"id": "A5", "kind": "userTask", "name": "Отправить товар на независимую экспертизу", "participant": "ВкусВилл", "lane": "L_qc"},
+   {"id": "G3", "kind": "exclusiveGateway", "name": "Экспертиза подтвердила брак?", "participant": "ВкусВилл", "lane": "L_qc"},
+   {"id": "A6", "kind": "userTask", "name": "Провести возврат и уведомить покупателя", "participant": "ВкусВилл", "lane": "L_cash"},
+   {"id": "A7", "kind": "userTask", "name": "Направить мотивированный отказ", "participant": "ВкусВилл", "lane": "L_cash"},
+   {"id": "A8", "kind": "userTask", "name": "Сверить возврат в кассовой отчётности", "participant": "ВкусВилл", "lane": "L_acc"},
+   {"id": "E1", "kind": "endEvent", "name": "Возврат закрыт", "participant": "ВкусВилл", "lane": "L_acc"},
+   {"id": "E2", "kind": "endEvent", "name": "Возврат не выполнен", "participant": "ВкусВилл", "lane": "L_cash"},
+   {"id": "S2", "kind": "startEvent", "name": "Покупатель принёс товар на возврат", "participant": "Покупатель", "lane": ""},
+   {"id": "P1", "kind": "userTask", "name": "Подать заявление и чек", "participant": "Покупатель", "lane": ""},
+   {"id": "P2", "kind": "endEvent", "name": "Ответ получен", "participant": "Покупатель", "lane": ""},
+   {"id": "S3", "kind": "startEvent", "name": "Запрос экспертизы поступил", "participant": "Сервисный центр", "lane": ""},
+   {"id": "C1", "kind": "userTask", "name": "Провести независимую экспертизу", "participant": "Сервисный центр", "lane": ""},
+   {"id": "C2", "kind": "endEvent", "name": "Заключение выдано", "participant": "Сервисный центр", "lane": ""}
+  ],
+  "flows": [
+   {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
+   {"id": "F2", "source": "A1", "target": "G2", "kind": "sequence", "condition": ""},
+   {"id": "F3", "source": "G2", "target": "A4", "kind": "sequence", "condition": "крупногабаритный"},
+   {"id": "F4", "source": "G2", "target": "A2", "kind": "sequence", "condition": "товар принят в магазине"},
+   {"id": "F5", "source": "A4", "target": "A2", "kind": "sequence", "condition": ""},
+   {"id": "F6", "source": "A2", "target": "G1", "kind": "sequence", "condition": ""},
+   {"id": "F7", "source": "G1", "target": "A3", "kind": "sequence", "condition": "качество в норме, 14 дней не истекло"},
+   {"id": "F8", "source": "G1", "target": "A5", "kind": "sequence", "condition": "есть признаки брака"},
+   {"id": "F9", "source": "A5", "target": "G3", "kind": "sequence", "condition": ""},
+   {"id": "F10", "source": "G3", "target": "A6", "kind": "sequence", "condition": "брак подтверждён"},
+   {"id": "F11", "source": "G3", "target": "A7", "kind": "sequence", "condition": "брак не подтверждён"},
+   {"id": "F12", "source": "A7", "target": "E2", "kind": "sequence", "condition": ""},
+   {"id": "F13", "source": "A6", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F14", "source": "A3", "target": "A8", "kind": "sequence", "condition": ""},
+   {"id": "F15", "source": "A8", "target": "E1", "kind": "sequence", "condition": ""},
+   {"id": "F16", "source": "S2", "target": "P1", "kind": "sequence", "condition": ""},
+   {"id": "F17", "source": "P1", "target": "P2", "kind": "sequence", "condition": ""},
+   {"id": "F18", "source": "S3", "target": "C1", "kind": "sequence", "condition": ""},
+   {"id": "F19", "source": "C1", "target": "C2", "kind": "sequence", "condition": ""},
+   {"id": "M1", "source": "P1", "target": "A1", "kind": "message", "condition": "заявление с чеком"},
+   {"id": "M2", "source": "A5", "target": "C1", "kind": "message", "condition": "запрос экспертизы"},
+   {"id": "M3", "source": "C1", "target": "G3", "kind": "message", "condition": "заключение экспертизы"},
+   {"id": "M4", "source": "A7", "target": "P2", "kind": "message", "condition": "мотивированный отказ"}
+  ]
+ }
+}

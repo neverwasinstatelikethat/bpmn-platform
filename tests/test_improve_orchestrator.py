@@ -289,6 +289,117 @@ def test_planner_prompt_lists_every_operation_the_applier_supports():
     assert set(bpmn_edits.OP_SPEC) == set(bpmn_edits._HANDLERS)
 
 
+def test_planner_prompt_teaches_the_defects_the_user_filed():
+    """Правила планирования: парной шлюз схождения, default на необусловленной
+    ветке, хронометраж таймера и судьба лишних/пустых пулов — иначе модель
+    продолжает предлагать те же дефекты, что были в прогоне «склад».
+    """
+    prompt = llm_improve._SYSTEM_PROMPT
+    assert "шлюз на входе, шлюз на выходе" in prompt
+    assert '"default": true' in prompt
+    assert "set_default" in prompt
+    assert "PT15M" in prompt and "R3/PT10M" in prompt
+    assert "ISO-8601" in prompt
+    assert "merge_participants" in prompt and "remove_participant" in prompt
+    assert "пустой" in prompt
+    # новая ветка не должна оставаться одиноким шагом
+    assert "откатывает" in prompt
+
+
+def test_retry_prompt_explains_the_missing_default_branch(orchestrator, monkeypatch,
+                                                          single_pool_xml):
+    """Развилка без парного шлюза схождения: модель ведёт третью ветку без
+    условия. Отказ обязан дойти до корректирующего повтора с подсказкой про
+    default, иначе повтор предложит то же самое."""
+    first = json.dumps({"analysis": "ветка", "operations": [
+        {"op": "connect", "source": "G_paid", "target": "End_cancel",
+         "default": True},
+        {"op": "connect", "source": "G_paid", "target": "T_collect"},
+    ]}, ensure_ascii=False)
+    second = json.dumps({"analysis": "исправила", "operations": [
+        {"op": "connect", "source": "G_paid", "target": "T_collect",
+         "condition": "paid == false и товар не отгружен"},
+    ]}, ensure_ascii=False)
+    fake = FakeLLM(monkeypatch, _wrap(first), _wrap(second))
+    analysis, xml_after, report = _improve(orchestrator, single_pool_xml)
+
+    # первая ветка стала выходом по умолчанию
+    assert 'default="new_Flow_1"' in xml_after
+    # отказ дошёл до корректирующего повтора вместе с подсказкой
+    assert "уже есть выход по умолчанию" in fake.prompts[1]
+    assert "condition" in fake.prompts[1]
+    assert report["skipped"][0]["op"] == "connect"
+    assert report["skipped"][0]["reapplied"] is True
+    assert report["status"] == "success", report["skipped"]
+    assert "Повтор добил 1 правку" in analysis
+    assert "paid == false и товар не отгружен" in xml_after
+
+
+def test_merge_pools_reaches_the_user_as_one_lane(orchestrator, monkeypatch,
+                                                  two_pool_xml):
+    """Нормализация «роль → дорожка» живёт и в HTTP-контуре: план со слиянием
+    обязан вернуться одним пулом с дорожкой и без messageFlow."""
+    plan = json.dumps({"analysis": "роли одной организации — дорожки", "operations": [
+        {"op": "merge_participants", "source": "Клиент", "target": "Магазин",
+         "as_lane": True},
+    ]}, ensure_ascii=False)
+    fake = FakeLLM(monkeypatch, _wrap(plan))
+    _, xml_after, report = _improve(orchestrator, two_pool_xml)
+
+    assert report["status"] == "success", report["skipped"]
+    assert xml_after.count("<bpmn:participant ") == 1
+    assert '<bpmn:lane ' in xml_after and 'name="Клиент"' in xml_after
+    assert "MF1" not in xml_after
+    assert report["repair_notes"] == []
+    assert "слит" in report["applied"][0]["note"]
+    # слияние сошлось с первого плана: корректирующий повтор не нужен
+    assert len(fake.calls) == 1
+
+
+def test_invalid_merge_rolls_the_package_back_and_is_explained(orchestrator,
+                                                               monkeypatch):
+    """Слияние, после которого шаг источника повис вне маршрута, откатывает весь
+    пакет: полуслитая схема не уходит ни пользователю, ни в БД, а причину
+    пользователь читает в тексте ошибки."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_rollback">
+  <collaboration id="C_r">
+    <participant id="Pool_a" name="Кладовщик" processRef="PrA"/>
+    <participant id="Pool_b" name="Склад" processRef="PrB"/>
+  </collaboration>
+  <process id="PrA" name="Кладовщик" isExecutable="true">
+    <startEvent id="A1" name="Старт"><outgoing>AF1</outgoing></startEvent>
+    <sequenceFlow id="AF1" sourceRef="A1" targetRef="A2"/>
+    <userTask id="A2" name="Собрать груз"><incoming>AF1</incoming><outgoing>AF2</outgoing></userTask>
+    <sequenceFlow id="AF2" sourceRef="A2" targetRef="A3"/>
+    <endEvent id="A3" name="Готово"><incoming>AF2</incoming></endEvent>
+    <userTask id="A4" name="Заказать паллету"/>
+  </process>
+  <process id="PrB" name="Склад" isExecutable="true">
+    <startEvent id="B1" name="Приёмка"><outgoing>BF1</outgoing></startEvent>
+    <sequenceFlow id="BF1" sourceRef="B1" targetRef="B2"/>
+    <userTask id="B2" name="Принять груз"><incoming>BF1</incoming><outgoing>BF2</outgoing></userTask>
+    <sequenceFlow id="BF2" sourceRef="B2" targetRef="B3"/>
+    <endEvent id="B3" name="Принято"><incoming>BF2</incoming></endEvent>
+  </process>
+</definitions>"""
+    plan = json.dumps({"analysis": "сливаем пулы", "operations": [
+        {"op": "add_documentation", "id": "A2", "text": "Собираем по заявке"},
+        {"op": "merge_participants", "source": "Кладовщик", "target": "Склад",
+         "as_lane": True},
+    ]}, ensure_ascii=False)
+    fake = FakeLLM(monkeypatch, _wrap(plan),
+                   _wrap('{"analysis": "не сливаем", "operations": []}'))
+    with pytest.raises(ImprovementError) as exc:
+        _improve(orchestrator, xml)
+    message = str(exc.value)
+    assert "не удалось применить" in message
+    assert "слияние пулов сделало схему невалидной" in message
+    assert "A4" in message
+    # корректирующий повтор получил причину отката и подсказку
+    assert "встройте шаги пула-источника в маршрут" in fake.prompts[1]
+
+
 def test_dangling_added_step_is_rolled_back_and_explained(orchestrator, monkeypatch,
                                                           single_pool_xml):
     """add_task без after и без connect не применим: аплайер откатывает такой
@@ -308,19 +419,67 @@ def test_dangling_added_step_is_rolled_back_and_explained(orchestrator, monkeypa
 def test_boundary_event_without_handler_is_surfaced_to_user(orchestrator,
                                                            monkeypatch,
                                                            single_pool_xml):
-    """Таймер без ветки обработки — применённая операция, которая ухудшает
-    схему. Пользователь узнаёт об этом из анализа, а не только из отчёта."""
+    """Таймер без ветки обработки аплайер откатывает: принятое улучшение не
+    имеет права ронять качество. Если и повтор принёс то же, пользователь
+    получает причину, а не молчаливое «улучшение не применено»."""
     plan = '{"analysis": "добавил таймер", "operations": [' \
            '{"op":"add_boundary_event","id":"new_BE","attached_to":"T_collect",' \
            '"event_type":"timer","name":"Просрочка"}]}'
-    FakeLLM(monkeypatch, _wrap(plan))
+    FakeLLM(monkeypatch, _wrap(plan), _wrap(plan))
+    with pytest.raises(ImprovementError) as exc:
+        _improve(orchestrator, single_pool_xml)
+    assert "без ветки обработки" in str(exc.value)
+
+
+def test_package_that_closes_an_unguarded_cycle_is_rolled_back(orchestrator,
+                                                               monkeypatch):
+    """Соединение, замкнувшее маршрут без ветки выхода, принимает схему в
+    ухудшение (`guarded_cycles` падает). Такой пакет откатывается к базе, а
+    модель получает шанс перестроить ветку — аплайер не вправе додумывать
+    шлюз за неё."""
+    linear = '<?xml version="1.0" encoding="UTF-8"?>\n' + """
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P" name="П" isExecutable="true">
+    <startEvent id="S" name="Старт"/>
+    <sequenceFlow id="F1" sourceRef="S" targetRef="A"/>
+    <userTask id="A" name="Шаг А"/>
+    <sequenceFlow id="F2" sourceRef="A" targetRef="B"/>
+    <userTask id="B" name="Шаг Б"/>
+    <sequenceFlow id="F3" sourceRef="B" targetRef="E"/>
+    <endEvent id="E" name="Финиш"/>
+  </process>
+</definitions>"""
+    plan = '{"analysis": "замкнул маршрут", "operations": [' \
+           '{"op":"connect","source":"B","target":"A"}]}'
+    FakeLLM(monkeypatch, _wrap(plan), _wrap(plan))
+    analysis, xml_after, report = _improve(orchestrator, linear,
+                                           prompt="Свяжи шаги по кругу")
+    assert 'sourceRef="B" targetRef="A"' not in xml_after
+    cycles = [s for s in report["skipped"]
+              if "цикл без защищённого выхода" in s["reason"]]
+    assert cycles, report["skipped"]
+    assert "исключающий шлюз" in cycles[0]["hint"]
+
+
+def test_retry_closes_the_handler_branch_the_rollback_asked_for(orchestrator,
+                                                                monkeypatch,
+                                                                single_pool_xml):
+    """Подсказка отката работает: повтор, где модель добавила ветку обработки,
+    применяется, и таймер остаётся в схеме."""
+    broken = '{"analysis": "таймер", "operations": [' \
+             '{"op":"add_boundary_event","id":"new_BE","attached_to":"T_collect",' \
+             '"event_type":"timer","name":"Просрочка"}]}'
+    fixed = '{"analysis": "таймер с эскалацией", "operations": [' \
+            '{"op":"add_boundary_event","id":"new_BE","attached_to":"T_collect",' \
+            '"event_type":"timer","name":"Просрочка"},' \
+            '{"op":"add_task","id":"new_BE_h","name":"Эскалация",' \
+            '"task_type":"userTask","after":"new_BE"},' \
+            '{"op":"connect","source":"new_BE_h","target":"End_cancel"}]}'
+    FakeLLM(monkeypatch, _wrap(broken), _wrap(fixed))
     analysis, xml_after, report = _improve(orchestrator, single_pool_xml)
-    assert xml_after is not None
-    assert "остались вне маршрута" in analysis
-    assert any("new_BE" in n for n in report["repair_notes"])
-    # Пометка аплайера доходит до пользователя дословно — с указанием, какой
-    # операции не хватает.
-    assert any("не ведёт ни к одному шагу" in n for n in report["repair_notes"])
+    assert 'id="new_BE"' in xml_after
+    assert report["applied"] and report["status"] in ("success", "partial")
+    assert "остались вне маршрута" not in analysis
 
 
 def test_rolled_back_step_triggers_the_corrective_round(orchestrator, monkeypatch,

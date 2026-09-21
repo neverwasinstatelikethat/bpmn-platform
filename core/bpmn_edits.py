@@ -5,6 +5,7 @@
 # с причиной и подсказкой в отчёте, пакет целиком не падает. Никакой магии
 # и эвристик: что не удаётся применить однозначно — сообщаем наверх.
 import logging
+import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -87,7 +88,69 @@ EVENT_DEFINITIONS: Dict[str, Tuple[str, str]] = {
 }
 
 # Хронометраж таймера по умолчанию: 15 минут — типичный SLA ожидания шага.
+# Подставляется, только когда поле не указано вовсе: выдуманное «PT5M» вместо
+# запрошенного пользователем часа хуже честного отказа.
 DEFAULT_TIMER_DURATION = "PT15M"
+
+# Поля операции → тег, в котором BPMN хранит этот хронометраж.
+TIMER_TIME_TAGS: Dict[str, str] = {
+    "duration": "timeDuration",
+    "cycle": "timeCycle",
+}
+
+# ISO-8601: `PT15M`, `P1DT2H`, `R3/PT10M` (повтор + интервал). Голые `P`, `PT`
+# и «2H» без разделителя T — не интервалы, а опечатка модели.
+_ISO_REPEAT = re.compile(r"R\d*")
+_ISO_DATE_PART = re.compile(r"(\d+Y)?(\d+M)?(\d+W)?(\d+D)?")
+_ISO_TIME_PART = re.compile(r"(\d+H)?(\d+M)?(\d+(?:[.,]\d+)?S)?")
+
+
+def _is_iso_interval(value: str) -> bool:
+    """Проверка хронометража таймера: только то, что читает bpmn-js."""
+    text = (value or "").strip().upper()
+    if not text:
+        return False
+    if text.startswith("R"):
+        head, slash, tail = text.partition("/")
+        if not (slash and _ISO_REPEAT.fullmatch(head) and tail):
+            return False
+        text = tail
+    if not text.startswith("P"):
+        return False
+    date_part, has_time, time_part = text[1:].partition("T")
+    if not _ISO_DATE_PART.fullmatch(date_part):
+        return False
+    if has_time and not (time_part and _ISO_TIME_PART.fullmatch(time_part)):
+        return False
+    # «P» и «PT» синтаксически разборчивы, но интервал не задают.
+    return bool(date_part or (has_time and time_part))
+
+
+def _timer_timing(op: Dict[str, Any],
+                  definition: Optional[str]) -> Optional[Tuple[str, str]]:
+    """Хронометраж таймера из операции: (тег, значение) либо None — по умолчанию.
+
+    Битое значение — отказ, а не молчаливая подстановка: схема с «PT-15» вместо
+    таймера на 15 минут не заведётся у bpmn-js, и пользователь узнает об этом
+    только в редакторе.
+    """
+    duration = str(op.get("duration") or "").strip()
+    cycle = str(op.get("cycle") or "").strip()
+    if not duration and not cycle:
+        return None
+    if duration and cycle:
+        raise _Skip("таймеру задают либо duration, либо cycle",
+                    "оставьте одно из полей")
+    if definition != "timer":
+        raise _Skip("хронометраж задают только таймеру",
+                    "укажите event_definition=timer (для граничного события — "
+                    "event_type=timer) либо уберите duration/cycle")
+    field, value = ("duration", duration) if duration else ("cycle", cycle)
+    if not _is_iso_interval(value):
+        raise _Skip(f"некорректный интервал таймера '{value}'",
+                    "формат ISO-8601: PT15M, PT2H или R3/PT10M")
+    return TIMER_TIME_TAGS[field], value.upper()
+
 
 # Словарь операций в одном месте: дословные формулировки полей, с которыми
 # аплайер их понимает. Планирующий промпт (core/llm_improve.py) обязан
@@ -103,19 +166,26 @@ OP_SPEC: Dict[str, str] = {
                  '"event_type":"start|end|intermediateCatch|intermediateThrow"'
                  ' либо определение ловушки: timer|message|error|signal",'
                  '"participant":"пул","after":"id (опц.)",'
-                 '"event_definition":"timer|message|error|signal (опц.)"}',
+                 '"event_definition":"timer|message|error|signal (опц.)",'
+                 '"duration":"PT15M (опц., таймеру)","cycle":"R3/PT10M (опц., таймеру)"}',
     "add_participant": '{"op":"add_participant","id":"new_...","name":"..."}',
     "add_documentation": '{"op":"add_documentation","id":"id элемента","text":"..."}',
     "add_lane": '{"op":"add_lane","id":"new_...","name":"...","participant":"пул"}',
     "move_to_lane": '{"op":"move_to_lane","id":"id элемента","lane":"id|имя дорожки"}',
     "add_boundary_event": '{"op":"add_boundary_event","id":"new_...","attached_to":"id задачи",'
-                          '"event_type":"timer|error","name":"..."}',
+                          '"event_type":"timer|error","name":"...",'
+                          '"duration":"PT15M (опц.)","cycle":"R3/PT10M (опц.)"}',
     "rename": '{"op":"rename","id":"...","name":"..."}',
     "delete": '{"op":"delete","id":"..."}',
     "connect": '{"op":"connect","source":"...","target":"...",'
-               '"flow_type":"sequence|message","condition":"опц."}',
+               '"flow_type":"sequence|message","condition":"опц.",'
+               '"default":true (опц. — сделать эту ветку шлюза выходом по умолчанию)}',
+    "set_default": '{"op":"set_default","gateway":"id шлюза","flow":"id его ветки"}',
     "disconnect": '{"op":"disconnect","flow":"id потока"}',
     "move_to_participant": '{"op":"move_to_participant","id":"...","participant":"пул"}',
+    "merge_participants": '{"op":"merge_participants","source":"пул-источник",'
+                          '"target":"пул-приёмник","as_lane":true|"имя дорожки"}',
+    "remove_participant": '{"op":"remove_participant","participant":"пустой пул"}',
 }
 
 XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -159,6 +229,9 @@ class _Index:
         self.flows_by_id: Dict[str, ET.Element] = {}
         self.lanes: List[ET.Element] = []
         self.parents: Dict[ET.Element, ET.Element] = {}
+        # Id элементов, затронутых merge_participants: по ним пакет слияния
+        # откатывается, если починка нашла поломку именно в перенесённом.
+        self.merge_touched: Set[str] = set()
         self._build()
 
     def _build(self) -> None:
@@ -353,6 +426,30 @@ class _Index:
             return participant.get("name") or participant.get("id", "")
         return process.get("name") or process.get("id", "")
 
+    def resolve_participant(
+            self, key: Optional[str]) -> Tuple[Optional[ET.Element], Optional[ET.Element], str]:
+        """(участник, процесс, прочитанное имя) по id/имени пула или процесса.
+
+        Возвращает и процесс, даже если участник не найден: вызывающий код
+        различает «нет такого пула» и «процесс, не заявленный участником» —
+        слияние и удаление пула для них отказывает по-разному.
+        """
+        name = (key or "").strip() if isinstance(key, str) else ""
+        if not name:
+            return None, None, ""
+        for participant in self.participants:
+            if name in (participant.get("id"), participant.get("name")):
+                process = next(
+                    (p for p in self.processes
+                     if p.get("id") == participant.get("processRef")), None)
+                return participant, process, name
+        process = next((p for p in self.processes
+                        if name in (p.get("id"), p.get("name"))), None)
+        if process is not None:
+            return (self.participant_by_process_id.get(process.get("id") or ""),
+                    process, name)
+        return None, None, name
+
 
 def build_inventory(xml_text: str) -> Dict[str, Any]:
     """Компактный инвентарь схемы — контекст для планирующих промптов."""
@@ -375,6 +472,14 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
             "participant": index.participant_name(process) if process is not None else "",
         })
     flows = []
+    # Ветки шлюзов, помеченные default: без этого планировщик не отличит
+    # «необусловленная ветка — ошибка» от «необусловленная ветка — выход по
+    # умолчанию», и предложил бы то, что аплайер правомерно отвергает.
+    default_ids = {
+        elem.get("default") for elem in index.elements.values()
+        if isinstance(elem.tag, str) and _local(elem.tag) in GATEWAY_TAGS
+        and elem.get("default")
+    }
     for flow in index.sequence_flows:
         entry = {
             "id": flow.get("id", ""),
@@ -382,6 +487,8 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
             "source": flow.get("sourceRef", ""),
             "target": flow.get("targetRef", ""),
         }
+        if flow.get("id") in default_ids:
+            entry["default"] = True
         condition = flow.find(_q("conditionExpression"))
         if condition is not None and (condition.text or "").strip():
             entry["condition"] = condition.text.strip()
@@ -473,7 +580,9 @@ def _ensure_lane_set(index: _Index, process: ET.Element) -> ET.Element:
     return lane_set
 
 
-def _new_flow_id(index: _Index, prefix: str) -> str:
+def _new_id(index: _Index, prefix: str) -> str:
+    """Свободный id с префиксом new_ — потоки, дорожки и узлы делят одно
+    пространство имён xml:id во всём документе."""
     counter = 1
     while index.is_taken(f"{prefix}_{counter}"):
         counter += 1
@@ -481,16 +590,19 @@ def _new_flow_id(index: _Index, prefix: str) -> str:
 
 
 def _adopt_event_definition(index: _Index, owner: ET.Element, key: str,
-                            owner_id: str) -> ET.Element:
+                            owner_id: str,
+                            timing: Optional[Tuple[str, str]] = None) -> ET.Element:
     """Добавить элементу определение события (bpmn:timerEventDefinition и т. п.).
 
     Без определения «событие с таймером» остаётся декларацией: bpmn-js рисует
-    пустой кружок, а скоринг не засчитывает тип события."""
+    пустой кружок, а скоринг не засчитывает тип события. `timing` — запрошенный
+    хронометраж (тег + значение); без него таймер получает DEFAULT_TIMER_DURATION.
+    """
     tag, timer_tag = EVENT_DEFINITIONS[key]
     definition = ET.Element(_q(tag), {"id": f"{owner_id}_def"})
     if timer_tag:
-        duration = ET.SubElement(definition, _q(timer_tag))
-        duration.text = DEFAULT_TIMER_DURATION
+        time_tag, time_text = timing if timing else (timer_tag, DEFAULT_TIMER_DURATION)
+        ET.SubElement(definition, _q(time_tag)).text = time_text
     return index.adopt(owner, definition)
 
 
@@ -525,7 +637,7 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
     new_id = new_elem.get("id", "")
     # Новый входящий поток: after → new (единственный, независимо от числа
     # переподвешиваемых исходящих).
-    in_flow_id = _new_flow_id(index, "new_Flow")
+    in_flow_id = _new_id(index, "new_Flow")
     in_flow = ET.Element(_q("sequenceFlow"), {
         "id": in_flow_id, "sourceRef": after_id, "targetRef": new_id,
     })
@@ -557,7 +669,7 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
 def _create_sequence_flow(index: _Index, source_id: str, target_id: str,
                           process: ET.Element,
                           condition: Optional[str] = None) -> ET.Element:
-    flow_id = _new_flow_id(index, "new_Flow")
+    flow_id = _new_id(index, "new_Flow")
     flow = ET.Element(_q("sequenceFlow"), {
         "id": flow_id,
         "sourceRef": source_id,
@@ -576,7 +688,7 @@ def _create_sequence_flow(index: _Index, source_id: str, target_id: str,
 def _create_message_flow(index: _Index, source_id: str, target_id: str,
                          name: str = "") -> ET.Element:
     collaboration = _ensure_collaboration(index)
-    flow_id = _new_flow_id(index, "new_MessageFlow")
+    flow_id = _new_id(index, "new_MessageFlow")
     attrs = {"id": flow_id, "sourceRef": source_id, "targetRef": target_id}
     if name:
         attrs["name"] = name
@@ -715,9 +827,10 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                 "стартовому и конечному событию определение не добавляется",
                 "операцией add_boundary_event можно добавить таймер или ошибку",
             )
+        timing = _timer_timing(op, definition)
         elem = ET.Element(_q(tag), {"id": op_id, "name": name})
         if definition:
-            _adopt_event_definition(index, elem, definition, op_id)
+            _adopt_event_definition(index, elem, definition, op_id, timing)
 
     after_id = op.get("after")
     notes: List[str] = [alias_note] if alias_note else []
@@ -850,6 +963,23 @@ def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
     return [f"удалены связанные потоки: {', '.join(removed_flows)}"] if removed_flows else []
 
 
+def _flag(value: Any, field: str) -> bool:
+    """Булево поле операции. Модель нередко присылает «true» строкой, а
+    «false» строкой — не то же самое, что False."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "да"):
+            return True
+        if text in ("", "false", "0", "no", "нет"):
+            return False
+        raise _Skip(f"поле {field} должно быть булевым", f'укажите {field}: true либо false')
+    return bool(value)
+
+
+def _gateway_branches(index: _Index, gateway_id: str) -> List[ET.Element]:
+    return [f for f in index.sequence_flows if f.get("sourceRef") == gateway_id]
+
+
 def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     source_id = op.get("source") or ""
     target_id = op.get("target") or ""
@@ -863,6 +993,16 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     flow_type = (op.get("flow_type") or "sequence").lower()
     if flow_type not in ("sequence", "message"):
         raise _Skip("flow_type должен быть sequence или message")
+    # Выход по умолчанию — атрибут шлюза на sequence-потоке из него: раньше
+    # аплайер не умел его ставить, и любая «иначе»-ветка отвергалась.
+    default_requested = _flag(op.get("default"), "default")
+    if default_requested:
+        if flow_type != "sequence":
+            raise _Skip("выходом по умолчанию назначают sequence-поток",
+                        "уберите default у messageFlow")
+        if _local(source.tag) not in GATEWAY_TAGS:
+            raise _Skip(f"'{source_id}' не является шлюзом",
+                        "default ставят только шлюзу, у задачи ветки по умолчанию нет")
     source_process = index.process_of.get(source_id)
     target_process = index.process_of.get(target_id)
     if flow_type == "sequence" and source_process is not target_process:
@@ -887,23 +1027,103 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
         if f.get("sourceRef") == source_id and f.get("targetRef") == target_id
     ]
     if existing:
-        raise _Skip("такой поток уже существует")
+        raise _Skip("такой поток уже существует",
+                    "существующую ветку помечают выходом по умолчанию "
+                    "операцией set_default")
+    notes: List[str] = []
     if flow_type == "sequence":
         condition = (op.get("condition") or "").strip() or None
-        # Исключение из `connect` ломает раньше проходившее правило: аплайер не
-        # умеет ставить атрибут default, а скоринг требует условие на каждой
-        # ветке exclusive-шлюза. Молча создать необусловленную ветку — значит
-        # ухудшить схему руками пользователя.
-        if _local(source.tag) == "exclusiveGateway" and condition is None:
-            raise _Skip(
-                f"у шлюза '{source_id}' нельзя вести необусловленный поток",
-                "добавьте condition — выход по умолчанию (default) аплайер "
-                "не ставит, а скоринг считает такую ветку ошибкой",
-            )
-        _create_sequence_flow(index, source_id, target_id, source_process, condition)
+        if default_requested:
+            # У выхода по умолчанию условия быть не может: иначе модель
+            # описывает «иначе» и условием, и веткой по умолчанию сразу.
+            if condition:
+                condition = None
+                notes.append("условие с выхода по умолчанию снято")
+            previous_default = source.get("default")
+            if previous_default:
+                raise _Skip(
+                    f"у шлюза '{source_id}' уже есть выход по умолчанию ({previous_default})",
+                    "переназначьте default операцией set_default на нужную ветку",
+                )
+        if (_local(source.tag) == "exclusiveGateway" and condition is None
+                and not default_requested):
+            notes.extend(_resolve_unconditioned_branch(index, source, source_id))
+            default_requested = True
+        flow = _create_sequence_flow(index, source_id, target_id, source_process,
+                                     condition)
+        if default_requested:
+            source.set("default", flow.get("id", ""))
+            notes.append(f"поток '{flow.get('id')}' — выход по умолчанию "
+                         f"шлюза '{source_id}'")
     else:
         _create_message_flow(index, source_id, target_id)
-    return []
+    return notes
+
+
+def _resolve_unconditioned_branch(index: _Index, gateway: ET.Element,
+                                  gateway_id: str) -> List[str]:
+    """Что делать с необусловленной веткой исключающего шлюза.
+
+    Скоринг требует условие на каждой ветке либо отметку default, поэтому
+    молча создать третью «просто ветку» — ухудшить схему. Варианты:
+    • у шлюза уже есть default — вторую ветку по умолчанию не сделать, отказ;
+    • условий на ветках нет вообще — непонятно, какая из них «иначе», отказ;
+    • ветки с условиями есть — эта ветка и есть «иначе», становится default.
+    """
+    previous_default = gateway.get("default")
+    conditioned = [
+        f for f in _gateway_branches(index, gateway_id)
+        if f.find(_q("conditionExpression")) is not None
+    ]
+    if previous_default:
+        raise _Skip(
+            f"у шлюза '{gateway_id}' уже есть выход по умолчанию ({previous_default}), "
+            "а новая ветка идёт без условия",
+            "добавьте condition: default у шлюза занят, двух выходов по умолчанию не бывает",
+        )
+    if not conditioned:
+        raise _Skip(
+            f"у шлюза '{gateway_id}' нет ни условий на ветках, ни выхода по умолчанию",
+            'проставьте condition на ветках, а одну из них пометьте "default": true',
+        )
+    return [f"необусловленная ветка стала выходом по умолчанию: у шлюза "
+            f"'{gateway_id}' уже есть условные потоки"]
+
+
+def _op_set_default(op: Dict[str, Any], index: _Index) -> List[str]:
+    """Пометить существующую ветку шлюза выходом по умолчанию.
+
+    Нужна именно отдельная операция: `connect` на уже существующую пару
+    отвергается как дубль, а без default необусловленная ветка из генерации
+    остаётся ошибкой по правилу gateway_conditions.
+    """
+    gateway_id = op.get("gateway") or ""
+    flow_id = op.get("flow") or ""
+    gateway = index.elements.get(gateway_id)
+    if gateway is None:
+        raise _Skip("шлюз не найден", "используйте id шлюза из инвентаря")
+    if _local(gateway.tag) not in GATEWAY_TAGS:
+        raise _Skip(f"'{gateway_id}' не является шлюзом",
+                    "выход по умолчанию бывает только у шлюза")
+    flow = index.find_flow(flow_id)
+    if flow is None:
+        raise _Skip("поток не найден", "используйте id потока из инвентаря")
+    if _local(flow.tag) != "sequenceFlow":
+        raise _Skip(f"'{flow_id}' не sequence-поток",
+                    "выходом по умолчанию назначают ветку шлюза, а не messageFlow")
+    if flow.get("sourceRef") != gateway_id:
+        raise _Skip(f"поток '{flow_id}' выходит не из шлюза '{gateway_id}'",
+                    "укажите id ветки этого шлюза")
+    previous_default = gateway.get("default")
+    gateway.set("default", flow_id)
+    notes = []
+    condition = flow.find(_q("conditionExpression"))
+    if condition is not None:
+        flow.remove(condition)
+        notes.append(f"условие с потока '{flow_id}' снято — он выход по умолчанию")
+    if previous_default and previous_default != flow_id:
+        notes.append(f"прежний выход по умолчанию ({previous_default}) снят")
+    return notes or [f"поток '{flow_id}' — выход по умолчанию шлюза '{gateway_id}'"]
 
 
 def _op_disconnect(op: Dict[str, Any], index: _Index) -> List[str]:
@@ -914,6 +1134,10 @@ def _op_disconnect(op: Dict[str, Any], index: _Index) -> List[str]:
     index.detach(flow)
     for elem in index.elements.values():
         _remove_refs(elem, flow_id)
+        # default — тоже ссылка на поток: без неё в пакете нельзя переназначить
+        # выход по умолчанию, а после починки атрибут всё равно был бы снят.
+        if elem.get("default") == flow_id:
+            del elem.attrib["default"]
     return []
 
 
@@ -982,12 +1206,201 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     process = index.process_of.get(host_id)
     if process is None:
         raise _Skip(f"не удалось определить пул элемента '{host_id}'")
+    timing = _timer_timing(op, event_type)
     elem = ET.Element(_q("boundaryEvent"), {
         "id": op_id, "name": name, "attachedToRef": host_id,
     })
-    _adopt_event_definition(index, elem, event_type, op_id)
+    _adopt_event_definition(index, elem, event_type, op_id, timing)
     index.adopt(process, elem)
-    return [f"граничное событие '{name}' прицеплено к '{host_id}'"]
+    note = f"граничное событие '{name}' прицеплено к '{host_id}'"
+    if timing:
+        note += f", {'цикл' if timing[0] == 'timeCycle' else 'длительность'} {timing[1]}"
+    return [note]
+
+
+def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
+    """Слить пул в дорожку: роли одной организации — дорожки одного процесса.
+
+    Операция рискованная: она переносит чужие узлы и потоки в другой процесс и
+    удаляет межпуловые messageFlow. Поэтому пакет слиянием после применения
+    проходит `validate_and_repair`, а при поломке откатывается целиком
+    (см. `apply_operations`).
+    """
+    source_participant, source_process, source_key = index.resolve_participant(
+        op.get("source"))
+    target_participant, target_process, target_key = index.resolve_participant(
+        op.get("target"))
+    for participant, process, key, role in ((source_participant, source_process,
+                                             source_key, "источник"),
+                                            (target_participant, target_process,
+                                             target_key, "приёмник")):
+        if not key:
+            raise _Skip(f"не задан пул ({role})",
+                        "укажите source и target именами или id пулов из инвентаря")
+        if process is None:
+            raise _Skip(f"пул '{key}' не найден ({role})",
+                        "используйте имена участников из инвентаря")
+        if participant is None:
+            raise _Skip(f"'{key}' не является пулом ({role}): процесс не заявлен "
+                        "участником в коллаборации",
+                        "слейте процессы по именам участников")
+    if source_participant is target_participant:
+        raise _Skip("пул нельзя слить в самого себя", "укажите разные source и target")
+
+    source_name = index.participant_name(source_process)
+    target_name = index.participant_name(target_process)
+    as_lane = op.get("as_lane")
+    if isinstance(as_lane, str):
+        lane_name = as_lane.strip()
+        if not lane_name:
+            raise _Skip("не задано имя дорожки",
+                        'as_lane: true — имя дорожки возьмём из имени '
+                        "пула-источника, либо укажите имя роли строкой")
+    elif as_lane is None or _flag(as_lane, "as_lane"):
+        lane_name = source_name
+    else:
+        raise _Skip("сливать пул можно только в дорожку целевого пула",
+                    'укажите as_lane: true или имя дорожки строкой')
+
+    # Узлы источника: верхнего уровня (получают flowNodeRef новой дорожки) и
+    # вложенные — они уедут внутри своего subProcess целиком. Узел, который
+    # принадлежит другому процессу, признак битой схемы: переносить его нельзя.
+    top_level: List[str] = []
+    touched: Set[str] = {source_participant.get("id") or "",
+                         source_participant.get("name") or "",
+                         source_process.get("id") or "",
+                         source_process.get("name") or "",
+                         target_process.get("id") or ""}
+    foreign: List[str] = []
+    steps = 0
+    moved_nodes = 0
+    for child in source_process.iter():
+        if child is source_process or not isinstance(child.tag, str):
+            continue
+        if not is_bpmn_tag(child.tag):
+            continue
+        child_id = child.get("id")
+        if not child_id:
+            continue
+        if _local(child.tag) in FLOW_NODE_TAGS:
+            if index.process_of.get(child_id) is not source_process:
+                foreign.append(child_id)
+                continue
+            moved_nodes += 1
+            if _local(child.tag) not in ("startEvent", "endEvent"):
+                steps += 1
+            touched.add(child_id)
+            if index.parents.get(child) is source_process:
+                top_level.append(child_id)
+        elif _local(child.tag) == "lane":
+            touched |= {child.get("id") or "", child.get("name") or ""}
+    if foreign:
+        raise _Skip(
+            f"в пуле «{source_name}» есть узлы, принадлежащие чужому процессу: "
+            + ", ".join(foreign[:5]),
+            "сначала верните их на место операцией move_to_participant",
+        )
+    if not steps:
+        # Старт и финиш — не содержание: такой пул надо удалять, а не тащить
+        # в главную дорожку пустым фрагментом маршрута.
+        raise _Skip(f"в пуле «{source_name}» нет ни одного шага",
+                    "удалите пустой пул операцией remove_participant")
+
+    lane_set = _ensure_lane_set(index, target_process)
+    lane_id = _new_id(index, "new_Lane")
+    lane = ET.Element(_q("lane"), {"id": lane_id, "name": lane_name})
+    index.adopt(lane_set, lane)
+    touched |= {lane_id, lane_name}
+
+    moved_flows: List[str] = []
+    for child in list(source_process):
+        if not isinstance(child.tag, str):
+            continue
+        if _local(child.tag) == "laneSet":
+            # Дорожки источника вместе с его пулом: узлы получат одну общую.
+            index.detach(child)
+            continue
+        if not is_bpmn_tag(child.tag):
+            continue
+        if _local(child.tag) in ("sequenceFlow", "messageFlow"):
+            moved_flows.append(child.get("id") or "")
+        index.detach(child)
+        index.adopt(target_process, child)
+    touched.update(moved_flows)
+
+    for node_id in top_level:
+        ET.SubElement(lane, _q("flowNodeRef")).text = node_id
+
+    # messageFlow между двумя пулами внутри одного процесса теряет смысл:
+    # роли одной организации общаются sequence-потоками, а межпуловый
+    # messageFlow bpmn-js больше не может нарисовать.
+    inside_target = {elem_id for elem_id
+                     in index.elements
+                     if index.process_of.get(elem_id) is target_process}
+    removed_messages = []
+    for flow in list(index.message_flows):
+        if flow.get("sourceRef") in inside_target and flow.get("targetRef") in inside_target:
+            index.detach(flow)
+            removed_messages.append(flow.get("id") or "")
+            touched.add(flow.get("id") or "")
+
+    index.detach(source_process)
+    index.detach(source_participant)
+    index.merge_touched |= {item for item in touched if item}
+
+    notes = [f"пул «{source_name}» слит в «{target_name}» дорожкой «{lane_name}», "
+             f"перенесено узлов: {moved_nodes}, потоков: {len(moved_flows)}"]
+    if removed_messages:
+        notes.append("messageFlow между пулами удалены: "
+                     + ", ".join(removed_messages[:5]))
+    starts = [elem_id for elem_id in index.elements
+              if _local(index.elements[elem_id].tag) == "startEvent"
+              and index.process_of.get(elem_id) is target_process]
+    if len(starts) > 1:
+        notes.append(f"в пуле «{target_name}» теперь {len(starts)} стартовых событий — "
+                     "сведите дорожки в один маршрут операциями connect")
+    return notes
+
+
+def _op_remove_participant(op: Dict[str, Any], index: _Index) -> List[str]:
+    """Удалить пул, в котором нет ни одной активности: только старт и финал."""
+    participant, process, key = index.resolve_participant(
+        op.get("participant") or op.get("id"))
+    if not key:
+        raise _Skip("не задан пул", "укажите participant именем или id пула из инвентаря")
+    if process is None:
+        raise _Skip(f"пул '{key}' не найден", "используйте имена участников из инвентаря")
+    if participant is None:
+        raise _Skip(f"'{key}' не является пулом: процесс не заявлен участником "
+                    "в коллаборации",
+                    "удалять можно только участников из инвентаря (participants)")
+    label = index.participant_name(process)
+    nodes = [(elem_id, elem) for elem_id, elem in list(index.elements.items())
+             if index.process_of.get(elem_id) is process]
+    activities = [elem_id for elem_id, elem in nodes
+                  if _local(elem.tag) not in ("startEvent", "endEvent")]
+    if activities:
+        raise _Skip(
+            f"в пуле «{label}» есть шаги ({', '.join(activities[:5])}) — удалять нельзя",
+            "слейте пул в дорожку операцией merge_participants или удалите "
+            "шаги операцией delete",
+        )
+    node_ids = {elem_id for elem_id, _ in nodes}
+    outside = sorted({flow.get("id") or "" for flow in
+                      index.sequence_flows + index.message_flows
+                      if {flow.get("sourceRef"), flow.get("targetRef")} & node_ids
+                      and not {flow.get("sourceRef"), flow.get("targetRef")} <= node_ids})
+    if outside:
+        raise _Skip(
+            f"пул «{label}» связан с другими пулами потоками {', '.join(outside[:5])}",
+            "разорвите связи операцией disconnect либо слейте пул "
+            "merge_participants вместо удаления",
+        )
+    for _, elem in nodes:
+        _remove_node(index, elem)
+    index.detach(process)
+    index.detach(participant)
+    return [f"пустой пул «{label}» удалён вместе с процессом"]
 
 
 _HANDLERS = {
@@ -1002,8 +1415,11 @@ _HANDLERS = {
     "rename": _op_rename,
     "delete": _op_delete,
     "connect": _op_connect,
+    "set_default": _op_set_default,
     "disconnect": _op_disconnect,
     "move_to_participant": _op_move,
+    "merge_participants": _op_merge_participants,
+    "remove_participant": _op_remove_participant,
 }
 
 
@@ -1036,22 +1452,33 @@ def _lane_move_pools(operations: List[Dict[str, Any]],
     return pools
 
 
-ADD_NODE_OPS = {"add_task", "add_event", "add_gateway"}
+ADD_NODE_OPS = {"add_task", "add_event", "add_gateway", "add_boundary_event"}
+
+# Поля, по которым правка опознаётся в отчёте. Они же — ключ сравнения
+# «пропуск первого раунда закрыт повтором» в оркестраторе: без них нельзя
+# понять, что исправленная версия той же операции прошла.
+_OP_IDENTITY_KEYS = ("id", "element_id", "flow", "source", "target", "name",
+                     "participant", "gateway")
+
+
+def _op_identity(op: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: op[key] for key in _OP_IDENTITY_KEYS if op.get(key)}
 
 
 def _routing_gap(index: _Index, elem_id: str) -> Optional[str]:
     """Чем узел односторонне связан с маршрутом: None, если связи есть с обеих
-    сторон. Граничное событие хозяина не обязано продолжать — его ветку
-    обработки оценивает validate_and_repair отдельной пометкой."""
+    сторон. Граничное событие хозяина не обязано продолжать — но ветка
+    обработки у него быть должна: без неё это кружок, за который скоринг
+    снимает балл, и принятое улучшение делает схему хуже исходной."""
     elem = index.elements.get(elem_id)
     if elem is None:
         return None
     tag = _local(elem.tag)
-    if tag == "boundaryEvent" or elem.get("attachedToRef"):
-        return None
     flows = index.sequence_flows + index.message_flows
     has_in = any(f.get("targetRef") == elem_id for f in flows)
     has_out = any(f.get("sourceRef") == elem_id for f in flows)
+    if tag == "boundaryEvent" or elem.get("attachedToRef"):
+        return None if has_out else "остался без ветки обработки"
     if tag == "startEvent":
         return None if has_out else "не имеет исходящего потока"
     if tag == "endEvent":
@@ -1109,6 +1536,7 @@ def apply_operations(xml_text: str,
     skipped: List[Dict[str, Any]] = []
     added: List[str] = []
     added_ops: Dict[str, str] = {}
+    merge_identities: List[Dict[str, Any]] = []
     for op in operations or []:
         if not isinstance(op, dict):
             skipped.append({"op": str(op), "reason": "операция не объект",
@@ -1134,20 +1562,21 @@ def apply_operations(xml_text: str,
             if op_name in ADD_NODE_OPS and op.get("id"):
                 added.append(str(op["id"]))
                 added_ops[str(op["id"])] = op_name
+            if op_name == "merge_participants":
+                merge_identities.append(_op_identity(op))
             if derived:
                 notes = notes + [derived]
-            entry = {"op": op_name}
-            for key in ("id", "element_id", "flow", "source", "target", "name"):
-                if op.get(key):
-                    entry[key] = op[key]
+            entry = {"op": op_name, **_op_identity(op)}
             if notes:
                 entry["note"] = "; ".join(notes)
             applied.append(entry)
         except _Skip as skip:
-            skipped.append({"op": op_name, "reason": str(skip), "hint": skip.hint})
+            skipped.append({"op": op_name, **_op_identity(op),
+                            "reason": str(skip), "hint": skip.hint})
         except Exception as e:  # noqa: BLE001 — одна операция не роняет пакет
             logger.exception("Операция %s упала", op_name)
-            skipped.append({"op": op_name, "reason": f"внутренняя ошибка: {e}",
+            skipped.append({"op": op_name, **_op_identity(op),
+                            "reason": f"внутренняя ошибка: {e}",
                             "hint": "упростите операцию"})
     # Узлы, добавленные пакетом и оставшиеся без маршрута, откатываем:
     # принятое улучшение не имеет права делать схему хуже исходной.
@@ -1158,15 +1587,43 @@ def apply_operations(xml_text: str,
                    and a.get("target") not in dropped
                    and a.get("flow") not in dropped_flows]
         for elem_id, gap in dropped.items():
-            skipped.append({"op": added_ops.get(elem_id, "add_task"), "id": elem_id,
-                            "reason": f"новый шаг ({elem_id}) {gap} — изменение откачено",
-                            # Откатанный узел из схемы убран, поэтому connect на
-                            # него уже не работает: повтор обязан перевставить
-                            # шаг операцией after, иначе он добавится заново
-                            # таким же висячим.
-                            "hint": f"перевставьте шаг операцией с after "
-                                    f"(связать его connect-ами нельзя: "
-                                    f"'{elem_id}' уже не существует)"})
+            op_name = added_ops.get(elem_id, "add_task")
+            # Откатанный узел из схемы убран, поэтому connect на него уже не
+            # работает: повтор обязан перевставить шаг операцией after, иначе
+            # он добавится заново таким же висячим. Для граничного события
+            # «after» бессмысленно — ему нужна ветка обработки.
+            hint = (f"добавьте ветку обработки: шаг-эскалацию операцией add_task "
+                    f"и connect от '{elem_id}' к нему ('{elem_id}' уже откатан, "
+                    f"связывать его нельзя)") if op_name == "add_boundary_event" \
+                else f"перевставьте шаг операцией с after " \
+                     f"(связать его connect-ами нельзя: " \
+                     f"'{elem_id}' уже не существует)"
+            skipped.append({"op": op_name, "id": elem_id,
+                            "reason": f"новый шаг ({elem_id}) {gap} — изменение "
+                                      f"откачено",
+                            "hint": hint})
+
+    # Слияние пулов — единственная правка, которая переносит чужие узлы и потоки
+    # в другой процесс. Если из-за переноса починка чистит висящий поток или
+    # находит узел вне маршрута, полуслитая схема хуже целой: откатываем весь
+    # пакет к XML до применения и честно сообщаем причину.
+    if index.merge_touched:
+        problems = _merge_breakage(_serialize(root), index.merge_touched)
+        if problems:
+            # Откатывается весь пакет, поэтому пропуск оформляется по последней
+            # слиявшей операции: по её полям оркестратор поймёт, какая правка
+            # не закрыта, и не покажет её как успешное изменение.
+            for identity in reversed(merge_identities):
+                skipped.insert(0, {
+                    "op": "merge_participants", **identity,
+                    "reason": "слияние пулов сделало схему невалидной: "
+                              + "; ".join(problems[:3]),
+                    "hint": "сначала встройте шаги пула-источника в маршрут "
+                            "операциями after/connect внутри его пула, затем "
+                            "повторите merge_participants",
+                })
+                break
+            return xml_text, {"status": "failed", "applied": [], "skipped": skipped}
 
     status = "success" if not skipped else ("partial" if applied else "failed")
     return _serialize(root), {"status": status, "applied": applied, "skipped": skipped}
@@ -1204,7 +1661,23 @@ def _ensure_process_event(index: _Index, process: ET.Element, tag: str,
 # работу, а не как успешное изменение.
 UNROUTED_NOTE_MARKERS = ("остался без потоков", "не ведёт ни к одному шагу",
                          "остался без шагов", "— тупик: вход есть",
-                         "недостижим: выход есть")
+                         "недостижим: выход есть", "остался без ветки обработки")
+
+# Поломки, из-за которых пакет с `merge_participants` откатывается целиком: те
+# же дефекты маршрута плюс следы переноса — висящий поток или ссылка дорожки на
+# элемент, который уехал в другой процесс.
+MERGE_FATAL_NOTE_MARKERS = UNROUTED_NOTE_MARKERS + (
+    "удалён висящий поток", "ссылалась на удалённый элемент",
+    "перенесён в другой пул")
+
+
+def _merge_breakage(applied_xml: str, touched: Set[str]) -> List[str]:
+    """Заметки починки, относящиеся к элементам, перенесённым слиянием пулов.
+    Пустой список означает «слияние не сломало маршрут»."""
+    _, notes = validate_and_repair(applied_xml)
+    return [note for note in notes
+            if any(item in note for item in touched)
+            and any(marker in note for marker in MERGE_FATAL_NOTE_MARKERS)]
 
 
 def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
@@ -1261,27 +1734,54 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
             ref.text = flow_id
             elem.insert(shift + offset, ref)
 
-    # 4. Исключающий шлюз с единственной веткой — не развилка, а обычный шаг.
-    # То же правило, что у генератора (`_demote_single_branch_gateways`):
-    # вторую ветку выдумывать нельзя, поэтому шлюз понижается до задачи, а
-    # условие с его единственного потока снимается — иначе улучшение,
-    # добавившее такой шлюз, роняло бы правило gateway_conditions.
+    # 3b. default шлюза — такая же ссылка на поток, как incoming/outgoing:
+    # после disconnect, delete или откатанного пакета она может смотреть в
+    # несуществующую ветку либо в чужой поток. bpmn-js на битый IDREF ругается,
+    # а скоринг по такому атрибуту перестаёт считать ветку условной.
+    for elem_id, elem in index.elements.items():
+        default_id = elem.get("default")
+        if not default_id or _local(elem.tag) not in GATEWAY_TAGS:
+            continue
+        flow = index.find_flow(default_id)
+        if (flow is None or _local(flow.tag) != "sequenceFlow"
+                or flow.get("sourceRef") != elem_id):
+            del elem.attrib["default"]
+            notes.append(f"шлюз «{elem.get('name') or elem_id}» ({elem_id}) "
+                         f"ссылался на недоступный выход по умолчанию "
+                         f"{default_id} — атрибут снят")
+
+    # 4. Исключающий шлюз, который ни расщепляет, ни сливает, — не шлюз, а
+    # обычный шаг. То же правило, что у генератора
+    # (`_demote_single_branch_gateways`): вторую ветку выдумывать нельзя,
+    # поэтому шлюз понижается до задачи, а условие с его единственного потока
+    # снимается — иначе улучшение, добавившее такой шлюз, роняло бы правило
+    # gateway_conditions.
     outgoing_by_source: Dict[str, List[ET.Element]] = {}
+    incoming_count: Dict[str, int] = {}
     for flow in index.sequence_flows:
         outgoing_by_source.setdefault(flow.get("sourceRef") or "", []).append(flow)
+        target_id = flow.get("targetRef") or ""
+        incoming_count[target_id] = incoming_count.get(target_id, 0) + 1
     for elem_id, elem in index.elements.items():
         if _local(elem.tag) != "exclusiveGateway":
             continue
         branches = outgoing_by_source.get(elem_id) or []
-        if len(branches) >= 2:
+        if len(branches) >= 2 or incoming_count.get(elem_id, 0) >= 2:
+            # Сходящийся шлюз легален с одним исходящим: понижение съело бы
+            # слияния веток, которые генератор вставляет осознанно.
             continue
         elem.tag = _q("task")
         condition = branches[0].find(_q("conditionExpression")) if branches else None
         if condition is not None:
             branches[0].remove(condition)
+        had_default = elem.get("default") is not None
+        if had_default:
+            # У единственной ветки нет «выхода по умолчанию»: выбирать не из чего.
+            del elem.attrib["default"]
         notes.append(f"шлюз «{elem.get('name') or elem_id}» ({elem_id}) с "
                      f"единственной веткой понижен до задачи "
-                     + ("; условие с потока снято" if condition is not None else ""))
+                     + ("; условие с потока снято" if condition is not None else "")
+                     + ("; выход по умолчанию снят" if had_default else ""))
 
     # 5. У каждого процесса — хотя бы один старт и один энд.
     counter = 1

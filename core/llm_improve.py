@@ -26,6 +26,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from . import llm_client
 from .llm_client import LLMError, LLMTruncatedError
 from . import bpmn_edits
+from .bpmn_scoring import has_unguarded_cycle
 
 logger = logging.getLogger(__name__)
 
@@ -575,24 +576,35 @@ _SYSTEM_PROMPT = """Ты — эксперт по BPMN 2.0 и бизнес-ана
 3. Поток между разными пулами — только flow_type=message.
 4. Роли сотрудников одной организации — ДОРОЖКИ внутри одного пула
    (`add_lane`, `move_to_lane`), а не новые пулы: новый пул заводят только для
-   реального внешнего участника (другая организация, внешняя система).
-5. Сроки и эскалации закрыты — `add_boundary_event` с event_type=timer,
-   обработка исключений — event_type=error, пояснения к шагам — `add_documentation`.
+   реального внешнего участника (другая организация, внешняя система). Если
+   схема уже разведена по пулам-ролям, сливай их операцией `merge_participants`
+   (source — лишний пул, target — пул организации, `as_lane: true` — дорожку
+   назовём именем пула-источника). Пул, где из шагов только старт и финиш,
+   пустой: удали его операцией `remove_participant`, не оставляй «на потом».
+5. Ожидание и сроки (SLA) оформляются таймером с хронометражем:
+   `add_boundary_event` event_type=timer с duration ("PT15M", "PT2H") либо
+   cycle ("R3/PT10M") на задаче, обработка исключений — event_type=error.
    Промежуточное событие-ловушку можно просить коротко: `add_event`
    event_type=timer (или message, error, signal) — аплайер сам возьмёт
-   intermediateCatch с нужным определением.
-   Граничное событие само по себе ничего не делает: сразу добавляй ему ветку
-   обработки — `add_event` или `add_task` и `connect` от события к этой ветке.
-   Событие без исходящего потока остаётся тупиком и качество схемы ухудшит.
-6. Ветвление — `add_gateway` gateway_type=exclusive. У такого шлюза должно
-   быть минимум два исходящих потока, и `condition` обязателен на КАЖДОМ из
-   них: выход по умолчанию (атрибут default) аплайер ставить не умеет, а
-   скоринг считает необусловленную ветку ошибкой.
+   intermediateCatch с нужным определением, `duration`/`cycle` работают так же.
+   Значение — только ISO-8601, битое отвергается; без поля таймер получит
+   PT15M. Граничное событие само по себе ничего не делает: сразу добавляй ему
+   ветку обработки — `add_event` или `add_task` и `connect` от события к этой
+   ветке. Событие без исходящего потока остаётся тупиком и качество схемы
+   ухудшит. Пояснения к шагам — `add_documentation`.
+6. Ветвление — `add_gateway` gateway_type=exclusive. Развилку закрывают
+   парной: если ветки должны сойтись в одну точку, добавь ВТОРОЙ `add_gateway`
+   и поведи в него по одному потоку из каждой ветки, а из него — дальше по
+   маршруту («шлюз на входе, шлюз на выходе»), иначе ветка обрывается.
+   На КАЖДОЙ ветке исключающего шлюза обязателен `condition`, кроме одной —
+   её помечай `"default": true` в `connect`, а уже существующий поток помечай
+   `set_default`. Необусловленную ветку без default аплайер отвергает: скоринг
+   считает такую ветку ошибкой.
 7. Новый шаг обязан встать в маршрут с двух сторон: вход (через `after` либо
    `connect` от предыдущего шага) и выход (`connect` к следующему шагу или к
    конечному событию его пула). Шаг, связанный только с одной стороны, — это
-   тупик или недостижимый узел, и из-за него качество схемы падает ниже
-   исходного.
+   тупик или недостижимый узел, из-за него качество схемы падает ниже
+   исходного, и аплайер такой шаг откатывает целиком.
 8. Если задача пользователя — только анализ (например, «найди узкие места»,
    «проверь ошибки»), верни пустой массив "operations".
 9. Сохраняй бизнес-логику: предлагай минимально необходимые изменения.
@@ -763,8 +775,28 @@ class BPMNImprovementOrchestrator:
         # применились, но остались вне маршрута. Без второго пункта принятие
         # улучшения роняет балл схемы — модель обязана добить связность сама,
         # а не доверять это эвристике аплайера.
+        # Цикл без защищённого выхода — ухудшение, а не стиль: процесс из него
+        # не выходит. Пакет, который его замкнул, откатывается к базе (тот же
+        # порядок, что с нерассорченными шагами), и модель получает шанс
+        # перестроить ветку корректирующим повтором.
+        def _reject_cycle(candidate: str) -> str:
+            if (candidate == xml_content or not has_unguarded_cycle(candidate)
+                    or has_unguarded_cycle(xml_content)):
+                return candidate
+            report["skipped"].append({
+                "op": "batch", "stage": "plan", "reapplied": False,
+                "reason": "пакет создал цикл без защищённого выхода — изменение "
+                          "откачено",
+                "hint": "верните ветку через исключающий шлюз, у которого есть "
+                        "выход из цикла (condition либо default)",
+            })
+            return xml_content
+
         xml_after, repair_notes = await asyncio.to_thread(bpmn_edits.validate_and_repair,
                                                           xml_after)
+        rolled_back = _reject_cycle(xml_after)
+        if rolled_back != xml_after:
+            xml_after, repair_notes = rolled_back, []
         unrouted = _unrouted(repair_notes)
         if report["skipped"] or unrouted:
             try:
@@ -777,6 +809,9 @@ class BPMNImprovementOrchestrator:
                 logger.warning("Корректирующий повтор не выполнен: %s", e)
             xml_after, repair_notes = await asyncio.to_thread(
                 bpmn_edits.validate_and_repair, xml_after)
+            rolled_back = _reject_cycle(xml_after)
+            if rolled_back != xml_after:
+                xml_after, repair_notes = rolled_back, []
         report["repair_notes"] = repair_notes
 
         # Висячий шаг — не улучшение: модель не указала, между какими шагами

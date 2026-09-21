@@ -30,7 +30,7 @@ app/                     backend (FastAPI + SQLAlchemy)
 core/                    AI-ядро
   bpmn_generator.py      генерация схемы, bpmn_scoring.py — скоринг
   llm_improve.py         улучшение, bpmn_edits.py — операции над схемой
-  llm_client.py          транспорт и разбор ответов (OpenAI-совместимый API)
+  llm_client.py          транспорт и разбор ответов (GigaChat)
   bpmn_dataset/          корпус эталонов для RAG
 bpmn-constructor/        frontend: React (CRA) + bpmn-js 18
   src/styles/tokens.css  дизайн-токены, вся вёрстка на них
@@ -39,13 +39,14 @@ migrations/              Alembic (версионируемая схема)
 ```
 
 СУБД задаётся `DATABASE_URL`: PostgreSQL — целевой режим, SQLite — легаси для
-локальной разработки. Секреты (`SECRET_KEY`, SMTP, `LLM_API_KEY`) читаются
-только из окружения, в код не попадают.
+локальной разработки. Секреты (`SECRET_KEY`, SMTP, `GIGACHAT_CREDENTIALS`) читаются
+только из окружения, в код не попадают. Локальный `python main.py` подхватывает
+`.env` из корня проекта; в контейнер переменные передаёт compose.
 
 ## Запуск через Docker Compose
 
 ```bash
-cp .env.example .env      # заполнить SECRET_KEY, POSTGRES_PASSWORD, LLM_API_KEY
+cp .env.example .env      # заполнить SECRET_KEY, POSTGRES_PASSWORD, GIGACHAT_CREDENTIALS
 docker compose up -d      # backend 127.0.0.1:8765, frontend 127.0.0.1:3456
 ```
 
@@ -68,7 +69,8 @@ cd bpmn-constructor && npm install && npm start                  # dev-серв�
 | --- | --- |
 | `DATABASE_URL` | строка подключения SQLAlchemy (PostgreSQL или SQLite) |
 | `SECRET_KEY` | подпись JWT; обязателен при работе с PostgreSQL |
-| `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` | провайдер LLM (OpenAI-совместимый) |
+| `GIGACHAT_CREDENTIALS`, `GIGACHAT_SCOPE`, `GIGACHAT_VERIFY_SSL`, `GIGACHAT_MODEL`, `GIGACHAT_MAX_CONCURRENT` | провайдер LLM (GigaChat) |
+| `AI_MAX_XML_CHARS`, `MAX_UPLOAD_BYTES`, `AI_REQUESTS_PER_HOUR` | лимиты ИИ-контура: размер схемы, размер загрузки, часовой бюджет запросов на пользователя |
 | `MAIL_*` | SMTP для приглашений и сброса пароля |
 | `BACKEND_PORT`, `FRONTEND_URL`, `REACT_APP_API_URL` | порты и адреса локального запуска |
 
@@ -80,8 +82,11 @@ cd bpmn-constructor && npm install && npm start                  # dev-серв�
 python -m pytest tests/ -q
 ```
 
-109 тестов: разбор ответов LLM, аплайер операций, скоринг, HTTP-контур
-генерации/улучшения/принятия, все маршруты, миграции схемы. Сеть и ключ LLM не
+297 тестов: разбор ответов LLM, генерация структуры и починка плана модели,
+аплайер операций (включая откат шагов, оставшихся вне маршрута), RAG-поиск по
+эталонам, скоринг, HTTP-контур
+генерации/улучшения/принятия, все маршруты (включая импорт `.bpmn` и сброс
+пароля), миграции схемы. Сеть и ключ LLM не
 нужны — LLM подставлен на уровне транспорта. Прогон на PostgreSQL — переменной
 `TEST_DATABASE_URL`.
 

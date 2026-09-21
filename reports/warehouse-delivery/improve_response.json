@@ -1,0 +1,104 @@
+{
+ "status": "success",
+ "improvement_id": "1255e258-d6dc-4540-9fdf-851283a82d90",
+ "recommendations": "добавлены таймеры SLA и эскалация руководителя смены при превышении времени выполнения задач сбора груза и проверки упаковки\n\nНе применено (требует уточнения):\n- план: connect: такой поток уже существует\n- план: add_gateway: не задано имя элемента\n- план: add_flow: неизвестная операция\n- план: add_flow: неизвестная операция\n- повтор: add_task: новый шаг (new_timer_task_2) недостижим: выход есть, входа нет — изменение откачено",
+ "report": {
+  "status": "partial",
+  "applied": [
+   {
+    "op": "add_task",
+    "id": "new_timer_task",
+    "name": "Таймер SLA сбора груза",
+    "note": "потоки после 'A3' переподвешены через 'new_timer_task'"
+   },
+   {
+    "op": "add_task",
+    "id": "new_escalation_task",
+    "name": "Эскалация руководителю смены",
+    "note": "потоки после 'new_timer_task' переподвешены через 'new_escalation_task'"
+   },
+   {
+    "op": "add_documentation",
+    "id": "A3"
+   },
+   {
+    "op": "add_documentation",
+    "id": "A4"
+   },
+   {
+    "op": "add_gateway",
+    "id": "new_gateway",
+    "name": "Выбор дальнейшего действия",
+    "note": "добавлен элемент 'Выбор дальнейшего действия'"
+   },
+   {
+    "op": "connect",
+    "source": "new_timer_task",
+    "target": "new_gateway"
+   },
+   {
+    "op": "connect",
+    "source": "new_gateway",
+    "target": "A7"
+   }
+  ],
+  "skipped": [
+   {
+    "op": "connect",
+    "reason": "такой поток уже существует",
+    "hint": "",
+    "stage": "plan",
+    "reapplied": false
+   },
+   {
+    "op": "add_gateway",
+    "reason": "не задано имя элемента",
+    "hint": "укажите name",
+    "stage": "plan",
+    "reapplied": false
+   },
+   {
+    "op": "add_flow",
+    "reason": "неизвестная операция",
+    "hint": "допустимы: add_boundary_event, add_documentation, add_event, add_gateway, add_lane, add_participant, add_task, connect, delete, disconnect, move_to_lane, move_to_participant, rename",
+    "stage": "plan",
+    "reapplied": false
+   },
+   {
+    "op": "add_flow",
+    "reason": "неизвестная операция",
+    "hint": "допустимы: add_boundary_event, add_documentation, add_event, add_gateway, add_lane, add_participant, add_task, connect, delete, disconnect, move_to_lane, move_to_participant, rename",
+    "stage": "plan",
+    "reapplied": false
+   },
+   {
+    "op": "add_task",
+    "id": "new_timer_task_2",
+    "reason": "новый шаг (new_timer_task_2) недостижим: выход есть, входа нет — изменение откачено",
+    "hint": "перевставьте шаг операцией с after (связать его connect-ами нельзя: 'new_timer_task_2' уже не существует)",
+    "stage": "retry",
+    "reapplied": false
+   },
+   {
+    "op": "add_event",
+    "id": "new_intermediate_catch",
+    "reason": "новый шаг (new_intermediate_catch) недостижим: выход есть, входа нет — изменение откачено",
+    "hint": "перевставьте шаг операцией с after (связать его connect-ами нельзя: 'new_intermediate_catch' уже не существует)",
+    "stage": "retry",
+    "reapplied": false
+   },
+   {
+    "op": "add_task",
+    "id": "new_escalation_task_2",
+    "reason": "новый шаг (new_escalation_task_2) тупик: вход есть, выхода нет — изменение откачено",
+    "hint": "перевставьте шаг операцией с after (связать его connect-ами нельзя: 'new_escalation_task_2' уже не существует)",
+    "stage": "retry",
+    "reapplied": false
+   }
+  ],
+  "truncated_operations": 0,
+  "repair_notes": [
+   "шлюз «Выбор дальнейшего действия» (new_gateway) с единственной веткой понижен до задачи ; условие с потока снято"
+  ]
+ }
+}

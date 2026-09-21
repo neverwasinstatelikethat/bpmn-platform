@@ -17,13 +17,15 @@
 - AI-ядро: `core/` — генерация BPMN, rule-based скоринг, улучшение через
   LLM с RAG по корпусу `core/bpmn_dataset/`. Улучшение работает пакетом
   операций над схемой (`core/bpmn_edits.py`), а не генерацией XML целиком.
-  LLM-провайдер — Foundation Models API (OpenAI-совместимый клиент),
+  LLM-провайдер — GigaChat (библиотека `gigachat`),
   транспорт и разбор ответа — `core/llm_client.py`.
 - Frontend: React (CRA) + bpmn-js в `bpmn-constructor/`; dev-сервер на
   порту `3456`, ожидает backend на `http://localhost:8765`.
-- Автотесты: `python -m pytest tests/ -q` (99 тестов: разбор ответов LLM,
-  аплайер операций, скоринг, HTTP-контур улучшения и принятия, все маршруты,
-  миграции схемы). LLM в тестах подставлен на уровне транспорта, сеть и ключ
+- Автотесты: `python -m pytest tests/ -q` (297 тестов: разбор ответов LLM,
+  генерация структуры и починка плана, аплайер операций включая откат шагов вне
+  маршрута, RAG-поиск, скоринг, HTTP-контур улучшения и принятия с пересчётом
+  балла, все маршруты включая импорт .bpmn и сброс пароля, миграции схемы).
+  LLM в тестах подставлен на уровне транспорта, сеть и ключ
   не нужны. Прогон на PostgreSQL — переменной `TEST_DATABASE_URL`.
   Docker Compose-контур обкатан (`docker-compose.yml`): `db` (PostgreSQL),
   `backend`, `frontend`; конфигурация через `.env` по шаблону `.env.example`.
@@ -31,11 +33,13 @@
 ## Цели и дорожная карта
 
 1. **Переход с SQLite на PostgreSQL** (выполнено). Подключение читается из
-   `DATABASE_URL`, схема создаётся из моделей, предопределённые роли
-   сидируются на любой СУБД; данные из `bpmn.db` перенесены скриптом
-   `migrate_sqlite_to_postgres.py` (94 строки, сверено по таблицам) и
-   проверены сквозным сценарием (register → login → `/api/me`). Осталось:
-   перейти на версионируемые миграции (цель — Alembic) вместо `create_all`.
+   `DATABASE_URL`, схема версионируется Alembic (`migrations/`, вызов из
+   `app/startup.py`), предопределённые роли сидируются на любой СУБД; данные
+   из `bpmn.db` перенесены скриптом `migrate_sqlite_to_postgres.py` (94 строки,
+   сверено по таблицам) и проверены сквозным сценарием (register → login →
+   `/api/me`). Пару `create_all` + ad-hoc `apply_migration()` в коде больше не
+   добавляй: новое поле модели — миграция в `migrations/versions/` (её
+   сверяет с моделями `tests/test_migrations.py`).
    Новый код пиши сразу в расчёте на PostgreSQL.
 2. **Docker Compose-контур** (обкатан): сервисы `db` (PostgreSQL),
    `backend`, `frontend`; секреты через `.env`; healthcheck по `/health`;

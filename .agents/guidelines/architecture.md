@@ -27,10 +27,12 @@
   операций), `bpmn_edits.py` (инвентарь схемы, детерминированный аплайер
   операций, семантическая починка), `llm_client.py` (транспорт, ретраи,
   разбор «непослушного» ответа);
-- RAG-корпус `core/bpmn_dataset/` (сотни эталонных `.bpmn`) и pickle-кэши
-  индексов (`bpmn_rag_cache.pkl`, `bpmn_agent_cache.pkl`);
-- LLM через OpenAI-совместимый клиент (Foundation Models API,
-  `openai/gpt-oss-120b`);
+- RAG-корпус `core/bpmn_dataset/` (сотни эталонных `.bpmn`) и кэш индексов
+  `core/bpmn_rag_cache.npz` + манифест `core/bpmn_rag_cache.json` (не pickle:
+  загрузка кэша не должна исполнять данные; путь — `BPMN_RAG_CACHE_FILE`);
+- LLM через GigaChat (библиотека `gigachat`, модель `GigaChat`); транспорт и
+  разбор ответа — `core/llm_client.py`, настройки только из окружения
+  (`GIGACHAT_CREDENTIALS`, `GIGACHAT_SCOPE`, `GIGACHAT_VERIFY_SSL`, `GIGACHAT_MODEL`);
 - email через fastapi_mail (настройки из окружения) — приглашения и сброс пароля;
 - статика и артефакты экспорта в `static/`;
 - frontend: React (CRA) + bpmn-js в `bpmn-constructor/`, адрес backend

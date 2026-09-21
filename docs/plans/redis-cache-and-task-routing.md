@@ -12,7 +12,7 @@ Celery, см. раздел 7).
   выполняются синхронно в обработчике запроса.
 - `POST /api/ai/improve` (main.py, ~стр. 1098) — `await
   bpmn_processor.improve_diagram(...)`: RAG по корпусу
-  `core/bpmn_dataset/` + вызов внешней LLM (Foundation Models API);
+  `core/bpmn_dataset/` + вызов внешней LLM (GigaChat);
   результат складывается в `pending_improvements` и ждёт апрува.
 - ИИ-ядро (`core/llm_improve.py`) поднимает тяжёлые модели (эмбеддинги
   sentence-transformers, TF-IDF-векторизатор; векторного индекса нет —

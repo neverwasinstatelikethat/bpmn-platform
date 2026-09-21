@@ -4,16 +4,22 @@
 Это та часть контура улучшения, которая раньше отдавала 500: LLM возвращал
 произвольный XML, а валидатор требовал полную DI-раскладку. Теперь модель
 возвращает операции, и применяем их мы."""
+import time
 import xml.etree.ElementTree as ET
 
 import pytest
 
 from core.bpmn_edits import (
     BPMN_NS,
+    DEFAULT_TIMER_DURATION,
+    FLOW_NODE_TAGS,
+    OP_SPEC,
+    UNROUTED_NOTE_MARKERS,
     XML_DECLARATION,
     apply_operations,
     build_inventory,
     validate_and_repair,
+    _HANDLERS,
 )
 
 NS = {"bpmn": BPMN_NS}
@@ -33,6 +39,891 @@ def _flow(root, flow_id):
 
 def _refs(elem, tag):
     return [ref.text for ref in elem.findall(f"bpmn:{tag}", NS)]
+
+
+def _tag(elem):
+    return elem.tag.rsplit("}", 1)[-1]
+
+
+def _child_tags(elem):
+    return [_tag(child) for child in elem if isinstance(child.tag, str)]
+
+
+def _order(elem, first, second):
+    """True, если тег first встречается в детях elem раньше тега second."""
+    tags = _child_tags(elem)
+    return first in tags and second in tags and tags.index(first) < tags.index(second)
+
+
+def _dangling(xml_text):
+    """id flow-узлов без единого входящего или исходящего потока.
+
+    Граничные события не считаем: они по определению без рёбер, их «висячесть»
+    выражается через attachedToRef."""
+    root = _root(xml_text)
+    has_incoming, has_outgoing = set(), set()
+    for flow in root.findall(".//bpmn:sequenceFlow", NS):
+        has_outgoing.add(flow.get("sourceRef"))
+        has_incoming.add(flow.get("targetRef"))
+    dangling = []
+    for elem in root.iter():
+        if not isinstance(elem.tag, str) or _tag(elem) not in FLOW_NODE_TAGS:
+            continue
+        if elem.get("attachedToRef"):
+            continue
+        elem_id = elem.get("id")
+        if elem_id not in has_incoming and elem_id not in has_outgoing:
+            dangling.append(elem_id)
+    return dangling
+
+
+def _lanes(xml_text):
+    return _root(xml_text).findall(".//bpmn:lane", NS)
+
+
+def _lane_refs(lane):
+    return [ref.text for ref in lane.findall("bpmn:flowNodeRef", NS)]
+
+
+def _process(root, process_id):
+    return root.find(f".//bpmn:process[@id='{process_id}']", NS)
+
+
+LANES_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_3">
+  <process id="Process_order" name="Заказ" isExecutable="true">
+    <documentation>Пул обработки заказов</documentation>
+    <startEvent id="Start_1" name="Заказ создан">
+      <outgoing>F1</outgoing>
+    </startEvent>
+    <sequenceFlow id="F1" sourceRef="Start_1" targetRef="T_collect"/>
+    <userTask id="T_collect" name="Собрать заказ">
+      <incoming>F1</incoming>
+      <outgoing>F2</outgoing>
+    </userTask>
+    <sequenceFlow id="F2" sourceRef="T_collect" targetRef="End_ok"/>
+    <endEvent id="End_ok" name="Заказ выдан">
+      <incoming>F2</incoming>
+    </endEvent>
+  </process>
+</definitions>"""
+
+
+NESTED_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_4">
+  <collaboration id="Collaboration_4">
+    <participant id="Pool_outer" name="Внешний" processRef="Process_outer"/>
+    <participant id="Pool_side" name="Смежный" processRef="Process_side"/>
+  </collaboration>
+  <process id="Process_outer" name="Внешний" isExecutable="true">
+    <startEvent id="O_start" name="Старт">
+      <outgoing>OF1</outgoing>
+    </startEvent>
+    <sequenceFlow id="OF1" sourceRef="O_start" targetRef="O_sub"/>
+    <subProcess id="O_sub" name="Подпроцесс">
+      <incoming>OF1</incoming>
+      <outgoing>OF2</outgoing>
+      <startEvent id="I_start" name="Вход подпроцесса">
+        <outgoing>IF1</outgoing>
+      </startEvent>
+      <sequenceFlow id="IF1" sourceRef="I_start" targetRef="I_first"/>
+      <userTask id="I_first" name="Первый шаг">
+        <incoming>IF1</incoming>
+        <outgoing>IF2</outgoing>
+      </userTask>
+      <sequenceFlow id="IF2" sourceRef="I_first" targetRef="I_second"/>
+      <userTask id="I_second" name="Второй шаг">
+        <incoming>IF2</incoming>
+      </userTask>
+    </subProcess>
+    <sequenceFlow id="OF2" sourceRef="O_sub" targetRef="O_end"/>
+    <endEvent id="O_end" name="Финиш">
+      <incoming>OF2</incoming>
+    </endEvent>
+  </process>
+  <process id="Process_side" name="Смежный" isExecutable="true">
+    <startEvent id="S_start" name="Сигнал">
+      <outgoing>SF1</outgoing>
+    </startEvent>
+    <sequenceFlow id="SF1" sourceRef="S_start" targetRef="S_task"/>
+    <userTask id="S_task" name="Чужая задача">
+      <incoming>SF1</incoming>
+      <outgoing>SF2</outgoing>
+    </userTask>
+    <sequenceFlow id="SF2" sourceRef="S_task" targetRef="S_end"/>
+    <endEvent id="S_end" name="Конец смежного">
+      <incoming>SF2</incoming>
+    </endEvent>
+  </process>
+</definitions>"""
+
+
+def _cycle_xml():
+    """Процесс без старта и энда, где у каждого узла есть и вход, и выход:
+    кандидата для нового события нет, и починка обязана честно сказать почему."""
+    return XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="Кольцо" isExecutable="true">
+    <userTask id="T1" name="Шаг один"/>
+    <userTask id="T2" name="Шаг два"/>
+    <sequenceFlow id="F12" sourceRef="T1" targetRef="T2"/>
+    <sequenceFlow id="F21" sourceRef="T2" targetRef="T1"/>
+  </process>
+</definitions>"""
+
+
+def _wide_xml(nodes=250):
+    """Схема из `nodes` задач и ~двух потоков на узел — размер пользовательского
+    XML под лимитом в 1 МБ символов."""
+    half = nodes // 2
+    flows = ['<sequenceFlow id="F_in" sourceRef="S0" targetRef="T0"/>']
+    flows += [f'<sequenceFlow id="F_c{i}" sourceRef="T{i}" targetRef="T{i + 1}"/>'
+              for i in range(nodes - 1)]
+    flows.append(f'<sequenceFlow id="F_out" sourceRef="T{nodes - 1}" targetRef="E0"/>')
+    flows += [f'<sequenceFlow id="F_x{i}" sourceRef="T{i}" targetRef="T{(i + half) % nodes}"/>'
+              for i in range(nodes)]
+    body = "".join(f'<userTask id="T{i}" name="Шаг {i}"/>' for i in range(nodes))
+    return (XML_DECLARATION
+            + '<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">'
+            + '<process id="Process_wide" name="Широкий" isExecutable="true">'
+            + '<startEvent id="S0" name="Старт"/><endEvent id="E0" name="Финиш"/>'
+            + body + "".join(flows) + "</process></definitions>")
+
+
+def _batch_of_25(nodes=250):
+    """25 разнородных операций: вставки, удаления, переносы, дорожки, события."""
+    return (
+        [{"op": "add_task", "id": f"new_T{k}", "name": f"Новый шаг {k}",
+          "task_type": "userTask", "after": f"T{(k * 17 + 7) % nodes}"} for k in range(9)]
+        + [{"op": "delete", "id": f"T{k * 31 % nodes}"} for k in range(3)]
+        + [{"op": "disconnect", "flow": f"F_c{50 + k}"} for k in range(3)]
+        + [{"op": "add_documentation", "id": f"T{60 + k}", "text": "Описание шага"}
+           for k in range(2)]
+        + [{"op": "add_lane", "id": f"new_Lane{k}", "name": f"Дорожка {k}",
+            "participant": "Широкий"} for k in range(2)]
+        + [{"op": "move_to_lane", "id": f"T{70 + k}", "lane": "new_Lane0"} for k in range(2)]
+        + [{"op": "add_boundary_event", "id": f"new_BE{k}", "attached_to": f"T{80 + k}",
+            "event_type": "timer", "name": f"Таймер {k}"} for k in range(2)]
+        + [{"op": "connect", "source": f"T{200}", "target": f"T{203}"}]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Документация элемента
+# ---------------------------------------------------------------------------
+
+class TestDocumentation:
+    OPS = [{"op": "add_documentation", "id": "T_collect",
+            "text": "Собираем со склада, проверяем сроки"}]
+
+    def test_documentation_is_written_into_the_element(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, self.OPS)
+        assert report["status"] == "success"
+        doc = _by_id(out, "T_collect").find("bpmn:documentation", NS)
+        assert doc.text == "Собираем со склада, проверяем сроки"
+
+    def test_documentation_precedes_flow_references(self, single_pool_xml):
+        out, _ = apply_operations(single_pool_xml, self.OPS)
+        task = _by_id(out, "T_collect")
+        assert _order(task, "documentation", "incoming")
+        assert _order(task, "documentation", "outgoing")
+
+    def test_repair_keeps_documentation_before_rebuilt_references(
+            self, single_pool_xml):
+        out, _ = apply_operations(single_pool_xml, self.OPS)
+        repaired, notes = validate_and_repair(out)
+        assert notes == []
+        task = _by_id(repaired, "T_collect")
+        assert _child_tags(task)[0] == "documentation"
+        assert _refs(task, "incoming") == ["F1"]
+        assert _refs(task, "outgoing") == ["F2"]
+        assert build_inventory(repaired)["flows"] == build_inventory(out)["flows"]
+
+    def test_second_documentation_stays_next_to_the_first(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, self.OPS + [
+            {"op": "add_documentation", "id": "T_collect", "text": "Ответственный — кладовщик"},
+        ])
+        assert report["status"] == "success"
+        task = _by_id(out, "T_collect")
+        assert _child_tags(task) == ["documentation", "documentation", "incoming", "outgoing"]
+
+    def test_missing_text_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml,
+                                     [{"op": "add_documentation", "id": "T_collect"}])
+        assert report["skipped"][0]["reason"] == "не задан текст документации"
+        assert report["skipped"][0]["hint"] == "укажите text"
+
+    def test_unknown_element_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_documentation", "id": "no_such_id", "text": "Текст"},
+        ])
+        assert report["skipped"][0]["reason"] == "элемент не найден"
+
+    def test_broken_documentation_does_not_break_the_batch(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_documentation", "id": "no_such_id", "text": "Текст"},
+            {"op": "add_documentation", "id": "T_collect", "text": "Нужный текст"},
+        ])
+        assert report["status"] == "partial"
+        assert [a["op"] for a in report["applied"]] == ["add_documentation"]
+        assert _by_id(out, "T_collect").find("bpmn:documentation", NS).text == "Нужный текст"
+
+
+# ---------------------------------------------------------------------------
+# Дорожки
+# ---------------------------------------------------------------------------
+
+class TestLanes:
+    def test_lane_set_becomes_first_content_of_the_process(self):
+        out, report = apply_operations(LANES_XML, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Кладовщик",
+             "participant": "Заказ"},
+        ])
+        assert report["status"] == "success"
+        process = _process(_root(out), "Process_order")
+        # документация процесса идёт по схеме BPMN раньше laneSet, laneSet —
+        # раньше flow-элементов (так же пишет bpmn-js)
+        assert _child_tags(process)[:2] == ["documentation", "laneSet"]
+        assert _order(process, "laneSet", "userTask")
+        lane = _by_id(out, "new_Lane_1")
+        assert lane.get("name") == "Кладовщик"
+
+    def test_second_lane_joins_the_existing_lane_set(self):
+        out, report = apply_operations(LANES_XML, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Кладовщик",
+             "participant": "Process_order"},
+            {"op": "add_lane", "id": "new_Lane_2", "name": "Курьер",
+             "participant": "Process_order"},
+        ])
+        assert report["status"] == "success"
+        root = _root(out)
+        assert len(root.findall(".//bpmn:laneSet", NS)) == 1
+        assert [_lane_refs(lane) for lane in _lanes(out)] == [[], []]
+        assert _child_tags(root.find(".//bpmn:laneSet", NS)) == ["lane", "lane"]
+
+    def test_lane_lands_in_the_named_pool(self, two_pool_xml):
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_pack", "name": "Сборка",
+             "participant": "Магазин"},
+        ])
+        assert report["status"] == "success"
+        shop = _process(_root(out), "Process_shop")
+        assert _child_tags(shop)[0] == "laneSet"
+        assert shop.find("bpmn:laneSet/bpmn:lane", NS).get("id") == "new_Lane_pack"
+
+    def test_lane_pool_derived_from_move_in_same_batch(self, two_pool_xml):
+        """Модель опустила participant у add_lane, но назвала элемент переноса.
+        Пул при этом определён схемой: дорожка обязана быть в пуле элемента,
+        иначе следующая же операция отвергается как «дорожка другому пулу»."""
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_lane", "id": "new_L6", "name": "Контроль"},
+            {"op": "move_to_lane", "id": "S_accept", "lane": "new_L6"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        shop = _process(_root(out), "Process_shop")
+        lane_set = shop.find("bpmn:laneSet", NS)
+        assert [lane.get("id") for lane in lane_set.findall("bpmn:lane", NS)] == ["new_L6"]
+        assert _lane_refs(lane_set.find("bpmn:lane", NS)) == ["S_accept"]
+        # Вывод виден в отчёте: правка плана, а не молчаливая догадка.
+        assert "пул 'Магазин' взят из элемента 'S_accept'" in report["applied"][0]["note"]
+        # Расходился бы по всей схеме — у второго пула дорожек бы прибавилось.
+        client = _process(_root(out), "Process_client")
+        assert client.find("bpmn:laneSet", NS) is None
+
+    def test_lane_without_pool_and_without_move_is_skipped(self, two_pool_xml):
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_lane", "id": "new_L7", "name": "Сирота"},
+        ])
+        assert report["skipped"][0]["reason"] == "пул не определён"
+
+    def test_move_to_lane_only_references_the_element(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Кладовщик",
+             "participant": "Заказ"},
+            {"op": "move_to_lane", "id": "T_collect", "lane": "new_Lane_1"},
+        ])
+        assert report["status"] == "success"
+        root = _root(out)
+        lane = root.find(".//bpmn:lane", NS)
+        assert _lane_refs(lane) == ["T_collect"]
+        # сам элемент остаётся ребёнком процесса — так хранит bpmn-js
+        assert "T_collect" in [child.get("id") for child in _process(root, "Process_order")]
+
+    def test_move_to_lane_accepts_the_lane_name(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Кладовщик",
+             "participant": "Заказ"},
+            {"op": "move_to_lane", "id": "T_collect", "lane": "Кладовщик"},
+        ])
+        assert report["status"] == "success"
+        assert _lane_refs(_root(out).find(".//bpmn:lane", NS)) == ["T_collect"]
+
+    def test_repeating_the_move_relocates_the_reference(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Кладовщик",
+             "participant": "Заказ"},
+            {"op": "add_lane", "id": "new_Lane_2", "name": "Курьер",
+             "participant": "Заказ"},
+            {"op": "move_to_lane", "id": "T_collect", "lane": "new_Lane_1"},
+            {"op": "move_to_lane", "id": "T_collect", "lane": "new_Lane_2"},
+        ])
+        assert report["status"] == "success"
+        refs = {lane.get("id"): _lane_refs(lane) for lane in _lanes(out)}
+        assert refs == {"new_Lane_1": [], "new_Lane_2": ["T_collect"]}
+
+    def test_inventory_still_reads_a_laned_scheme(self, single_pool_xml):
+        out, _ = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Кладовщик",
+             "participant": "Заказ"},
+            {"op": "move_to_lane", "id": "T_collect", "lane": "new_Lane_1"},
+        ])
+        repaired, notes = validate_and_repair(out)
+        assert notes == []
+        inventory = build_inventory(repaired)
+        assert {e["id"] for e in inventory["elements"]} >= {"Start_1", "T_collect", "End_ok"}
+        assert {f["id"] for f in inventory["flows"]} == {"F1", "F2", "F3", "F4", "F5", "F6"}
+
+    def test_created_lane_is_visible_to_the_planner(self, single_pool_xml):
+        """move_to_lane целиится в id или имя дорожки — значит, инвентарь обязан
+        их показывать, иначе модель выдумывает несуществующие дорожки."""
+        assert build_inventory(single_pool_xml)["lanes"] == []
+        out, _ = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Кладовщик",
+             "participant": "Заказ"},
+        ])
+        assert build_inventory(out)["lanes"] == [
+            {"id": "new_Lane_1", "name": "Кладовщик", "participant": "Заказ"},
+        ]
+
+    def test_lane_without_id_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "name": "Без id", "participant": "Заказ"},
+        ])
+        assert report["skipped"][0]["reason"] == "не задан id нового элемента"
+
+    def test_taken_lane_id_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Первая", "participant": "Заказ"},
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Вторая", "participant": "Заказ"},
+        ])
+        assert report["status"] == "partial"
+        assert "уже занят" in report["skipped"][0]["reason"]
+
+    def test_lane_id_cannot_be_reused_by_another_element(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Первая", "participant": "Заказ"},
+            {"op": "add_task", "id": "new_Lane_1", "name": "Дубликат",
+             "participant": "Заказ"},
+        ])
+        assert report["status"] == "partial"
+        assert "уже занят" in report["skipped"][0]["reason"]
+
+    def test_lane_without_name_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "participant": "Заказ"},
+        ])
+        assert report["skipped"][0]["reason"] == "не задано имя дорожки"
+
+    def test_unknown_pool_for_lane_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_1", "name": "Дорожка",
+             "participant": "Склад"},
+        ])
+        assert report["skipped"][0]["reason"] == "пул не определён"
+
+    def test_move_to_unknown_lane_points_at_add_lane(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "move_to_lane", "id": "T_collect", "lane": "new_Lane_ghost"},
+        ])
+        assert report["skipped"][0]["reason"] == "дорожка 'new_Lane_ghost' не найдена"
+        assert "add_lane" in report["skipped"][0]["hint"]
+
+    def test_move_without_lane_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [{"op": "move_to_lane", "id": "T_collect"}])
+        assert report["skipped"][0]["reason"] == "не задана дорожка"
+
+    def test_move_to_lane_of_another_pool_is_skipped(self, two_pool_xml):
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_shop", "name": "Сборка",
+             "participant": "Магазин"},
+            {"op": "move_to_lane", "id": "C_request", "lane": "new_Lane_shop"},
+        ])
+        assert report["status"] == "partial"
+        assert report["skipped"][0]["reason"] == "дорожка принадлежит другому пулу"
+
+    def test_move_unknown_element_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "move_to_lane", "id": "no_such_id", "lane": "new_Lane_1"},
+        ])
+        assert report["skipped"][0]["reason"] == "элемент не найден"
+
+
+# ---------------------------------------------------------------------------
+# Граничные события и определения событий
+# ---------------------------------------------------------------------------
+
+class TestBoundaryEvent:
+    OPS = [{"op": "add_boundary_event", "id": "new_BE_timeout",
+            "attached_to": "T_collect", "event_type": "timer", "name": "Дождались"}]
+
+    def test_timer_boundary_event_is_attached_to_the_task(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, self.OPS)
+        assert report["status"] == "success"
+        event = _by_id(out, "new_BE_timeout")
+        assert event.tag == f"{{{BPMN_NS}}}boundaryEvent"
+        assert event.get("attachedToRef") == "T_collect"
+        assert event.get("name") == "Дождались"
+        definition = event.find("bpmn:timerEventDefinition", NS)
+        assert definition is not None
+        assert definition.find("bpmn:timeDuration", NS).text == DEFAULT_TIMER_DURATION
+        # событие живёт в том же процессе, что и задача
+        assert "new_BE_timeout" in [c.get("id") for c in _process(_root(out), "Process_order")]
+
+    def test_error_boundary_event_keeps_the_inventory_consistent(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [{
+            "op": "add_boundary_event", "id": "new_BE_fail", "attached_to": "T_ship",
+            "event_type": "error", "name": "Ошибка сборки",
+        }])
+        assert report["status"] == "success"
+        event = _by_id(out, "new_BE_fail")
+        assert event.find("bpmn:errorEventDefinition", NS) is not None
+        assert event.find("bpmn:timerEventDefinition", NS) is None
+        inventory = build_inventory(out)
+        assert "new_BE_fail" in {e["id"] for e in inventory["elements"]}
+
+    def test_boundary_event_without_handler_is_reported(self, single_pool_xml):
+        """Событие применилось, но обрабатывать нечего: скоринг считает такой
+        узел тупиком, поэтому починка обязана сказать об этом вслух."""
+        out, report = apply_operations(single_pool_xml, self.OPS)
+        assert report["status"] == "success"
+        _, notes = validate_and_repair(out)
+        assert len(notes) == 1 and "new_BE_timeout" in notes[0]
+        assert "не ведёт ни к одному шагу" in notes[0]
+        assert any(m in notes[0] for m in UNROUTED_NOTE_MARKERS)
+
+    def test_boundary_event_with_handler_leaves_nothing_to_report(
+            self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, self.OPS + [
+            {"op": "connect", "source": "new_BE_timeout", "target": "T_ship",
+             "flow_type": "sequence"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        event = _by_id(out, "new_BE_timeout")
+        assert _refs(event, "outgoing")
+        assert _refs(event, "incoming") == []
+        _, notes = validate_and_repair(out)
+        assert notes == []
+
+    def test_unknown_task_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_BE", "attached_to": "no_such_id",
+             "event_type": "timer", "name": "Таймер"},
+        ])
+        assert report["skipped"][0]["reason"] == "задача 'no_such_id' не найдена"
+
+    def test_gateway_is_not_a_host(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_BE", "attached_to": "G_paid",
+             "event_type": "timer", "name": "Таймер"},
+        ])
+        assert report["skipped"][0]["reason"] == "'G_paid' не является задачей"
+
+    def test_unsupported_event_type_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_BE", "attached_to": "T_collect",
+             "event_type": "signal", "name": "Сигнал"},
+        ])
+        assert report["skipped"][0]["reason"] == "неизвестный тип граничного события 'signal'"
+        assert report["skipped"][0]["hint"] == "допустимы: timer, error"
+
+    def test_missing_name_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_BE", "attached_to": "T_collect",
+             "event_type": "timer"},
+        ])
+        assert report["skipped"][0]["reason"] == "не задано имя элемента"
+
+    def test_reused_id_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, self.OPS + self.OPS)
+        assert report["status"] == "partial"
+        assert "уже занят" in report["skipped"][0]["reason"]
+
+    def test_id_without_prefix_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "Boundary_1", "attached_to": "T_collect",
+             "event_type": "timer", "name": "Таймер"},
+        ])
+        assert "без префикса new_" in report["skipped"][0]["reason"]
+
+    def test_intermediate_event_can_carry_a_definition(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [{
+            "op": "add_event", "id": "new_IC_wait", "name": "Ожидание оплаты",
+            "event_type": "intermediateCatch", "participant": "Заказ",
+            "after": "T_collect", "event_definition": "timer",
+        }])
+        assert report["status"] == "success"
+        event = _by_id(out, "new_IC_wait")
+        assert event.find("bpmn:timerEventDefinition/bpmn:timeDuration", NS).text == "PT15M"
+        assert _refs(event, "incoming") and _refs(event, "outgoing")
+
+    def test_unknown_definition_is_skipped(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [{
+            "op": "add_event", "id": "new_IC", "name": "Ожидание",
+            "event_type": "intermediateCatch", "participant": "Заказ",
+            "event_definition": "pulse",
+        }])
+        assert report["skipped"][0]["reason"] == "неизвестное определение события 'pulse'"
+
+    def test_definition_on_start_event_is_refused(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [{
+            "op": "add_event", "id": "new_E", "name": "Старт", "event_type": "start",
+            "participant": "Заказ", "event_definition": "timer",
+        }])
+        assert report["skipped"][0]["reason"] == \
+            "стартовому и конечному событию определение не добавляется"
+
+    def test_definition_on_task_is_refused(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [{
+            "op": "add_task", "id": "new_T1", "name": "Шаг", "participant": "Заказ",
+            "event_definition": "timer",
+        }])
+        assert report["skipped"][0]["reason"] == "определение события задают только событию"
+
+
+# ---------------------------------------------------------------------------
+# Вложенность: потоки и переносы не пересекают границу subProcess
+# ---------------------------------------------------------------------------
+
+class TestNestingRestriction:
+    def test_connect_from_nested_node_to_outer_is_skipped(self):
+        _, report = apply_operations(NESTED_XML, [
+            {"op": "connect", "source": "I_second", "target": "O_end"},
+        ])
+        assert report["status"] == "failed"
+        assert report["skipped"][0]["reason"] == "элементы лежат на разной вложенности"
+        assert "subProcess" in report["skipped"][0]["hint"]
+
+    def test_connect_from_outer_into_nested_node_is_skipped(self):
+        _, report = apply_operations(NESTED_XML, [
+            {"op": "connect", "source": "O_start", "target": "I_first"},
+        ])
+        assert report["skipped"][0]["reason"] == "элементы лежат на разной вложенности"
+
+    def test_message_flow_across_nesting_is_skipped_too(self):
+        _, report = apply_operations(NESTED_XML, [
+            {"op": "connect", "source": "I_second", "target": "S_task",
+             "flow_type": "message"},
+        ])
+        assert report["skipped"][0]["reason"] == "элементы лежат на разной вложенности"
+
+    def test_connect_inside_the_subprocess_is_allowed(self):
+        out, report = apply_operations(NESTED_XML, [
+            {"op": "connect", "source": "I_second", "target": "I_first",
+             "condition": "снова"},
+        ])
+        assert report["status"] == "success"
+        flows = [f for f in _root(out).findall(".//bpmn:sequenceFlow", NS)
+                 if f.get("sourceRef") == "I_second" and f.get("targetRef") == "I_first"]
+        assert len(flows) == 1
+
+    def test_moving_a_nested_node_to_another_pool_is_skipped(self):
+        _, report = apply_operations(NESTED_XML, [
+            {"op": "move_to_participant", "id": "I_first", "participant": "Смежный"},
+        ])
+        assert report["skipped"][0]["reason"] == \
+            "элемент внутри subProcess не переносится между пулами"
+        assert "subProcess" in report["skipped"][0]["hint"]
+
+    def test_nested_node_passes_a_no_op_move_to_its_own_pool(self):
+        _, report = apply_operations(NESTED_XML, [
+            {"op": "move_to_participant", "id": "I_first", "participant": "Внешний"},
+        ])
+        assert report["status"] == "success"
+
+    def test_outer_node_still_movable(self):
+        out, report = apply_operations(NESTED_XML, [
+            {"op": "move_to_participant", "id": "O_end", "participant": "Смежный"},
+        ])
+        assert report["status"] == "success"
+        assert "O_end" in [c.get("id") for c in _process(_root(out), "Process_side")]
+
+
+# ---------------------------------------------------------------------------
+# События после починки не висят
+# ---------------------------------------------------------------------------
+
+class TestRepairWiresEvents:
+    def test_added_events_are_connected_to_the_process(self):
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="Один шаг" isExecutable="true">
+    <userTask id="T1" name="Работа"/>
+  </process>
+</definitions>"""
+        out, notes = validate_and_repair(xml)
+        assert notes == ["добавлено стартовое событие StartEvent_new_1",
+                         "добавлено конечное событие EndEvent_new_2"]
+        assert _dangling(out) == []
+        assert _refs(_by_id(out, "T1"), "incoming") == ["new_Flow_1"]
+        assert _refs(_by_id(out, "T1"), "outgoing") == ["new_Flow_2"]
+
+    def test_start_joins_the_node_without_incoming(self):
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="Без старта" isExecutable="true">
+    <endEvent id="E1" name="Финиш"/>
+    <sequenceFlow id="F1" sourceRef="T1" targetRef="E1"/>
+    <userTask id="T1" name="Работа"/>
+    <userTask id="T2" name="Подготовка"/>
+    <sequenceFlow id="F2" sourceRef="T2" targetRef="T1"/>
+  </process>
+</definitions>"""
+        out, notes = validate_and_repair(xml)
+        assert notes == ["добавлено стартовое событие StartEvent_new_1"]
+        assert _dangling(out) == []
+        # вход ждёт узел без входящих потоков, а не тот, у кого вход уже есть
+        assert _refs(_by_id(out, "T2"), "incoming") == ["new_Flow_1"]
+        assert _refs(_by_id(out, "T1"), "incoming") == ["F2"]
+
+    def test_event_is_not_added_when_no_candidate_exists(self):
+        out, notes = validate_and_repair(_cycle_xml())
+        assert len(notes) == 2
+        assert "стартовое событие не добавлено" in notes[0]
+        assert "конечное событие не добавлено" in notes[1]
+        assert "Кольцо" in notes[0]
+        assert _by_id(out, "StartEvent_new_1") is None
+        assert _by_id(out, "EndEvent_new_1") is None
+        # починка не оставила ни узла без единого потока
+        assert _dangling(out) == []
+
+    def test_nested_nodes_are_left_alone_by_repair(self):
+        repaired, notes = validate_and_repair(NESTED_XML)
+        assert notes == []
+        assert _dangling(repaired) == []
+        root = _root(repaired)
+        assert _refs(_by_id(repaired, "I_second"), "outgoing") == []
+        assert root.findall(".//bpmn:boundaryEvent", NS) == []
+
+    def test_add_event_wires_the_new_end_itself(self):
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="Без финиша" isExecutable="true">
+    <startEvent id="S1" name="Старт">
+      <outgoing>F1</outgoing>
+    </startEvent>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="T1"/>
+    <userTask id="T1" name="Работа">
+      <incoming>F1</incoming>
+    </userTask>
+  </process>
+</definitions>"""
+        out, report = apply_operations(xml, [
+            {"op": "add_event", "id": "new_E1", "name": "Финиш", "event_type": "end",
+             "participant": "P1"},
+        ])
+        assert report["status"] == "success"
+        assert report["applied"][0]["note"] == "событие подключено к 'T1'"
+        link = _refs(_by_id(out, "T1"), "outgoing")
+        assert link == _refs(_by_id(out, "new_E1"), "incoming")
+        assert _dangling(out) == []
+
+    def test_unattachable_event_is_rolled_back_not_left_hanging(self):
+        out, report = apply_operations(_cycle_xml(), [
+            {"op": "add_event", "id": "new_E1", "name": "Финиш", "event_type": "end",
+             "participant": "Кольцо"},
+        ])
+        # У обоих узлов кольца уже есть выход: цеплять нечего. Оставлять в
+        # схеме событие без входящего потока нельзя — принятие улучшения
+        # добавило бы тупик, поэтому изменение откатывается целиком.
+        assert report["status"] == "failed"
+        assert report["applied"] == []
+        assert "не имеет входящего потока" in report["skipped"][0]["reason"]
+        assert _by_id(out, "new_E1") is None
+
+
+# ---------------------------------------------------------------------------
+# Словарь операций и неквадратичность
+# ---------------------------------------------------------------------------
+
+class TestNestedPlacement:
+    """Граница subProcess нерушима и для вставки, и для ссылок дорожек."""
+
+    SUB_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="PO" name="Основной" isExecutable="true">
+    <startEvent id="S" name="Старт"><outgoing>F0</outgoing></startEvent>
+    <sequenceFlow id="F0" sourceRef="S" targetRef="SP"/>
+    <subProcess id="SP" name="Подпроцесс">
+      <incoming>F0</incoming><outgoing>IF2</outgoing>
+      <startEvent id="IS" name="Внутри"><outgoing>IF1</outgoing></startEvent>
+      <sequenceFlow id="IF1" sourceRef="IS" targetRef="I1"/>
+      <userTask id="I1" name="Шаг внутри"><incoming>IF1</incoming><outgoing>IF3</outgoing></userTask>
+      <sequenceFlow id="IF3" sourceRef="I1" targetRef="IE"/>
+      <endEvent id="IE" name="Внутри финиш"><incoming>IF3</incoming></endEvent>
+    </subProcess>
+    <sequenceFlow id="IF2" sourceRef="SP" targetRef="E"/>
+    <endEvent id="E" name="Финиш"><incoming>IF2</incoming></endEvent>
+  </process>
+</definitions>"""
+
+    def _parent_of(self, root, elem_id):
+        return next((p.get("id") for p in root.iter()
+                     if any(c.get("id") == elem_id for c in p)), None)
+
+    def test_insert_after_nested_node_stays_in_the_subprocess(self):
+        out, report = apply_operations(self.SUB_XML, [
+            {"op": "add_task", "id": "new_T", "name": "Новый шаг",
+             "task_type": "userTask", "after": "I1"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        root = _root(out)
+        assert self._parent_of(root, "new_T") == "SP"
+        nested_flow = next(f.get("id") for f in root.iter(f"{{{BPMN_NS}}}sequenceFlow")
+                           if f.get("sourceRef") == "I1")
+        assert self._parent_of(root, nested_flow) == "SP"
+        assert _by_id(out, "IF3").get("sourceRef") == "new_T"
+        assert self._parent_of(root, "IF3") == "SP"
+        # внешний процесс не обрастает чужими узлами и не теряет поток
+        assert self._parent_of(root, "IF2") == "PO"
+        assert validate_and_repair(out)[1] == []
+
+    def test_top_level_insert_is_unaffected(self):
+        out, report = apply_operations(self.SUB_XML, [
+            {"op": "add_task", "id": "new_T", "name": "Снаружи",
+             "task_type": "userTask", "after": "S"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        assert self._parent_of(_root(out), "new_T") == "PO"
+
+
+class TestLaneReferences:
+    """flowNodeRef — IDREF: битую или сбежавшую в чужой пул ссылку убираем."""
+
+    LANED = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <collaboration id="C">
+    <participant id="PA" name="Пул А" processRef="PrA"/>
+    <participant id="PB" name="Пул Б" processRef="PrB"/>
+  </collaboration>
+  <process id="PrA" name="Пул А" isExecutable="true">
+    <laneSet id="LSA"><lane id="LA" name="Исполнитель">
+      <flowNodeRef>TA</flowNodeRef></lane></laneSet>
+    <startEvent id="SA" name="Старт А"><outgoing>FA</outgoing></startEvent>
+    <userTask id="TA" name="Задача А"><incoming>FA</incoming><outgoing>FB</outgoing></userTask>
+    <endEvent id="EA" name="Финиш А"><incoming>FB</incoming></endEvent>
+    <sequenceFlow id="FA" sourceRef="SA" targetRef="TA"/>
+    <sequenceFlow id="FB" sourceRef="TA" targetRef="EA"/>
+  </process>
+  <process id="PrB" name="Пул Б" isExecutable="true">
+    <startEvent id="SB" name="Старт Б"><outgoing>FC</outgoing></startEvent>
+    <userTask id="TB" name="Задача Б"><incoming>FC</incoming><outgoing>FD</outgoing></userTask>
+    <endEvent id="EB" name="Финиш Б"><incoming>FD</incoming></endEvent>
+    <sequenceFlow id="FC" sourceRef="SB" targetRef="TB"/>
+    <sequenceFlow id="FD" sourceRef="TB" targetRef="EB"/>
+  </process>
+</definitions>"""
+
+    def _refs(self, xml):
+        return [r.text for r in _root(xml).findall(".//bpmn:flowNodeRef", NS)]
+
+    def test_ref_to_deleted_element_is_dropped_with_note(self):
+        out, report = apply_operations(self.LANED, [{"op": "delete", "id": "TA"}])
+        assert report["status"] == "success", report["skipped"]
+        fixed, notes = validate_and_repair(out)
+        assert self._refs(out) == ["TA"], "до починки ссылка ещё есть"
+        assert self._refs(fixed) == []
+        assert any("ссылалась на удалённый элемент TA" in n for n in notes)
+
+    def test_ref_after_move_to_another_pool_is_dropped(self):
+        out, report = apply_operations(self.LANED, [
+            {"op": "move_to_participant", "id": "TA", "participant": "Пул Б"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        fixed, notes = validate_and_repair(out)
+        # ссылка исчезла из дорожки пула А, но сам элемент жив
+        assert self._refs(fixed) == []
+        assert _by_id(fixed, "TA") is not None
+        assert any("перенесён в другой пул" in n for n in notes)
+
+    def test_foreign_namespace_lookalikes_are_not_bpmn(self):
+        """Расширение вида <acme:lane> не дорожка: сортировка по одному
+        локальному имени превращала чужие теги в узлы процесса, и правки
+        уезжали в элемент, которого bpmn-js не знает."""
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:acme="http://acme.example/schema" id="D">
+  <process id="P1" name="P" isExecutable="true">
+    <acme:lane id="X1" name="не дорожка"/>
+    <acme:startEvent id="X2" name="не старт"/>
+    <startEvent id="S1" name="Старт"><outgoing>F1</outgoing></startEvent>
+    <userTask id="T1" name="Настоящая задача"><incoming>F1</incoming><outgoing>F2</outgoing></userTask>
+    <endEvent id="E1" name="Финиш"><incoming>F2</incoming></endEvent>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="T1"/>
+    <sequenceFlow id="F2" sourceRef="T1" targetRef="E1"/>
+  </process>
+</definitions>"""
+        inventory = build_inventory(xml)
+        assert {e["id"] for e in inventory["elements"]} == {"S1", "T1", "E1"}
+        assert inventory["lanes"] == []
+        fixed, notes = validate_and_repair(xml)
+        assert notes == []
+        assert _by_id(fixed, "X1") is not None, "чужой узел нельзя вырезать"
+
+    def test_move_to_lane_cannot_target_a_foreign_lane(self):
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:acme="http://acme.example/schema" id="D">
+  <process id="P1" name="P" isExecutable="true">
+    <acme:lane id="X1" name="не дорожка"/>
+    <userTask id="T1" name="Задача"/>
+  </process>
+</definitions>"""
+        _, report = apply_operations(xml, [
+            {"op": "move_to_lane", "id": "T1", "lane": "X1"},
+        ])
+        assert report["skipped"][0]["reason"] == "дорожка 'X1' не найдена"
+
+    def test_valid_reference_is_untouched(self):
+        out, report = apply_operations(self.LANED, [
+            {"op": "add_documentation", "id": "TA", "text": "Пояснение"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        fixed, notes = validate_and_repair(out)
+        assert self._refs(fixed) == ["TA"]
+        assert not any("дорожка" in n or "дорожки" in n for n in notes)
+
+
+class TestOperationVocabulary:
+    def test_every_handler_is_described_for_the_planner(self):
+        # планировщик получает OP_SPEC, а подсказка — список _HANDLERS:
+        # расхождение означало бы «модель предлагает то, чего аплайер не умеет»
+        assert set(OP_SPEC) == set(_HANDLERS)
+
+    def test_new_operations_are_documented_verbatim(self):
+        assert '"op":"add_documentation"' in OP_SPEC["add_documentation"]
+        assert '"op":"add_lane"' in OP_SPEC["add_lane"]
+        assert '"op":"move_to_lane"' in OP_SPEC["move_to_lane"]
+        assert '"op":"add_boundary_event"' in OP_SPEC["add_boundary_event"]
+
+    def test_hint_for_unknown_operation_lists_the_dictionary(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [{"op": "add_lane_set"}])
+        assert "add_boundary_event" in report["skipped"][0]["hint"]
+
+
+class TestPerformance:
+    def test_batch_of_25_operations_on_a_wide_scheme_stays_linear(self):
+        xml = _wide_xml()
+        inventory = build_inventory(xml)
+        assert len(inventory["elements"]) >= 250
+        assert len(inventory["flows"]) >= 500
+        started = time.perf_counter()
+        out, report = apply_operations(xml, _batch_of_25())
+        validate_and_repair(out)
+        elapsed = time.perf_counter() - started
+        assert report["status"] == "success", report["skipped"]
+        # порог с десятикратным запасом: линейный проход по 250 узлам × 25
+        # операциям — единицы миллисекунд
+        assert elapsed < 0.5
+
+    def test_index_survives_a_batch_of_deletions(self):
+        """Удаление узла внутри subProcess больше не «внутренняя ошибка»:
+        родитель находится по parent-map, а не перебором дерева."""
+        out, report = apply_operations(NESTED_XML, [{"op": "delete", "id": "I_first"}])
+        assert report["status"] == "success"
+        assert _by_id(out, "I_first") is None
+        assert _flow(_root(out), "IF1") is None
+        assert _flow(_root(out), "IF2") is None
+        inventory = build_inventory(out)
+        assert "I_first" not in {e["id"] for e in inventory["elements"]}
+        assert "I_second" in {e["id"] for e in inventory["elements"]}
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +1129,45 @@ class TestConnections:
         messages = collaboration.findall("bpmn:messageFlow", NS)
         assert len(messages) == 2
 
+    def test_unconditioned_flow_from_exclusive_gateway_is_skipped(
+            self, single_pool_xml):
+        """Необусловленная ветка от exclusive-шлюза ломает раньше проходившее
+        правило `gateway_conditions`: default аплайер не ставит, поэтому такой
+        connect — ухудшение схемы, а не улучшение."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "connect", "source": "G_paid", "target": "End_cancel"},
+        ])
+        assert report["skipped"][0]["reason"] == (
+            "у шлюза 'G_paid' нельзя вести необусловленный поток")
+        assert "condition" in report["skipped"][0]["hint"]
+
+    def test_conditioned_flow_from_exclusive_gateway_is_applied(
+            self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [{
+            "op": "connect", "source": "G_paid", "target": "End_cancel",
+            "condition": "paid == true и остаток на складе",
+        }])
+        assert report["status"] == "success", report["skipped"]
+        root = _root(out)
+        added = [f for f in root.findall(".//bpmn:sequenceFlow", NS)
+                 if f.get("sourceRef") == "G_paid" and f.get("targetRef") == "End_cancel"]
+        assert len(added) == 1
+        assert added[0].find("bpmn:conditionExpression", NS).text
+
+    def test_timer_event_type_is_read_as_definition(self, single_pool_xml):
+        """Модель зовёт «таймер» типом события — это определение ловушки у
+        промежуточного события. Отказывать тут значит терять всю ветку SLA
+        каскадом пропусков."""
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_event", "id": "new_timer", "name": "Таймер SLA",
+             "event_type": "timer", "participant": "Заказ"},
+            {"op": "connect", "source": "T_ship", "target": "new_timer"},
+            {"op": "connect", "source": "new_timer", "target": "End_ok"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        assert "timerEventDefinition" in out
+        assert "intermediateCatch" in report["applied"][0]["note"]
+
     def test_disconnect_removes_flow_and_refs(self, single_pool_xml):
         out, report = apply_operations(single_pool_xml, [{"op": "disconnect", "flow": "F2"}])
         assert report["status"] == "success"
@@ -277,17 +1207,18 @@ class TestParticipants:
         assert root.find(f".//bpmn:process[@id='{process_id}']", NS) is not None
 
     def test_new_node_lands_in_named_pool(self, two_pool_xml):
-        out, report = apply_operations(two_pool_xml, [{
-            "op": "add_task", "id": "new_T_pack", "name": "Упаковать",
-            "participant": "Магазин", "task_type": "userTask",
-        }])
-        assert report["status"] == "success"
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_T_pack", "name": "Упаковать",
+             "participant": "Магазин", "task_type": "userTask"},
+            {"op": "connect", "source": "S_accept", "target": "new_T_pack"},
+            {"op": "connect", "source": "new_T_pack", "target": "S_end"},
+        ])
+        assert report["status"] == "success", report["skipped"]
         root = _root(out)
         shop = root.find(".//bpmn:process[@id='Process_shop']", NS)
         assert "new_T_pack" in [child.get("id") for child in shop]
-        # Без 'after' элемент добавлен без потоков — починка обязана это пережить.
-        _, notes = validate_and_repair(out)
-        assert notes == []
+        # Соседний пул не тронут: новые потоки остались в «Магазине».
+        assert _flow(root, "CF2") is not None
 
     def test_unknown_pool_is_skipped_with_hint(self, two_pool_xml):
         _, report = apply_operations(two_pool_xml, [{
@@ -304,6 +1235,61 @@ class TestParticipants:
 
 
 # ---------------------------------------------------------------------------
+# Откат узлов вне маршрута
+# ---------------------------------------------------------------------------
+
+class TestUnroutedRollback:
+    """Пакет не должен оставлять в схеме шаг, который ниоткуда не входит или
+    никуда не выходит: принятое улучшение иначе ухудшает качество схемы."""
+
+    def test_insert_into_a_node_deleted_by_the_same_batch_is_rolled_back(
+            self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_T_pack", "name": "Упаковать",
+             "after": "T_ship", "task_type": "userTask"},
+            {"op": "delete", "id": "T_ship"},
+        ])
+        assert [a["id"] for a in report["applied"]] == ["T_ship"]
+        rollback = [s for s in report["skipped"] if s.get("id") == "new_T_pack"]
+        assert rollback and "недостижим" in rollback[0]["reason"]
+        assert _by_id(out, "new_T_pack") is None
+        # Остаток схемы цел: удалённый хост и его потоки — след операции
+        # delete, а не отката.
+        assert _by_id(out, "T_ship") is None
+        assert _flow(_root(out), "F1") is not None
+        assert _flow(_root(out), "F5") is None
+
+    def test_isolated_pair_of_new_nodes_disappears_together(self, single_pool_xml):
+        """Связанные только между собой новые шаги — тот же дефект: откат
+        идёт до неподвижной точки, иначе второй узел остался бы висеть."""
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_A", "name": "Шаг А",
+             "task_type": "userTask"},
+            {"op": "add_task", "id": "new_B", "name": "Шаг Б",
+             "task_type": "userTask"},
+            {"op": "connect", "source": "new_A", "target": "new_B"},
+        ])
+        assert report["applied"] == []
+        assert report["status"] == "failed"
+        assert {"new_A", "new_B"} <= {s.get("id") for s in report["skipped"]}
+        root = _root(out)
+        assert _by_id(out, "new_A") is None and _by_id(out, "new_B") is None
+        assert len(root.findall(".//bpmn:sequenceFlow", NS)) == 6
+
+    def test_routed_addition_survives_and_is_not_reported(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_T_pack", "name": "Упаковать",
+             "task_type": "userTask"},
+            {"op": "connect", "source": "T_collect", "target": "new_T_pack"},
+            {"op": "connect", "source": "new_T_pack", "target": "G_paid"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        assert _by_id(out, "new_T_pack") is not None
+        _, notes = validate_and_repair(out)
+        assert [n for n in notes if "new_T_pack" in n] == []
+
+
+# ---------------------------------------------------------------------------
 # Починка
 # ---------------------------------------------------------------------------
 
@@ -314,7 +1300,10 @@ class TestValidateAndRepair:
             '<sequenceFlow id="F5" sourceRef="T_ghost" targetRef="End_ok"/>',
         )
         out, notes = validate_and_repair(broken)
-        assert notes == ["удалён висящий поток F5"]
+        assert notes == ["удалён висящий поток F5",
+                         "узел «Отгрузить товар» (T_ship) — тупик: вход есть, "
+                         "выхода нет. Нужен connect от него к следующему шагу "
+                         "или конечному событию пула"]
         assert _flow(_root(out), "F5") is None
 
     def test_duplicate_flows_collapsed(self, single_pool_xml):
@@ -340,13 +1329,60 @@ class TestValidateAndRepair:
         assert _by_id(out, "StartEvent_new_1") is not None
         assert _by_id(out, "EndEvent_new_2") is not None
 
-    def test_empty_process_left_alone(self):
+    def test_empty_process_is_reported_not_invented(self):
+        """Пустой пул скоринг наказывает, но дописывать в него события за
+        пользователя нельзя — правка обязана быть видна."""
         xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
   <process id="P1" name="P" isExecutable="true"/>
 </definitions>"""
         out, notes = validate_and_repair(xml)
-        assert notes == []
+        assert notes == ['пул «P» остался без шагов — добавьте в него элементы '
+                         "операциями add_task/add_event"]
         assert _root(out).find(".//bpmn:process", NS) is not None
+
+    def test_unreachable_node_is_reported(self):
+        """Шаг только с исходящими недостижим: операции применились, но маршрут
+        обрывается выше него. Починка здесь не в правах (непонятно, от какого
+        шага вести), поэтому отчёт обязан его показать."""
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="P" isExecutable="true">
+    <startEvent id="S1" name="Старт"/>
+    <serviceTask id="T1" name="Проверка">
+      <outgoing>F2</outgoing>
+    </serviceTask>
+    <sequenceFlow id="F2" sourceRef="T1" targetRef="E1"/>
+    <endEvent id="E1" name="Финиш"/>
+  </process>
+</definitions>"""
+        out, notes = validate_and_repair(xml)
+        assert notes == ["узел «Проверка» (T1) недостижим: выход есть, входа нет. "
+                         "Нужен connect от предыдущего шага или шлюза к нему"]
+        assert _by_id(out, "T1") is not None
+
+    def test_single_branch_exclusive_gateway_is_demoted(self):
+        """Шлюз с одной веткой — не развилка. Вторую ветку аплайер выдумать не
+        может, поэтому шлюз понижается до задачи, а условие с единственного
+        его потока снимается (иначе скоринг наказывается за правку модели)."""
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="P" isExecutable="true">
+    <startEvent id="S1" name="Старт"/>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="G1"/>
+    <exclusiveGateway id="G1" name="Проверка">
+      <incoming>F1</incoming><outgoing>F2</outgoing>
+    </exclusiveGateway>
+    <sequenceFlow id="F2" sourceRef="G1" targetRef="E1">
+      <conditionExpression>paid == true</conditionExpression>
+    </sequenceFlow>
+    <endEvent id="E1" name="Финиш"/>
+  </process>
+</definitions>"""
+        out, notes = validate_and_repair(xml)
+        assert any("понижен до задачи" in n for n in notes), notes
+        root = _root(out)
+        gateway = root.find(".//bpmn:exclusiveGateway", NS)
+        assert gateway is None
+        assert _by_id(out, "G1").tag.endswith("}task")
+        assert _flow(root, "F2").find("bpmn:conditionExpression", NS) is None
 
     def test_references_rebuilt_from_actual_flows(self):
         xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
@@ -361,7 +1397,9 @@ class TestValidateAndRepair:
   </process>
 </definitions>"""
         out, notes = validate_and_repair(xml)
-        assert notes == []
+        assert notes == ["узел «Работа» (T1) — тупик: вход есть, выхода нет. "
+                         "Нужен connect от него к следующему шагу или конечному "
+                         "событию пула"]
         assert _refs(_by_id(out, "S1"), "outgoing") == ["F1"]
         assert _refs(_by_id(out, "T1"), "incoming") == ["F1"]
         assert _refs(_by_id(out, "T1"), "outgoing") == []

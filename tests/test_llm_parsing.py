@@ -4,9 +4,11 @@
 Регрессии, из-за которых обновление схем не работало никогда: парсер ожидал
 только префикс bpmn: и молча отдавал мусор, когда модель оборачивала ответ в
 ```xml или писала пространство имён по умолчанию."""
+import json
+
 import pytest
 
-from core.llm_client import extract_json, extract_xml
+from core.llm_client import LLMTruncatedError, extract_json, extract_xml
 
 
 class TestExtractJson:
@@ -38,22 +40,29 @@ class TestExtractJson:
         raw = '{"analysis": "ветка {друг} сломана", "operations": []}'
         assert extract_json(raw)["analysis"] == "ветка {друг} сломана"
 
-    def test_truncated_tail_is_closed(self):
+    def test_truncated_tail_is_not_applied_as_a_plan(self):
+        """Дозакрытый JSON = обрезанный ответ: план применять нельзя."""
         raw = (
             '{"analysis": "готово", "operations": '
             '[{"op": "add_task", "id": "new_T9", "name": "Проверить оплат'
         )
-        result = extract_json(raw)
-        assert result["analysis"] == "готово"
-        assert result["operations"][0]["id"] == "new_T9"
+        with pytest.raises(LLMTruncatedError):
+            extract_json(raw)
 
-    def test_dangling_key_without_value_is_dropped(self):
+    def test_dangling_key_without_value_is_not_silently_accepted(self):
         raw = '{"analysis": "x", "operations": [{"op": "rename"}, {"'
-        result = extract_json(raw)
-        assert result["analysis"] == "x"
+        with pytest.raises(LLMTruncatedError):
+            extract_json(raw)
 
-    def test_unclosed_container_with_number(self):
-        assert extract_json('{"a": 1, "b": [2, 3') == {"a": 1, "b": [2, 3]}
+    def test_unclosed_container_is_truncation(self):
+        with pytest.raises(LLMTruncatedError):
+            extract_json('{"a": 1, "b": [2, 3')
+
+    def test_close_truncated_helper_still_repairs_for_callers(self):
+        """Сам механизм дозакрытия остаётся: он нужен для диагностики и
+        повторного разбора, просто наружу обрезанный ответ не выходит."""
+        from core.llm_client import _close_truncated
+        assert json.loads(_close_truncated('{"a": 1, "b": [2, 3')) == {"a": 1, "b": [2, 3]}
 
     def test_escaped_quote_inside_string(self):
         raw = '{"analysis": "модель сказала \\"нет\\"", "operations": []}'

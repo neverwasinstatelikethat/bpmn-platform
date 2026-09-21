@@ -5,9 +5,8 @@
 # с причиной и подсказкой в отчёте, пакет целиком не падает. Никакой магии
 # и эвристик: что не удаётся применить однозначно — сообщаем наверх.
 import logging
-import re
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     from defusedxml import ElementTree as _SafeET
@@ -45,6 +44,18 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
+def is_bpmn_tag(tag: Any) -> bool:
+    """Элемент принадлежит BPMN: неймспейс OMG (любой редакции) либо его нет.
+
+    Сортировать узлы по одному локальному имени опасно: расширение вида
+    ``<acme:lane>`` становилось дорожкой схемы, ``<acme:startEvent>`` —
+    стартовым событием, и правки уезжали в элемент, о котором bpmn-js не знает.
+    """
+    if not isinstance(tag, str) or "{" not in tag:
+        return True
+    return tag[1:].split("}", 1)[0].startswith("http://www.omg.org/spec/BPMN/")
+
+
 TASK_TAGS = {
     "task", "userTask", "serviceTask", "scriptTask", "manualTask",
     "businessRuleTask", "sendTask", "receiveTask", "callActivity", "subProcess",
@@ -65,15 +76,75 @@ EVENT_TYPE_TO_TAG = {
     "intermediateThrowEvent": "intermediateThrowEvent",
 }
 
+# Определения событий, которые аплайер умеет проставлять: имя → (тег, тег
+# хронометража). Без определения «промежуточное событие» остаётся декларацией:
+# bpmn-js рисует пустой кружок, и скоринг не засчитывает тип события.
+EVENT_DEFINITIONS: Dict[str, Tuple[str, str]] = {
+    "timer": ("timerEventDefinition", "timeDuration"),
+    "message": ("messageEventDefinition", ""),
+    "error": ("errorEventDefinition", ""),
+    "signal": ("signalEventDefinition", ""),
+}
+
+# Хронометраж таймера по умолчанию: 15 минут — типичный SLA ожидания шага.
+DEFAULT_TIMER_DURATION = "PT15M"
+
+# Словарь операций в одном месте: дословные формулировки полей, с которыми
+# аплайер их понимает. Планирующий промпт (core/llm_improve.py) обязан
+# перечислять операции так же, а тест сверяет состав OP_SPEC и _HANDLERS:
+# расхождение означает «модель предлагает то, чего аплайер не умеет».
+OP_SPEC: Dict[str, str] = {
+    "add_task": '{"op":"add_task","id":"new_...","name":"...","task_type":"'
+                + "|".join(sorted(TASK_TAGS))
+                + '","participant":"пул","after":"id элемента"}',
+    "add_gateway": '{"op":"add_gateway","id":"new_...","name":"...",'
+                   '"gateway_type":"exclusive|parallel|inclusive","participant":"пул","after":"id"}',
+    "add_event": '{"op":"add_event","id":"new_...","name":"...",'
+                 '"event_type":"start|end|intermediateCatch|intermediateThrow"'
+                 ' либо определение ловушки: timer|message|error|signal",'
+                 '"participant":"пул","after":"id (опц.)",'
+                 '"event_definition":"timer|message|error|signal (опц.)"}',
+    "add_participant": '{"op":"add_participant","id":"new_...","name":"..."}',
+    "add_documentation": '{"op":"add_documentation","id":"id элемента","text":"..."}',
+    "add_lane": '{"op":"add_lane","id":"new_...","name":"...","participant":"пул"}',
+    "move_to_lane": '{"op":"move_to_lane","id":"id элемента","lane":"id|имя дорожки"}',
+    "add_boundary_event": '{"op":"add_boundary_event","id":"new_...","attached_to":"id задачи",'
+                          '"event_type":"timer|error","name":"..."}',
+    "rename": '{"op":"rename","id":"...","name":"..."}',
+    "delete": '{"op":"delete","id":"..."}',
+    "connect": '{"op":"connect","source":"...","target":"...",'
+               '"flow_type":"sequence|message","condition":"опц."}',
+    "disconnect": '{"op":"disconnect","flow":"id потока"}',
+    "move_to_participant": '{"op":"move_to_participant","id":"...","participant":"пул"}',
+}
+
 XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8"?>\n'
+
+# Теги, которые по схеме BPMN обязаны идти до incoming/outgoing: документация
+# процесса или элемента и extensionElements. Позиция вставки ссылается на них,
+# чтобы пересборка ссылок не поставила потоки раньше описания.
+_REFS_PRECEDING_TAGS = {"documentation", "extensionElements", "audios", "bricks"}
 
 
 def _serialize(root: ET.Element) -> str:
     return XML_DECLARATION + ET.tostring(root, encoding="unicode")
 
 
+def _discard(items: List[ET.Element], elem: ET.Element) -> None:
+    try:
+        items.remove(elem)
+    except ValueError:  # элемент пришёл из другой ветки или уже удалён
+        pass
+
+
 class _Index:
-    """Снимок структуры схемы для быстрого доступа при применении операций."""
+    """Снимок структуры схемы для быстрого доступа при применении операций.
+
+    Индексы обновляются инкрементально через adopt/insert/detach: полная
+    пересборка после каждой операции и поиск родителя перебором всего дерева
+    давали O(n^2) на пакете из 25 правок, а пользовательский XML ограничен
+    гигабайтом символов — такие проходы блокировали событийный цикл.
+    """
 
     def __init__(self, root: ET.Element):
         self.root = root
@@ -85,49 +156,175 @@ class _Index:
         self.collaboration: Optional[ET.Element] = None
         self.sequence_flows: List[ET.Element] = []
         self.message_flows: List[ET.Element] = []
+        self.flows_by_id: Dict[str, ET.Element] = {}
+        self.lanes: List[ET.Element] = []
+        self.parents: Dict[ET.Element, ET.Element] = {}
         self._build()
 
     def _build(self) -> None:
-        for elem in self.root.iter():
-            if not isinstance(elem.tag, str):
+        for node in self.root.iter():
+            if not isinstance(node.tag, str):
                 continue
-            tag = _local(elem.tag)
-            if tag == "collaboration":
-                self.collaboration = elem
-            elif tag == "participant":
-                self.participants.append(elem)
-            elif tag == "process":
-                self.processes.append(elem)
-            elif tag == "sequenceFlow":
-                self.sequence_flows.append(elem)
-            elif tag == "messageFlow":
-                self.message_flows.append(elem)
-            elif tag in FLOW_NODE_TAGS:
-                elem_id = elem.get("id")
-                if elem_id:
-                    self.elements[elem_id] = elem
+            for child in node:
+                self.parents[child] = node
+            self._classify(node, None)
+        # Привязка узла к процессу считается отдельным проходом: узел внутри
+        # subProcess принадлежит внешнему процессу (так же читает bpmn-js).
         for process in self.processes:
             for child in process.iter():
                 if not isinstance(child.tag, str):
                     continue
                 child_id = child.get("id")
-                if child_id and _local(child.tag) in FLOW_NODE_TAGS:
+                if child_id and is_bpmn_tag(child.tag) and _local(child.tag) in FLOW_NODE_TAGS:
                     self.process_of[child_id] = process
-        for participant in self.participants:
-            process_ref = participant.get("processRef")
+
+    # --- инкрементальное обслуживание индексов ---
+
+    def _classify(self, node: ET.Element, process: Optional[ET.Element]) -> None:
+        """Зарегистрировать узел в индексах. process — владеющий процесс, если известен."""
+        if not isinstance(node.tag, str):
+            return
+        if not is_bpmn_tag(node.tag):
+            return
+        tag = _local(node.tag)
+        if tag == "collaboration":
+            self.collaboration = node
+        elif tag == "participant":
+            self.participants.append(node)
+            process_ref = node.get("processRef")
             if process_ref:
-                self.participant_by_process_id[process_ref] = participant
+                self.participant_by_process_id[process_ref] = node
+        elif tag == "process":
+            self.processes.append(node)
+        elif tag == "lane":
+            self.lanes.append(node)
+        elif tag == "sequenceFlow":
+            self.sequence_flows.append(node)
+            self._remember_flow(node)
+        elif tag == "messageFlow":
+            self.message_flows.append(node)
+            self._remember_flow(node)
+        elif tag in FLOW_NODE_TAGS:
+            node_id = node.get("id")
+            if node_id:
+                self.elements[node_id] = node
+                if process is not None:
+                    self.process_of[node_id] = process
+
+    def _remember_flow(self, flow: ET.Element) -> None:
+        flow_id = flow.get("id")
+        if flow_id and flow_id not in self.flows_by_id:
+            self.flows_by_id[flow_id] = flow
+
+    def _unclassify(self, node: ET.Element) -> None:
+        if not isinstance(node.tag, str):
+            return
+        tag = _local(node.tag)
+        if tag in ("sequenceFlow", "messageFlow"):
+            _discard(self.sequence_flows if tag == "sequenceFlow" else self.message_flows, node)
+            flow_id = node.get("id")
+            if flow_id and self.flows_by_id.get(flow_id) is node:
+                self.flows_by_id.pop(flow_id, None)
+        elif tag == "lane":
+            _discard(self.lanes, node)
+        elif tag == "process":
+            _discard(self.processes, node)
+        elif tag == "participant":
+            _discard(self.participants, node)
+            process_ref = node.get("processRef")
+            if process_ref and self.participant_by_process_id.get(process_ref) is node:
+                self.participant_by_process_id.pop(process_ref, None)
+        elif tag in FLOW_NODE_TAGS:
+            node_id = node.get("id")
+            if node_id and self.elements.get(node_id) is node:
+                self.elements.pop(node_id, None)
+                self.process_of.pop(node_id, None)
+
+    def _track(self, elem: ET.Element, parent: Optional[ET.Element]) -> None:
+        """Занести в индексы поддерево, только что вставленное в parent."""
+        if parent is not None:
+            self.parents[elem] = parent
+        process = self.enclosing_process(elem)
+        self._classify(elem, process)
+        stack: List[Tuple[ET.Element, ET.Element]] = [(child, elem) for child in elem]
+        while stack:
+            node, node_parent = stack.pop()
+            if not isinstance(node.tag, str):
+                continue
+            self.parents[node] = node_parent
+            self._classify(node, process)
+            stack.extend((child, node) for child in node)
+
+    def _untrack(self, elem: ET.Element) -> None:
+        self.parents.pop(elem, None)
+        self._unclassify(elem)
+        for node in elem.iter():
+            if node is elem:
+                continue
+            self.parents.pop(node, None)
+            self._unclassify(node)
+
+    def adopt(self, parent: ET.Element, elem: ET.Element) -> ET.Element:
+        """Вставить elem последним ребёнком parent и обновить индексы."""
+        parent.append(elem)
+        self._track(elem, parent)
+        return elem
+
+    def insert(self, parent: ET.Element, position: int, elem: ET.Element) -> ET.Element:
+        """Вставить elem в parent по позиции (порядок тегов BPMN!) и обновить индексы."""
+        parent.insert(position, elem)
+        self._track(elem, parent)
+        return elem
+
+    def detach(self, elem: ET.Element) -> Optional[ET.Element]:
+        """Вынуть elem из дерева и из индексов; возвращает бывшего родителя."""
+        parent = self.parents.get(elem)
+        self._untrack(elem)
+        if parent is not None:
+            parent.remove(elem)
+        return parent
 
     # --- справочные доступы ---
 
     def find_flow(self, flow_id: str) -> Optional[ET.Element]:
-        for flow in self.sequence_flows + self.message_flows:
-            if flow.get("id") == flow_id:
-                return flow
+        return self.flows_by_id.get(flow_id)
+
+    def find_lane(self, key: str) -> Optional[ET.Element]:
+        """Дорожка по id или имени; при коллизии имён выигрывает первая."""
+        for lane in self.lanes:
+            if key in (lane.get("id"), lane.get("name")):
+                return lane
         return None
 
+    def enclosing_process(self, elem: ET.Element) -> Optional[ET.Element]:
+        """Ближайший предок-process (для самого процесса — он сам)."""
+        node: Optional[ET.Element] = elem
+        while node is not None:
+            if isinstance(node.tag, str) and _local(node.tag) == "process":
+                return node
+            node = self.parents.get(node)
+        return None
+
+    def has_subprocess_ancestor(self, elem: ET.Element) -> bool:
+        """Лежит ли элемент внутри subProcess: такие узлы не соединяют с внешним
+        процессом и не переносят между пулами."""
+        node = self.parents.get(elem)
+        while node is not None:
+            if isinstance(node.tag, str):
+                tag = _local(node.tag)
+                if tag == "subProcess":
+                    return True
+                if tag == "process":
+                    return False
+            node = self.parents.get(node)
+        return False
+
     def resolve_process(self, key: Optional[str]) -> Optional[ET.Element]:
-        """Участник по id, имени или id процесса → элемент процесса."""
+        """Участник по id, имени или id процесса → элемент процесса.
+
+        Имя процесса участвует наравне с именем участника: инвентарь отдаёт
+        `participant_name`, а для схемы без collaboration это именно имя
+        процесса — иначе аплайер отвергал бы то, что сам же показал модели."""
         if not key:
             if len(self.processes) == 1:
                 return self.processes[0]
@@ -140,35 +337,21 @@ class _Index:
                         return process
                 return None
         for process in self.processes:
-            if process.get("id") == key:
+            if key in (process.get("id"), process.get("name")):
                 return process
         return None
+
+    def is_taken(self, candidate: str) -> bool:
+        """Занят ли id в схеме: элементы, потоки и дорожки делят одно
+        пространство имён (xml:id обязан быть уникальным во всём документе)."""
+        return (candidate in self.elements or candidate in self.flows_by_id
+                or self.find_lane(candidate) is not None)
 
     def participant_name(self, process: ET.Element) -> str:
         participant = self.participant_by_process_id.get(process.get("id", ""))
         if participant is not None:
             return participant.get("name") or participant.get("id", "")
         return process.get("name") or process.get("id", "")
-
-    def rebuild_flows(self) -> None:
-        self.sequence_flows = [
-            e for e in self.root.iter()
-            if isinstance(e.tag, str) and _local(e.tag) == "sequenceFlow"
-        ]
-        self.message_flows = [
-            e for e in self.root.iter()
-            if isinstance(e.tag, str) and _local(e.tag) == "messageFlow"
-        ]
-        self.elements = {}
-        self.process_of = {}
-        for process in self.processes:
-            for child in process.iter():
-                if not isinstance(child.tag, str):
-                    continue
-                child_id = child.get("id")
-                if child_id and _local(child.tag) in FLOW_NODE_TAGS:
-                    self.elements[child_id] = child
-                    self.process_of[child_id] = process
 
 
 def build_inventory(xml_text: str) -> Dict[str, Any]:
@@ -210,7 +393,18 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
             "source": flow.get("sourceRef", ""),
             "target": flow.get("targetRef", ""),
         })
-    return {"participants": participants, "elements": elements, "flows": flows}
+    # Дорожки — отдельным списком: без id и имён планировщик не сможет указать
+    # цель для move_to_lane и начнёт выдумывать несуществующие дорожки.
+    lanes = []
+    for lane in index.lanes:
+        process = index.enclosing_process(lane)
+        lanes.append({
+            "id": lane.get("id", ""),
+            "name": lane.get("name", ""),
+            "participant": index.participant_name(process) if process is not None else "",
+        })
+    return {"participants": participants, "elements": elements, "flows": flows,
+            "lanes": lanes}
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +425,7 @@ def _require_new_id(op_id: Optional[str], index: _Index) -> str:
             f"id '{op_id}' без префикса new_",
             "новые элементы обязаны иметь id, начинающийся с new_",
         )
-    if op_id in index.elements or index.find_flow(op_id) is not None:
+    if index.is_taken(op_id):
         raise _Skip(f"id '{op_id}' уже занят", "используйте уникальный id")
     return op_id
 
@@ -243,6 +437,18 @@ def _remove_refs(elem: ET.Element, flow_id: str) -> None:
                 elem.remove(ref)
 
 
+def _position_after(elem: ET.Element, preceding_tags: set) -> int:
+    """Индекс вставки ребёнка так, чтобы порядок тегов BPMN не сломался:
+    сразу после идущих раньше тегов (документация, extensionElements, ...)."""
+    position = 0
+    for child in elem:
+        if isinstance(child.tag, str) and _local(child.tag) in preceding_tags:
+            position += 1
+        else:
+            break
+    return position
+
+
 def _ensure_collaboration(index: _Index) -> ET.Element:
     if index.collaboration is not None:
         return index.collaboration
@@ -251,19 +457,41 @@ def _ensure_collaboration(index: _Index) -> ET.Element:
     first_process = index.processes[0] if index.processes else None
     if first_process is not None:
         position = list(index.root).index(first_process)
-        index.root.insert(position, collaboration)
+        index.insert(index.root, position, collaboration)
     else:
-        index.root.append(collaboration)
-    index.collaboration = collaboration
+        index.adopt(index.root, collaboration)
     return collaboration
 
 
+def _ensure_lane_set(index: _Index, process: ET.Element) -> ET.Element:
+    lane_set = process.find(_q("laneSet"))
+    if lane_set is None:
+        lane_set = ET.Element(_q("laneSet"), {"id": f"{process.get('id', 'Process')}_LaneSet"})
+        # laneSet — первый ребёнок процесса (после документации), до flow-элементов:
+        # именно так пишет bpmn-js, и так его понимает валидатор.
+        index.insert(process, _position_after(process, _REFS_PRECEDING_TAGS), lane_set)
+    return lane_set
+
+
 def _new_flow_id(index: _Index, prefix: str) -> str:
-    used = {f.get("id", "") for f in index.sequence_flows + index.message_flows}
     counter = 1
-    while f"{prefix}_{counter}" in used:
+    while index.is_taken(f"{prefix}_{counter}"):
         counter += 1
     return f"{prefix}_{counter}"
+
+
+def _adopt_event_definition(index: _Index, owner: ET.Element, key: str,
+                            owner_id: str) -> ET.Element:
+    """Добавить элементу определение события (bpmn:timerEventDefinition и т. п.).
+
+    Без определения «событие с таймером» остаётся декларацией: bpmn-js рисует
+    пустой кружок, а скоринг не засчитывает тип события."""
+    tag, timer_tag = EVENT_DEFINITIONS[key]
+    definition = ET.Element(_q(tag), {"id": f"{owner_id}_def"})
+    if timer_tag:
+        duration = ET.SubElement(definition, _q(timer_tag))
+        duration.text = DEFAULT_TIMER_DURATION
+    return index.adopt(owner, definition)
 
 
 def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[str]:
@@ -278,6 +506,11 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
     process = index.process_of.get(after_id)
     if process is None:
         raise _Skip(f"не удалось определить пул элемента '{after_id}'")
+    # Вставляем в непосредственный контейнер узла, а не в процесс: у шага
+    # внутри subProcess и новый элемент, и переподвешиваемый поток обязаны
+    # остаться того же уровня вложенности. `connect` границу подпроцесса
+    # отвергает, и вставка не должна делать то, что соединению запрещено.
+    container = index.parents.get(after) if index.parents.get(after) is not None else process
 
     outgoing = [
         f for f in index.sequence_flows
@@ -293,9 +526,10 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
     # Новый входящий поток: after → new (единственный, независимо от числа
     # переподвешиваемых исходящих).
     in_flow_id = _new_flow_id(index, "new_Flow")
-    in_flow = ET.SubElement(process, _q("sequenceFlow"), {
+    in_flow = ET.Element(_q("sequenceFlow"), {
         "id": in_flow_id, "sourceRef": after_id, "targetRef": new_id,
     })
+    index.adopt(container, in_flow)
     ET.SubElement(after, _q("outgoing")).text = in_flow_id
     ET.SubElement(new_elem, _q("incoming")).text = in_flow_id
 
@@ -307,14 +541,14 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
             condition = flow.find(_q("conditionExpression"))
             if condition is not None:
                 flow.remove(condition)
+                # conditionExpression — лист без id, в индексе не участвует.
                 in_flow.append(condition)
         flow.set("sourceRef", new_id)
         _remove_refs(after, flow.get("id", ""))
         ET.SubElement(new_elem, _q("outgoing")).text = flow.get("id")
         moved.append(flow.get("id", ""))
 
-    process.append(new_elem)
-    index.rebuild_flows()
+    index.adopt(container, new_elem)
     if moved:
         return [f"потоки после '{after_id}' переподвешены через '{new_id}'"]
     return []
@@ -324,13 +558,14 @@ def _create_sequence_flow(index: _Index, source_id: str, target_id: str,
                           process: ET.Element,
                           condition: Optional[str] = None) -> ET.Element:
     flow_id = _new_flow_id(index, "new_Flow")
-    flow = ET.SubElement(process, _q("sequenceFlow"), {
+    flow = ET.Element(_q("sequenceFlow"), {
         "id": flow_id,
         "sourceRef": source_id,
         "targetRef": target_id,
     })
     if condition:
         ET.SubElement(flow, _q("conditionExpression")).text = condition
+    index.adopt(process, flow)
     for elem_id, ref_tag in ((source_id, "outgoing"), (target_id, "incoming")):
         elem = index.elements.get(elem_id)
         if elem is not None:
@@ -345,8 +580,45 @@ def _create_message_flow(index: _Index, source_id: str, target_id: str,
     attrs = {"id": flow_id, "sourceRef": source_id, "targetRef": target_id}
     if name:
         attrs["name"] = name
-    flow = ET.SubElement(collaboration, _q("messageFlow"), attrs)
-    return flow
+    flow = ET.Element(_q("messageFlow"), attrs)
+    return index.adopt(collaboration, flow)
+
+
+def _process_nodes(index: _Index, process: ET.Element) -> List[Tuple[str, ET.Element]]:
+    """Узлы процесса верхнего уровня: узлы внутри subProcess и граничные
+    события событиями процесса подключать нельзя."""
+    nodes = []
+    for elem_id, elem in index.elements.items():
+        if index.process_of.get(elem_id) is not process:
+            continue
+        if elem.get("attachedToRef") or index.has_subprocess_ancestor(elem):
+            continue
+        nodes.append((elem_id, elem))
+    return nodes
+
+
+def _link_new_event(index: _Index, process: ET.Element, event_id: str,
+                    tag: str) -> Optional[str]:
+    """Привязать добавленное стартовое/конечное событие к узлу процесса: для
+    start — к первому узлу без входа, для end — к первому без выхода.
+    Возвращает id выбранного узла либо None, если кандидата нет."""
+    # Ориентир — фактические потоки, а не теги incoming/outgoing: в XML
+    # пользователя ссылки могут расходиться (их ровняет validate_and_repair).
+    wanted_attr = "targetRef" if tag == "startEvent" else "sourceRef"
+    occupied = {f.get(wanted_attr) for f in index.sequence_flows}
+    # Событие того же фронта кандидатом быть не может: старт не принимает вход,
+    # у энда не бывает выхода, граничное событие по смыслу вообще без рёбер.
+    blocked = ({"startEvent", "boundaryEvent"} if tag == "startEvent"
+               else {"endEvent", "boundaryEvent"})
+    for elem_id, elem in _process_nodes(index, process):
+        if _local(elem.tag) in blocked or elem_id in occupied:
+            continue
+        if tag == "startEvent":
+            _create_sequence_flow(index, event_id, elem_id, process)
+        else:
+            _create_sequence_flow(index, elem_id, event_id, process)
+        return elem_id
+    return None
 
 
 def _op_add_participant(op: Dict[str, Any], index: _Index) -> List[str]:
@@ -358,14 +630,26 @@ def _op_add_participant(op: Dict[str, Any], index: _Index) -> List[str]:
     process = ET.Element(_q("process"), {
         "id": f"{op_id}_proc", "isExecutable": "true",
     })
-    participant = ET.SubElement(collaboration, _q("participant"), {
+    participant = ET.Element(_q("participant"), {
         "id": op_id, "name": name, "processRef": process.get("id", ""),
     })
-    index.root.append(process)
-    index.processes.append(process)
-    index.participants.append(participant)
-    index.participant_by_process_id[process.get("id", "")] = participant
+    index.adopt(collaboration, participant)
+    index.adopt(index.root, process)
     return [f"создан пул '{name}'"]
+
+
+def _event_definition_key(op: Dict[str, Any]) -> Optional[str]:
+    """Определение события из операции: None — не запрошено, иначе валидируется."""
+    raw = op.get("event_definition")
+    if raw is None or not str(raw).strip():
+        return None
+    key = str(raw).strip().lower()
+    if key not in EVENT_DEFINITIONS:
+        raise _Skip(
+            f"неизвестное определение события '{raw}'",
+            "допустимы: " + ", ".join(sorted(EVENT_DEFINITIONS)),
+        )
+    return key
 
 
 def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
@@ -379,8 +663,15 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
             "пул не определён",
             "укажите participant именем или id пула из инвентаря",
         )
+    definition = _event_definition_key(op)
+    alias_note = ""
 
     if kind == "task":
+        if definition:
+            raise _Skip(
+                "определение события задают только событию",
+                "перенесите event_definition в add_event",
+            )
         task_type = op.get("task_type") or "task"
         if task_type not in TASK_TAGS:
             raise _Skip(
@@ -390,6 +681,8 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
         elem = ET.Element(_q(task_type), {"id": op_id, "name": name})
         tag = task_type
     elif kind == "gateway":
+        if definition:
+            raise _Skip("определение события шлюзу не требуется")
         gateway_type = (op.get("gateway_type") or "exclusive").lower()
         tag = {"exclusive": "exclusiveGateway",
                "parallel": "parallelGateway",
@@ -403,19 +696,40 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     else:  # event
         event_type = (op.get("event_type") or "").strip()
         tag = EVENT_TYPE_TO_TAG.get(event_type) or EVENT_TYPE_TO_TAG.get(event_type.lower())
+        if not tag and event_type.lower() in EVENT_DEFINITIONS:
+            # Модель просит «таймер» или «ошибку» как тип события. Это
+            # определение ловушки, а ловит её промежуточное событие: без
+            # такого прочтения ветка обработки откатывалась каскадом пропусков.
+            tag = EVENT_TYPE_TO_TAG["intermediatecatch"]
+            definition = definition or event_type.lower()
+            alias_note = (f"тип события '{event_type}' понят как "
+                          f"intermediateCatch с определением '{definition}'")
         if not tag:
             raise _Skip(
                 f"неизвестный тип события '{event_type}'",
-                "допустимы: start, end, intermediateCatch, intermediateThrow",
+                "допустимы: start, end, intermediateCatch, intermediateThrow "
+                "либо определение события: " + ", ".join(sorted(EVENT_DEFINITIONS)),
+            )
+        if definition and tag in ("startEvent", "endEvent"):
+            raise _Skip(
+                "стартовому и конечному событию определение не добавляется",
+                "операцией add_boundary_event можно добавить таймер или ошибку",
             )
         elem = ET.Element(_q(tag), {"id": op_id, "name": name})
+        if definition:
+            _adopt_event_definition(index, elem, definition, op_id)
 
     after_id = op.get("after")
-    notes: List[str] = []
+    notes: List[str] = [alias_note] if alias_note else []
     if tag in ("startEvent", "endEvent"):
-        process.append(elem)
-        index.rebuild_flows()
-        notes.append("событие добавлено без автопривязки потоков")
+        # Событие без рёбер — висячий узел, который скоринг считает дефектом
+        # связей, поэтому пробуем сразу привязать его к потоку.
+        index.adopt(process, elem)
+        linked = _link_new_event(index, process, op_id, tag)
+        notes.append(
+            f"событие подключено к '{linked}'" if linked
+            else "событие добавлено без автопривязки потоков"
+        )
     elif after_id:
         target_process = index.process_of.get(after_id)
         if target_process is not None and target_process is not process:
@@ -425,8 +739,7 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
             )
         notes.extend(_insert_after(elem, after_id, index))
     else:
-        process.append(elem)
-        index.rebuild_flows()
+        index.adopt(process, elem)
     return notes or [f"добавлен элемент '{name}'"]
 
 
@@ -441,6 +754,88 @@ def _op_rename(op: Dict[str, Any], index: _Index) -> List[str]:
     return []
 
 
+def _op_add_documentation(op: Dict[str, Any], index: _Index) -> List[str]:
+    elem = index.elements.get(op.get("id") or "")
+    if elem is None:
+        raise _Skip("элемент не найден", "используйте id из инвентаря")
+    text = (op.get("text") or "").strip()
+    if not text:
+        raise _Skip("не задан текст документации", "укажите text")
+    doc = ET.Element(_q("documentation"))
+    doc.text = text
+    # По схеме BPMN документация идёт до extensionElements и до incoming /
+    # outgoing; несколько документации складываются рядом.
+    elem.insert(_position_after(elem, {"documentation"}), doc)
+    return []
+
+
+def _op_add_lane(op: Dict[str, Any], index: _Index) -> List[str]:
+    op_id = _require_new_id(op.get("id"), index)
+    name = (op.get("name") or "").strip()
+    if not name:
+        raise _Skip("не задано имя дорожки", "укажите name")
+    process = index.resolve_process(op.get("participant"))
+    if process is None:
+        raise _Skip(
+            "пул не определён",
+            "укажите participant именем или id пула из инвентаря",
+        )
+    lane_set = _ensure_lane_set(index, process)
+    lane = ET.Element(_q("lane"), {"id": op_id, "name": name})
+    index.adopt(lane_set, lane)
+    return [f"добавлена дорожка '{name}'"]
+
+
+def _op_move_to_lane(op: Dict[str, Any], index: _Index) -> List[str]:
+    elem_id = op.get("id") or ""
+    elem = index.elements.get(elem_id)
+    if elem is None:
+        raise _Skip("элемент не найден", "используйте id из инвентаря")
+    lane_key = (op.get("lane") or "").strip()
+    if not lane_key:
+        raise _Skip("не задана дорожка", "укажите lane — id или имя дорожки")
+    lane = index.find_lane(lane_key)
+    if lane is None:
+        raise _Skip(
+            f"дорожка '{lane_key}' не найдена",
+            "создайте её операцией add_lane или возьмите id из инвентаря",
+        )
+    process = index.process_of.get(elem_id)
+    if process is None or index.enclosing_process(lane) is not process:
+        raise _Skip(
+            "дорожка принадлежит другому пулу",
+            "переносить элемент можно только в дорожку своего процесса",
+        )
+    # flowNodeRef переставляется, а не дублируется: ссылка обязана остаться
+    # ровно в одной дорожке, иначе bpmn-js покажет элемент дважды.
+    for other in index.lanes:
+        for ref in list(other.findall(_q("flowNodeRef"))):
+            if (ref.text or "").strip() == elem_id:
+                other.remove(ref)
+    # Сам элемент остаётся ребёнком процесса — так пишет bpmn-js; дорожка
+    # ссылается на него только flowNodeRef.
+    ET.SubElement(lane, _q("flowNodeRef")).text = elem_id
+    return []
+
+
+def _remove_node(index: _Index, elem: ET.Element) -> List[str]:
+    """Вынуть узел вместе с его потоками и ссылками на них. Возвращает id
+    удалённых потоков."""
+    elem_id = elem.get("id") or ""
+    removed_flows = []
+    for flow in list(index.sequence_flows) + list(index.message_flows):
+        if elem_id in (flow.get("sourceRef"), flow.get("targetRef")):
+            index.detach(flow)
+            removed_flows.append(flow.get("id", ""))
+    for other in index.elements.values():
+        if other is elem:
+            continue
+        for flow_id in removed_flows:
+            _remove_refs(other, flow_id)
+    index.detach(elem)
+    return removed_flows
+
+
 def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
     elem_id = op.get("id") or ""
     elem = index.elements.get(elem_id)
@@ -451,36 +846,16 @@ def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
             "стартовые и конечные события не удаляются",
             "у процесса должен оставаться вход и выход",
         )
-    process = index.process_of.get(elem_id)
-    removed_flows = []
-    for flow in list(index.sequence_flows) + list(index.message_flows):
-        if elem_id in (flow.get("sourceRef"), flow.get("targetRef")):
-            parent = _parent_of(index.root, flow)
-            if parent is not None:
-                parent.remove(flow)
-            removed_flows.append(flow.get("id", ""))
-    for other in index.elements.values():
-        if other is elem:
-            continue
-        for flow_id in removed_flows:
-            _remove_refs(other, flow_id)
-    if process is not None:
-        process.remove(elem)
-    index.rebuild_flows()
+    removed_flows = _remove_node(index, elem)
     return [f"удалены связанные потоки: {', '.join(removed_flows)}"] if removed_flows else []
-
-
-def _parent_of(root: ET.Element, child: ET.Element) -> Optional[ET.Element]:
-    for parent in root.iter():
-        if child in list(parent):
-            return parent
-    return None
 
 
 def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     source_id = op.get("source") or ""
     target_id = op.get("target") or ""
-    if source_id not in index.elements or target_id not in index.elements:
+    source = index.elements.get(source_id)
+    target = index.elements.get(target_id)
+    if source is None or target is None:
         raise _Skip(
             "источник или цель не найдены",
             "используйте существующие id из инвентаря",
@@ -500,6 +875,13 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
             "messageFlow внутри одного пула не имеет смысла",
             "используйте flow_type=sequence",
         )
+    # Поток не должен пересекать границу subProcess: узел внутри подпроцесса
+    # принадлежит ему, и bpmn-js такую конструкцию не отрисует.
+    if index.has_subprocess_ancestor(source) is not index.has_subprocess_ancestor(target):
+        raise _Skip(
+            "элементы лежат на разной вложенности",
+            "поток не может выходить из subProcess: соединяйте узлы одного уровня",
+        )
     existing = [
         f for f in index.sequence_flows + index.message_flows
         if f.get("sourceRef") == source_id and f.get("targetRef") == target_id
@@ -508,10 +890,19 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
         raise _Skip("такой поток уже существует")
     if flow_type == "sequence":
         condition = (op.get("condition") or "").strip() or None
+        # Исключение из `connect` ломает раньше проходившее правило: аплайер не
+        # умеет ставить атрибут default, а скоринг требует условие на каждой
+        # ветке exclusive-шлюза. Молча создать необусловленную ветку — значит
+        # ухудшить схему руками пользователя.
+        if _local(source.tag) == "exclusiveGateway" and condition is None:
+            raise _Skip(
+                f"у шлюза '{source_id}' нельзя вести необусловленный поток",
+                "добавьте condition — выход по умолчанию (default) аплайер "
+                "не ставит, а скоринг считает такую ветку ошибкой",
+            )
         _create_sequence_flow(index, source_id, target_id, source_process, condition)
     else:
         _create_message_flow(index, source_id, target_id)
-    index.rebuild_flows()
     return []
 
 
@@ -520,12 +911,9 @@ def _op_disconnect(op: Dict[str, Any], index: _Index) -> List[str]:
     flow = index.find_flow(flow_id)
     if flow is None:
         raise _Skip("поток не найден", "используйте id потока из инвентаря")
-    parent = _parent_of(index.root, flow)
-    if parent is not None:
-        parent.remove(flow)
+    index.detach(flow)
     for elem in index.elements.values():
         _remove_refs(elem, flow_id)
-    index.rebuild_flows()
     return []
 
 
@@ -540,15 +928,18 @@ def _op_move(op: Dict[str, Any], index: _Index) -> List[str]:
         raise _Skip("целевой пул не найден", "укажите имя или id пула")
     if current is target:
         return []
+    if index.has_subprocess_ancestor(elem):
+        raise _Skip(
+            "элемент внутри subProcess не переносится между пулами",
+            "переносить можно только узлы верхнего уровня: вынесите элемент из subProcess",
+        )
     broken = []
     for flow in list(index.sequence_flows):
         ends = (flow.get("sourceRef"), flow.get("targetRef"))
         if elem_id in ends:
             other = ends[0] if ends[1] == elem_id else ends[1]
             if index.process_of.get(other) is not target:
-                parent = _parent_of(index.root, flow)
-                if parent is not None:
-                    parent.remove(flow)
+                index.detach(flow)
                 broken.append(flow.get("id", ""))
     for other in index.elements.values():
         if other is not elem:
@@ -558,13 +949,45 @@ def _op_move(op: Dict[str, Any], index: _Index) -> List[str]:
         for ref in list(elem.findall(_q(ref_tag))):
             if (ref.text or "").strip() in broken:
                 elem.remove(ref)
-    if current is not None:
-        current.remove(elem)
-    target.append(elem)
-    index.rebuild_flows()
+    index.detach(elem)
+    index.adopt(target, elem)
     if broken:
         return [f"межпульные потоки удалены: {', '.join(broken)}"]
     return []
+
+
+def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
+    op_id = _require_new_id(op.get("id"), index)
+    name = (op.get("name") or "").strip()
+    if not name:
+        raise _Skip("не задано имя элемента", "укажите name")
+    event_type = str(op.get("event_type") or "").strip().lower()
+    if event_type not in ("timer", "error"):
+        raise _Skip(
+            f"неизвестный тип граничного события '{event_type}'",
+            "допустимы: timer, error",
+        )
+    host_id = op.get("attached_to") or ""
+    host = index.elements.get(host_id)
+    if host is None:
+        raise _Skip(
+            f"задача '{host_id}' не найдена",
+            "используйте существующие id из инвентаря",
+        )
+    if _local(host.tag) not in TASK_TAGS:
+        raise _Skip(
+            f"'{host_id}' не является задачей",
+            "граничное событие цепляется только к задаче или подпроцессу",
+        )
+    process = index.process_of.get(host_id)
+    if process is None:
+        raise _Skip(f"не удалось определить пул элемента '{host_id}'")
+    elem = ET.Element(_q("boundaryEvent"), {
+        "id": op_id, "name": name, "attachedToRef": host_id,
+    })
+    _adopt_event_definition(index, elem, event_type, op_id)
+    index.adopt(process, elem)
+    return [f"граничное событие '{name}' прицеплено к '{host_id}'"]
 
 
 _HANDLERS = {
@@ -572,12 +995,104 @@ _HANDLERS = {
     "add_gateway": lambda op, i: _op_add_node(op, i, "gateway"),
     "add_event": lambda op, i: _op_add_node(op, i, "event"),
     "add_participant": _op_add_participant,
+    "add_documentation": _op_add_documentation,
+    "add_lane": _op_add_lane,
+    "move_to_lane": _op_move_to_lane,
+    "add_boundary_event": _op_add_boundary_event,
     "rename": _op_rename,
     "delete": _op_delete,
     "connect": _op_connect,
     "disconnect": _op_disconnect,
     "move_to_participant": _op_move,
 }
+
+
+def _lane_move_pools(operations: List[Dict[str, Any]],
+                     index: _Index) -> Dict[str, Tuple[str, str]]:
+    """Дорожка → (пул, элемент) по операциям переноса этой же пачки.
+
+    Модель часто опускает participant у add_lane, оставляя рядом move_to_lane.
+    Пул при этом определён однозначно: дорожка обязана принадлежать пулу
+    переносимого элемента, иначе перенос будет отвергнут как «дорожка
+    принадлежит другому пулу». Это разбор ссылки из плана, а не выдумывание
+    структуры — поэтому заметка в отчёте остаётся.
+    """
+    pools: Dict[str, Tuple[str, str]] = {}
+    for op in operations or []:
+        if not isinstance(op, dict) or op.get("op") != "move_to_lane":
+            continue
+        lane_key = str(op.get("lane") or "").strip()
+        elem_id = str(op.get("id") or "").strip()
+        if not lane_key or lane_key in pools:
+            continue
+        process = index.process_of.get(elem_id)
+        if process is None:
+            continue
+        participant = index.participant_by_process_id.get(process.get("id") or "")
+        label = ((participant.get("name") if participant is not None else None)
+                 or process.get("id") or "")
+        if label:
+            pools[lane_key] = (label, elem_id)
+    return pools
+
+
+ADD_NODE_OPS = {"add_task", "add_event", "add_gateway"}
+
+
+def _routing_gap(index: _Index, elem_id: str) -> Optional[str]:
+    """Чем узел односторонне связан с маршрутом: None, если связи есть с обеих
+    сторон. Граничное событие хозяина не обязано продолжать — его ветку
+    обработки оценивает validate_and_repair отдельной пометкой."""
+    elem = index.elements.get(elem_id)
+    if elem is None:
+        return None
+    tag = _local(elem.tag)
+    if tag == "boundaryEvent" or elem.get("attachedToRef"):
+        return None
+    flows = index.sequence_flows + index.message_flows
+    has_in = any(f.get("targetRef") == elem_id for f in flows)
+    has_out = any(f.get("sourceRef") == elem_id for f in flows)
+    if tag == "startEvent":
+        return None if has_out else "не имеет исходящего потока"
+    if tag == "endEvent":
+        return None if has_in else "не имеет входящего потока"
+    if has_in and has_out:
+        return None
+    if has_in:
+        return "тупик: вход есть, выхода нет"
+    if has_out:
+        return "недостижим: выход есть, входа нет"
+    return "не связан ни с одним элементом"
+
+
+def _rollback_unrouted(index: _Index,
+                       added: List[str]) -> Tuple[Dict[str, str], Set[str]]:
+    """Убрать новые узлы, которые остались вне маршрута.
+
+    Так происходит, когда связи не применились: соседний шаг пакета добавить
+    не удалось, и `connect` повис. Оставлять из-за этого в схеме висячий шаг
+    нельзя — принятое улучшение сделало бы схему хуже исходной. Потоки
+    удаляемого узла созданы этим же пакетом, поэтому исходные шаги маршрут не
+    теряют: откат не способен добавить тупик там, где его не было.
+
+    Возвращает id откатанных узлов с причинами и id удалённых вместе с ними
+    потоков — по ним отчёт очищается от операций, которых в XML уже нет.
+    """
+    dropped: Dict[str, str] = {}
+    flows: Set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for elem_id in added:
+            if elem_id in dropped:
+                continue
+            gap = _routing_gap(index, elem_id)
+            if gap is None:
+                continue
+            flows.update(_remove_node(index, index.elements[elem_id]))
+            dropped[elem_id] = gap
+            changed = True
+    return dropped, flows
 
 
 def apply_operations(xml_text: str,
@@ -589,8 +1104,11 @@ def apply_operations(xml_text: str,
     """
     root = parse_xml(xml_text)
     index = _Index(root)
+    lane_moves = _lane_move_pools(operations, index)
     applied: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    added: List[str] = []
+    added_ops: Dict[str, str] = {}
     for op in operations or []:
         if not isinstance(op, dict):
             skipped.append({"op": str(op), "reason": "операция не объект",
@@ -603,8 +1121,21 @@ def apply_operations(xml_text: str,
                             "reason": "неизвестная операция",
                             "hint": "допустимы: " + ", ".join(sorted(_HANDLERS))})
             continue
+        derived = ""
+        if op_name == "add_lane" and index.resolve_process(op.get("participant")) is None:
+            lane_key = str(op.get("id") or "").strip()
+            hint = lane_moves.get(lane_key) or lane_moves.get(
+                str(op.get("name") or "").strip())
+            if hint:
+                op = {**op, "participant": hint[0]}
+                derived = f"пул '{hint[0]}' взят из элемента '{hint[1]}'"
         try:
             notes = handler(op, index)
+            if op_name in ADD_NODE_OPS and op.get("id"):
+                added.append(str(op["id"]))
+                added_ops[str(op["id"])] = op_name
+            if derived:
+                notes = notes + [derived]
             entry = {"op": op_name}
             for key in ("id", "element_id", "flow", "source", "target", "name"):
                 if op.get(key):
@@ -618,6 +1149,25 @@ def apply_operations(xml_text: str,
             logger.exception("Операция %s упала", op_name)
             skipped.append({"op": op_name, "reason": f"внутренняя ошибка: {e}",
                             "hint": "упростите операцию"})
+    # Узлы, добавленные пакетом и оставшиеся без маршрута, откатываем:
+    # принятое улучшение не имеет права делать схему хуже исходной.
+    dropped, dropped_flows = _rollback_unrouted(index, added)
+    if dropped:
+        applied = [a for a in applied
+                   if a.get("id") not in dropped and a.get("source") not in dropped
+                   and a.get("target") not in dropped
+                   and a.get("flow") not in dropped_flows]
+        for elem_id, gap in dropped.items():
+            skipped.append({"op": added_ops.get(elem_id, "add_task"), "id": elem_id,
+                            "reason": f"новый шаг ({elem_id}) {gap} — изменение откачено",
+                            # Откатанный узел из схемы убран, поэтому connect на
+                            # него уже не работает: повтор обязан перевставить
+                            # шаг операцией after, иначе он добавится заново
+                            # таким же висячим.
+                            "hint": f"перевставьте шаг операцией с after "
+                                    f"(связать его connect-ами нельзя: "
+                                    f"'{elem_id}' уже не существует)"})
+
     status = "success" if not skipped else ("partial" if applied else "failed")
     return _serialize(root), {"status": status, "applied": applied, "skipped": skipped}
 
@@ -626,9 +1176,41 @@ def apply_operations(xml_text: str,
 # Семантическая починка
 # ---------------------------------------------------------------------------
 
+def _ensure_process_event(index: _Index, process: ET.Element, tag: str,
+                          counter: int, notes: List[str]) -> int:
+    """Добавить процессу стартовое или конечное событие и сразу связать его с
+    потоком. Событие без рёбер — висячий узел, поэтому если кандидата нет,
+    событие не создаётся вовсе, а причина уходит в notes."""
+    is_start = tag == "startEvent"
+    event_id = f"{'Start' if is_start else 'End'}Event_new_{counter}"
+    label = "стартовое" if is_start else "конечное"
+    event = ET.Element(_q(tag), {"id": event_id, "name": "Старт" if is_start else "Завершение"})
+    index.adopt(process, event)
+    linked = _link_new_event(index, process, event_id, tag)
+    if linked is None:
+        index.detach(event)
+        side = "входящих" if is_start else "исходящих"
+        notes.append(
+            f"процесс '{index.participant_name(process)}': узел без {side} потоков "
+            f"не найден — {label} событие не добавлено"
+        )
+        return counter
+    notes.append(f"добавлено {label} событие {event_id}")
+    return counter + 1
+
+
+# Пометки validate_and_repair о правках, после которых узел всё ещё вне
+# маршрута. Планировщик улучшения показывает их пользователю как незаконченную
+# работу, а не как успешное изменение.
+UNROUTED_NOTE_MARKERS = ("остался без потоков", "не ведёт ни к одному шагу",
+                         "остался без шагов", "— тупик: вход есть",
+                         "недостижим: выход есть")
+
+
 def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
-    """Детерминированная починка после аплая: висящие потоки, согласованность
-    входящих/исходящих ссылок, дубли потоков, старт/энд на каждый процесс."""
+    """Детерминированная починка после применения операций: висящие потоки,
+    согласованность входящих/исходящих ссылок, дубли потоков, старт/энд на
+    каждый процесс."""
     root = parse_xml(xml_text)
     index = _Index(root)
     notes: List[str] = []
@@ -638,24 +1220,18 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
     # 1. Потоки с несуществующими концами удаляются.
     for flow in list(index.sequence_flows) + list(index.message_flows):
         if flow.get("sourceRef") not in known_ids or flow.get("targetRef") not in known_ids:
-            parent = _parent_of(root, flow)
-            if parent is not None:
-                parent.remove(flow)
+            index.detach(flow)
             notes.append(f"удалён висящий поток {flow.get('id')}")
-    index.rebuild_flows()
 
     # 2. Дубли потоков (одинаковые вид/источник/цель) — оставляем первый.
     seen = set()
     for flow in list(index.sequence_flows) + list(index.message_flows):
         key = (_local(flow.tag), flow.get("sourceRef"), flow.get("targetRef"))
         if key in seen:
-            parent = _parent_of(root, flow)
-            if parent is not None:
-                parent.remove(flow)
+            index.detach(flow)
             notes.append(f"удалён дубль потока {flow.get('id')}")
         else:
             seen.add(key)
-    index.rebuild_flows()
 
     # 3. incoming/outgoing пересобираются из фактических потоков.
     incoming: Dict[str, List[str]] = {elem_id: [] for elem_id in known_ids}
@@ -672,38 +1248,130 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
         for ref in list(elem.findall(_q("incoming"))) + list(elem.findall(_q("outgoing"))):
             elem.remove(ref)
     for elem_id, elem in index.elements.items():
-        # Порядок тегов в BPMN: документация, входящие, исходящие — для нас
-        # достаточно просто наличия; вставляем в начало для стабильности.
-        for pos, flow_id in enumerate(incoming[elem_id]):
+        # Порядок тегов BPMN: документация и extensionElements идут до
+        # incoming/outgoing, поэтому вставка начинается сразу после них.
+        base = _position_after(elem, _REFS_PRECEDING_TAGS)
+        for offset, flow_id in enumerate(incoming[elem_id]):
             ref = ET.Element(_q("incoming"))
             ref.text = flow_id
-            elem.insert(pos, ref)
-        base = len(incoming[elem_id])
+            elem.insert(base + offset, ref)
+        shift = base + len(incoming[elem_id])
         for offset, flow_id in enumerate(outgoing[elem_id]):
             ref = ET.Element(_q("outgoing"))
             ref.text = flow_id
-            elem.insert(base + offset, ref)
+            elem.insert(shift + offset, ref)
 
-    # 4. У каждого процесса — хотя бы один старт и один энд.
+    # 4. Исключающий шлюз с единственной веткой — не развилка, а обычный шаг.
+    # То же правило, что у генератора (`_demote_single_branch_gateways`):
+    # вторую ветку выдумывать нельзя, поэтому шлюз понижается до задачи, а
+    # условие с его единственного потока снимается — иначе улучшение,
+    # добавившее такой шлюз, роняло бы правило gateway_conditions.
+    outgoing_by_source: Dict[str, List[ET.Element]] = {}
+    for flow in index.sequence_flows:
+        outgoing_by_source.setdefault(flow.get("sourceRef") or "", []).append(flow)
+    for elem_id, elem in index.elements.items():
+        if _local(elem.tag) != "exclusiveGateway":
+            continue
+        branches = outgoing_by_source.get(elem_id) or []
+        if len(branches) >= 2:
+            continue
+        elem.tag = _q("task")
+        condition = branches[0].find(_q("conditionExpression")) if branches else None
+        if condition is not None:
+            branches[0].remove(condition)
+        notes.append(f"шлюз «{elem.get('name') or elem_id}» ({elem_id}) с "
+                     f"единственной веткой понижен до задачи "
+                     + ("; условие с потока снято" if condition is not None else ""))
+
+    # 5. У каждого процесса — хотя бы один старт и один энд.
     counter = 1
     for process in index.processes:
         tags = [_local(child.tag) for child in process
                 if isinstance(child.tag, str)]
         if not any(t in FLOW_NODE_TAGS for t in tags):
+            # Пустой пул (add_participant без последующих шагов) скоринг
+            # наказывает, а молча добавить в него события — выдумать процесс,
+            # которого пользователь не просил. Значит, говорим вслух.
+            owner = index.participant_by_process_id.get(process.get("id") or "")
+            label = ((owner.get("name") if owner is not None else None)
+                     or process.get("name") or process.get("id") or "?")
+            notes.append(f"пул «{label}» остался без шагов — добавьте в него "
+                         "элементы операциями add_task/add_event")
             continue
         if "startEvent" not in tags:
-            event_id = f"StartEvent_new_{counter}"
-            ET.SubElement(process, _q("startEvent"), {
-                "id": event_id, "name": "Старт",
-            })
-            counter += 1
-            notes.append(f"добавлено стартовое событие {event_id}")
+            counter = _ensure_process_event(index, process, "startEvent", counter, notes)
         if "endEvent" not in tags:
-            event_id = f"EndEvent_new_{counter}"
-            ET.SubElement(process, _q("endEvent"), {
-                "id": event_id, "name": "Завершение",
-            })
-            counter += 1
-            notes.append(f"добавлено конечное событие {event_id}")
+            counter = _ensure_process_event(index, process, "endEvent", counter, notes)
+
+    # 5. Узлы вне маршрута. Операция применилась, но включить шаг в маршрут
+    # планировщик не предложил (add_task без `after` и без последующего
+    # connect), а у граничего события — не описал ветку обработки. Вставить
+    # такой узел между шагами нельзя — непонятно, между какими, поэтому это
+    # сообщение наверх, а не эвристическая правка.
+    for elem_id, elem in index.elements.items():
+        tag = _local(elem.tag)
+        if tag in ("startEvent", "endEvent"):
+            continue
+        parent = index.parents.get(elem)
+        if parent is None or _local(parent.tag) != "process":
+            continue
+        incoming = elem.findall(_q("incoming"))
+        outgoing = elem.findall(_q("outgoing"))
+        if tag == "boundaryEvent" or elem.get("attachedToRef"):
+            # Входящего потока у граничного события нет по семантике BPMN: его
+            # «запускает» хозяин. Без исходящего оно не делает ничего — и
+            # скоринг правомерно считает его тупиком.
+            if not outgoing:
+                notes.append(
+                    f"граничное событие «{elem.get('name') or elem_id}» "
+                    f"({elem_id}) не ведёт ни к одному шагу — нужна ветка "
+                    "обработки (add_event или add_task и connect от события)"
+                )
+            continue
+        if incoming or outgoing:
+            continue
+        notes.append(f"узел «{elem.get('name') or elem_id}» ({elem_id}) остался без "
+                     "потоков — нужна операция connect или параметр after")
+
+    # 5b. Оборванный маршрут: шаг приняли, но связали только с одной стороны.
+    # Для `connect` это частая ловушка — новый узел добавляют «от» существующего
+    # и забывают вести дальше, а недостижимый шлюз выглядит валидным в отчёте
+    # операций. Чинить эвристикой нельзя (непонятно, к какому именно концу
+    # процесса вести), поэтому это сообщение наверх.
+    for elem_id, elem in index.elements.items():
+        tag = _local(elem.tag)
+        if tag in ("startEvent", "endEvent") or elem.get("attachedToRef"):
+            continue
+        parent = index.parents.get(elem)
+        if parent is None or _local(parent.tag) != "process":
+            continue
+        label = f"узел «{elem.get('name') or elem_id}» ({elem_id})"
+        if elem.findall(_q("incoming")) and not elem.findall(_q("outgoing")):
+            notes.append(f"{label} — тупик: вход есть, выхода нет. Нужен connect "
+                         "от него к следующему шагу или конечному событию пула")
+        elif elem.findall(_q("outgoing")) and not elem.findall(_q("incoming")):
+            notes.append(f"{label} недостижим: выход есть, входа нет. Нужен connect "
+                         "от предыдущего шага или шлюза к нему")
+
+    # 6. Ссылки дорожек. flowNodeRef — это IDREF: после delete он остаётся
+    # смотреть на несуществующий элемент, а после move_to_participant — на узел
+    # чужого процесса. bpmn-js на битые IDREF ругается, а скоринг такую ссылку
+    # считает порядком: убираем ссылающийся не туда узел и пишем об этом в
+    # notes, молча не оставляем.
+    for lane in index.lanes:
+        lane_process = index.enclosing_process(lane)
+        for ref in list(lane.findall(_q("flowNodeRef"))):
+            target_id = (ref.text or "").strip()
+            target = index.elements.get(target_id)
+            if target is None:
+                lane.remove(ref)
+                notes.append(f"дорожка «{lane.get('name') or lane.get('id')}» "
+                             f"ссылалась на удалённый элемент {target_id} — "
+                             "ссылка убрана")
+            elif index.process_of.get(target_id) is not lane_process:
+                lane.remove(ref)
+                notes.append(f"элемент {target_id} перенесён в другой пул — "
+                             f"ссылка убрана из дорожки "
+                             f"«{lane.get('name') or lane.get('id')}»")
 
     return _serialize(root), notes

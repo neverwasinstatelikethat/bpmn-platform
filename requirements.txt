@@ -5,16 +5,18 @@ sqlalchemy
 alembic
 psycopg2-binary
 pydantic[email]
+python-dotenv
 fastapi-mail
 bcrypt
 PyJWT
 python-multipart
 
-# ИИ-ядро: LLM-клиент, гибридный RAG по корпусу эталонов, XML-правки
-openai
+# ИИ-ядро: транспорт LLM (GigaChat), гибридный RAG по корпусу эталонов, XML-правки
+gigachat
 numpy
 scikit-learn
 sentence-transformers
+scipy
 chardet
 defusedxml
 

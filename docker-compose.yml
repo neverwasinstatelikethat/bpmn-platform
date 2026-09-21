@@ -36,10 +36,16 @@ services:
       MAIL_SERVER: ${MAIL_SERVER:-imap.yandex.ru}
       MAIL_STARTTLS: ${MAIL_STARTTLS:-true}
       MAIL_SSL_TLS: ${MAIL_SSL_TLS:-false}
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://foundation-models.api.cloud.ru/v1}
-      LLM_MODEL: ${LLM_MODEL:-openai/gpt-oss-120b}
-      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      # Без ключа ИИ-контур недоступен (эндпоинты честно отвечают ошибкой),
+      # поэтому значение опциональное — как и SECRET_KEY для голых миграций.
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      # В контейнере нет корневого сертификата российского УЦ, поэтому проверка
+      # TLS по умолчанию выключена. Для прода: смонтируйте CA-bundle и поставьте true.
+      GIGACHAT_VERIFY_SSL: ${GIGACHAT_VERIFY_SSL:-false}
+      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-GigaChat}
+      # PERS/B2B тариф — один одновременный запрос к модели.
+      GIGACHAT_MAX_CONCURRENT: ${GIGACHAT_MAX_CONCURRENT:-1}
     ports:
       # Хост-порты 8000/3000 заняты сторонними проектами; внутри сети контейнеров остаются 8000/80.
       - "127.0.0.1:8765:8000"

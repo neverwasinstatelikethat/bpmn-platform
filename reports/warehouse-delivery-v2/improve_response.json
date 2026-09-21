@@ -1,0 +1,76 @@
+{
+  "status": "success",
+  "improvement_id": "736baef3-df7e-474b-9343-e81b8b064732",
+  "recommendations": "Добавлены таймеры SLA и документация к развилкам, закрыты пары шлюзов входа и выхода.\n\nИзменения применены, но остались вне маршрута — скоринг считает их тупиками, пока не добавлена связь:\n- граничное событие «Таймер SLA отгрузки» (new_TimerEvent) не ведёт ни к одному шагу — нужна ветка обработки (add_event или add_task и connect от события)\n\nНе применено (требует уточнения):\n- план: connect: такой поток уже существует\n- план: set_default: 'G2' не является шлюзом\n- план: connect: источник или цель не найдены\n- план: add_task: новый шаг (new_TaskEscalate) тупик: вход есть, выхода нет — изменение откачено",
+  "report": {
+    "status": "partial",
+    "applied": [
+      {
+        "op": "add_boundary_event",
+        "id": "new_TimerEvent",
+        "name": "Таймер SLA отгрузки",
+        "note": "граничное событие 'Таймер SLA отгрузки' прицеплено к 'A2', длительность PT2H"
+      },
+      {
+        "op": "add_documentation",
+        "id": "A2"
+      },
+      {
+        "op": "add_documentation",
+        "id": "A3"
+      },
+      {
+        "op": "add_gateway",
+        "id": "new_GatewayOut",
+        "name": "Выход сборочной линии",
+        "participant": "Склад",
+        "note": "потоки после 'A3' переподвешены через 'new_GatewayOut'"
+      },
+      {
+        "op": "move_to_lane",
+        "id": "new_GatewayOut"
+      }
+    ],
+    "skipped": [
+      {
+        "op": "connect",
+        "source": "new_TimerEvent",
+        "target": "new_TaskEscalate",
+        "reason": "такой поток уже существует",
+        "hint": "существующую ветку помечают выходом по умолчанию операцией set_default",
+        "stage": "plan",
+        "reapplied": false
+      },
+      {
+        "op": "set_default",
+        "flow": "F7",
+        "gateway": "G2",
+        "reason": "'G2' не является шлюзом",
+        "hint": "выход по умолчанию бывает только у шлюза",
+        "stage": "plan",
+        "reapplied": false
+      },
+      {
+        "op": "connect",
+        "source": "Flow_A7_E1",
+        "target": "new_GatewayOut",
+        "reason": "источник или цель не найдены",
+        "hint": "используйте существующие id из инвентаря",
+        "stage": "plan",
+        "reapplied": false
+      },
+      {
+        "op": "add_task",
+        "id": "new_TaskEscalate",
+        "reason": "новый шаг (new_TaskEscalate) тупик: вход есть, выхода нет — изменение откачено",
+        "hint": "перевставьте шаг операцией с after (связать его connect-ами нельзя: 'new_TaskEscalate' уже не существует)",
+        "stage": "plan",
+        "reapplied": false
+      }
+    ],
+    "truncated_operations": 0,
+    "repair_notes": [
+      "граничное событие «Таймер SLA отгрузки» (new_TimerEvent) не ведёт ни к одному шагу — нужна ветка обработки (add_event или add_task и connect от события)"
+    ]
+  }
+}

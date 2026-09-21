@@ -306,6 +306,39 @@ class TestAcceptImprovement:
         version = db.query(DiagramVersion).filter_by(diagram_id=diagram.id).one()
         assert version.score == expected
 
+    def test_accept_reports_rule_delta_against_previous_xml(self, client, db, user,
+                                                            single_pool_xml):
+        """Дельта по правилам считается от сохранённого XML, а не от принятого:
+        снимок «до» берётся до перезаписи. Иначе «85 → 85» скрывает, что
+        принятая правка сломала конкретные правила."""
+        from core.bpmn_scoring import BPMNScorer
+
+        dead_end_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D" targetNamespace="http://bpmn.io/schema/bpmn">
+  <process id="P" name="П" isExecutable="true">
+    <startEvent id="S" name="Старт"/>
+    <userTask id="T" name="Шаг без связей"/>
+  </process>
+</definitions>"""
+        diagram = _diagram(db, user.id, xml_content=single_pool_xml)
+        diagram.score = BPMNScorer().evaluate(single_pool_xml)["score"]
+        db.commit()
+        improvement = _improvement(db, user.id, diagram.id,
+                                   xml_content=dead_end_xml)
+
+        body = client.post("/api/ai/accept-improvement",
+                           json={"improvement_id": improvement.id},
+                           headers=_headers(user)).json()
+
+        delta = body["rules_delta"]
+        assert delta["score_before"] == BPMNScorer().evaluate(single_pool_xml)["score"]
+        assert delta["score_after"] == BPMNScorer().evaluate(dead_end_xml)["score"]
+        assert delta["score_delta"] == delta["score_after"] - delta["score_before"]
+        broken = {name: change for name, change in delta["rules"].items()
+                  if change["before"] == "passed" and change["after"] == "failed"}
+        assert broken, "ухудшающее принятие обязано показать сломанные правила"
+        assert "no_isolated" in broken
+
     def test_repeated_accept_is_not_found(self, client, db, user):
         diagram = _diagram(db, user.id)
         improvement = _improvement(db, user.id, diagram.id)

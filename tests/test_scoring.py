@@ -2,10 +2,15 @@
 
 Фиксирует поведение после правок ревью: нормированный балл по применимым
 правилам, полные details/details_meta, отказ от мутации схемы, линейный
-поиск циклов и защищённые циклы как норма BPMN."""
+поиск циклов и защищённые циклы как норма BPMN.
+
+Второй круг — связность участников: пул-декорация (`startEvent → endEvent`),
+изолированный пул без messageFlow, развилка шлюза без схождения и граничное
+событие без хозяина больше не проходят скоринг."""
 import inspect
 import json
 import time
+from pathlib import Path
 
 from core import llm_client
 from core.bpmn_generator import BPMNGenerator
@@ -14,12 +19,17 @@ from core.bpmn_scoring import (
     NOT_APPLICABLE,
     PASSED,
     BPMNScorer,
+    diff_scores,
 )
 
 scorer = BPMNScorer()
 
 HEADER = ('<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" '
           'id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn">')
+
+# Артефакт живого прогона (см. reports/warehouse-delivery/recommendations.md):
+# он и есть та схема, которую скоринг пропускал с 85 баллами.
+WAREHOUSE = Path(__file__).parents[1] / "reports" / "warehouse-delivery" / "process.bpmn"
 
 
 def _doc(process_inner: str, collaboration: str = "") -> str:
@@ -113,6 +123,75 @@ def diamond_chain(count: int) -> str:
     return _doc("".join(body) + "".join(flows))
 
 
+def pools_doc(bodies, message_flows: str = "") -> str:
+    """Коллаборация из N пулов: участник P{i} ссылается на процесс Proc_{i}.
+
+    Пулы и потоки сообщений собираются списком тел — правила связности
+    участников проверяются только на мультипуловой схеме."""
+    participants = "".join(
+        f'<participant id="P{i}" name="Участник {i}" processRef="Proc_{i}"/>'
+        for i in range(1, len(bodies) + 1))
+    processes = "".join(
+        f'<process id="Proc_{i}" name="Пул {i}">{body}</process>'
+        for i, body in enumerate(bodies, 1))
+    return (f'<?xml version="1.0" encoding="UTF-8"?>\n{HEADER}'
+            f'<collaboration id="C1">{participants}{message_flows}</collaboration>'
+            f'{processes}</definitions>')
+
+
+def pool_body(i: int, with_task: bool = True) -> str:
+    """Старт → задача → финиш; с with_task=False — пул-декорация без единого шага."""
+    if not with_task:
+        return (f'<startEvent id="S{i}" name="Старт"/>'
+                + _flow(f"sf{i}", f"S{i}", f"E{i}")
+                + f'<endEvent id="E{i}" name="Финиш"/>')
+    return (f'<startEvent id="S{i}" name="Старт"/>'
+            + _flow(f"sf{i}", f"S{i}", f"A{i}")
+            + f'<userTask id="A{i}" name="Шаг {i}"/>'
+            + _flow(f"ef{i}", f"A{i}", f"E{i}")
+            + f'<endEvent id="E{i}" name="Финиш"/>')
+
+
+def lanes_doc(empty_lanes: int) -> str:
+    """Пул с одной заполненной дорожкой и `empty_lanes` дорожками без элементов."""
+    lanes = ('<lane id="L1" name="Исполнитель"><flowNodeRef>S</flowNodeRef>'
+             '<flowNodeRef>A</flowNodeRef><flowNodeRef>E</flowNodeRef></lane>')
+    lanes += "".join(f'<lane id="L{i}" name="Роль {i}"/>'
+                     for i in range(2, empty_lanes + 2))
+    return _doc(f'<laneSet id="LS">{lanes}</laneSet>'
+                '<startEvent id="S" name="Начало"/>' + _flow("f1", "S", "A")
+                + '<userTask id="A" name="Задача"/>' + _flow("f2", "A", "E")
+                + '<endEvent id="E" name="Конец"/>')
+
+
+def boundary_xml(attached_to="A", with_branch=True):
+    """Граничное событие на задаче A; без ветки — сигнал сорвётся в никуда."""
+    branch = ('<manualTask id="R" name="Эскалация руководителю"/>'
+              + _flow("f3", "BN", "R") + _flow("f4", "R", "E")) if with_branch else ""
+    attach = f' attachedToRef="{attached_to}"' if attached_to else ""
+    return _doc(
+        '<startEvent id="S" name="Начало"/>' + _flow("f1", "S", "A")
+        + '<userTask id="A" name="Оформить заявку"/>' + _flow("f2", "A", "E")
+        + f'<boundaryEvent id="BN" name="Срок вышел"{attach}>'
+          '<timerEventDefinition/></boundaryEvent>'
+        + branch + '<endEvent id="E" name="Готово"/>')
+
+
+def split_join_xml(join=True):
+    """Параллельный шлюз расходится на две ветки: либо обе сходятся в J, либо
+    правая уходит в цепочку, которая ни к чему не приводит."""
+    tail = (_flow("f4", "B", "J") + _flow("f5", "A", "J")
+            + '<parallelGateway id="J" name="Собрать ветки"/>' + _flow("f6", "J", "E")
+            if join else _flow("f4", "B", "D") + '<serviceTask id="D" name="Отчёт"/>')
+    return _doc(
+        '<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "G")
+        + '<parallelGateway id="G" name="Запустить параллельно"/>'
+        + _flow("f1", "G", "A") + '<userTask id="A" name="Собрать груз"/>'
+        + _flow("f2", "A", "E1") + '<endEvent id="E1" name="Груз собран"/>'
+        + _flow("f3", "G", "B") + '<serviceTask id="B" name="Отпечатать накладную"/>'
+        + tail + '<endEvent id="E" name="Готово"/>')
+
+
 def status(result, rule):
     return result["details_meta"][rule]["status"]
 
@@ -161,7 +240,7 @@ class TestContract:
     def test_recommendation_names_touched_elements(self):
         result = scorer.evaluate(simple_xml(gateway_conditions=False))
         assert "G1" in elements(result, "gateway_conditions")
-        rec = next(r for r in result["recommendations"] if "условия" in r)
+        rec = next(r for r in result["recommendations"] if "услов" in r)
         assert "G1" in rec
 
     def test_broken_xml_degrades_instead_of_raising(self):
@@ -175,7 +254,9 @@ class TestContract:
         assert "direction" not in scorer.rules
         assert "no_loops" not in scorer.rules
         assert "guarded_cycles" in scorer.rules
-        assert sum(r["weight"] for r in scorer.rules.values()) == 112
+        # 112 — веса двенадцати правил до связности участников, ещё 34 дают
+        # четыре новых правила
+        assert sum(r["weight"] for r in scorer.rules.values()) == 146
 
 
 class TestScoringDoesNotMutateSchema:
@@ -219,6 +300,9 @@ class TestCycles:
         assert elapsed < 2.0, f"обход графа занял {elapsed:.2f} с"
         assert status(result, "guarded_cycles") == PASSED
         assert status(result, "no_isolated") == PASSED
+        # 24 развилки × 2 ветки: обход «от каждой ветки своего шлюза» уложился
+        # бы в экспоненту, здесь сходимость считается одним обратным обходом
+        assert status(result, "gateway_split_join") == PASSED
 
 
 class TestRules:
@@ -289,6 +373,22 @@ class TestRules:
                       "gateway_conditions") == FAILED
         assert status(scorer.evaluate(simple_xml()), "gateway_conditions") == PASSED
 
+    def test_merge_gateway_needs_no_condition(self):
+        """Сходящийся шлюз (два входа, один выход) выбирать не из чего. Требовать
+        на его выходе условие — значит снимать 15 баллов за починку развилки,
+        которую сам же скоринг и просит (`gateway_split_join`)."""
+        xml = _doc(
+            '<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "G")
+            + '<exclusiveGateway id="G" name="Оплачен?"/>'
+            + _flow("f1", "G", "A", "да") + '<userTask id="A" name="Собрать"/>'
+            + _flow("f2", "G", "B", "нет") + '<serviceTask id="B" name="Отменить"/>'
+            + _flow("f3", "A", "J") + _flow("f4", "B", "J")
+            + '<exclusiveGateway id="J" name="Собрать ветки"/>'
+            + _flow("f5", "J", "E") + '<endEvent id="E" name="Конец"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "gateway_conditions") == PASSED
+        assert status(result, "gateway_split_join") == PASSED
+
     def test_element_count_limit(self):
         assert status(scorer.evaluate(diamond_chain(10)), "element_count") == PASSED
         assert status(scorer.evaluate(diamond_chain(24)), "element_count") == FAILED
@@ -309,6 +409,281 @@ class TestRules:
         assert status(result, "start_event") == FAILED
         assert any("ожидается 2 стартовых событий" in rec
                    for rec in result["recommendations"])
+
+
+class TestPoolHasSteps:
+    def test_pool_with_a_task_passes(self):
+        xml = pools_doc([pool_body(1), pool_body(2)],
+                        '<messageFlow id="M1" sourceRef="A1" targetRef="A2"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "pool_has_steps") == PASSED
+        assert status(result, "participant_interacts") == PASSED
+        assert status(result, "end_event") == PASSED
+        assert status(result, "start_event") == PASSED
+
+    def test_waiting_pool_with_intermediate_event_passes(self):
+        """Пул, который только ждёт таймер, — работа, а не декорация."""
+        xml = pools_doc([
+            pool_body(1),
+            '<startEvent id="S2" name="Старт"/>' + _flow("sf2", "S2", "W2")
+            + '<intermediateCatchEvent id="W2" name="Ожидание отгрузки">'
+              '<timerEventDefinition/></intermediateCatchEvent>'
+            + _flow("ef2", "W2", "E2") + '<endEvent id="E2" name="Финиш"/>',
+        ], '<messageFlow id="M1" sourceRef="A1" targetRef="W2"/>')
+        assert status(scorer.evaluate(xml), "pool_has_steps") == PASSED
+
+    def test_pool_of_start_and_end_only_fails(self):
+        """Схема, которая проходила весь прежний скоринг: `startEvent → endEvent`
+        формально связен и завершается, но процесса в нём нет."""
+        xml = pools_doc([pool_body(1), pool_body(2, with_task=False)],
+                        '<messageFlow id="M1" sourceRef="A1" targetRef="S2"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "pool_has_steps") == FAILED
+        assert elements(result, "pool_has_steps") == ["P2"]
+        assert any("без шагов 1 из 2 участников" in rec
+                   for rec in result["recommendations"])
+        # за пустоту отвечает ровно одно правило: формально пул завершается
+        assert status(result, "end_event") == PASSED
+
+    def test_participant_without_process_fails(self):
+        xml = pools_doc([pool_body(1)],
+                        '<participant id="PX" name="Потерянный" processRef="Proc_X"/>')
+        result = scorer.evaluate(xml)
+        assert elements(result, "pool_has_steps") == ["PX"]
+        assert elements(result, "end_event") == ["PX"]
+
+    def test_single_pool_schema_is_not_applicable(self):
+        result = scorer.evaluate(straight_xml())
+        assert status(result, "pool_has_steps") == NOT_APPLICABLE
+        assert status(result, "participant_interacts") == NOT_APPLICABLE
+
+
+class TestParticipantInteracts:
+    def test_isolated_pool_fails(self):
+        xml = pools_doc([pool_body(1), pool_body(2), pool_body(3)],
+                        '<messageFlow id="M1" sourceRef="A1" targetRef="A2"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "participant_interacts") == FAILED
+        assert elements(result, "participant_interacts") == ["P3"]
+        assert status(result, "pool_has_steps") == PASSED
+
+    def test_message_flow_to_the_pool_itself_is_enough(self):
+        """messageFlow может ссылаться и на пул целиком, а не на его шаг."""
+        xml = pools_doc([pool_body(1), pool_body(2)],
+                        '<messageFlow id="M1" sourceRef="A1" targetRef="P2"/>')
+        assert status(scorer.evaluate(xml), "participant_interacts") == PASSED
+
+    def test_one_participant_collaboration_is_not_applicable(self):
+        result = scorer.evaluate(pools_doc([pool_body(1)]))
+        assert status(result, "participant_interacts") == NOT_APPLICABLE
+        assert status(result, "pool_has_steps") == PASSED
+
+
+class TestGatewaySplitJoin:
+    def test_branches_that_merge_pass(self):
+        assert status(scorer.evaluate(split_join_xml()), "gateway_split_join") == PASSED
+
+    def test_branch_without_merge_fails(self):
+        result = scorer.evaluate(split_join_xml(join=False))
+        assert status(result, "gateway_split_join") == FAILED
+        # шлюз и корень висящей ветки: дальше по потокам схода нет
+        assert elements(result, "gateway_split_join") == ["G", "B"]
+        assert any("ветки не сходятся" in rec for rec in result["recommendations"])
+
+    def test_branch_to_end_event_needs_no_join(self):
+        """simple_xml: обе ветки ведут в свои конечные события — схождение не нужно."""
+        assert status(scorer.evaluate(simple_xml()), "gateway_split_join") == PASSED
+
+    def test_single_outgoing_flow_is_not_a_split(self):
+        xml = _doc(
+            '<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "G")
+            + '<exclusiveGateway id="G" name="Один выход"/>' + _flow("f1", "G", "A")
+            + '<userTask id="A" name="Задача"/>' + _flow("f2", "A", "E")
+            + '<endEvent id="E" name="Конец"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "gateway_split_join") == NOT_APPLICABLE
+        # один выход — не развилка: условий на нём скоринг не требует
+        assert status(result, "gateway_conditions") == PASSED
+
+    def test_no_gateway_schema_is_not_applicable(self):
+        assert status(scorer.evaluate(straight_xml()),
+                      "gateway_split_join") == NOT_APPLICABLE
+
+    def test_branch_reaching_a_converging_task_counts(self):
+        """Сходиться ветки могут и в обычный шаг с двумя входящими потоками."""
+        xml = _doc(
+            '<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "G")
+            + '<parallelGateway id="G" name="Параллельно"/>'
+            + _flow("f1", "G", "A") + '<userTask id="A" name="Левая ветка"/>'
+            + _flow("f3", "A", "J")
+            + _flow("f2", "G", "B") + '<serviceTask id="B" name="Правая ветка"/>'
+            + _flow("f4", "B", "J") + '<manualTask id="J" name="Слить результат"/>'
+            + _flow("f5", "J", "E") + '<endEvent id="E" name="Конец"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "gateway_split_join") == PASSED
+        assert status(result, "no_isolated") == PASSED
+
+
+class TestBoundaryEvents:
+    def test_attached_event_with_handler_branch_passes(self):
+        assert status(scorer.evaluate(boundary_xml()), "boundary_events") == PASSED
+
+    def test_event_without_host_fails(self):
+        result = scorer.evaluate(boundary_xml(attached_to="NOPE"))
+        assert status(result, "boundary_events") == FAILED
+        assert elements(result, "boundary_events") == ["BN"]
+
+    def test_event_without_attached_to_ref_fails(self):
+        result = scorer.evaluate(boundary_xml(attached_to=None))
+        assert status(result, "boundary_events") == FAILED
+        assert elements(result, "boundary_events") == ["BN"]
+
+    def test_event_without_handler_branch_fails(self):
+        result = scorer.evaluate(boundary_xml(with_branch=False))
+        assert status(result, "boundary_events") == FAILED
+        assert elements(result, "boundary_events") == ["BN"]
+        # висящее без ветки обработки граничное событие намеренно не ловит
+        # `no_isolated`: одна ошибка не должна стоить веса двух правил
+        assert status(result, "no_isolated") == PASSED
+
+    def test_event_on_a_gateway_is_not_a_handler(self):
+        """Хозяином граничного события может быть только активность."""
+        xml = _doc(
+            '<startEvent id="S" name="Начало"/>' + _flow("f1", "S", "G")
+            + '<exclusiveGateway id="G" name="Развилка"/>'
+            + _flow("f2", "G", "A", "да") + '<userTask id="A" name="Задача"/>'
+            + _flow("f3", "A", "E") + _flow("f4", "G", "E", "нет")
+            + '<boundaryEvent id="BN" name="Срок вышел" attachedToRef="G">'
+              '<timerEventDefinition/></boundaryEvent>'
+            + '<manualTask id="R" name="Напомнить"/>' + _flow("f5", "BN", "R")
+            + _flow("f6", "R", "E") + '<endEvent id="E" name="Конец"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "boundary_events") == FAILED
+        assert elements(result, "boundary_events") == ["BN"]
+
+    def test_schema_without_boundary_events_is_not_applicable(self):
+        assert status(scorer.evaluate(eventless_xml("<timerEventDefinition/>")),
+                      "boundary_events") == NOT_APPLICABLE
+
+
+class TestTightenedRules:
+    def test_one_filled_lane_no_longer_covers_empty_ones(self):
+        result = scorer.evaluate(lanes_doc(empty_lanes=3))
+        assert status(result, "pool_lanes") == FAILED
+        assert elements(result, "pool_lanes") == ["L2", "L3", "L4"]
+        assert any("без элементов 3 из 4 дорожек" in rec
+                   for rec in result["recommendations"])
+
+    def test_all_lanes_filled_still_passes(self):
+        assert status(scorer.evaluate(lanes_doc(empty_lanes=0)), "pool_lanes") == PASSED
+
+    def test_schema_without_lane_set_still_fails(self):
+        """Дорожки — часть методологии, и их отсутствие по-прежнему провал:
+        иначе схема вовсе без ролей получила бы бесплатный балл."""
+        assert status(scorer.evaluate(straight_xml()), "pool_lanes") == FAILED
+
+    def test_one_typed_event_no_longer_covers_untyped_ones(self):
+        xml = _doc(
+            '<startEvent id="S" name="Начало"/>' + _flow("f1", "S", "A")
+            + '<userTask id="A" name="Оформить заявку"/>' + _flow("f2", "A", "W")
+            + '<intermediateCatchEvent id="W" name="Ожидание оплаты">'
+              '<timerEventDefinition/></intermediateCatchEvent>'
+            + _flow("f3", "W", "W2")
+            + '<intermediateCatchEvent id="W2" name="Ожидание отгрузки"/>'
+            + _flow("f4", "W2", "E") + '<endEvent id="E" name="Готово"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "event_types") == FAILED
+        assert elements(result, "event_types") == ["W2"]
+        assert any("без типа 1 из 2 событий" in rec for rec in result["recommendations"])
+
+    def test_all_typed_events_pass(self):
+        assert status(scorer.evaluate(eventless_xml("<timerEventDefinition/>")),
+                      "event_types") == PASSED
+
+    def test_end_event_is_checked_per_participant(self):
+        """Раньше хватало одного endEvent на всю схему: пул без завершения
+        проходил скоринг, хотя его маршрут обрывается."""
+        xml = pools_doc(
+            [pool_body(1),
+             '<startEvent id="S2" name="Старт"/>' + _flow("sf2", "S2", "A2")
+             + '<userTask id="A2" name="Шаг 2"/>'],
+            '<messageFlow id="M1" sourceRef="A1" targetRef="A2"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "end_event") == FAILED
+        assert elements(result, "end_event") == ["P2"]
+        # шаг в пуле есть — за «пустоту» правило не отвечает
+        assert status(result, "pool_has_steps") == PASSED
+
+
+class TestScoreDiff:
+    def test_identical_answers_give_empty_delta(self):
+        before = scorer.evaluate(simple_xml(gateway_conditions=False))
+        delta = diff_scores(before, scorer.evaluate(simple_xml(gateway_conditions=False)))
+        assert delta["rules"] == {}
+        assert delta["score_delta"] == 0
+        assert delta["score_before"] == delta["score_after"] == before["score"]
+
+    def test_fixed_rule_is_reported_with_its_weight(self):
+        before = scorer.evaluate(simple_xml(gateway_conditions=False))
+        after = scorer.evaluate(simple_xml())
+        delta = diff_scores(before, after)
+        assert delta["rules"]["gateway_conditions"] == {
+            "before": FAILED, "after": PASSED,
+            "weight": scorer.rules["gateway_conditions"]["weight"]}
+        assert delta["score_delta"] > 0
+
+    def test_broken_xml_answer_does_not_break_the_delta(self):
+        delta = diff_scores(scorer.evaluate("<definitions><не-xml"),
+                            scorer.evaluate(simple_xml()))
+        assert delta["score_before"] == 0
+        assert delta["score_delta"] > 0
+
+    def test_delta_is_pure(self):
+        before = scorer.evaluate(simple_xml(gateway_conditions=False))
+        snapshot = json.dumps(before, sort_keys=True)
+        diff_scores(before, scorer.evaluate(simple_xml()))
+        assert json.dumps(before, sort_keys=True) == snapshot
+
+
+class TestRealGeneratedSchema:
+    """Артефакт живого прогона (`reports/warehouse-delivery/`): четыре пула, где
+    из содержания только `startEvent → endEvent`, и ни одного messageFlow на них.
+    Прежний скоринг выдавал за такую схему 85/100."""
+
+    def test_warehouse_schema_no_longer_passes_as_good(self):
+        result = scorer.evaluate(WAREHOUSE.read_text(encoding="utf-8"))
+        assert result["score"] < 80, f"балл {result['score']}: пустые пулы снова проходят"
+        assert status(result, "pool_has_steps") == FAILED
+        assert elements(result, "pool_has_steps") == [
+            "Participant_4", "Participant_5", "Participant_6", "Participant_8"]
+        assert status(result, "participant_interacts") == FAILED
+        assert elements(result, "participant_interacts") == elements(
+            result, "pool_has_steps")
+
+    def test_accepting_the_improvement_shows_rule_delta(self):
+        """«71 → 71» из отчёта принятия теперь объясним: в этом прогоне не
+        починено ни одного правила, и дельта говорит об этом прямо."""
+        improved = (WAREHOUSE.parent / "process_improved.bpmn").read_text(encoding="utf-8")
+        delta = diff_scores(scorer.evaluate(WAREHOUSE.read_text(encoding="utf-8")),
+                            scorer.evaluate(improved))
+        assert delta["rules"] == {}
+        assert delta["score_delta"] == 0
+        assert delta["score_before"] == delta["score_after"]
+
+
+class TestWeights:
+    def test_new_rules_cost_like_existing_ones(self):
+        """Новые правила не раздувают знаменатель: вес в уже принятом диапазоне
+        и суммарно меньше половины всех весов."""
+        new = {"pool_has_steps", "participant_interacts", "gateway_split_join",
+               "boundary_events"}
+        assert new <= set(scorer.rules)
+        assert all(6 <= scorer.rules[name]["weight"] <= 15 for name in new)
+        assert sum(scorer.rules[name]["weight"] for name in new) < sum(
+            rule["weight"] for name, rule in scorer.rules.items() if name not in new)
+
+    def test_every_rule_has_a_check(self):
+        assert set(scorer.rules) == set(scorer._checks)
 
 
 class TestUnsafeXml:
@@ -357,6 +732,12 @@ class TestCeiling:
             json.dumps(self.STRUCTURE, ensure_ascii=False))
         xml = BPMNGenerator().generate("Согласование договора")["bpmn"]
         result = scorer.evaluate(xml)
-        assert [name for name, entry in result["details_meta"].items()
-                if entry["status"] == FAILED] == ["pool_lanes", "documentation"]
+        failed = {name for name, entry in result["details_meta"].items()
+                  if entry["status"] == FAILED}
+        # Правила связности участников не дают ложных срабатываний на валидном
+        # плане: пустых пулов, изолированных участников и висящих развилок тут нет.
+        assert not failed & {"pool_has_steps", "participant_interacts",
+                             "gateway_split_join", "boundary_events"}
+        # Потолок задают дорожки и документация — их дописывает зона генерации.
+        assert failed == {"pool_lanes", "documentation"}
         assert result["score"] >= 85

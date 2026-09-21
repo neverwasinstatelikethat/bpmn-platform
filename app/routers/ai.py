@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -17,6 +18,7 @@ from app.services.improvements import (ANALYSIS_ONLY, APPROVED, PENDING, REJECTE
                                         record_proposal)
 from app.services.versions import record_version
 from app.timeutils import utc_now
+from core.bpmn_scoring import diff_scores
 from core.llm_improve import ImprovementError, ImprovementUnavailable
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,10 @@ async def generate_bpmn(request: GenerateRequest,
         "bpmn": result["bpmn"],
         "structure": result.get("structure") or {},
         "notes": result.get("notes") or [],
+        # Что осталось нарушенным после починки и сколько вызовов модели
+        # потратила генерация — метрики качества снимаются с этого ответа.
+        "gaps": result.get("gaps") or [],
+        "attempts": result.get("attempts") or 1,
     }
 
 
@@ -164,6 +170,7 @@ async def accept_improvement(
     if not improvement:
         raise HTTPException(404, detail="Improvement not found")
 
+    previous_xml: Optional[str] = None
     if improvement.diagram_id:
         diagram = load_diagram(db, current_user, improvement.diagram_id, edit=True)
         if improvement.base_seq is not None and diagram.version_seq != improvement.base_seq:
@@ -173,6 +180,10 @@ async def accept_improvement(
                 409,
                 detail="Схема изменилась после расчёта улучшения — запросите его заново",
             )
+        # Снимок «до» берётся до перезаписи: иначе дельта по правилам всегда
+        # пустая, и пользователь не видит, что принятое изменение ухудшило
+        # схему.
+        previous_xml = diagram.xml_content
         diagram.xml_content = improvement.xml_content
         diagram.updated_at = utc_now()
     else:
@@ -191,9 +202,18 @@ async def accept_improvement(
     # и в истории версий — то есть вся статистика качества врала бы после
     # каждого принятия.
     score_before = diagram.score
-    score_after = (await asyncio.to_thread(scorer.evaluate,
-                                           improvement.xml_content))["score"]
+    after_report = await asyncio.to_thread(scorer.evaluate,
+                                           improvement.xml_content)
+    score_after = after_report["score"]
     diagram.score = score_after
+
+    # Дельта по правилам, а не только итоговая цифра: «85 → 85» выглядит как
+    # бесполезное улучшение, хотя три правила починены, а прирост съеден
+    # новым требованием к документации.
+    rules_delta = None
+    if previous_xml:
+        rules_delta = diff_scores(
+            await asyncio.to_thread(scorer.evaluate, previous_xml), after_report)
 
     version = record_version(db, diagram, source="approved", author_id=current_user.id,
                              note=f"улучшение {improvement.id}")
@@ -207,6 +227,7 @@ async def accept_improvement(
         "version_seq": version.seq if version else diagram.version_seq,
         "score": score_after,
         "score_before": score_before,
+        "rules_delta": rules_delta,
     }
 
 

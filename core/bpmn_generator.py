@@ -997,6 +997,27 @@ _NON_PARTICIPANT_ACRONYMS = {
     "КБ", "АУ", "НК", "ОК",
 }
 _ACRONYM_RE = re.compile(r"\b[A-ZА-ЯЁ]{2,}\b")
+# Именованный участник по русской орфографии: заглавное слово не в начале
+# фразы. Аббревиатура («WMS») — не единственный способ назвать контрагента:
+# «Перевозчик», «Клиент», «Система мониторинга» план-гейт раньше не видел
+# вовсе, и «план-гейт про него молчал» был вторым по величине источником
+# провала `expected_participants` (4 из 14 в прогоне #40). Строчные
+# «перевозчик»/«кладовщик» не ловятся намеренно: должность участником не
+# считает план, а не код.
+_PROPER_RE = re.compile(r"(?<![А-Яа-яЁёA-Za-z0-9])[А-ЯЁ][а-яё]{2,}")
+_PHRASE_START = ".!?:;\n\r"
+
+
+def _proper_names(text: str) -> List[str]:
+    """Заглавные имена собственные описания, стоящие внутри фразы."""
+    out: List[str] = []
+    for found in _PROPER_RE.finditer(text or ""):
+        head = (text or "")[:found.start()].rstrip()
+        if not head or head[-1] in _PHRASE_START:
+            continue
+        if found.group(0) not in out:
+            out.append(found.group(0))
+    return out
 
 
 def _text_words(text: str) -> List[str]:
@@ -1069,8 +1090,9 @@ def _unclaimed_tokens(pools: List[str], lanes: List[Dict[str, Any]],
         _norm_name(_raw_text(lane.get("name"))) for lane in lanes}
     named.discard("")
     out: List[str] = []
-    for token in sorted({m for m in _ACRONYM_RE.findall(text)
-                         if m not in _NON_PARTICIPANT_ACRONYMS}):
+    tokens = {m for m in _ACRONYM_RE.findall(text)
+              if m not in _NON_PARTICIPANT_ACRONYMS} | set(_proper_names(text))
+    for token in sorted(tokens):
         low = token.lower()
         if any(low == name or low in name or (name in low and len(name) >= 3)
                for name in named):

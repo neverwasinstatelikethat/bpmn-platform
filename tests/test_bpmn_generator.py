@@ -229,6 +229,49 @@ class TestRolesAreLanesNotPools:
         assert "кроме endEvent" in prompt
 
 
+def test_counterparty_named_inside_a_phrase_is_a_gap():
+    """План-гейт видел только аббревиатуры: «Перевозчик», названный в середине
+    фразы, нарушением не считался и в переспрос не попадал — «план-гейт про
+    него молчал» стал вторым по величине источником провалов
+    `expected_participants` в прогоне #40 (4 из 14)."""
+    gaps = bpmn_generator.plan_gaps(
+        _plan_dict(),
+        "ВкусВилл собирает заказ, Перевозчик вывозит его на адрес получателя.")
+    assert any("«Перевозчик»" in g and "заведи" in g for g in gaps)
+
+
+def test_start_of_a_phrase_is_not_taken_for_a_participant():
+    """Заглавная буква в начале фразы — не признак имени: так каждый «Далее»
+    и «Если» стал бы участником, а план-гейт честно просил бы завести под него
+    пул. Ограничение осознанное: ловим только то написание, которое русская
+    орфография оставляем именем собственным."""
+    gaps = bpmn_generator.plan_gaps(
+        _plan_dict(),
+        "Перевозчик вывозит заказ. Далее получатель ставит подпись.")
+    assert not any("«Перевозчик»" in g for g in gaps)
+    assert not any("«Далее»" in g for g in gaps)
+
+
+def test_generate_asks_about_a_counterparty_the_plan_never_named(monkeypatch):
+    """Сквозная проверка: названный в описании контрагент, о котором молчал
+    план-гейт, уходит в переспрос и возвращается на схему."""
+    first = _fence(_plan_dict())
+    with_carrier = _plan_dict()
+    with_carrier["participants"] = ["ВкусВилл", "Перевозчик"]
+    with_carrier["elements"] = list(with_carrier["elements"]) + [
+        _e("P1", "userTask", "Вывезти груз", "", participant="Перевозчик")]
+    with_carrier["flows"] = list(with_carrier["flows"]) + [
+        _f("MF1", "T5", "P1", kind="message")]
+    fake = FakeLLM(monkeypatch, first, _fence(with_carrier),
+                   '{"moves": [], "roles": [], "missing": []}')
+    result = BPMNGenerator().generate(
+        "ВкусВилл собирает заказ, Перевозчик вывозит его на адрес.")
+
+    asked = fake.calls[1][1]["content"]
+    assert "Перевозчик" in asked
+    assert "Перевозчик" in [p["name"] for p in result["structure"]["participants"]]
+
+
 class TestUnknownParticipant:
     def test_unknown_pool_name_creates_own_pool_with_note(self, monkeypatch):
         plan = _plan(

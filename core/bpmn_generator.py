@@ -789,7 +789,15 @@ class BPMNGenerator:
                         "startEvent", "endEvent"):
                     continue
                 donor = _raw_text(elem.get("participant"))
-                if step_count(donor) <= 1 and _norm_name(donor) != _norm_name(pool):
+                # Донор без действий — не аргумент против шага, который называет
+                # самого участника: имя шага говорит о владельце прямо, а пул без
+                # своих действий — честная пустота, которую починка и закроет.
+                # Живые прогоны теряли здесь названного в описании участника
+                # целиком («WMS», «Клиент»).
+                names_the_pool = _norm_name(pool) in _norm_name(
+                    _raw_text(elem.get("name")))
+                if (step_count(donor) <= 1 and not names_the_pool
+                        and _norm_name(donor) != _norm_name(pool)):
                     notes.append(f"шаг {_raw_text(elem.get('id'))} в «{pool}» не "
                                  "перенесён: после переноса его пул остался без "
                                  "действий")

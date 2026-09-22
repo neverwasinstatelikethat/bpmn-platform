@@ -1825,6 +1825,27 @@ class TestOwnershipClarification:
         assert "Дельта" not in asked
         assert _note(result["notes"], "пул «Дельта» — роль «ВкусВилл» по описанию")
 
+    def test_step_that_names_the_system_leaves_a_one_step_donor(self, monkeypatch):
+        """Донорский запрет терял участника: модель назвала «WMS» и его шаг
+        «Зарезервировать упаковку в WMS», а перенос блокировался тем, что у
+        пула-донора оставался единственный шаг. Имя шага, в котором сам
+        участник и назван, — доказательство сильнее бухгалтерии донора: два
+        живых прогона подряд теряли `expected_participants` именно здесь."""
+        plan = {"participants": ["Оператор склада"],
+                "elements": [{"id": "A1", "kind": "userTask",
+                              "name": "Зарезервировать упаковку в WMS",
+                              "participant": "Оператор склада"}], "flows": []}
+        fenced = _fence(plan)
+        FakeLLM(monkeypatch, fenced, fenced,
+                '{"missing": [{"pool": "WMS", "steps": ["A1"]}]}')
+        result = BPMNGenerator().generate(
+            "Оператор склада резервирует упаковку в WMS, система подтверждает "
+            "резерв.")
+        assert _note(result["notes"], "участник «WMS» добавлен на схему")
+        moved = next(e for e in result["structure"]["elements"] if e["id"] == "A1")
+        assert moved["participant"] == "WMS"
+        assert "WMS" in [p["name"] for p in result["structure"]["participants"]]
+
     def test_generic_organization_name_is_not_invented_a_host(self, monkeypatch):
         """Две действующие организации — выбирать хозяина роли не из чего, и
         родовое слово не становится подсказкой для догадки: пул «Организация» не

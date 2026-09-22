@@ -44,6 +44,9 @@ STEP_KINDS = TASK_KINDS | GATEWAY_KINDS | {
 # События, у которых обязан быть тип-определение (timerEventDefinition и т. п.).
 TYPED_EVENT_KINDS = {"intermediateCatchEvent", "intermediateThrowEvent",
                      "boundaryEvent"}
+# Цели sequenceFlow, которых в BPMN 2.0 не бывает: в старт поток не входит,
+# а граничное событие запускает хозяин через attachedToRef.
+ILLEGAL_SEQUENCE_TARGETS = {"startEvent", "boundaryEvent"}
 EVENT_DEFINITION_NAMES = {"timer", "message", "error", "signal", "escalation",
                           "conditional", "compensation", "terminate", "link"}
 
@@ -58,6 +61,7 @@ CORE_INVARIANTS: Tuple[str, ...] = (
     "gateway_conditions_or_default",
     "event_definitions",
     "boundary_handled",
+    "flow_ends_legal",
     "no_unrouted",
 )
 SCENARIO_EXPECTATIONS: Tuple[str, ...] = (
@@ -528,6 +532,40 @@ def _check_boundary_handled(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     return _fail("boundary_handled", "; ".join(details), bad)
 
 
+def _check_flow_ends_legal(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    # messageFlow здесь вне игры: сообщение в startEvent чужого пула — штатный
+    # способ запустить процесс, а поток между пулами — это уже не sequenceFlow.
+    seq = [e for e in g.edges if e.kind != "message"]
+    if not g.nodes:
+        return _na("flow_ends_legal", "узлов нет")
+    if not seq:
+        return _na("flow_ends_legal", "sequence-потоков нет — проверять нечего")
+    bad: List[str] = []
+    details: List[str] = []
+    for edge in seq:
+        source, target = g.by_id.get(edge.source), g.by_id.get(edge.target)
+        # висячая ссылка — забота `no_unrouted`: дважды про неё не рапортуем
+        if source is None or target is None:
+            continue
+        problems = []
+        if target.kind in ILLEGAL_SEQUENCE_TARGETS:
+            problems.append(f"входит в {target.kind} {target.id} («{target.name}»)")
+        if source.kind == "endEvent":
+            problems.append(f"исходит из {source.kind} {source.id} «{source.name}»")
+        if not problems:
+            continue
+        ident = edge.id or f"{edge.source}->{edge.target}"
+        bad.append(ident)
+        details.append(f"{ident}: " + ", ".join(problems))
+    if not bad:
+        return _pass("flow_ends_legal", f"проверено sequence-потоков: {len(seq)}")
+    return _fail("flow_ends_legal",
+                 "недопустимые концы sequenceFlow: " + "; ".join(details)
+                 + " — sequence-поток не входит ни в startEvent, ни в граничное "
+                 "событие (его запускает хозяин по attachedToRef), а у endEvent "
+                 "исходящего потока не бывает", bad)
+
+
 def _check_no_unrouted(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     if not g.nodes:
         return _na("no_unrouted", "узлов нет")
@@ -643,6 +681,7 @@ def _run_checks(g: _Graph, expectations: Mapping[str, Any]) -> Dict[str, Check]:
         "gateway_conditions_or_default": _check_gateway_conditions(g, expectations),
         "event_definitions": _check_event_definitions(g, expectations),
         "boundary_handled": _check_boundary_handled(g, expectations),
+        "flow_ends_legal": _check_flow_ends_legal(g, expectations),
         "no_unrouted": _check_no_unrouted(g, expectations),
     }
     for name, fn in _SCENARIO_CHECKS.items():

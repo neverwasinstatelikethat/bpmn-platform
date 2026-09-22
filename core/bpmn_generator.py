@@ -585,18 +585,23 @@ class BPMNGenerator:
         # это полной задержкой генерации. Требование перечислить действующих лиц
         # переехало в первый же вызов (см. `actors` в `_SYSTEM_PROMPT`).
         absent = missing_actors(structure)
-        if not vacant and not role_pools:
-            # Расхождение с `actors` само по себе нового вызова не добивается:
-            # пять прогонов подряд показывали, что на вопрос о чужих шагах модель
-            # отвечает пустым `missing` (12 случаев из 18), а пользователю это
-            # +0,6 обращения и +4 с. Нарушение при этом остаётся в `gaps` —
-            # пользователь его видит, а если уточнение всё же идёт по другому
-            # поводу, имена пропущенных участников в него вписаны (`absent`).
+        # Названная в тексте система без пула — повод спросить и без пустых
+        # пулов: шаги её в плане чужие, и только модель скажет, какие. Раньше
+        # вопрос заводился исключительно из-за пустых пулов и ролей, поэтому
+        # «WMS» доезжал до переспроса планом целиком — а тот отбрасывался чаще.
+        # Расхождение с `actors` отдельно спрашивать по-прежнему нечего: пять
+        # прогонов подряд давали пустой `missing` (12 случаев из 18) и +4 с
+        # пользователю, а имена из `actors` вписываются в вопрос, когда он уже
+        # идёт по другому поводу.
+        unclaimed = _unclaimed_tokens(pools,
+                                      _raw_dicts(structure.get("lanes")), text)
+        sought = list(dict.fromkeys(absent + unclaimed))
+        if not vacant and not role_pools and not unclaimed:
             return structure, []
         # Пропущенных участников спрашиваем у плана, где их ещё мало, — или когда
         # они противоречат собственному списку `actors`: там имена уже взяты из
         # описания, и дорисовать что-то сверх него модель не может.
-        ask_missing = bool(absent) or len(pools) < MAX_POOLS_FOR_MISSING_QUESTION
+        ask_missing = bool(sought) or len(pools) < MAX_POOLS_FOR_MISSING_QUESTION
         question = _OWNERSHIP_TEMPLATE.format(
             vacant="\n".join(
                 f"«{v['pool']}» — "
@@ -609,11 +614,12 @@ class BPMNGenerator:
             role_pools=", ".join(f"«{p}»" for p in role_pools[:12]) or "нет",
             pools=", ".join(f"«{p}»" for p in pools),
             missing=(
-                ("Ты сама выписал(а) этих действующих лиц из описания, но в плане "
-                 "у них нет ни пула, ни дорожки: "
-                 + ", ".join(f"«{a}»" for a in absent[:MAX_PATCH_MISSING])
+                ("Эти действующие лица названы в описании (ты сама выписала их "
+                 "в actors или они звучат в тексте), но в плане у них нет ни "
+                 "пула, ни дорожки: "
+                 + ", ".join(f"«{a}»" for a in sought[:MAX_PATCH_MISSING])
                  + ". Назови в missing для каждого его шаги из плана — те, чьё "
-                 "действие в описании делает именно он.") if absent else
+                 "действие в описании делает именно он.") if sought else
                 "Проверь описание и назови в missing каждое действующее лицо, "
                 "которое действует от своего имени («поставщик подтверждает», "
                 "«система регистрирует», «клиент подаёт»), с id шагов плана, "
@@ -976,6 +982,31 @@ def _mentioned(name: str, words: List[str]) -> bool:
     return True
 
 
+def _unclaimed_tokens(pools: List[str], lanes: List[Dict[str, Any]],
+                      text: str) -> List[str]:
+    """Названные в описании системы и участники, у которых в плане нет ни пула,
+    ни дорожки.
+
+    Один источник признака и для нарушения (`_participant_gaps`), и для уточняющего
+    вопроса: разъехавшиеся правила давали бы план, где модель чинит дефект, о
+    котором её не спрашивали, и наоборот.
+    """
+    if not (text or "").strip():
+        return []
+    named = {_norm_name(p) for p in pools} | {
+        _norm_name(_raw_text(lane.get("name"))) for lane in lanes}
+    named.discard("")
+    out: List[str] = []
+    for token in sorted({m for m in _ACRONYM_RE.findall(text)
+                         if m not in _NON_PARTICIPANT_ACRONYMS}):
+        low = token.lower()
+        if any(low == name or low in name or (name in low and len(name) >= 3)
+               for name in named):
+            continue
+        out.append(token)
+    return out
+
+
 def _participant_gaps(pools: List[str], lanes: List[Dict[str, Any]],
                       text: str) -> List[str]:
     """Два дрейфа имён участников, которые починка не устранит.
@@ -996,12 +1027,7 @@ def _participant_gaps(pools: List[str], lanes: List[Dict[str, Any]],
             gaps.append(f"пул «{pool}» не упоминается в описании: назови "
                         "участника тем словом, которое в тексте, и обнови "
                         "participant у его шагов")
-    for token in sorted({m for m in _ACRONYM_RE.findall(text)
-                         if m not in _NON_PARTICIPANT_ACRONYMS}):
-        low = token.lower()
-        if any(low == name or low in name or (name in low and len(name) >= 3)
-               for name in named):
-            continue
+    for token in _unclaimed_tokens(pools, lanes, text):
         gaps.append(f"в описании назван участник «{token}», а в схеме его нет: "
                     f"заведи пул «{token}» с его шагами, либо дорожку, если "
                     "это подсистема другой организации")

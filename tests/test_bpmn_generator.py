@@ -1820,6 +1820,39 @@ class TestOwnershipClarification:
         assert next(e for e in result["structure"]["elements"]
                     if e["id"] == "A3")["participant"] == "ВкусВилл"
 
+    def test_named_system_without_a_pool_is_asked_by_itself(self, monkeypatch):
+        """Ни пустых пулов, ни ролей-пулов: в плане только названная в тексте
+        система без пула. Вопрос о принадлежности раньше заводился исключительно
+        из-за пустых пулов, и «WMS» доезжал до переспроса планом целиком — а
+        повтор переписывал план хуже. Шаг модели здесь — назвать чужие шаги."""
+        plan = {"participants": ["ВкусВилл"],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Завести заявку",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask",
+                     "name": "Зарегистрировать отгрузку в WMS",
+                     "participant": "ВкусВилл"},
+                    {"id": "A3", "kind": "userTask",
+                     "name": "Списать остатки в WMS", "participant": "ВкусВилл"}],
+                "flows": []}
+        fenced = _fence(plan)
+        fake = FakeLLM(monkeypatch, fenced, fenced,
+                       '{"missing": [{"pool": "WMS", "external": true,'
+                       ' "steps": ["A2", "A3"]}]}')
+        result = BPMNGenerator().generate(
+            "ВкусВилл заводит заявку, система WMS регистрирует отгрузку и "
+            "списывает остатки в WMS.")
+        assert "WMS" in fake.calls[-1][1]["content"]
+        pools = [p["name"] for p in result["structure"]["participants"]]
+        assert "WMS" in pools, result["notes"]
+        assert _note(result["notes"], "добавлен на схему")
+        for step in ("A2", "A3"):
+            assert next(e for e in result["structure"]["elements"]
+                        if e["id"] == step)["participant"] == "WMS"
+        # донор не выхолощен: у «ВкусВилла» остаётся своё действие
+        assert next(e for e in result["structure"]["elements"]
+                    if e["id"] == "A1")["participant"] == "ВкусВилл"
+
     def test_missing_participant_rides_the_ownership_question(self, monkeypatch):
         """Вопрос о пропущенных участниках едет тем же вызовом, который уже нужен
         из-за пустого пула: второй запрос пользователь бы не дождался."""

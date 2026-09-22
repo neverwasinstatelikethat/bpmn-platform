@@ -90,6 +90,10 @@ POOL_MATCH_CUTOFF = 0.6
 # каждая лишняя итерация удваивает пользовательскую задержку, а переспрос по
 # нарушениям дешевле, чем принятая пользователем битая схема.
 MAX_RETRY_PLAN_CHARS = 12_000
+# Бюджет ответа на план в токенах. 8000 хватало плану без описаний; теперь
+# модель пишет документацию к каждому шагу, а обрезанный JSON — не «схема без
+# описаний», а отказ всей генерации: `LLMTruncatedError` повторять бессмысленно.
+MAX_PLAN_TOKENS = 12_000
 # Правка принадлежности шагов отправляет не план, а список id: лимиты держат
 # запрос в размерах, которые модель не обрезает.
 MAX_PATCH_QUESTION_CHARS = 9_000
@@ -533,7 +537,7 @@ class BPMNGenerator:
 
     def _extract_structure(self, text: str) -> Dict[str, Any]:
         data = call_json(_SYSTEM_PROMPT, f"Описание процесса:\n{text}",
-                         temperature=0.2, max_tokens=8000)
+                         temperature=0.2, max_tokens=MAX_PLAN_TOKENS)
         if not isinstance(data, dict):
             raise ValueError("ответ модели не объект")
         return data
@@ -554,7 +558,7 @@ class BPMNGenerator:
                 _RETRY_TEMPLATE.format(
                     gaps="\n".join(f"- {g}" for g in gaps),
                     text=text, plan=payload),
-                temperature=0.1, max_tokens=8000)
+                temperature=0.1, max_tokens=MAX_PLAN_TOKENS)
         except (LLMError, ValueError) as e:
             logger.warning("Повтор генерации не удался, остаётся первый план: %s", e)
             return None

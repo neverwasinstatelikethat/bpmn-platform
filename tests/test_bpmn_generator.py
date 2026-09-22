@@ -272,6 +272,16 @@ def test_generate_asks_about_a_counterparty_the_plan_never_named(monkeypatch):
     assert "Перевозчик" in [p["name"] for p in result["structure"]["participants"]]
 
 
+def test_camel_case_brand_is_not_cut_into_a_participant():
+    """«ВкусВилл» — одно имя, а не «Вкус» + «Вилл»: без границы после заглавной
+    части план-гейт требовал бы завести пул «Вкус» в каждом описании с брендом
+    (живая проверка на текстах харнесса дала три таких ложных имени)."""
+    gaps = bpmn_generator.plan_gaps(
+        _plan_dict(),
+        "ВкусВилл собирает заказ, перевозчик вывозит его на адрес.")
+    assert not any("«Вкус»" in g or "«Вилл»" in g for g in gaps)
+
+
 class TestUnknownParticipant:
     def test_unknown_pool_name_creates_own_pool_with_note(self, monkeypatch):
         plan = _plan(

@@ -31,6 +31,8 @@ router = APIRouter()
 _GENERATE_HTTP = {
     "llm": status.HTTP_503_SERVICE_UNAVAILABLE,
     "llm_truncated": status.HTTP_400_BAD_REQUEST,
+    # Вход не влезает в контекст: повтор запроса не поможет, это 400.
+    "llm_too_large": status.HTTP_400_BAD_REQUEST,
     "parse": status.HTTP_400_BAD_REQUEST,
     "generation": status.HTTP_400_BAD_REQUEST,
     "internal": status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -14,8 +14,10 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from gigachat import GigaChat
-from gigachat.exceptions import (AuthenticationError, ForbiddenError,
-                                 RateLimitError, ResponseError, ServerError)
+from gigachat.exceptions import (AuthenticationError, BadRequestError,
+                                 ForbiddenError, RateLimitError,
+                                 RequestEntityTooLargeError, ResponseError,
+                                 ServerError, UnprocessableEntityError)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,24 @@ class LLMTruncatedError(LLMError):
     применять такой ответ нельзя: `_close_truncated` молча «починил» бы
     оборванный на середине список операций.
     """
+
+
+class LLMRequestTooLargeError(LLMError):
+    """Запрос корректен по форме, но не помещается в контекст провайдера.
+
+    Отличается от LLMError тем, что повтор бесполезен: вход той же длины.
+    Раньше такое падало в общий отказ и роутер отвечал 503 с Retry-After —
+    пользователь получал «попробуйте позже» на запрос, который не пройдёт
+    никогда, и совет переформулировать то, с чем всё в порядке.
+    """
+
+
+# Формулировки отказов из-за длины разбросаны (GigaChat и OpenAI-совместимые
+# шлюзы пишут по-разному), поэтому ищем по подстроке в теле ответа.
+_CONTEXT_LIMIT_HINTS = (
+    "context length", "maximum context", "token", "too long",
+    "длин", "контекст", "токен", "превыс",
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -124,6 +144,29 @@ def _is_auth_failure(error: ResponseError) -> bool:
     return "/oauth" in str(getattr(error, "url", "")).lower()
 
 
+def _is_too_large(error: ResponseError) -> bool:
+    """Отказ «запрос не влезает»: 413 по размеру тела, 400/422 по тексту ответа.
+
+    Тот же BadRequestError приходит и по другим причинам, поэтому для него
+    решающим является содержание: без подсказки про длину это обычная ошибка
+    запроса. Авторизация проверяется раньше, так что 400 от эндпоинта токена
+    сюда не доходит.
+    """
+    if isinstance(error, RequestEntityTooLargeError):
+        return True
+    if not isinstance(error, (BadRequestError, UnprocessableEntityError)):
+        return False
+    content = error.content
+    if isinstance(content, bytes):
+        # Битые байты из ответа не должны ронять разбор: заменяем на читаемый
+        # текст — нам нужны только подстроки.
+        content = content.decode("utf-8", "replace")
+    if not isinstance(content, str):
+        return False
+    text = content.casefold()
+    return any(hint in text for hint in _CONTEXT_LIMIT_HINTS)
+
+
 def get_model_name() -> str:
     return os.getenv("GIGACHAT_MODEL", DEFAULT_MODEL)
 
@@ -163,7 +206,8 @@ def _log_usage(model: str, attempt: int, elapsed_ms: int,
 def _complete(messages: List[Dict[str, str]], temperature: float,
               max_tokens: Optional[int]) -> str:
     """Один раунд с ограниченными повторами. Только транспортные повторы
-    (429/5xx/сеть); смысловые ошибки ответа повторяет вызывающий код."""
+    (429/5xx/сеть); смысловые ошибки ответа повторяет вызывающий код, а отказ
+    «не влезло в контекст» поднимается сразу — повтор его не лечит."""
     from gigachat.models import Chat, Messages
 
     model = get_model_name()
@@ -201,6 +245,12 @@ def _complete(messages: List[Dict[str, str]], temperature: float,
                 logger.warning("Попытка %s: ошибка обращения к LLM: %s",
                                attempt, last_error)
                 continue
+            if _is_too_large(e):
+                raise LLMRequestTooLargeError(
+                    "Запрос не помещается в контекст GigaChat "
+                    f"(HTTP {e.status_code}): {e}. Повтор бесполезен — "
+                    "нужно уменьшать вход (схему, инвентарь, историю)."
+                ) from e
             raise LLMError(f"LLM отклонила запрос: {e}") from e
         except _RETRYABLE as e:
             last_error = str(e)
@@ -219,16 +269,6 @@ def _complete(messages: List[Dict[str, str]], temperature: float,
             continue
         return content
     raise LLMError(f"LLM недоступна после {MAX_ATTEMPTS} попыток: {last_error}")
-
-
-def call_text(system: str, user: str, *, temperature: float = 0.2,
-              max_tokens: Optional[int] = 16000) -> str:
-    """Текстовый ответ модели (сырой, без разбора)."""
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    return _complete(messages, temperature, max_tokens)
 
 
 def call_json(system: str, user: str, *, temperature: float = 0.2,

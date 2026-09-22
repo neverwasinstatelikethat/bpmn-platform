@@ -3,12 +3,69 @@
 
 Регрессии, из-за которых обновление схем не работало никогда: парсер ожидал
 только префикс bpmn: и молча отдавал мусор, когда модель оборачивала ответ в
-```xml или писала пространство имён по умолчанию."""
+```xml или писала пространство имён по умолчанию.
+
+Вторая часть файла — разбор отказов провайдера: «запрос не влез в контекст»
+не должен выглядеть как «провайдер недоступен». Транспорт подменён на уровне
+клиента GigaChat, поэтому сети и ключа не нужно."""
 import json
+from types import SimpleNamespace
 
 import pytest
+from gigachat.exceptions import (BadRequestError, RequestEntityTooLargeError,
+                                 ServerError, UnprocessableEntityError)
 
-from core.llm_client import LLMTruncatedError, extract_json, extract_xml
+from core import llm_client
+from core.llm_client import (LLMError, LLMRequestTooLargeError,
+                             LLMTruncatedError, extract_json, extract_xml)
+
+CHAT_URL = "https://gigachat-api.sberbank.ru/v1/chat/completions"
+OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+
+
+class FakeProvider:
+    """Клиент провайдера, у которого `chat` бросает заготовленные ошибки.
+
+    Последняя ошибка отдаётся на всех остальных вызовах: так видно число
+    попыток."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def chat(self, request):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _response(content):
+    """Ответ, похожий на то, что отдаёт SDK: choices[0].message.content."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content),
+                                 finish_reason=None)],
+        usage=None,
+    )
+
+
+def _provider(monkeypatch, *outcomes) -> FakeProvider:
+    """Ставит подмену транспорта и убирает паузы повторов из теста."""
+    provider = FakeProvider(*outcomes)
+    monkeypatch.setattr(llm_client, "get_llm_client", lambda: provider)
+    monkeypatch.setattr(llm_client, "RETRY_PAUSE_SECONDS", 0)
+    return provider
+
+
+def _response_error(cls, status_code: int, content, url: str = CHAT_URL):
+    body = content.encode() if isinstance(content, str) else content
+    return cls(url, status_code, body, None)
+
+
+def _complete() -> str:
+    return llm_client._complete([{"role": "user", "content": "собери схему"}],
+                                0.2, 1000)
 
 
 class TestExtractJson:
@@ -128,3 +185,81 @@ class TestExtractXml:
     def test_empty_answer_raises(self):
         with pytest.raises(ValueError):
             extract_xml("")
+
+
+class TestProviderRefusals:
+    """Что `_complete` повторяет, а что отдаёт наружу сразу.
+
+    Главная регрессия: отказ «схема не влезла в контекст» не должен притворяться
+    недоступностью провайдера — иначе роутер отвечает 503 с Retry-After, а
+    пользователь бесконечно пересылает заведомо непроходимый запрос."""
+
+    def test_413_is_too_large_and_never_retried(self, monkeypatch):
+        provider = _provider(
+            monkeypatch,
+            _response_error(RequestEntityTooLargeError, 413, b"Request body is too large"))
+        with pytest.raises(LLMRequestTooLargeError) as caught:
+            _complete()
+        assert provider.calls == 1
+        # Наследник LLMError: потребители, которые ловили только его, не ломаются.
+        assert isinstance(caught.value, LLMError)
+
+    def test_400_context_length_message_is_too_large(self, monkeypatch):
+        _provider(monkeypatch, _response_error(
+            BadRequestError, 400,
+            '{"error": {"message": "This model\'s maximum context length is 128000 '
+            'tokens, however you requested 310000 tokens"}}'))
+        with pytest.raises(LLMRequestTooLargeError):
+            _complete()
+
+    def test_422_russian_message_about_context_is_too_large(self, monkeypatch):
+        _provider(monkeypatch, _response_error(
+            UnprocessableEntityError, 422,
+            "Превышена максимально допустимая длина контекста".encode("utf-8")))
+        with pytest.raises(LLMRequestTooLargeError):
+            _complete()
+
+    def test_400_unrelated_body_stays_plain_llm_error(self, monkeypatch):
+        _provider(monkeypatch, _response_error(
+            BadRequestError, 400, '{"error": {"message": "unknown field temperature_x"}}'))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+
+    def test_400_without_readable_body_stays_plain_llm_error(self, monkeypatch):
+        # content бывает None или битыми байтами: разбор не должен падать на этом.
+        _provider(monkeypatch,
+                  _response_error(BadRequestError, 400, None),
+                  _response_error(BadRequestError, 400, b"\xff\xfe\x00context"))
+        with pytest.raises(LLMError):
+            _complete()
+        with pytest.raises(LLMError):
+            _complete()
+
+    def test_oauth_400_about_token_stays_auth_failure(self, monkeypatch):
+        """Проверка порядка: 400 с «token» в теле — отказ авторизации, а не
+        размер запроса; иначе слишком большой вход замаскируется под него."""
+        _provider(monkeypatch, _response_error(
+            BadRequestError, 400, "invalid token: authorization failed", url=OAUTH_URL))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+        assert "авторизаци" in str(caught.value).lower()
+
+    def test_5xx_is_retried_and_ends_as_llm_error(self, monkeypatch):
+        provider = _provider(monkeypatch,
+                             _response_error(ServerError, 503, b"upstream unavailable"))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert provider.calls == llm_client.MAX_ATTEMPTS
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+
+    def test_repair_round_does_not_mask_too_large(self, monkeypatch):
+        """Repair-цикл `call_json` ловит только ValueError разбора: отказ
+        провайдера по размеру обязан пройти сквозь него наружу."""
+        provider = _provider(
+            monkeypatch, _response("модель сказала слово без JSON"),
+            _response_error(BadRequestError, 400, "слишком длинный запрос, превышен контекст"))
+        with pytest.raises(LLMRequestTooLargeError):
+            llm_client.call_json("система", "запрос")
+        assert provider.calls == 2

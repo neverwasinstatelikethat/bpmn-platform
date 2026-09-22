@@ -523,6 +523,47 @@ class TestAIRoutes:
         assert client.post("/api/generate", json={"text": "заявка"},
                            headers=headers).status_code == 400
 
+    def test_generate_maps_oversized_request_to_400(self, client, auth, monkeypatch):
+        """Вход не влезает в контекст: это 400 без Retry-After, иначе клиент
+        будет повторять запрос, который не может получиться."""
+        headers, _ = auth
+        from app.routers import ai as ai_router
+
+        monkeypatch.setattr(ai_router.generator, "generate", lambda text: {
+            "status": "error", "step": "llm_too_large",
+            "error": "Описание не помещается в контекст модели"})
+        response = client.post("/api/generate", json={"text": "заявка"},
+                               headers=headers)
+        assert response.status_code == 400
+        assert not response.headers.get("retry-after")
+
+    def test_improve_oversized_scheme_is_400_not_503(self, client, auth, monkeypatch):
+        """Сквозная проверка: отказ провайдера «слишком большой запрос» доходит
+        до клиента как ошибка запроса, а не как «сервис лег»."""
+        headers, _ = auth
+        from app import ai as ai_module
+        from core import llm_client
+        from core.llm_improve import BPMNImprovementOrchestrator
+
+        class NoKb:
+            def ensure_ready(self):
+                pass
+
+            def find_best_practices(self, query, xml_content=None):
+                return []
+
+        def refuse(*args, **kwargs):
+            raise llm_client.LLMRequestTooLargeError("максимальный размер контекста")
+
+        monkeypatch.setattr(llm_client, "_complete", refuse)
+        monkeypatch.setattr(ai_module, "_orchestrator",
+                            BPMNImprovementOrchestrator(knowledge_base=NoKb()))
+        response = client.post("/api/ai/improve",
+                               json={"bpmn_xml": XML, "prompt": "улучши схему"},
+                               headers=headers)
+        assert response.status_code == 400
+        assert "слишком велика" in response.json()["detail"]
+
     def test_ai_budget_blocks_after_hourly_limit(self, client, auth, monkeypatch):
         from app import deps
 

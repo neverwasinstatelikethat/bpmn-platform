@@ -1724,6 +1724,54 @@ class TestOwnershipClarification:
         # своему названию, а не по выдуманному «Экспедитору»
         assert moved["participant"] != "Экспедитор"
 
+    def test_generic_organization_name_is_not_made_into_a_pool(self, monkeypatch):
+        """«Организация» — родовое слово, а не имя: такой пул в живом прогоне
+        собрал три роли с нулём перенесённых шагов, и участников схемы стало не
+        с чем проверять. Слово встречается в описании, но участником не делает."""
+        plan = {"participants": ["ВкусВилл", "Дежурный инженер"],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Принять алерт",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask",
+                     "name": "Эскалировать руководителю",
+                     "participant": "ВкусВилл"}], "flows": []}
+        fenced = _fence(plan)
+        FakeLLM(monkeypatch, fenced, fenced,
+                '{"roles": [{"pool": "Дежурный инженер", "inside": "Организация"}]}')
+        result = BPMNGenerator().generate(
+            "Дежурный инженер организации принимает алерт и эскалирует его "
+            "руководителю.")
+        assert _note(result["notes"], "родовое слово")
+        assert "Организация" not in [
+            p["name"] for p in result["structure"]["participants"]]
+        # отказ не выбрасывает действующее лицо: единственная организация плана
+        # принимает роль к себе дорожкой
+        assert {l["name"]: l["participant"]
+                for l in result["structure"]["lanes"]} == {
+                    "Дежурный инженер": "ВкусВилл"}
+
+    def test_generic_organization_name_is_not_invented_a_host(self, monkeypatch):
+        """Две действующие организации — выбирать хозяина роли не из чего, и
+        родовое слово не становится подсказкой для догадки: пул «Организация» не
+        заводится, роль остаётся тем, чем её назвал план."""
+        plan = {"participants": ["ВкусВилл", "Перевозчик", "Дежурный инженер"],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Принять алерт",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask", "name": "Отгрузить",
+                     "participant": "ВкусВилл"},
+                    {"id": "B1", "kind": "userTask", "name": "Вывезти груз",
+                     "participant": "Перевозчик"}], "flows": []}
+        fenced = _fence(plan)
+        FakeLLM(monkeypatch, fenced, fenced,
+                '{"roles": [{"pool": "Дежурный инженер", "inside": "Организация"}]}')
+        result = BPMNGenerator().generate(
+            "Дежурный инженер организации принимает алерт, ВкусВилл отгружает "
+            "товар, а перевозчик вывозит груз.")
+        assert _note(result["notes"], "родовое слово, а не название")
+        assert "Организация" not in [
+            p["name"] for p in result["structure"]["participants"]]
+
     def test_vacant_pool_named_in_text_can_be_declared_a_role(self, monkeypatch):
         """Пустой пул, названный в описании, — тупик: шаги взять не откуда,
         удалять нельзя. Единственный честный выход — роль организации, и модель

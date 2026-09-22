@@ -2917,6 +2917,16 @@ class TestReaskAcceptanceByPriority:
         assert not bpmn_generator._reask_improves(
             [self.MINOR], [self.MINOR, self.MINOR])
 
+    def test_content_fixed_at_the_price_of_cosmetics_is_accepted(self):
+        """#39: повтор снял все нарушения содержания (пять потерянных
+        действующих лиц) и заплатил за это выросшим числом мелочи — суммарный
+        запрет выбрасывал такой план, и схема оставалась без участников.
+        Профиль по классам важности для этого и сравняется: «важное на мелкое»
+        не выменивается, если мелкого стало больше, а важного — меньше."""
+        before = [self.ACTOR] * 5 + [self.MINOR, self.MINOR]
+        after = [self.MINOR] * 8
+        assert bpmn_generator._reask_improves(before, after)
+
     def test_same_plan_is_not_an_improvement(self):
         assert not bpmn_generator._reask_improves(
             [self.ACTOR, self.MINOR], [self.MINOR, self.ACTOR])

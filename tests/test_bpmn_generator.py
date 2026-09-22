@@ -2094,12 +2094,37 @@ class TestOwnershipClarification:
         gaps = bpmn_generator.plan_gaps(raw, "Кладовщик проверяет заказ. Если "
                                              "товара не хватает, он заказывает остаток.")
         assert [g for g in gaps if "ни одного шлюза" in g and "Если" in g]
-        # план со шлюзом не нарушен, даже если условие в тексте есть
+        # план с настоящей развилкой не нарушен, даже если условие в тексте есть
         raw["elements"].append({"id": "G1", "kind": "exclusiveGateway",
                                 "name": "Хватает?", "participant": "ВкусВилл"})
+        raw["flows"] = [{"id": "F1", "source": "G1", "target": "A1",
+                         "kind": "sequence", "condition": "не хватает"},
+                        {"id": "F2", "source": "G1", "target": "A2",
+                         "kind": "sequence", "condition": "хватает"}]
         assert not [g for g in bpmn_generator.plan_gaps(
             raw, "Кладовщик проверяет заказ. Если товара не хватает, он "
                  "заказывает остаток.") if "ни одного шлюза" in g]
+
+    def test_gateway_that_splits_nothing_is_not_a_branch(self):
+        """Шлюз с одним входящим и одним исходящим — это task, которого модель
+        постыдилась: план с таким «шлюзом» обещанного ветвления не содержит, и
+        гейт обязан это сказать, а не молчать ради наличия кружка."""
+        raw = {"participants": ["ВкусВилл"],
+               "elements": [
+                   {"id": "A1", "kind": "userTask", "name": "Проверить",
+                    "participant": "ВкусВилл"},
+                   {"id": "G1", "kind": "exclusiveGateway", "name": "Хватает?",
+                    "participant": "ВкусВилл"},
+                   {"id": "A2", "kind": "userTask", "name": "Отгрузить",
+                    "participant": "ВкусВилл"}],
+               "flows": [{"id": "F1", "source": "A1", "target": "G1",
+                          "kind": "sequence"},
+                         {"id": "F2", "source": "G1", "target": "A2",
+                          "kind": "sequence"}]}
+        gaps = bpmn_generator.plan_gaps(raw, "Кладовщик проверяет заказ. Если "
+                                             "товара не хватает, он заказывает "
+                                             "остаток.")
+        assert [g for g in gaps if "ни одного шлюза" in g and "раздваивает" in g]
 
     def test_plain_description_without_a_condition_is_not_blamed(self):
         raw = {"participants": ["ВкусВилл"],

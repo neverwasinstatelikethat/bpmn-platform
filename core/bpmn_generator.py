@@ -1551,6 +1551,28 @@ CONDITION_CUES = ("если ", "при условии", "в случае ", "к�
 CLAUSE_CLIP = 90
 
 
+def _gateways_split_or_join(gateway_ids: Set[str],
+                            flows: List[Dict[str, Any]]) -> bool:
+    """Есть ли в плане шлюз, который правда раздваивает или сливает маршрут.
+
+    Шлюз с одним входящим и одним исходящим — это step, которого модель
+    постыдилась: им ветвление из описания не выражено, и считать такое планом
+    развилки нельзя (скоринг за него снимает, а `repair` оставит как есть).
+    """
+    out: Dict[str, int] = {}
+    inc: Dict[str, int] = {}
+    for flow in flows:
+        if _raw_text(flow.get("kind")).lower() == "message":
+            continue
+        source = _norm_name(_raw_text(flow.get("source")))
+        target = _norm_name(_raw_text(flow.get("target")))
+        if source in gateway_ids:
+            out[source] = out.get(source, 0) + 1
+        if target in gateway_ids:
+            inc[target] = inc.get(target, 0) + 1
+    return any(out.get(g, 0) >= 2 or inc.get(g, 0) >= 2 for g in gateway_ids)
+
+
 def _condition_gaps(raw: Dict[str, Any], text: str) -> List[str]:
     """Описание ветвится, а план — нет: условие есть, шлюза в структуре нуль.
 
@@ -1561,18 +1583,20 @@ def _condition_gaps(raw: Dict[str, Any], text: str) -> List[str]:
     body = (text or "").strip()
     if not body:
         return []
-    if any(_raw_text(elem.get("kind") or elem.get("type")) in GATEWAY_KINDS
-           for elem in _raw_dicts(raw.get("elements"))):
+    gateways = {_norm_name(_raw_text(e.get("id"))) for e in _raw_dicts(raw.get("elements"))
+                if _raw_text(e.get("kind") or e.get("type")) in GATEWAY_KINDS}
+    if _gateways_split_or_join(gateways, _raw_dicts(raw.get("flows"))):
         return []
     low = body.lower()
     at = min((low.find(cue) for cue in CONDITION_CUES if cue in low), default=-1)
     if at < 0:
         return []
     return [f"описание задаёт условие («{body[at:at + CLAUSE_CLIP].strip()}…»),"
-            " а в плане ни одного шлюза: развей маршрут gateway (exclusive — "
-            "когда дальше идёт одна ветка, parallel — когда несколько "
-            "одновременно). Если развилки в описании на самом деле нет, верни "
-            "план без изменений"]
+            " а в плане ни одного шлюза, который раздваивает или сливает"
+            " маршрут: развей маршрут gateway (exclusive — когда дальше идёт"
+            " одна ветка, parallel — когда несколько одновременно). Шлюз с одним"
+            " входящим и одним исходящим — не развилка, а обычный шаг. Если"
+            " развилки в описании на самом деле нет, верни план без изменений"]
 
 
 _GAP_PRIORITY = (("действующим лицом", 0),

@@ -407,7 +407,7 @@ class BPMNGenerator:
                     lost = _plan_content(structure) - _plan_content(retry)
                     reask.update(gaps_after=len(candidate_gaps),
                                  lost_steps=lost)
-                    if len(candidate_gaps) >= len(gaps):
+                    if not _reask_improves(gaps, candidate_gaps):
                         retry_note = (f"Повторный запрос модели не улучшил план "
                                       f"({len(gaps)} нарушений) — оставлен первый")
                         reask["kept"] = "первый ответ"
@@ -1427,14 +1427,41 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
     return sorted(gaps, key=_gap_priority)
 
 
-_GAP_PRIORITY = (("действующим лицом", 0), ("без единого шага", 1))
+_GAP_PRIORITY = (("действующим лицом", 0), ("без единого шага", 1),
+                 # Срок из описания — содержание, а не косметика: менять его на
+                 # снятое предупреждение о потоке значит портить процесс.
+                 ("задаёт ожидание", 1))
+# Последний класс — «остальное»: он никогда не выбирается иглой, а служит
+# приданым для сравнения профилей.
+_GAP_RANK_DEFAULT = 2
+_GAP_RANKS = _GAP_RANK_DEFAULT + 1
 
 
 def _gap_priority(gap: str) -> int:
     for needle, rank in _GAP_PRIORITY:
         if needle in gap:
             return rank
-    return 2
+    return _GAP_RANK_DEFAULT
+
+
+def _gap_profile(gaps: List[str]) -> Tuple[int, ...]:
+    """Число нарушений по классам важности (от главных к мелким)."""
+    return tuple(sum(1 for g in gaps if _gap_priority(g) == rank)
+                 for rank in range(_GAP_RANKS))
+
+
+def _reask_improves(gaps: List[str], candidate: List[str]) -> bool:
+    """Стоит ли принять второй план вместо первого.
+
+    Сравнение «сколько всего нарушений» отбрасывало план, который вернул
+    потерянного участника и заплатил за это одним потоком без условия: по сумме
+    он не лучше, а по существу — да. Поэтому профиль сравнивается по важности
+    классов, а общий рост числа нарушений всё равно отказ: выменивать важное на
+    мелкое контур не вправе.
+    """
+    if len(candidate) > len(gaps):
+        return False
+    return _gap_profile(candidate) < _gap_profile(gaps)
 
 
 def _valid_timer(value: str) -> bool:

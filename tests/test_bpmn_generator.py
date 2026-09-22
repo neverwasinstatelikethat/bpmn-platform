@@ -2498,3 +2498,94 @@ def test_flow_end_rule_shares_one_source_with_the_applier():
     for source in bpmn_edits.SEQUENCE_FORBIDDEN_SOURCES:
         assert bpmn_generator._illegal_flow_end(source, "userTask")
     assert bpmn_generator._illegal_flow_end("userTask", "serviceTask") == ""
+
+
+class TestReaskAcceptanceByPriority:
+    """Приём повтора сравнивает нарушения по важности, а не по штукам.
+
+    Сводка «сколько всего» отбрасывала план, вернувший потерянного участника
+    ценой одного потока без условия, — и наоборот пропускала план, который
+    променял участника на мелочь.
+    """
+
+    ACTOR = "ты сама назвала «Клиент» действующим лицом описания"
+    VACANT = "пул «Кладовщик» без единого шага — в нём только старт и финиш"
+    TIMER = "описание задаёт ожидание («в течение 15 минут»), таймера нет"
+    MINOR = "у шлюза G1 2 ветки без условия"
+
+    def test_profiles_split_gaps_by_class(self):
+        profile = bpmn_generator._gap_profile(
+            [self.ACTOR, self.VACANT, self.TIMER, self.MINOR])
+        assert profile == (1, 2, 1)
+
+    def test_equal_total_but_better_class_is_accepted(self):
+        assert bpmn_generator._reask_improves(
+            [self.ACTOR, self.MINOR], [self.MINOR, self.MINOR])
+
+    def test_fewer_gaps_is_not_better_when_an_actor_was_lost(self):
+        """Меньше — не значит лучше: променять действующее лицо на мелочь
+        нельзя, иначе метрика участника падала бы молча."""
+        assert not bpmn_generator._reask_improves(
+            [self.MINOR, self.MINOR, self.MINOR], [self.ACTOR])
+
+    def test_timer_is_content_not_cosmetics(self):
+        """План, где таймер променяли на снятую мелочь, хуже исходного, даже
+        если число нарушений не выросло."""
+        assert not bpmn_generator._reask_improves(
+            [self.MINOR, self.MINOR], [self.TIMER, self.MINOR])
+
+    def test_more_violations_are_never_accepted(self):
+        assert not bpmn_generator._reask_improves(
+            [self.MINOR], [self.MINOR, self.MINOR])
+
+    def test_same_plan_is_not_an_improvement(self):
+        assert not bpmn_generator._reask_improves(
+            [self.ACTOR, self.MINOR], [self.MINOR, self.ACTOR])
+
+    def test_generate_accepts_the_plan_that_returns_the_actor(self, monkeypatch):
+        """Сквозная проверка: второй план с тем же числом нарушений, но без
+        потерянного участника, становится схемой."""
+        lost_actor = _plan(
+            actors=["Клиент", "Менеджер"],
+            participants=["ВкусВилл"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заявка", "L_m"),
+                _e("T1", "userTask", "Согласовать заявку", "L_m"),
+                _e("G1", "exclusiveGateway", "Сумма большая?", "L_m"),
+                _e("T2", "userTask", "Утвердить у директора", "L_m"),
+                _e("E1", "endEvent", "Согласовано", "L_m"),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "G1"),
+                   _f("F3", "G1", "T2"), _f("F4", "G1", "E1"),
+                   _f("F5", "T2", "E1")])
+        # Тот же план: у клиента появились свои шаги, но ветка шлюза осталась
+        # без условия — по сумме нарушений столько же.
+        with_actor = _plan(
+            actors=["Клиент", "Менеджер"],
+            participants=["ВкусВилл", "Клиент"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заявка", "L_m"),
+                _e("T1", "userTask", "Согласовать заявку", "L_m"),
+                _e("G1", "exclusiveGateway", "Сумма большая?", "L_m"),
+                _e("T2", "userTask", "Утвердить у директора", "L_m"),
+                _e("E1", "endEvent", "Согласовано", "L_m"),
+                _e("S2", "startEvent", "Отказ принят", "", "Клиент"),
+                _e("T3", "userTask", "Оплатить услугу", "", "Клиент"),
+                _e("E2", "endEvent", "Оплачено", "", "Клиент"),
+                _e("G2", "exclusiveGateway", "Оплата прошла?", "", "Клиент"),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "G1"),
+                   _f("F3", "G1", "T2"), _f("F4", "G1", "E1"),
+                   _f("F5", "T2", "E1"), _f("F6", "S2", "T3"),
+                   _f("F7", "T3", "E2"), _f("F8", "G2", "T3"),
+                   _f("F9", "G2", "E2"),
+                   _f("M1", "T2", "T3", kind="message")])
+        FakeLLM(monkeypatch, lost_actor, with_actor)
+        result = BPMNGenerator().generate(
+            "Клиент заводит заявку, менеджер её согласует, при большой сумме "
+            "заявка уходит директору, после утверждения клиент оплачивает услугу")
+        reask = next(e for e in result["trace"] if e["node"] == "переспрос плана")
+        assert reask["kept"] == "переспрос", reask
+        assert "Клиент" in [p["name"] for p in result["structure"]["participants"]]

@@ -7,6 +7,7 @@
 """
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -567,6 +568,52 @@ def test_rolled_back_step_triggers_the_corrective_round(orchestrator, monkeypatc
     assert report["repair_notes"] == []
     assert "остались вне маршрута" not in analysis
     assert "Проверить склад" in xml_after
+
+
+def test_repair_that_rips_out_a_package_flow_rolls_it_back_and_is_retried(
+        orchestrator, monkeypatch, single_pool_xml):
+    """Починка идёт после аплайера и вправе снять дугу — тогда узел пакета
+    остаётся кружком без маршрута, и контур обязан откатить его сам: в прогоне
+    #40 такое «улучшение» приняли, и принятие потеряло 15 баллов на
+    `boundary_handled`. Откат — пропуск, значит модель получает о нём подсказку
+    в корректирующем повторе и может добить ветку."""
+    first = '{"analysis": "таймер", "operations": [' \
+            '{"op":"add_boundary_event","id":"new_T1","attached_to":"T_collect",' \
+            '"event_type":"timer","name":"Долгий разбор","to":"T_ship"}]}'
+    second = '{"analysis": "таймер с веткой", "operations": [' \
+             '{"op":"add_boundary_event","id":"new_T1","attached_to":"T_collect",' \
+             '"event_type":"timer","name":"Долгий разбор"},' \
+             '{"op":"add_task","id":"new_H","name":"Эскалация","task_type":"userTask",' \
+             '"after":"new_T1"},' \
+             '{"op":"connect","source":"new_H","target":"T_ship"}]}'
+    fake = FakeLLM(monkeypatch, _wrap(first), _wrap(second))
+    real_repair = bpmn_edits.validate_and_repair
+    strips = {"left": 1}
+
+    def repair_then_strip(xml_text):
+        """Первая починка ведёт себя как в живом прогоне: переподвешивает дугу и
+        оставляет граничное событие без исхода."""
+        xml, notes = real_repair(xml_text)
+        if strips["left"]:
+            strips["left"] -= 1
+            xml = re.sub(r'<bpmn:sequenceFlow[^>]*sourceRef="new_T1"[^>]*/>',
+                         "", xml)
+        return xml, notes
+
+    monkeypatch.setattr(bpmn_edits, "validate_and_repair", repair_then_strip)
+    analysis, improved_xml, report = _improve(orchestrator, single_pool_xml)
+
+    rolled = [s for s in report["skipped"] if s.get("stage") == "repair"]
+    assert [s["id"] for s in rolled] == ["new_T1"]
+    assert "откачено после починки" in rolled[0]["reason"]
+    # Откат дошёл до модели: повтор знает, что исход надо задать той же
+    # операцией, и доводит ветку до конца.
+    assert len(fake.calls) == 2
+    assert "откачено после починки" in fake.prompts[1]
+    assert 'id="new_H"' in improved_xml
+    assert 'sourceRef="new_T1"' in improved_xml
+    # Маршрут исходной схемы цел: откатан был только узел пакета.
+    assert 'sourceRef="T_collect"' in improved_xml
 
 
 def test_reapplied_in_the_retry_is_not_reported_as_missed(orchestrator, monkeypatch,

@@ -20,6 +20,7 @@ from core.bpmn_edits import (
     XML_DECLARATION,
     apply_operations,
     build_inventory,
+    rollback_stranded,
     validate_and_repair,
     _HANDLERS,
 )
@@ -2316,6 +2317,26 @@ class TestSerialization:
         out, report = apply_operations(single_pool_xml, [])
         assert report == {"status": "success", "applied": [], "skipped": []}
         assert build_inventory(out) == build_inventory(single_pool_xml)
+
+
+def test_stranded_addition_falls_out_of_the_repaired_scheme():
+    """Откат узла вне маршрута обязан работать и по финальному XML: в прогоне
+    #40 аплайер принял пакет, у которого семантическая починка сняла дугу, и
+    схема потеряла 15 баллов на `boundary_handled`. Здесь дуга уже снята —
+    проверяется, что узел уходит из схемы, а не остаётся кружком без ветки."""
+    xml = TestFlowEndsAndAttachments.XML.replace(
+        '<sequenceFlow id="AF3" sourceRef="A_timer" targetRef="A_escalate"/>',
+        "").replace("<outgoing>AF3</outgoing>", "")
+    out, dropped = rollback_stranded(
+        xml, {"A_timer": "add_boundary_event", "A_escalate": "add_task"})
+
+    assert 'id="A_timer"' not in out and 'id="A_escalate"' not in out
+    assert [(d["id"], d["op"]) for d in dropped] == [
+        ("A_timer", "add_boundary_event"), ("A_escalate", "add_task")]
+    assert "без ветки обработки" in dropped[0]["gap"]
+    assert "add_boundary_event" in dropped[0]["hint"] or "перевставить" in dropped[0]["hint"]
+    # Легальный маршрут пакета не тронут: откат касается только названных узлов.
+    assert 'id="AF1"' in out and 'id="A_sub"' in out
 
 
 class TestFlowEndsAndAttachments:

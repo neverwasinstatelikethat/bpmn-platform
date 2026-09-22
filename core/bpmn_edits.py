@@ -2034,6 +2034,32 @@ def _rollback_unrouted(index: _Index,
     return dropped, flows
 
 
+def rollback_stranded(xml_text: str,
+                      created: Dict[str, str]) -> Tuple[
+                          str, List[Dict[str, Any]]]:
+    """Перепроверить узлы пакета по уже отпочиненной схеме.
+
+    `apply_operations` откатывает узлы вне маршрута сам, но семантическая
+    починка идёт после аплайера и вправе снять дугу: живой прогон #40 принял
+    улучшение, у которого починка убрала исход граничного события, — принятие
+    вместо +5 баллов дало −15 на `boundary_handled`. Гарантия «принятое
+    улучшение не делает схему хуже исходной» не может действовать только до
+    починки, поэтому финальный XML проверяется ещё раз — по тем же правилам и
+    с теми же подсказками.
+    """
+    root = parse_xml(xml_text)
+    index = _Index(root)
+    dropped, _flows = _rollback_unrouted(index, [
+        elem_id for elem_id in created if elem_id in index.elements])
+    if not dropped:
+        return xml_text, []
+    report = [{"id": elem_id, "op": created.get(elem_id) or "add_task",
+               "gap": gap, "hint": _rollback_hint(elem_id, gap,
+                                                  created.get(elem_id) or "")}
+              for elem_id, gap in dropped.items()]
+    return _serialize(root), report
+
+
 def apply_operations(xml_text: str,
                      operations: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
     """Применяет пакет операций. Возвращает (новый XML, отчёт).

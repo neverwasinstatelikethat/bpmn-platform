@@ -914,11 +914,49 @@ class BPMNImprovementOrchestrator:
             })
             return xml_content
 
+        async def _drop_stranded(candidate: str, notes: List[str]) -> Tuple[str, List[str]]:
+            """Откатить узлы пакета, которые починка оставила вне маршрута.
+
+            Починка идёт после аплайера и вправе снять дугу: в прогоне #40 так
+            приняли улучшение, и принятие потеряло 15 баллов на
+            `boundary_handled`. Гарантия «принятое изменение не делает схему
+            хуже» должна действовать после починки, а пропуск — попасть в
+            корректирующий повтор, если он ещё впереди.
+            """
+            created = {str(entry.get("id")): str(entry.get("op") or "")
+                       for entry in (report.get("applied") or [])
+                       if entry.get("id") and str(entry.get("op") or "")
+                       in bpmn_edits.ADD_NODE_OPS}
+            if not created:
+                return candidate, notes
+            candidate, stranded = await asyncio.to_thread(
+                bpmn_edits.rollback_stranded, candidate, created)
+            for drop in stranded:
+                gone = drop["id"]
+                report["applied"] = [
+                    e for e in report["applied"]
+                    if gone not in (str(e.get("id") or ""),
+                                    str(e.get("source") or ""),
+                                    str(e.get("target") or ""))]
+                report["skipped"].append({
+                    "op": drop["op"], "id": gone, "stage": "repair",
+                    "reapplied": False,
+                    "reason": f"новый шаг ({gone}) {drop['gap']} — изменение "
+                              "откачено после починки",
+                    "hint": drop["hint"]})
+                # Замечание починки про уже удалённый узел читать нельзя: чинить
+                # там нечего, правка откатана.
+                notes = [n for n in notes if gone not in n]
+            if stranded and report.get("status") == "success":
+                report["status"] = "partial"
+            return candidate, notes
+
         xml_after, repair_notes = await asyncio.to_thread(bpmn_edits.validate_and_repair,
                                                           xml_after)
         rolled_back = _reject_cycle(xml_after)
         if rolled_back != xml_after:
             xml_after, repair_notes = rolled_back, []
+        xml_after, repair_notes = await _drop_stranded(xml_after, repair_notes)
         unrouted = _unrouted(repair_notes)
         empty_pools = _empty_pools(repair_notes)
         if report["skipped"] or unrouted or empty_pools:
@@ -935,6 +973,8 @@ class BPMNImprovementOrchestrator:
             rolled_back = _reject_cycle(xml_after)
             if rolled_back != xml_after:
                 xml_after, repair_notes = rolled_back, []
+            xml_after, repair_notes = await _drop_stranded(xml_after,
+                                                           repair_notes)
         report["repair_notes"] = repair_notes
 
         # Висячий шаг — не улучшение: модель не указала, между какими шагами

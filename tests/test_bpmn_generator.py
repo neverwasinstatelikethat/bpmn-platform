@@ -1926,6 +1926,38 @@ class TestOwnershipClarification:
         result = BPMNGenerator().generate("ВкусВилл заводит заявку.")
         assert result["attempts"] == 1 and len(fake.calls) == 1
 
+    def test_condition_in_the_description_without_a_gateway_is_a_gap(self):
+        """Линейный план там, где текст различает ветки, — обещанного процесса
+        на схеме нет. Нарушение ищется по описанию, потому что структурного
+        признака у него нет: развилку некуда вставлять, её надо нарисовать."""
+        raw = {"participants": ["ВкусВилл"],
+               "elements": [
+                   {"id": "A1", "kind": "userTask", "name": "Проверить", "participant": "ВкусВилл"},
+                   {"id": "A2", "kind": "userTask", "name": "Отгрузить", "participant": "ВкусВилл"}]}
+        gaps = bpmn_generator.plan_gaps(raw, "Кладовщик проверяет заказ. Если "
+                                             "товара не хватает, он заказывает остаток.")
+        assert [g for g in gaps if "ни одного шлюза" in g and "Если" in g]
+        # план со шлюзом не нарушен, даже если условие в тексте есть
+        raw["elements"].append({"id": "G1", "kind": "exclusiveGateway",
+                                "name": "Хватает?", "participant": "ВкусВилл"})
+        assert not [g for g in bpmn_generator.plan_gaps(
+            raw, "Кладовщик проверяет заказ. Если товара не хватает, он "
+                 "заказывает остаток.") if "ни одного шлюза" in g]
+
+    def test_plain_description_without_a_condition_is_not_blamed(self):
+        raw = {"participants": ["ВкусВилл"],
+               "elements": [{"id": "A1", "kind": "userTask", "name": "Отгрузить",
+                             "participant": "ВкусВилл"}]}
+        assert not [g for g in bpmn_generator.plan_gaps(
+            raw, "Кладовщик собирает груз и отгружает его перевозчику.")
+            if "ни одного шлюза" in g]
+
+    def test_lost_branch_ranks_above_route_nonsense(self):
+        """Ветвление — содержание: план, который меняет его на снятое
+        предупреждение о потоке, лучше не стал."""
+        assert bpmn_generator._gap_profile(
+            ["в плане ни одного шлюза: развей маршрут"]) == (0, 1, 0)
+
     def test_actor_without_pool_or_lane_is_a_gap(self):
         """`actors` — выписка самой модели из описания: если действующее лицо в
         списке есть, а пула или дорожки нет, план противоречит себе."""
@@ -2270,7 +2302,7 @@ class TestDeadlineTimerGate:
         gaps = bpmn_generator.plan_gaps(
             self._plan(self._timer(timer="четыре часа")), self.TEXT)
         assert any("ISO-8601" in g for g in gaps)
-        assert not [g for g in gaps if "ни одного" in g]
+        assert not [g for g in gaps if "таймер" in g and "ни одного" in g]
 
     def test_description_without_a_stated_deadline_is_silent(self):
         gaps = bpmn_generator.plan_gaps(

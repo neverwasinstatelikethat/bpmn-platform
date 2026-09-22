@@ -779,8 +779,11 @@ class TestRolePools:
         result = scorer.evaluate(self._doc())
         assert status(result, "role_pools") == FAILED
         assert elements(result, "role_pools") == ["P2"]
-        # рекомендация называет операцию, которой это чинится
-        assert any("merge_participants" in rec for rec in result["recommendations"])
+        # рекомендация называет операцию и приёмник: на схеме из восьми пулов
+        # «сливай роль» без адресата невыполнимо
+        assert any("merge_participants" in rec
+                   and "Кладовщик → ВкусВилл" in rec
+                   for rec in result["recommendations"])
 
     def test_lane_of_its_own_pool_is_not_a_duplicate(self):
         """Дорожка внутри своего пула — обычная раскладка по ролям, а не второй

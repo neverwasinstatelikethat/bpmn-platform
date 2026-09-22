@@ -500,22 +500,33 @@ def _check_role_pools(s: _Schema) -> _Check:
     импортированная или нарисованная руками схема, где «Кладовщик» стоит вторым
     «участником» рядом с «ВкусВиллом», проходила скоринг как коллаборация двух
     организаций. Признак структурный и описания читать не требует: имя
-    участника совпало с именем дорожки другого процесса."""
+    участника совпало с именем дорожки другого процесса.
+
+    Приёмник подсказывается тем же признаком: это пул того процесса, где лежит
+    одноимённая дорожка. Без него совет «сливай» невыполним — на схеме из восьми
+    пулов модель вынуждена угадывать организацию."""
     if len(s.participants) < 2:
         return _Check(NOT_APPLICABLE, note="пулов меньше двух")
-    offenders = []
+    offenders: List[ET.Element] = []
+    pairs: List[str] = []
     for participant in s.participants:
         name = (participant.get("name") or "").strip().casefold()
         own = participant.get("processRef") or ""
         if not name:
             continue
-        if any(pid != own and name in [lane.casefold() for lane in lanes]
-               for pid, lanes in s.lane_names_by_process.items()):
+        for pid, lanes in s.lane_names_by_process.items():
+            if pid == own or name not in [lane.casefold() for lane in lanes]:
+                continue
+            # Приёмник берётся тем же структурным признаком: пул того процесса,
+            # где лежит одноимённая дорожка.
+            receiver = next(((p.get("name") or p.get("id") or "")
+                             for p in s.participants
+                             if (p.get("processRef") or "") == pid), "")
             offenders.append(participant)
+            pairs.append(f"{participant.get('name')} → {receiver}")
+            break
     if offenders:
-        return _Check(FAILED, _ids(offenders),
-                      note=", ".join((p.get("name") or p.get("id") or "")
-                                     for p in offenders))
+        return _Check(FAILED, _ids(offenders), note=", ".join(pairs))
     return _Check(PASSED)
 
 

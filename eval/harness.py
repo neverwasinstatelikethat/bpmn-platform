@@ -1037,10 +1037,24 @@ def dump_schemes(report: "RunReport", out_dir: Path) -> List[Path]:
         if not case.xml:
             continue
         verdict = "pass" if case.scenario_pass else "fail"
-        path = out_dir / _safe_name(
-            f"{case.key}_r{case.repeat}_{verdict}.bpmn")
+        stem = _safe_name(f"{case.key}_r{case.repeat}_{verdict}")
+        path = out_dir / f"{stem}.bpmn"
         path.write_text(case.xml, encoding="utf-8")
         written.append(path)
+        # План рядом со схемой: по XML не отличить «модель не назвала
+        # контрагента» от «назвала, а починка свернула пул в дорожку», а без
+        # такого файла каждый разбор стоил отдельного живого прогона.
+        plan = out_dir / f"{stem}.plan.json"
+        plan.write_text(json.dumps(
+            {"participants": case.structure.get("participants"),
+             "actors": case.structure.get("actors"),
+             "lanes": case.structure.get("lanes"),
+             "elements": [{k: e.get(k) for k in
+                           ("id", "kind", "name", "participant", "lane")}
+                          for e in (case.structure.get("elements") or [])],
+             "gaps": case.gaps},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+        written.append(plan)
     for case in report.improve_cases:
         if not case.xml_after:
             continue

@@ -1744,11 +1744,9 @@ class TestOwnershipClarification:
         assert _note(result["notes"], "родовое слово")
         assert "Организация" not in [
             p["name"] for p in result["structure"]["participants"]]
-        # отказ не выбрасывает действующее лицо: единственная организация плана
-        # принимает роль к себе дорожкой
-        assert {l["name"]: l["participant"]
-                for l in result["structure"]["lanes"]} == {
-                    "Дежурный инженер": "ВкусВилл"}
+        # и роль не переезжает в «единственную организацию плана»: хозяина по
+        # имени роли угадать нельзя, это остаётся вопросом к модели
+        assert result["structure"]["lanes"] == []
 
     def test_generic_organization_name_is_not_invented_a_host(self, monkeypatch):
         """Две действующие организации — выбирать хозяина роли не из чего, и
@@ -1823,7 +1821,7 @@ class TestOwnershipClarification:
                         {"name": "Склад", "external": False, "inside": "ВкусВилл"},
                         {"name": "Кладовщик", "external": False, "inside": "Склад"}]
         lanes: list = []
-        bpmn_generator._declare_role_lanes(participants, lanes, [], set(), [])
+        bpmn_generator._declare_role_lanes(participants, lanes, set(), [])
         assert {l["name"]: l["participant"] for l in lanes} == {
             "Склад": "ВкусВилл", "Кладовщик": "ВкусВилл"}
 
@@ -1831,76 +1829,42 @@ class TestOwnershipClarification:
         participants = [{"name": "Оператор", "external": False, "inside": "Смена"},
                         {"name": "Смена", "external": False, "inside": "Оператор"}]
         lanes: list = []
-        bpmn_generator._declare_role_lanes(participants, lanes, [], set(), [])
+        bpmn_generator._declare_role_lanes(participants, lanes, set(), [])
         assert lanes == []
 
-    def test_role_without_an_organization_falls_to_the_only_organization(self):
-        """«Кладовщик» помечен ролью, а `inside` модель не заполнила. В плане
-        одна организация со своими шагами — альтернативы нет, и сворачивать роль
-        в её дорожку приходится коду: живые прогоны оставляли такую роль пулом,
-        починка снимала пустой пул, и действующее лицо исчезало со схемы."""
+    def test_role_without_an_organization_is_not_parked_on_a_guess(self):
+        """Хозяина роли код не подставляет, даже когда действующая организация в
+        плане одна: промер живого прогона поймал обратный случай — «единственной
+        организацией с шагами» оказался пул «Руководитель службы поддержки», и
+        сама организация уехала к своему сотруднику дорожкой. Роль без `inside`
+        остаётся пулом и нарушением, которое закрывает только модель."""
         participants = [{"name": "ВкусВилл"},
                         {"name": "Кладовщик", "external": False}]
         elements = [{"id": "A1", "kind": "userTask", "name": "Принять товар",
                      "participant": "ВкусВилл"}]
         lanes: list = []
         notes: list = []
-        bpmn_generator._declare_role_lanes(participants, lanes, elements,
-                                           set(), notes)
-        assert {l["name"]: l["participant"] for l in lanes} == {
-            "Кладовщик": "ВкусВилл"}
-        assert _note(notes, "одна организация с шагами")
-
-    def test_role_is_not_parked_on_a_random_organization(self):
-        """Две организации с шагами — выбирать нельзя: чьей ролью является
-        «Водитель», знает только описание, а неверная дорожка скрывает
-        самостоятельного участника."""
-        participants = [{"name": "ВкусВилл"}, {"name": "Перевозчик"},
-                        {"name": "Водитель", "external": False}]
-        elements = [{"id": "A1", "kind": "userTask", "name": "Отгрузить",
-                     "participant": "ВкусВилл"},
-                    {"id": "B1", "kind": "userTask", "name": "Вывезти",
-                     "participant": "Перевозчик"}]
-        lanes: list = []
-        bpmn_generator._declare_role_lanes(participants, lanes, elements,
-                                           set(), [])
+        bpmn_generator._declare_role_lanes(participants, lanes, set(), notes)
         assert lanes == []
 
-    def test_role_is_not_parked_on_an_organization_without_steps(self):
-        """Хозяин обязан действовать: пул с одними событиями сам уедет при
-        починке пустых пулов, и роль повисла бы вместе с ним."""
-        participants = [{"name": "ВкусВилл"},
-                        {"name": "Кладовщик", "external": False}]
-        elements = [{"id": "S1", "kind": "startEvent", "name": "Старт",
-                     "participant": "ВкусВилл"}]
-        lanes: list = []
-        bpmn_generator._declare_role_lanes(participants, lanes, elements,
-                                           set(), [])
-        assert lanes == []
-
-    def test_resolved_role_is_not_asked_again(self):
-        """Спрашивать про организацию роли, для которой в плане одна действующая
-        организация, нечего: ответ из плана следует однозначно, и код его уже
-        применит. Вопрос же стоил бы того, что переспрос отбрасывают именно из-за
-        нарушений, которые он сам и породил."""
-        raw = {"participants": [{"name": "ВкусВилл"},
-                                {"name": "Кладовщик", "external": False}],
-               "elements": [{"id": "A1", "kind": "userTask", "name": "Принять товар",
-                             "participant": "ВкусВилл"}]}
-        gaps = bpmn_generator.plan_gaps(raw, "Кладовщик ВкусВилла принимает товар "
-                                             "у поставщика.")
-        assert not [g for g in gaps if "помечен ролью" in g]
-
-    def test_role_between_two_organizations_is_still_asked(self):
-        raw = {"participants": [{"name": "ВкусВилл"}, {"name": "Перевозчик"},
-                                {"name": "Водитель", "external": False}],
-               "elements": [
-                   {"id": "A1", "kind": "userTask", "name": "Отгрузить",
-                    "participant": "ВкусВилл"},
-                   {"id": "B1", "kind": "userTask", "name": "Вывезти",
-                    "participant": "Перевозчик"}]}
-        gaps = bpmn_generator.plan_gaps(raw, "Водитель вывозит товар.")
-        assert [g for g in gaps if "помечен ролью" in g and "Водитель" in g]
+    def test_role_without_an_organization_is_asked_whatever_the_plan_offers(self):
+        """Вопрос про организацию роли звучит и когда план как будто бы подсказывает
+        ответ: молчание план-гейта отдало бы выбор имени хозяйки коду."""
+        for participants, elements in (
+            ([{"name": "ВкусВилл"}, {"name": "Кладовщик", "external": False}],
+             [{"id": "A1", "kind": "userTask", "name": "Принять товар",
+               "participant": "ВкусВилл"}]),
+            ([{"name": "ВкусВилл"}, {"name": "Перевозчик"},
+              {"name": "Водитель", "external": False}],
+             [{"id": "A1", "kind": "userTask", "name": "Отгрузить",
+               "participant": "ВкусВилл"},
+              {"id": "B1", "kind": "userTask", "name": "Вывезти",
+               "participant": "Перевозчик"}]),
+        ):
+            gaps = bpmn_generator.plan_gaps(
+                {"participants": participants, "elements": elements},
+                "Кладовщик принимает товар у водителя.")
+            assert [g for g in gaps if "помечен ролью" in g]
 
     def test_missing_participant_declared_a_role_becomes_a_lane(self, monkeypatch):
         """Живой прогон вернул «кладовщик принимает товар» в `missing`

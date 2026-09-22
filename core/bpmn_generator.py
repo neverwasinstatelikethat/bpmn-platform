@@ -702,23 +702,18 @@ class BPMNGenerator:
                 continue
             if _norm_name(inside) not in organizations:
                 if _generic_actor_name(inside):
-                    # Родовое слово вместо имени («inside: "Организация"») — это
-                    # не название, а способ сказать «я роль, хозяина назови сам».
-                    # Пул с таким именем глотает роли и лишает схему связи с
-                    # описанием, поэтому принимаем организацию плана, если она
-                    # одна, и отказываем, когда выбирать не из чего.
-                    host = _sole_role_host(structure.get("participants"),
-                                           structure.get("elements"))
-                    if host is None:
-                        notes.append(f"роль «{pool}» не объявлена: «{inside}» — "
-                                     "родовое слово, а не название организации "
-                                     "из описания")
-                        continue
-                    notes.append(f"роль «{pool}»: «{inside}» — родовое слово, а не "
-                                 f"имя; в плане одна организация с шагами — "
-                                 f"«{host}»")
-                    inside = host
-                elif not _mentioned(inside, _text_words(text)):
+                    # Родовое слово вместо имени («inside: "Организация"») — не
+                    # название, а способ сказать «я роль, хозяина назови сам».
+                    # Проверка «такое слово есть в описании» через него проходит,
+                    # и контур заводил пул «Организация», в который сливались все
+                    # роли с нулём перенесённых шагов: участников схемы сверять с
+                    # описанием становилось нечем. Хозяина из плана не подставляем
+                    # (см. `_declare_role_lanes`) — роль остаётся нарушением.
+                    notes.append(f"роль «{pool}» не объявлена: «{inside}» — "
+                                 "родовое слово, а не название организации из "
+                                 "описания")
+                    continue
+                if not _mentioned(inside, _text_words(text)):
                     notes.append(f"роль «{pool}» не объявлена: организации "
                                 f"«{inside}» в описании нет")
                     continue
@@ -1396,20 +1391,12 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
     # всё тот же раздутый участник, а inside на несуществующий пул — опечатка,
     # из-за которой шаги некуда переносить.
     pool_norms = {_norm_name(p) for p in pools}
-    sole_host = _sole_role_host(raw.get("participants"), raw.get("elements"))
     for item in (raw.get("participants") or []):
         if not isinstance(item, dict) or item.get("external") is not False:
             continue
         name = _raw_text(item.get("name"))
         inside = _raw_text(item.get("inside"))
         if not inside:
-            # Организация, которой роль может принадлежать, в плане одна — и
-            # спрашивать нечего: `_declare_role_lanes` свернёт роль в её
-            # дорожку. Вопрос же только портит переспрос: ответ модели с
-            # ролью без `inside` добавлял нарушения того же ранга, и целый
-            # план с вернувшимся участником отбрасывался.
-            if sole_host:
-                continue
             gaps.append(f"участник «{name}» помечен ролью (external=false), но "
                         "не сказал, чьей: укажи inside — название организации "
                         "из текста")
@@ -1853,7 +1840,7 @@ def repair_structure(raw: Dict[str, Any],
     # Объявленные роли получают дорожки ДО слияния: сам признак «пул назван
     # дорожкой» модель могла не проставить, но её решение уже в плане.
     _mark("дорожки для объявленных ролей", participants, lanes, elements, flows)
-    _declare_role_lanes(participants, lanes, elements, used_ids, notes)
+    _declare_role_lanes(participants, lanes, used_ids, notes)
     _close(participants, lanes, elements, flows)
     # Слияние «ролей-пулов» — до отбрасывания пустых: у пула, который оказался
     # дорожкой, шаги никуда не деваются, и удалять его не за что.
@@ -2302,31 +2289,8 @@ def _lane_named_like_pool(pool_name: str,
     return close
 
 
-def _sole_role_host(participants: Any, elements: Any) -> Optional[str]:
-    """Единственная возможная организация для роли, которая её не назвала.
-
-    Хозяин обязан действовать (роль в пустом пуле уедет вместе с ним при починке)
-    и сам ролью не быть. Когда действующих организаций в плане больше одной,
-    вывода о хозяине нет — «Водитель» принадлежит то ВкусВиллу, то Перевозчику,
-    и решать это обязана модель по описанию, а не код по подсказке.
-    """
-    acting = {_norm_name(_raw_text(e.get("participant")))
-              for e in _raw_dicts(elements)
-              if _raw_text(e.get("kind") or e.get("type")) in STEP_KINDS}
-    hosts = []
-    for item in (participants or []):
-        name = _raw_text(item.get("name") if isinstance(item, dict) else item)
-        if not name or _norm_name(name) not in acting:
-            continue
-        if isinstance(item, dict) and item.get("external") is False:
-            continue
-        hosts.append(name)
-    return hosts[0] if len(hosts) == 1 else None
-
-
 def _declare_role_lanes(participants: List[Dict[str, Any]],
                         lanes: List[Dict[str, Any]],
-                        elements: List[Dict[str, Any]],
                         used_ids: Set[str],
                         notes: List[str]) -> None:
     """Материализует объявленную роль: у пула-роли появляется своя дорожка.
@@ -2338,11 +2302,10 @@ def _declare_role_lanes(participants: List[Dict[str, Any]],
     признаком «пул назван дорожкой», и коллаборация не раздувается участниками,
     которых в тексте нет.
 
-    Роль без `inside` — нерешённый случай, который модель возвращает регулярно
-    (живые прогоны: «роль „Система мониторинга“ не объявлена»). Оставлять её
-    пулом нельзя: шагов у неё нет, починка снимет пустой пул, и действующее лицо
-    исчезнет со схемы. Поэтому `_sole_role_host` закрывает единственный случай,
-    где ответа не надо угадывать.
+    Хозяина из плана код не подставляет: промер живого прогона (2026-09-23)
+    показал, что «единственная действующая организация» оказывается и пулом
+    «Руководитель службы поддержки», то есть ролью человека, — и организация
+    уезжала дорожкой к своему же сотруднику.
     """
     names = {_norm_name(p["name"]): p["name"] for p in participants}
     role_inside = {_norm_name(p["name"]): _norm_name(p.get("inside") or "")
@@ -2361,15 +2324,10 @@ def _declare_role_lanes(participants: List[Dict[str, Any]],
             seen.add(current)
         return names.get(current)
 
-    only_host = _sole_role_host(participants, elements)
-
     for pool in participants:
         if pool.get("external") is not False:
             continue
         inside = organization(_norm_name(pool["name"]))
-        deduced = False
-        if not inside or inside == pool["name"]:
-            inside, deduced = only_host, True
         if not inside or inside == pool["name"]:
             continue
         if _lane_named_like_pool(pool["name"], lanes) is not None:
@@ -2378,14 +2336,8 @@ def _declare_role_lanes(participants: List[Dict[str, Any]],
         used_ids.add(lane_id)
         lanes.append({"id": lane_id, "name": pool["name"],
                       "participant": inside})
-        if deduced:
-            notes.append(f"«{pool['name']}» объявлен ролью, а организации нет: в "
-                         f"плане одна организация с шагами — «{inside}» (другой "
-                         f"хозяина роли быть не может), создана дорожка "
-                         f"«{pool['name']}» ({lane_id})")
-        else:
-            notes.append(f"«{pool['name']}» объявлен ролью пула «{inside}» — "
-                         f"создана дорожка «{pool['name']}» ({lane_id})")
+        notes.append(f"«{pool['name']}» объявлен ролью пула «{inside}» — "
+                     f"создана дорожка «{pool['name']}» ({lane_id})")
 
 
 def _merge_role_pools(elements: List[Dict[str, Any]],

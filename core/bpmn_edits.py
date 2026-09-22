@@ -68,13 +68,24 @@ EVENT_TAGS = {
 }
 FLOW_NODE_TAGS = TASK_TAGS | GATEWAY_TAGS | EVENT_TAGS
 
+# `add_task` создаёт плоский шаг: пустой subProcess или callActivity потом
+# нечем наполнить (в `after` нельзя сослаться на несуществующего ребёнка), и
+# в TASK_TAGS эти типы остаются только потому, что к подпроцессу цепляют
+# граничное событие.
+ADD_TASK_TAGS = TASK_TAGS - {"subProcess", "callActivity"}
+
+# Концы sequenceFlow: стартовое событие не принимают, из конечного не выходят,
+# и граничное событие не имеет входящего потока — его запускает хозяин через
+# attachedToRef. messageFlow под правило не попадает: сообщение в чужой старт
+# — единственный легальный способ запустить второй пул.
+SEQUENCE_FORBIDDEN_TARGETS = {"startEvent", "boundaryEvent"}
+SEQUENCE_FORBIDDEN_SOURCES = {"endEvent"}
+
 EVENT_TYPE_TO_TAG = {
     "start": "startEvent",
     "end": "endEvent",
     "intermediatecatch": "intermediateCatchEvent",
-    "intermediatecatchEvent": "intermediateCatchEvent",
     "intermediatethrow": "intermediateThrowEvent",
-    "intermediateThrowEvent": "intermediateThrowEvent",
 }
 
 # Определения событий, которые аплайер умеет проставлять: имя → (тег, тег
@@ -157,15 +168,24 @@ def _timer_timing(op: Dict[str, Any],
 # перечислять операции так же, а тест сверяет состав OP_SPEC и _HANDLERS:
 # расхождение означает «модель предлагает то, чего аплайер не умеет».
 OP_SPEC: Dict[str, str] = {
+    # `to` — исход нового узла. Без него модель обязана помнить второй
+    # `connect`, и в живых прогонах забывала: шаг откатывался тупиком, а вместе
+    # с ним и правка. Одна операция описывает обе стороны маршрута.
     "add_task": '{"op":"add_task","id":"new_...","name":"...","task_type":"'
-                + "|".join(sorted(TASK_TAGS))
-                + '","participant":"пул","after":"id элемента"}',
+                + "|".join(sorted(ADD_TASK_TAGS))
+                + '","participant":"пул","after":"id элемента",'
+                '"to":"id следующего шага (опц.)",'
+                '"lane":"id или имя дорожки (опц.)"}',
     "add_gateway": '{"op":"add_gateway","id":"new_...","name":"...",'
-                   '"gateway_type":"exclusive|parallel|inclusive","participant":"пул","after":"id"}',
+                   '"gateway_type":"exclusive|parallel|inclusive","participant":"пул",'
+                   '"after":"id","to":"id (опц., один выход шлюза)",'
+                   '"lane":"id или имя дорожки (опц.)"}',
     "add_event": '{"op":"add_event","id":"new_...","name":"...",'
                  '"event_type":"start|end|intermediateCatch|intermediateThrow"'
                  ' либо определение ловушки: timer|message|error|signal",'
                  '"participant":"пул","after":"id (опц.)",'
+                 '"to":"id следующего шага (опц., не для end)",'
+                 '"lane":"id или имя дорожки (опц.)",'
                  '"event_definition":"timer|message|error|signal (опц.)",'
                  '"duration":"PT15M (опц., таймеру)","cycle":"R3/PT10M (опц., таймеру)"}',
     "add_participant": '{"op":"add_participant","id":"new_...","name":"..."}',
@@ -174,6 +194,7 @@ OP_SPEC: Dict[str, str] = {
     "move_to_lane": '{"op":"move_to_lane","id":"id элемента","lane":"id|имя дорожки"}',
     "add_boundary_event": '{"op":"add_boundary_event","id":"new_...","attached_to":"id задачи",'
                           '"event_type":"timer|error","name":"...",'
+                          '"to":"id шага обработки (опц.)",'
                           '"duration":"PT15M (опц.)","cycle":"R3/PT10M (опц.)"}',
     "rename": '{"op":"rename","id":"...","name":"..."}',
     "delete": '{"op":"delete","id":"..."}',
@@ -189,6 +210,18 @@ OP_SPEC: Dict[str, str] = {
 }
 
 XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8"?>\n'
+
+# Потолок инвентаря. Принятый XML ограничен AI_MAX_XML_CHARS (1 МБ), и схема
+# на сотни элементов целиком в контекст модели не влезает: провайдер отвечает
+# 400, а это не транспортный сбой, а вечный отказ. Поэтому инвентарь режем
+# здесь и честно пишем в поле `limits`, сколько не показаны, — молча
+# обрывать список нельзя: планировщик начал бы ссылаться на id, которых нет.
+INVENTORY_MAX_ELEMENTS = 250
+INVENTORY_MAX_FLOWS = 500
+INVENTORY_MAX_LANES = 60
+# Длина документации в инвентаре: модели нужен факт «описание уже есть», а не
+# его полный текст — иначе одно подробное описание съедает строку целиком.
+INVENTORY_DOC_CHARS = 80
 
 # Теги, которые по схеме BPMN обязаны идти до incoming/outgoing: документация
 # процесса или элемента и extensionElements. Позиция вставки ссылается на них,
@@ -451,8 +484,52 @@ class _Index:
         return None, None, name
 
 
+def _subprocess_of(index: _Index, elem: ET.Element) -> str:
+    """Ид ближайшего subProcess-контейнера (пусто — узел верхнего уровня).
+
+    Без этого поля планировщик видит элементы подпроцесса наравне с внешними и
+    предлагает `connect` через границу вложенности — аплайер такое отвергает, и
+    правка уезжает в повтор вместо полезной работы.
+    """
+    node = index.parents.get(elem)
+    while node is not None:
+        if isinstance(node.tag, str) and is_bpmn_tag(node.tag):
+            tag = _local(node.tag)
+            if tag == "subProcess":
+                return node.get("id") or ""
+            if tag == "process":
+                return ""
+        node = index.parents.get(node)
+    return ""
+
+
+def _definition_of(elem: ET.Element) -> Tuple[str, str]:
+    """(определение события, хронометраж) — чтобы модель не лепила второй
+    таймер на шаг, где ожидание уже нарисовано."""
+    for child in elem:
+        if not isinstance(child.tag, str) or not is_bpmn_tag(child.tag):
+            continue
+        tag = _local(child.tag)
+        if tag.endswith("EventDefinition"):
+            timing = next((_text_of(t) for t in child
+                           if isinstance(t.tag, str)
+                           and _local(t.tag) in ("timeDuration", "timeCycle")), "")
+            return tag[:-len("EventDefinition")].lower(), timing
+    return "", ""
+
+
+def _text_of(elem: ET.Element) -> str:
+    return (elem.text or "").strip()
+
+
 def build_inventory(xml_text: str) -> Dict[str, Any]:
-    """Компактный инвентарь схемы — контекст для планирующих промптов."""
+    """Компактный инвентарь схемы — контекст для планирующих промптов.
+
+    Показывает не только id и имена: без текущей дорожки, хозяина граничного
+    события, определения таймера и факта документации планировщик работает
+    вслепую — предлагает перенос в ту же дорожку, второй таймер на тот же шаг
+    и описание там, где оно уже есть.
+    """
     root = parse_xml(xml_text)
     index = _Index(root)
     participants = []
@@ -462,16 +539,49 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
             "id": participant.get("id") if participant is not None else process.get("id"),
             "name": index.participant_name(process),
         })
+
+    # Узел принадлежит ровно одной дорожке: разворачиваем flowNodeRef в
+    # обратную ссылку, иначе «в какой дорожке шаг» пришлось бы искать перебором
+    # на каждый элемент.
+    lane_of: Dict[str, str] = {}
+    for lane in index.lanes:
+        for ref in lane.findall(_q("flowNodeRef")):
+            ref_id = _text_of(ref)
+            if ref_id:
+                lane_of.setdefault(ref_id, lane.get("id") or "")
+
     elements = []
     for elem_id, elem in index.elements.items():
         process = index.process_of.get(elem_id)
-        elements.append({
+        entry = {
             "id": elem_id,
             "type": _local(elem.tag),
             "name": elem.get("name", ""),
             "participant": index.participant_name(process) if process is not None else "",
-        })
-    flows = []
+        }
+        if elem_id in lane_of:
+            entry["lane"] = lane_of[elem_id]
+        host = elem.get("attachedToRef")
+        if host:
+            entry["attached_to"] = host
+        definition, timing = _definition_of(elem)
+        if definition:
+            entry["definition"] = definition
+        if timing:
+            entry["timer"] = timing
+        documentation = next((doc for doc in elem
+                              if isinstance(doc.tag, str)
+                              and is_bpmn_tag(doc.tag)
+                              and _local(doc.tag) == "documentation"), None)
+        if documentation is not None and _text_of(documentation):
+            text = _text_of(documentation)
+            entry["documentation"] = (text[:INVENTORY_DOC_CHARS] + "…"
+                                      if len(text) > INVENTORY_DOC_CHARS else text)
+        container = _subprocess_of(index, elem)
+        if container:
+            entry["subprocess"] = container
+        elements.append(entry)
+
     # Ветки шлюзов, помеченные default: без этого планировщик не отличит
     # «необусловленная ветка — ошибка» от «необусловленная ветка — выход по
     # умолчанию», и предложил бы то, что аплайер правомерно отвергает.
@@ -480,6 +590,7 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
         if isinstance(elem.tag, str) and _local(elem.tag) in GATEWAY_TAGS
         and elem.get("default")
     }
+    flows = []
     for flow in index.sequence_flows:
         entry = {
             "id": flow.get("id", ""),
@@ -500,6 +611,7 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
             "source": flow.get("sourceRef", ""),
             "target": flow.get("targetRef", ""),
         })
+
     # Дорожки — отдельным списком: без id и имён планировщик не сможет указать
     # цель для move_to_lane и начнёт выдумывать несуществующие дорожки.
     lanes = []
@@ -510,8 +622,30 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
             "name": lane.get("name", ""),
             "participant": index.participant_name(process) if process is not None else "",
         })
-    return {"participants": participants, "elements": elements, "flows": flows,
-            "lanes": lanes}
+
+    limits: Dict[str, int] = {}
+    shown_elements = elements[:INVENTORY_MAX_ELEMENTS]
+    if len(elements) > len(shown_elements):
+        limits["elements_omitted"] = len(elements) - len(shown_elements)
+    shown_ids = {e["id"] for e in shown_elements} | {
+        p["id"] for p in participants if p.get("id")}
+    kept_flows = [f for f in flows if f["source"] in shown_ids
+                  and f["target"] in shown_ids][:INVENTORY_MAX_FLOWS]
+    if len(kept_flows) < len(flows):
+        limits["flows_omitted"] = len(flows) - len(kept_flows)
+    shown_lanes = lanes[:INVENTORY_MAX_LANES]
+    if len(lanes) > len(shown_lanes):
+        limits["lanes_omitted"] = len(lanes) - len(shown_lanes)
+
+    inventory: Dict[str, Any] = {
+        "participants": participants,
+        "elements": shown_elements,
+        "flows": kept_flows,
+        "lanes": shown_lanes,
+    }
+    if limits:
+        inventory["limits"] = limits
+    return inventory
 
 
 # ---------------------------------------------------------------------------
@@ -519,9 +653,14 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 class _Skip(Exception):
-    def __init__(self, reason: str, hint: str = ""):
+    """Операция не применена. `needs` — id, которых операция ждёт: если тот же
+    пакет создаёт их следующей операцией, аплайер отложит её, а не выбросит
+    вместе со всей веткой."""
+
+    def __init__(self, reason: str, hint: str = "", needs: Tuple[str, ...] = ()):
         super().__init__(reason)
         self.hint = hint
+        self.needs = tuple(n for n in needs if n)
 
 
 def _require_new_id(op_id: Optional[str], index: _Index) -> str:
@@ -614,6 +753,13 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
         raise _Skip(
             f"элемент '{after_id}' не найден",
             "используйте существующие id из инвентаря",
+            needs=(after_id,),
+        )
+    if _local(after.tag) in SEQUENCE_FORBIDDEN_SOURCES:
+        raise _Skip(
+            f"после '{after_id}' ({_local(after.tag)}) шага не будет",
+            "из конечного события исходящий поток не рисуют: вставляйте шаг "
+            "до него, операцией after у предыдущего узла маршрута",
         )
     process = index.process_of.get(after_id)
     if process is None:
@@ -764,6 +910,69 @@ def _event_definition_key(op: Dict[str, Any]) -> Optional[str]:
     return key
 
 
+def _check_outlet(op: Dict[str, Any], index: _Index, process: ET.Element,
+                  source_tag: str, after_id: str = "") -> str:
+    """Проверяет явный исход нового узла ДО его создания.
+
+    Порядок принципиален: `after` перешивает существующий поток, и отказ в
+    середине оставил бы разорванную цепочку вместо целой схемы. Модель в живых
+    прогонах добавляла шаг и один connect к нему — исход она забывала, шаг
+    откатывался тупиком, и вся правка уходила в отказ. `to` даёт обе стороны
+    одной операцией, поэтому проверяется заранее и не может упасть позже.
+    """
+    outlet_id = str(op.get("to") or "").strip()
+    if not outlet_id:
+        return ""
+    if source_tag in SEQUENCE_FORBIDDEN_SOURCES:
+        raise _Skip(
+            f"{source_tag} завершает маршрут: исход у него не задают",
+            "уберите to — конечное событие только принимают потоком",
+        )
+    outlet = index.elements.get(outlet_id)
+    if outlet is None:
+        raise _Skip(f"цель исхода '{outlet_id}' не найдена",
+                    "укажите to id элемента из инвентаря", needs=(outlet_id,))
+    outlet_tag = _local(outlet.tag)
+    if outlet_tag in SEQUENCE_FORBIDDEN_TARGETS:
+        raise _Skip(
+            f"в '{outlet_id}' ({outlet_tag}) исход нового узла не входит",
+            "ведите поток к шагу или конечному событию его пула",
+        )
+    if index.process_of.get(outlet_id) is not process:
+        raise _Skip(
+            "цель исхода лежит в другом пуле",
+            "sequence-поток остаётся внутри процесса, между пулами — "
+            "отдельный connect с flow_type=message",
+        )
+    after_elem = index.elements.get(after_id) if after_id else None
+    scope = (index.has_subprocess_ancestor(after_elem) if after_elem is not None
+             else index.has_subprocess_ancestor(process))
+    if index.has_subprocess_ancestor(outlet) is not scope:
+        raise _Skip(
+            "цель исхода лежит на другой вложенности",
+            "поток не пересекает границу subProcess: вставляйте шаг того же "
+            "уровня, что и его исход",
+        )
+    return outlet_id
+
+
+def _link_outlet(index: _Index, source_id: str, outlet_id: str,
+                 process: ET.Element) -> str:
+    """Провёренный `_check_outlet` исход нового узла: поток создаётся здесь.
+
+    `after` уже может вести новый узел ровно туда же — второй поток тем же
+    маршрутом не добавляется, иначе схема получила бы немоделируемую двойную
+    ветку.
+    """
+    for flow in index.sequence_flows:
+        if (flow.get("sourceRef") == source_id
+                and flow.get("targetRef") == outlet_id):
+            return (f"исход к '{outlet_id}' уже даёт вставка after — "
+                    "второй поток не создан")
+    flow = _create_sequence_flow(index, source_id, outlet_id, process, None)
+    return f"исход потока '{flow.get('id')}' → '{outlet_id}'"
+
+
 def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     op_id = _require_new_id(op.get("id"), index)
     name = (op.get("name") or "").strip()
@@ -775,6 +984,23 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
             "пул не определён",
             "укажите participant именем или id пула из инвентаря",
         )
+    lane_key = str(op.get("lane") or "").strip()
+    lane = None
+    if lane_key:
+        # Дорожку валидируем до создания узла: отказ в середине оставил бы
+        # элемент в процессе без дорожки, а в отчёте — частичную правку.
+        lane = index.find_lane(lane_key)
+        if lane is None:
+            raise _Skip(
+                f"дорожка '{lane_key}' не найдена",
+                "создайте её операцией add_lane или возьмите id из инвентаря",
+                needs=(lane_key,),
+            )
+        if index.enclosing_process(lane) is not process:
+            raise _Skip(
+                "дорожка принадлежит другому пулу",
+                "указывайте lane дорожкой того же пула, где создаёте элемент",
+            )
     definition = _event_definition_key(op)
     alias_note = ""
 
@@ -785,10 +1011,11 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                 "перенесите event_definition в add_event",
             )
         task_type = op.get("task_type") or "task"
-        if task_type not in TASK_TAGS:
+        if task_type not in ADD_TASK_TAGS:
             raise _Skip(
                 f"неизвестный тип задачи '{task_type}'",
-                "допустимы: " + ", ".join(sorted(TASK_TAGS)),
+                "допустимы: " + ", ".join(sorted(ADD_TASK_TAGS))
+                + " (subProcess и callActivity создать нечем наполнить)",
             )
         elem = ET.Element(_q(task_type), {"id": op_id, "name": name})
         tag = task_type
@@ -833,16 +1060,22 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
             _adopt_event_definition(index, elem, definition, op_id, timing)
 
     after_id = op.get("after")
+    outlet_id = _check_outlet(op, index, process, tag,
+                              str(after_id or "").strip())
     notes: List[str] = [alias_note] if alias_note else []
     if tag in ("startEvent", "endEvent"):
         # Событие без рёбер — висячий узел, который скоринг считает дефектом
-        # связей, поэтому пробуем сразу привязать его к потоку.
+        # связей, поэтому пробуем сразу привязать его к потоку. Явный `to`
+        # сильнее автопривязки: маршрут модель описала сама.
         index.adopt(process, elem)
-        linked = _link_new_event(index, process, op_id, tag)
+        if outlet_id:
+            linked = None
+        else:
+            linked = _link_new_event(index, process, op_id, tag)
         notes.append(
             f"событие подключено к '{linked}'" if linked
-            else "событие добавлено без автопривязки потоков"
-        )
+            else ("событие выведено явным to" if outlet_id
+                  else "событие добавлено без автопривязки потоков"))
     elif after_id:
         target_process = index.process_of.get(after_id)
         if target_process is not None and target_process is not process:
@@ -853,6 +1086,13 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
         notes.extend(_insert_after(elem, after_id, index))
     else:
         index.adopt(process, elem)
+    if outlet_id:
+        notes.append(_link_outlet(index, op_id, outlet_id, process))
+    if lane is not None:
+        # Новый узел становится ребёнком процесса, а дорожка только ссылается
+        # на него — ровно так пишет bpmn-js (см. _op_move_to_lane).
+        ET.SubElement(lane, _q("flowNodeRef")).text = op_id
+        notes.append(f"помещён в дорожку '{lane.get('name') or lane_key}'")
     return notes or [f"добавлен элемент '{name}'"]
 
 
@@ -874,12 +1114,19 @@ def _op_add_documentation(op: Dict[str, Any], index: _Index) -> List[str]:
     text = (op.get("text") or "").strip()
     if not text:
         raise _Skip("не задан текст документации", "укажите text")
+    existing = [doc for doc in elem
+                if isinstance(doc.tag, str) and is_bpmn_tag(doc.tag)
+                and _local(doc.tag) == "documentation" and _text_of(doc)]
+    if any(_text_of(doc) == text for doc in existing):
+        # Повтор той же правки не «применён», а бесполезен: без этого отчёта
+        # модель могла бесконечно дописывать одно и то же описание.
+        return ["такая документация у элемента уже есть — добавлено не было"]
     doc = ET.Element(_q("documentation"))
     doc.text = text
     # По схеме BPMN документация идёт до extensionElements и до incoming /
     # outgoing; несколько документации складываются рядом.
     elem.insert(_position_after(elem, {"documentation"}), doc)
-    return []
+    return [f"дополнено к {len(existing)} существующей(им)"] if existing else []
 
 
 def _op_add_lane(op: Dict[str, Any], index: _Index) -> List[str]:
@@ -912,6 +1159,7 @@ def _op_move_to_lane(op: Dict[str, Any], index: _Index) -> List[str]:
         raise _Skip(
             f"дорожка '{lane_key}' не найдена",
             "создайте её операцией add_lane или возьмите id из инвентаря",
+            needs=(lane_key,),
         )
     process = index.process_of.get(elem_id)
     if process is None or index.enclosing_process(lane) is not process:
@@ -921,6 +1169,13 @@ def _op_move_to_lane(op: Dict[str, Any], index: _Index) -> List[str]:
         )
     # flowNodeRef переставляется, а не дублируется: ссылка обязана остаться
     # ровно в одной дорожке, иначе bpmn-js покажет элемент дважды.
+    current_lane = next((other.get("id") or "" for other in index.lanes
+                         for ref in other.findall(_q("flowNodeRef"))
+                         if (ref.text or "").strip() == elem_id), "")
+    if current_lane == (lane.get("id") or ""):
+        # No-op обязан называться no-op: иначе «применено» в отчёте там, где
+        # схема не изменилась, и модель не поймёт, что правка прошла зря.
+        return ["элемент уже стоит в этой дорожке — схема не изменилась"]
     for other in index.lanes:
         for ref in list(other.findall(_q("flowNodeRef"))):
             if (ref.text or "").strip() == elem_id:
@@ -931,11 +1186,26 @@ def _op_move_to_lane(op: Dict[str, Any], index: _Index) -> List[str]:
     return []
 
 
-def _remove_node(index: _Index, elem: ET.Element) -> List[str]:
-    """Вынуть узел вместе с его потоками и ссылками на них. Возвращает id
-    удалённых потоков."""
+def _attached_boundaries(index: _Index, host_id: str) -> List[ET.Element]:
+    """Граничные события, прицепленные к узлу: без хозяина они не существуют."""
+    return [elem for elem in index.elements.values()
+            if elem.get("attachedToRef") == host_id]
+
+
+def _remove_node(index: _Index, elem: ET.Element) -> Tuple[List[str], List[str]]:
+    """Вынуть узел вместе с его потоками, прицепленными событиями и ссылками
+    на них. Возвращает (id удалённых потоков, id удалённых граничных событий)."""
     elem_id = elem.get("id") or ""
     removed_flows = []
+    removed_boundaries: List[str] = []
+    # Событие без хозяина — битый XML: bpmn-js его не рисует, а скоринг и
+    # оракул считают dangling attachedToRef. Уносить его вместе с задачей
+    # честнее, чем оставить сироту, которую нечем починить.
+    for boundary in _attached_boundaries(index, elem_id):
+        flows, nested = _remove_node(index, boundary)
+        removed_flows.extend(flows)
+        removed_boundaries.extend(nested)
+        removed_boundaries.append(boundary.get("id") or "")
     for flow in list(index.sequence_flows) + list(index.message_flows):
         if elem_id in (flow.get("sourceRef"), flow.get("targetRef")):
             index.detach(flow)
@@ -946,7 +1216,7 @@ def _remove_node(index: _Index, elem: ET.Element) -> List[str]:
         for flow_id in removed_flows:
             _remove_refs(other, flow_id)
     index.detach(elem)
-    return removed_flows
+    return removed_flows, removed_boundaries
 
 
 def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
@@ -959,8 +1229,14 @@ def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
             "стартовые и конечные события не удаляются",
             "у процесса должен оставаться вход и выход",
         )
-    removed_flows = _remove_node(index, elem)
-    return [f"удалены связанные потоки: {', '.join(removed_flows)}"] if removed_flows else []
+    removed_flows, removed_boundaries = _remove_node(index, elem)
+    notes = []
+    if removed_boundaries:
+        notes.append("вместе с хозяином удалены граничные события: "
+                     + ", ".join(removed_boundaries))
+    if removed_flows:
+        notes.append(f"удалены связанные потоки: {', '.join(removed_flows)}")
+    return notes
 
 
 def _flag(value: Any, field: str) -> bool:
@@ -989,6 +1265,8 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
         raise _Skip(
             "источник или цель не найдены",
             "используйте существующие id из инвентаря",
+            needs=(source_id if source is None else "",
+                   target_id if target is None else ""),
         )
     flow_type = (op.get("flow_type") or "sequence").lower()
     if flow_type not in ("sequence", "message"):
@@ -1022,6 +1300,25 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
             "элементы лежат на разной вложенности",
             "поток не может выходить из subProcess: соединяйте узлы одного уровня",
         )
+    # Концы sequenceFlow легальны только так: стартовое событие не принимают,
+    # из конечного не выходят, а у граничного события вход — хозяин через
+    # attachedToRef, не поток. Ни скоринг, ни оракул такого дефекта не видят,
+    # поэтому проверка обязана быть здесь.
+    source_tag = _local(source.tag)
+    target_tag = _local(target.tag)
+    if flow_type == "sequence":
+        if target_tag in SEQUENCE_FORBIDDEN_TARGETS:
+            raise _Skip(
+                f"в '{target_id}' ({target_tag}) sequence-поток не входит",
+                "стартовое событие запускает процесс, а граничное событие "
+                "прикреплено к задаче: соединяйте их потоком только НАВЫС",
+            )
+        if source_tag in SEQUENCE_FORBIDDEN_SOURCES:
+            raise _Skip(
+                f"из '{source_id}' ({source_tag}) исходящего потока не бывает",
+                "конечное событие завершает маршрут: продолжение от него "
+                "нельзя нарисовать по BPMN",
+            )
     existing = [
         f for f in index.sequence_flows + index.message_flows
         if f.get("sourceRef") == source_id and f.get("targetRef") == target_id
@@ -1033,6 +1330,10 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     notes: List[str] = []
     if flow_type == "sequence":
         condition = (op.get("condition") or "").strip() or None
+        if condition and _local(source.tag) not in GATEWAY_TAGS:
+            # Условие на потоке от задачи движок не читает: генератор за такое
+            # пишет заметку, здесь — та же честность вместо молчаливой правки.
+            notes.append(f"условие задано, но источник {source_id} — не шлюз")
         if default_requested:
             # У выхода по умолчанию условия быть не может: иначе модель
             # описывает «иначе» и условием, и веткой по умолчанию сразу.
@@ -1046,7 +1347,12 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
                     "переназначьте default операцией set_default на нужную ветку",
                 )
         if (_local(source.tag) == "exclusiveGateway" and condition is None
-                and not default_requested):
+                and not default_requested
+                # Единственный выход шлюза — это схождение развилки, а не
+                # развилка: требовать от него условие или default нельзя, иначе
+                # аплайер отвергал бы корректную пару «шлюз на входе, шлюз на
+                # выходе», которую предписывает промпт.
+                and _gateway_branches(index, source_id)):
             notes.extend(_resolve_unconditioned_branch(index, source, source_id))
             default_requested = True
         flow = _create_sequence_flow(index, source_id, target_id, source_process,
@@ -1157,27 +1463,38 @@ def _op_move(op: Dict[str, Any], index: _Index) -> List[str]:
             "элемент внутри subProcess не переносится между пулами",
             "переносить можно только узлы верхнего уровня: вынесите элемент из subProcess",
         )
+    # Граничные события хозяина едут вместе с шагом: оставить их в старом пуле
+    # значит завести attachedToRef в чужой процесс, а такая ссылка не чинится
+    # пересборкой incoming/outgoing.
+    carried = _attached_boundaries(index, elem_id)
+    carried_ids = [b.get("id") or "" for b in carried]
+    moved_ids = {elem_id} | {i for i in carried_ids if i}
     broken = []
     for flow in list(index.sequence_flows):
         ends = (flow.get("sourceRef"), flow.get("targetRef"))
-        if elem_id in ends:
-            other = ends[0] if ends[1] == elem_id else ends[1]
-            if index.process_of.get(other) is not target:
-                index.detach(flow)
-                broken.append(flow.get("id", ""))
+        if ends[0] in moved_ids and ends[1] in moved_ids:
+            continue
+        if not (moved_ids & set(ends)):
+            continue
+        other = ends[1] if ends[0] in moved_ids else ends[0]
+        if index.process_of.get(other) is not target:
+            index.detach(flow)
+            broken.append(flow.get("id", ""))
     for other in index.elements.values():
-        if other is not elem:
-            for flow_id in broken:
-                _remove_refs(other, flow_id)
-    for ref_tag in ("incoming", "outgoing"):
-        for ref in list(elem.findall(_q(ref_tag))):
-            if (ref.text or "").strip() in broken:
-                elem.remove(ref)
+        for flow_id in broken:
+            _remove_refs(other, flow_id)
     index.detach(elem)
     index.adopt(target, elem)
+    for boundary in carried:
+        index.detach(boundary)
+        index.adopt(target, boundary)
+    notes = []
     if broken:
-        return [f"межпульные потоки удалены: {', '.join(broken)}"]
-    return []
+        notes.append(f"межпульные потоки удалены: {', '.join(broken)}")
+    if carried_ids:
+        notes.append("граничные события перенесены вместе с шагом: "
+                     + ", ".join(carried_ids))
+    return notes
 
 
 def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
@@ -1197,6 +1514,7 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
         raise _Skip(
             f"задача '{host_id}' не найдена",
             "используйте существующие id из инвентаря",
+            needs=(host_id,),
         )
     if _local(host.tag) not in TASK_TAGS:
         raise _Skip(
@@ -1206,7 +1524,21 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     process = index.process_of.get(host_id)
     if process is None:
         raise _Skip(f"не удалось определить пул элемента '{host_id}'")
+    # Одно и то же определение на том же шаге дважды — не два события, а
+    # дубль: второй таймер ничего не добавляет и только портит схему.
+    for existing in _attached_boundaries(index, host_id):
+        existing_def, _ = _definition_of(existing)
+        if existing_def == event_type:
+            raise _Skip(
+                f"к '{host_id}' уже прицеплено {event_type}-событие "
+                f"'{existing.get('id')}'",
+                "замените хронометраж нельзя — создайте событие другого типа "
+                "или удалите существующее операцией delete",
+            )
     timing = _timer_timing(op, event_type)
+    # Ветка обработки задаётся той же операцией: без `to` событие оставалось
+    # кружком без ветки и откатывалось, унося с собой весь маршрут эскалации.
+    outlet_id = _check_outlet(op, index, process, "boundaryEvent", host_id)
     elem = ET.Element(_q("boundaryEvent"), {
         "id": op_id, "name": name, "attachedToRef": host_id,
     })
@@ -1215,6 +1547,8 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     note = f"граничное событие '{name}' прицеплено к '{host_id}'"
     if timing:
         note += f", {'цикл' if timing[0] == 'timeCycle' else 'длительность'} {timing[1]}"
+    if outlet_id:
+        note += f", ветка обработки: {_link_outlet(index, op_id, outlet_id, process)}"
     return [note]
 
 
@@ -1402,7 +1736,6 @@ def _op_remove_participant(op: Dict[str, Any], index: _Index) -> List[str]:
     index.detach(participant)
     return [f"пустой пул «{label}» удалён вместе с процессом"]
 
-
 _HANDLERS = {
     "add_task": lambda op, i: _op_add_node(op, i, "task"),
     "add_gateway": lambda op, i: _op_add_node(op, i, "gateway"),
@@ -1453,6 +1786,13 @@ def _lane_move_pools(operations: List[Dict[str, Any]],
 
 
 ADD_NODE_OPS = {"add_task", "add_event", "add_gateway", "add_boundary_event"}
+# Операции, у которых `id`/`name` — создание, а не ссылка: по ним аплайер
+# видит, какую зависимость пакет закрывает сам, и откладывает ждущие их правки.
+CREATES_ID_OPS = ADD_NODE_OPS | {"add_lane"}
+# Проходов достаточно, чтобы раскрыть цепочку «создали шаг → прикрепили
+# событие → соединили поток»: каждый проход снимает хотя бы одно звено, а без
+# прогресса цикл обрывается сразу.
+MAX_PACKAGE_PASSES = 3
 
 # Поля, по которым правка опознаётся в отчёте. Они же — ключ сравнения
 # «пропуск первого раунда закрыт повтором» в оркестраторе: без них нельзя
@@ -1492,6 +1832,34 @@ def _routing_gap(index: _Index, elem_id: str) -> Optional[str]:
     return "не связан ни с одним элементом"
 
 
+def _rollback_hint(elem_id: str, gap: str, op_name: str) -> str:
+    """Подсказка для откатанного шага — по фактической дыре в маршруте.
+
+    Универсальное «перевставьте с after» здесь врёт: узел, вставленный через
+    `after`, вход уже имел, и повтор с той же вставкой даёт тот же тупик —
+    корректирующий раунд сжигался впустую. Поэтому подсказка называет
+    недостающую дугу, а не способ вставки.
+    """
+    gone = (f"в исходной схеме '{elem_id}' больше нет: его нужно перевставить "
+            "в этом же пакете, и только тогда он доступен для connect")
+    if gap == "остался без ветки обработки" or op_name == "add_boundary_event":
+        return ("задай ветку обработки той же операцией: шаг-эскалацию добавь "
+                f"через add_task, а у add_boundary_event укажи to этого шага "
+                f"('{elem_id}' уже откатан, связывать его нельзя)")
+    if gap.startswith("тупик"):
+        return (f"шаг остался без выхода: перевставьте его с after и задайте "
+                f"исход полем to ('{elem_id}' → следующий шаг или конечное "
+                f"событие его пула) — {gone}")
+    if gap.startswith("недостижим"):
+        return (f"шаг остался без входа: перевставьте его с after либо ведите "
+                f"connect от существующего шага к '{elem_id}', а исход задайте "
+                f"полем to — {gone}")
+    if gap == "хозяин события откачен":
+        return ("хозяин события откатан вместе с его маршрутом: перевставьте "
+                "сначала его, затем граничное событие с attached_to")
+    return f"перевставьте шаг операцией с after ({gone})"
+
+
 def _rollback_unrouted(index: _Index,
                        added: List[str]) -> Tuple[Dict[str, str], Set[str]]:
     """Убрать новые узлы, которые остались вне маршрута.
@@ -1516,8 +1884,14 @@ def _rollback_unrouted(index: _Index,
             gap = _routing_gap(index, elem_id)
             if gap is None:
                 continue
-            flows.update(_remove_node(index, index.elements[elem_id]))
+            removed_flows, removed_boundaries = _remove_node(
+                index, index.elements[elem_id])
+            flows.update(removed_flows)
             dropped[elem_id] = gap
+            # Граничное событие уехало вместе с хозяином: его операция в
+            # отчёте тоже обязана считаться откаченной, а не «применённой».
+            for boundary_id in removed_boundaries:
+                dropped[boundary_id] = "хозяин события откачен"
             changed = True
     return dropped, flows
 
@@ -1537,47 +1911,84 @@ def apply_operations(xml_text: str,
     added: List[str] = []
     added_ops: Dict[str, str] = {}
     merge_identities: List[Dict[str, Any]] = []
-    for op in operations or []:
+    # id и имена, которые пакет создаёт: операция, ждущая один из них,
+    # откладывается до прохода, где зависимость уже есть. Порядок, который
+    # модель выбрала для своих операций, не имеет права стоить ветки правок.
+    planned = {s for op in (operations or []) if isinstance(op, dict)
+               if str(op.get("op") or "") in CREATES_ID_OPS
+               for s in (str(op.get("id") or "").strip(),
+                         str(op.get("name") or "").strip()) if s}
+    queue: List[Tuple[Any, ...]] = [(op, (), None) for op in (operations or [])]
+    passes = 0
+    while queue and passes < MAX_PACKAGE_PASSES:
+        passes += 1
+        before = len(applied)
+        pending: List[Tuple[Any, ...]] = []
+        for op, waited, _last in queue:
+            if not isinstance(op, dict):
+                skipped.append({"op": str(op), "reason": "операция не объект",
+                                "hint": "каждая операция — JSON-объект с полем op"})
+                continue
+            op_name = op.get("op")
+            handler = _HANDLERS.get(op_name or "")
+            if handler is None:
+                skipped.append({"op": op_name or "?",
+                                "reason": "неизвестная операция",
+                                "hint": "допустимы: " + ", ".join(sorted(_HANDLERS))})
+                continue
+            derived = ""
+            if op_name == "add_lane" and index.resolve_process(op.get("participant")) is None:
+                lane_key = str(op.get("id") or "").strip()
+                hint = lane_moves.get(lane_key) or lane_moves.get(
+                    str(op.get("name") or "").strip())
+                if hint:
+                    op = {**op, "participant": hint[0]}
+                    derived = f"пул '{hint[0]}' взят из элемента '{hint[1]}'"
+            try:
+                notes = handler(op, index)
+                if op_name in ADD_NODE_OPS and op.get("id"):
+                    added.append(str(op["id"]))
+                    added_ops[str(op["id"])] = op_name
+                if op_name == "merge_participants":
+                    merge_identities.append(_op_identity(op))
+                if derived:
+                    notes = notes + [derived]
+                if waited:
+                    notes = notes + ["операция применена после того, как пакет "
+                                     "создал " + ", ".join(f"'{w}'" for w in waited)]
+                entry = {"op": op_name, **_op_identity(op)}
+                if notes:
+                    entry["note"] = "; ".join(notes)
+                applied.append(entry)
+            except _Skip as skip:
+                if (skip.needs and passes < MAX_PACKAGE_PASSES
+                        and all(n in planned for n in skip.needs)):
+                    pending.append((op, skip.needs,
+                                    {"reason": str(skip), "hint": skip.hint}))
+                    continue
+                skipped.append({"op": op_name, **_op_identity(op),
+                                "reason": str(skip), "hint": skip.hint})
+            except Exception as e:  # noqa: BLE001 — одна операция не роняет пакет
+                logger.exception("Операция %s упала", op_name)
+                skipped.append({"op": op_name, **_op_identity(op),
+                                "reason": f"внутренняя ошибка: {e}",
+                                "hint": "упростите операцию"})
+        queue = pending
+        if len(applied) == before:
+            # Проход ничего не создал: оставшиеся зависимости пакет не
+            # закроет, и крутиться по кругу незачем.
+            break
+    for op, _waited, last in queue:
+        # Отложенная операция так и не дождалась зависимости: в отчёт она
+        # попадает с той же причиной, что видела модель, — иначе повторный
+        # запрос не получит подсказки, что именно в пакете не сходится.
         if not isinstance(op, dict):
-            skipped.append({"op": str(op), "reason": "операция не объект",
-                            "hint": "каждая операция — JSON-объект с полем op"})
             continue
-        op_name = op.get("op")
-        handler = _HANDLERS.get(op_name or "")
-        if handler is None:
-            skipped.append({"op": op_name or "?",
-                            "reason": "неизвестная операция",
-                            "hint": "допустимы: " + ", ".join(sorted(_HANDLERS))})
-            continue
-        derived = ""
-        if op_name == "add_lane" and index.resolve_process(op.get("participant")) is None:
-            lane_key = str(op.get("id") or "").strip()
-            hint = lane_moves.get(lane_key) or lane_moves.get(
-                str(op.get("name") or "").strip())
-            if hint:
-                op = {**op, "participant": hint[0]}
-                derived = f"пул '{hint[0]}' взят из элемента '{hint[1]}'"
-        try:
-            notes = handler(op, index)
-            if op_name in ADD_NODE_OPS and op.get("id"):
-                added.append(str(op["id"]))
-                added_ops[str(op["id"])] = op_name
-            if op_name == "merge_participants":
-                merge_identities.append(_op_identity(op))
-            if derived:
-                notes = notes + [derived]
-            entry = {"op": op_name, **_op_identity(op)}
-            if notes:
-                entry["note"] = "; ".join(notes)
-            applied.append(entry)
-        except _Skip as skip:
-            skipped.append({"op": op_name, **_op_identity(op),
-                            "reason": str(skip), "hint": skip.hint})
-        except Exception as e:  # noqa: BLE001 — одна операция не роняет пакет
-            logger.exception("Операция %s упала", op_name)
-            skipped.append({"op": op_name, **_op_identity(op),
-                            "reason": f"внутренняя ошибка: {e}",
-                            "hint": "упростите операцию"})
+        entry = {"op": op.get("op") or "?", **_op_identity(op)}
+        entry.update(last or {"reason": "зависимость пакета не создана",
+                              "hint": "создайте элемент раньше, чем сошлётесь "
+                                      "на него"})
+        skipped.append(entry)
     # Узлы, добавленные пакетом и оставшиеся без маршрута, откатываем:
     # принятое улучшение не имеет права делать схему хуже исходной.
     dropped, dropped_flows = _rollback_unrouted(index, added)
@@ -1588,16 +1999,7 @@ def apply_operations(xml_text: str,
                    and a.get("flow") not in dropped_flows]
         for elem_id, gap in dropped.items():
             op_name = added_ops.get(elem_id, "add_task")
-            # Откатанный узел из схемы убран, поэтому connect на него уже не
-            # работает: повтор обязан перевставить шаг операцией after, иначе
-            # он добавится заново таким же висячим. Для граничного события
-            # «after» бессмысленно — ему нужна ветка обработки.
-            hint = (f"добавьте ветку обработки: шаг-эскалацию операцией add_task "
-                    f"и connect от '{elem_id}' к нему ('{elem_id}' уже откатан, "
-                    f"связывать его нельзя)") if op_name == "add_boundary_event" \
-                else f"перевставьте шаг операцией с after " \
-                     f"(связать его connect-ами нельзя: " \
-                     f"'{elem_id}' уже не существует)"
+            hint = _rollback_hint(elem_id, gap, op_name)
             skipped.append({"op": op_name, "id": elem_id,
                             "reason": f"новый шаг ({elem_id}) {gap} — изменение "
                                       f"откачено",
@@ -1623,6 +2025,15 @@ def apply_operations(xml_text: str,
                             "повторите merge_participants",
                 })
                 break
+            # Применённые до слияния правки тоже ушли вместе с пакетом: без
+            # переноса в skipped пользователь не узнал бы, что добавленный шаг
+            # отменён, — в отчёте не осталось бы ни applied, ни skipped.
+            for entry in applied:
+                rolled = {k: v for k, v in entry.items() if k != "note"}
+                rolled["reason"] = ("изменение откачено вместе с пакетом "
+                                    "слияния пулов")
+                rolled["hint"] = "повторите правку без merge_participants"
+                skipped.append(rolled)
             return xml_text, {"status": "failed", "applied": [], "skipped": skipped}
 
     status = "success" if not skipped else ("partial" if applied else "failed")
@@ -1660,15 +2071,23 @@ def _ensure_process_event(index: _Index, process: ET.Element, tag: str,
 # маршрута. Планировщик улучшения показывает их пользователю как незаконченную
 # работу, а не как успешное изменение.
 UNROUTED_NOTE_MARKERS = ("остался без потоков", "не ведёт ни к одному шагу",
-                         "остался без шагов", "— тупик: вход есть",
-                         "недостижим: выход есть", "остался без ветки обработки")
+                         "— тупик: вход есть", "недостижим: выход есть",
+                         "остался без ветки обработки")
+
+# Пул без шагов — не «узел вне маршрута»: его нельзя присоединить connect,
+# лечится только add_task/remove_participant. Отдельный список нужен, чтобы
+# планировщик получил правильный инструмент, а не бессмысленный совет.
+POOL_EMPTY_NOTE_MARKERS = ("остался без шагов",)
 
 # Поломки, из-за которых пакет с `merge_participants` откатывается целиком: те
 # же дефекты маршрута плюс следы переноса — висящий поток или ссылка дорожки на
-# элемент, который уехал в другой процесс.
-MERGE_FATAL_NOTE_MARKERS = UNROUTED_NOTE_MARKERS + (
+# элемент, который уехал в другой процесс. Нелегальные концы потока и сирота
+# attachedToRef сюда НЕ входят: это болезни исходного XML, а не урон от слияния,
+# и откатывать из-за них полезное слияние — значит оставить пользователя с
+# раздутыми ролями-пулами навсегда.
+MERGE_FATAL_NOTE_MARKERS = (UNROUTED_NOTE_MARKERS + POOL_EMPTY_NOTE_MARKERS + (
     "удалён висящий поток", "ссылалась на удалённый элемент",
-    "перенесён в другой пул")
+    "перенесён в другой пул"))
 
 
 def _merge_breakage(applied_xml: str, touched: Set[str]) -> List[str]:
@@ -1695,6 +2114,49 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
         if flow.get("sourceRef") not in known_ids or flow.get("targetRef") not in known_ids:
             index.detach(flow)
             notes.append(f"удалён висящий поток {flow.get('id')}")
+
+    # 1b. sequenceFlow между разными процессами — тот же дефект, который генератор
+    # лечит превращением в сообщение: межпуловая «линия маршрута» на самом деле
+    # передача сообщения. Вид меняем, концы не трогаем — messageFlow в чужое
+    # стартовое событие легален и есть штатный способ запустить второй пул.
+    for flow in list(index.sequence_flows):
+        source_process = index.process_of.get(flow.get("sourceRef") or "")
+        target_process = index.process_of.get(flow.get("targetRef") or "")
+        if source_process is None or target_process is None:
+            continue  # концы без пула разберёт шагом выше и пересборкой ссылок
+        if source_process is target_process:
+            continue
+        index.detach(flow)
+        condition = flow.find(_q("conditionExpression"))
+        text = _text_of(condition) if condition is not None else ""
+        if condition is not None:
+            flow.remove(condition)
+        flow.tag = _q("messageFlow")
+        if text and not flow.get("name"):
+            flow.set("name", text)
+        index.adopt(_ensure_collaboration(index), flow)
+        notes.append(f"поток {flow.get('id')} между пулами стал потоком-сообщением: "
+                     "sequenceFlow не пересекает границу процесса")
+
+    # 1c. Концы sequenceFlow внутри одного процесса: в стартовое и граничное
+    # событие поток не входит, из конечного — не выходит. Ни скоринг, ни оракул
+    # такого дефекта не видели, и резать нужно здесь: следующим шагом
+    # incoming/outgoing пересобираются по фактическим потокам, и нелегальный
+    # конец стал бы «валидным».
+    for flow in list(index.sequence_flows):
+        target = index.elements.get(flow.get("targetRef") or "")
+        source = index.elements.get(flow.get("sourceRef") or "")
+        if target is not None and _local(target.tag) in SEQUENCE_FORBIDDEN_TARGETS:
+            index.detach(flow)
+            notes.append(f"удалён недопустимый поток {flow.get('id')}: в "
+                         f"'{flow.get('targetRef')}' ({_local(target.tag)}) "
+                         "sequence-поток не входит")
+            continue
+        if source is not None and _local(source.tag) in SEQUENCE_FORBIDDEN_SOURCES:
+            index.detach(flow)
+            notes.append(f"удалён недопустимый поток {flow.get('id')}: из "
+                         f"'{flow.get('sourceRef')}' ({_local(source.tag)}) "
+                         "исходящего потока не бывает")
 
     # 2. Дубли потоков (одинаковые вид/источник/цель) — оставляем первый.
     seen = set()
@@ -1783,6 +2245,28 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
                      + ("; условие с потока снято" if condition is not None else "")
                      + ("; выход по умолчанию снят" if had_default else ""))
 
+    # 4a. Единственная безусловная ветка развилки — это «иначе». Генератор
+    # помечает её `default` (`_ensure_gateway_default`), и улучшение обязано
+    # держать то же правило: `add_gateway` переподвешивает существующий поток под
+    # новый шлюз, а он проходит мимо `connect` с его проверкой условия. Двум и
+    # более безусловным веткам приёмника не ищем — какую считать запасной, знает
+    # только автор правки.
+    for elem_id, elem in index.elements.items():
+        if _local(elem.tag) != "exclusiveGateway" or elem.get("default"):
+            continue
+        branches = outgoing_by_source.get(elem_id) or []
+        if len(branches) < 2:
+            continue
+        unconditioned = [f for f in branches
+                         if f.find(_q("conditionExpression")) is None]
+        if len(unconditioned) != 1:
+            continue
+        chosen = unconditioned[0]
+        elem.set("default", chosen.get("id") or "")
+        notes.append(f"ветка {chosen.get('id')} шлюза "
+                     f"«{elem.get('name') or elem_id}» ({elem_id}) объявлена "
+                     "выходом по умолчанию: она единственная без условия")
+
     # 5. У каждого процесса — хотя бы один старт и один энд.
     counter = 1
     for process in index.processes:
@@ -1802,6 +2286,36 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
             counter = _ensure_process_event(index, process, "startEvent", counter, notes)
         if "endEvent" not in tags:
             counter = _ensure_process_event(index, process, "endEvent", counter, notes)
+
+    # 4b. Граничное событие без живого хозяина своего процесса в BPMN не
+    # существует: delete и move_to_participant уносят его вместе с задачей, а
+    # сюда битый attachedToRef приходит из импортного XML. Определение есть —
+    # понижаем до промежуточного события (смысл ожидания сохранён, и узел
+    # станет недостижимым — шаг ниже честно об этом скажет), нет — удаляем,
+    # потому что пустой кружок ничего не значит и починить его нечем.
+    for elem_id, elem in list(index.elements.items()):
+        if _local(elem.tag) != "boundaryEvent":
+            continue
+        host_id = elem.get("attachedToRef") or ""
+        host = index.elements.get(host_id) if host_id else None
+        same_process = (host is not None and index.process_of.get(elem_id)
+                        is index.process_of.get(host_id))
+        if host is not None and _local(host.tag) in TASK_TAGS and same_process:
+            continue
+        if host_id:
+            del elem.attrib["attachedToRef"]
+        definition = next((_local(child.tag) for child in elem
+                           if isinstance(child.tag, str) and is_bpmn_tag(child.tag)
+                           and _local(child.tag).endswith("EventDefinition")), "")
+        label = f"граничное событие «{elem.get('name') or elem_id}» ({elem_id})"
+        if definition:
+            elem.tag = _q("intermediateCatchEvent")
+            notes.append(f"{label} осталось без хозяина — переведено в "
+                         "промежуточное событие маршрута")
+        else:
+            _remove_node(index, elem)
+            notes.append(f"{label} осталось без хозяина и без определения — "
+                         "удалено")
 
     # 5. Узлы вне маршрута. Операция применилась, но включить шаг в маршрут
     # планировщик не предложил (add_task без `after` и без последующего

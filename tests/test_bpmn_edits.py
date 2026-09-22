@@ -13,7 +13,9 @@ from core.bpmn_edits import (
     BPMN_NS,
     DEFAULT_TIMER_DURATION,
     FLOW_NODE_TAGS,
+    INVENTORY_MAX_ELEMENTS,
     OP_SPEC,
+    POOL_EMPTY_NOTE_MARKERS,
     UNROUTED_NOTE_MARKERS,
     XML_DECLARATION,
     apply_operations,
@@ -461,6 +463,80 @@ class TestLanes:
 
 
 # ---------------------------------------------------------------------------
+# Порядок операций внутри пакета
+# ---------------------------------------------------------------------------
+
+class TestPackageOrder:
+    """Пакет читают по зависимостям, а не по тому порядку, в котором модель их
+    перечислила. Живые прогоны улучшения теряли на этом половину пакета:
+    `add_boundary_event` с `to` на шаг, создаваемый следующей операцией,
+    отвергался («цель исхода не найдена»), а следом падала и вся ветка — при
+    полностью корректном намерении модели."""
+
+    def test_boundary_event_waits_for_the_handler_of_the_package(
+            self, two_pool_xml):
+        """Ровно отказ живого прогона: `add_boundary_event` с `to` на шаг,
+        который пакет создаёт следующей операцией, отвергался и уносил с собой
+        всю ветку таймера."""
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_T2",
+             "name": "Доставка дольше суток", "attached_to": "S_accept",
+             "event_type": "timer", "to": "new_A8"},
+            {"op": "add_task", "id": "new_A8", "name": "Эскалировать руководителю",
+             "participant": "Магазин", "after": "S_accept"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert [a["op"] for a in report["applied"]] == ["add_task",
+                                                        "add_boundary_event"]
+        # Отложенная правка видна в отчёте: порядок изменил код, и это не молча.
+        assert "new_A8" in report["applied"][1]["note"]
+        outlet = [f for f in _root(out).findall(".//bpmn:sequenceFlow", NS)
+                  if f.get("sourceRef") == "new_T2"]
+        assert [f.get("targetRef") for f in outlet] == ["new_A8"]
+
+    def test_node_waits_for_the_lane_created_later(self, two_pool_xml):
+        """Подсказка аплайера — «создайте дорожку операцией add_lane». Если её
+        слушают и ставят add_lane второй операцией, ветка не имеет права
+        отваливаться."""
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A6", "name": "Сообщить подразделениям",
+             "participant": "Магазин", "after": "S_accept", "lane": "new_L1"},
+            {"op": "add_lane", "id": "new_L1", "name": "Сервис-деск",
+             "participant": "Магазин"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert [a["op"] for a in report["applied"]] == ["add_lane", "add_task"]
+        shop = _process(_root(out), "Process_shop")
+        assert _lane_refs(shop.find(".//bpmn:laneSet/bpmn:lane", NS)) == ["new_A6"]
+
+    def test_dependency_the_package_never_creates_stays_a_refusal(
+            self, two_pool_xml):
+        """Отложенный проход не имеет права превращать отсутствующий id в
+        успех: зависимость, которой в пакете нет, отвергается тем же
+        сообщением."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "connect", "source": "new_ghost", "target": "S_end"},
+            {"op": "add_task", "id": "new_A8", "name": "Проверить наличие",
+             "participant": "Магазин", "after": "S_accept"},
+        ])
+        assert [s["op"] for s in report["skipped"]] == ["connect"]
+        assert report["skipped"][0]["reason"] == "источник или цель не найдены"
+
+    def test_mutual_dependency_does_not_loop(self, two_pool_xml):
+        """Шаг А ждёт Б, Б ждёт А: второй проход обязан остановиться, а не
+        крутиться до конца жизни процесса."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A1", "name": "Первый",
+             "participant": "Магазин", "after": "new_A2"},
+            {"op": "add_task", "id": "new_A2", "name": "Второй",
+             "participant": "Магазин", "after": "new_A1"},
+        ])
+        assert {s["op"] for s in report["skipped"]} == {"add_task"}
+        assert len(report["skipped"]) == 2 and report["applied"] == []
+        assert report["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
 # Граничные события и определения событий
 # ---------------------------------------------------------------------------
 
@@ -759,6 +835,76 @@ class TestRepairWiresEvents:
         assert _by_id(out, "new_E1") is None
 
 
+class TestNodeOutlet:
+    """`to` — явный исход нового узла. Модель в живых прогонах добавляла шаг и
+    один connect к нему, а про исход забывала: шаг откатывался тупиком и правка
+    уходила в отказ (applied_share 0.607, improve/pass@1 0)."""
+
+    def test_after_and_outlet_keep_the_route_single(self, single_pool_xml):
+        """Когда `after` уже ведёт узел туда же, второй поток не создаётся:
+        дуга-дубль — это немоделируемая ветка, а не «обе стороны закрыты»."""
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_T_pack", "name": "Упаковать",
+             "task_type": "userTask", "after": "T_ship", "to": "End_ok"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        assert _by_id(out, "new_T_pack") is not None
+        assert len(_root(out).findall(".//bpmn:sequenceFlow"
+                                      "[@sourceRef='new_T_pack']"
+                                      "[@targetRef='End_ok']", NS)) == 1
+        assert "уже даёт вставка after" in report["applied"][0]["note"]
+        assert validate_and_repair(out)[1] == []
+
+    def test_outlet_alone_does_not_make_the_step_reachable(self,
+                                                           single_pool_xml):
+        """Честность важнее доли применённых: шаг с одним только исходом —
+        недостижим, и откат обязан сказать про вход, а не про вставку."""
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_T_ghost", "name": "Ниоткуда",
+             "task_type": "userTask", "to": "End_ok"},
+        ])
+        skip = [s for s in report["skipped"] if s.get("id") == "new_T_ghost"]
+        assert skip and "недостижим" in skip[0]["reason"]
+        assert _by_id(out, "new_T_ghost") is None
+
+    def test_boundary_event_with_handler_in_one_operation(self, single_pool_xml):
+        """Тот же пропуск, что резал improve в каждом живом прогоне: таймер без
+        ветки обработки откатывался. С `to` ветка задана той же операцией."""
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_T_escal", "name": "Эскалация",
+             "task_type": "userTask", "after": "T_ship", "to": "End_ok"},
+            {"op": "add_boundary_event", "id": "new_Timer", "attached_to": "T_ship",
+             "event_type": "timer", "name": "Просрочка", "duration": "PT4H",
+             "to": "new_T_escal"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert _by_id(out, "new_Timer") is not None
+        assert len(_root(out).findall(
+            ".//bpmn:sequenceFlow[@sourceRef='new_Timer']", NS)) == 1
+        assert validate_and_repair(out)[1] == []
+
+    def test_outlet_to_a_start_event_is_refused_before_the_insert(
+            self, single_pool_xml):
+        """Порядок проверок принципиален: `after` перешивает существующий
+        поток, и отказ после вставки оставил бы разорванную цепочку."""
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_T_loop", "name": "В старт",
+             "task_type": "userTask", "after": "T_ship", "to": "Start_1"},
+        ])
+        assert report["applied"] == []
+        assert "не входит" in report["skipped"][0]["reason"]
+        # Исходная цепочка целая: T_ship по-прежнему ведёт свой единственный путь.
+        assert _by_id(out, "new_T_loop") is None
+        assert _refs(_by_id(out, "T_ship"), "outgoing") == ["F5"]
+        assert _flow(_root(out), "F5") is not None
+
+    def test_end_event_has_no_outlet(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_event", "id": "new_E", "name": "Финиш",
+             "event_type": "end", "participant": "Заказ", "to": "T_ship"}])
+        assert "завершает маршрут" in report["skipped"][0]["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Словарь операций и неквадратичность
 # ---------------------------------------------------------------------------
@@ -937,8 +1083,12 @@ class TestPerformance:
     def test_batch_of_25_operations_on_a_wide_scheme_stays_linear(self):
         xml = _wide_xml()
         inventory = build_inventory(xml)
-        assert len(inventory["elements"]) >= 250
-        assert len(inventory["flows"]) >= 500
+        # Ширина схемы — по самому XML: инвентарь ограничен потолком контекста
+        # модели и для теста линейности показывает, что срез по лimit работает.
+        assert xml.count("<userTask") >= 250
+        assert xml.count("<sequenceFlow") >= 500
+        assert inventory["limits"]["elements_omitted"] > 0
+        assert len(inventory["elements"]) == INVENTORY_MAX_ELEMENTS
         started = time.perf_counter()
         out, report = apply_operations(xml, _batch_of_25())
         validate_and_repair(out)
@@ -1305,12 +1455,28 @@ class TestUnroutedRollback:
         assert [a["id"] for a in report["applied"]] == ["T_ship"]
         rollback = [s for s in report["skipped"] if s.get("id") == "new_T_pack"]
         assert rollback and "недостижим" in rollback[0]["reason"]
+        assert "вход" in rollback[0]["hint"]
         assert _by_id(out, "new_T_pack") is None
         # Остаток схемы цел: удалённый хост и его потоки — след операции
         # delete, а не отката.
         assert _by_id(out, "T_ship") is None
         assert _flow(_root(out), "F1") is not None
         assert _flow(_root(out), "F5") is None
+
+    def test_dead_end_hint_names_the_missing_outlet(self, single_pool_xml):
+        """Подсказка обязана называть недостающую дугу, а не способ вставки:
+        «перевставьте с after» при уже имевшемся входе повторяет ровно тот же
+        тупик — живой прогон сжёг на таком повторе второй вызов модели."""
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_A9", "name": "Эскалация",
+             "task_type": "userTask"},
+            {"op": "connect", "source": "T_ship", "target": "new_A9"},
+        ])
+        rollback = [s for s in report["skipped"] if s.get("id") == "new_A9"]
+        assert rollback and "тупик" in rollback[0]["reason"]
+        assert "исход" in rollback[0]["hint"]
+        assert "to" in rollback[0]["hint"]
+        assert _by_id(out, "new_A9") is None
 
     def test_boundary_event_without_handler_is_rolled_back(self, single_pool_xml):
         """Граничное событие без ветки обработки — кружок, за который скоринг
@@ -1324,7 +1490,7 @@ class TestUnroutedRollback:
         rollback = [s for s in report["skipped"] if s.get("id") == "new_Timer"]
         assert rollback and "без ветки обработки" in rollback[0]["reason"]
         assert rollback[0]["op"] == "add_boundary_event"
-        assert "connect" in rollback[0]["hint"]
+        assert "to" in rollback[0]["hint"]
         assert _by_id(out, "new_Timer") is None
         # Откат не должен трогать исходную схему: сравнение по инвентарю,
         # потому что сериализация нормализует префиксы пространств имён.
@@ -1482,6 +1648,47 @@ class TestValidateAndRepair:
         out, notes = validate_and_repair(xml)
         assert not any("понижен до задачи" in n for n in notes), notes
         assert _by_id(out, "G2").tag.endswith("}exclusiveGateway")
+
+    def test_lone_unconditioned_branch_becomes_the_default(self):
+        """`add_gateway` переподвешивает готовый поток под новый шлюз мимо
+        `connect`, поэтому правило «единственная безусловная ветка — это „иначе“»
+        живёт в починке: без него улучшение добавляло шлюз и ронялась метрика."""
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="P" isExecutable="true">
+    <startEvent id="S1" name="Старт"><outgoing>F1</outgoing></startEvent>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="G1"/>
+    <exclusiveGateway id="G1" name="Оплата?">
+      <incoming>F1</incoming><outgoing>F2</outgoing><outgoing>F3</outgoing>
+    </exclusiveGateway>
+    <sequenceFlow id="F2" sourceRef="G1" targetRef="E1"><conditionExpression>paid</conditionExpression></sequenceFlow>
+    <sequenceFlow id="F3" sourceRef="G1" targetRef="E2"/>
+    <endEvent id="E1" name="Оплачен"><incoming>F2</incoming></endEvent>
+    <endEvent id="E2" name="Отменён"><incoming>F3</incoming></endEvent>
+  </process>
+</definitions>"""
+        out, notes = validate_and_repair(xml)
+        assert _by_id(out, "G1").get("default") == "F3"
+        assert any("единственная без условия" in n for n in notes), notes
+
+    def test_two_unconditioned_branches_are_left_to_the_author(self):
+        """Какую из двух безусловных веток считать запасной — решает модель:
+        назначить default наугад значит нарисовать маршрут, которого не просили."""
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P1" name="P" isExecutable="true">
+    <startEvent id="S1" name="Старт"><outgoing>F1</outgoing></startEvent>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="G1"/>
+    <exclusiveGateway id="G1" name="Оплата?">
+      <incoming>F1</incoming><outgoing>F2</outgoing><outgoing>F3</outgoing>
+    </exclusiveGateway>
+    <sequenceFlow id="F2" sourceRef="G1" targetRef="E1"/>
+    <sequenceFlow id="F3" sourceRef="G1" targetRef="E2"/>
+    <endEvent id="E1" name="Оплачен"><incoming>F2</incoming></endEvent>
+    <endEvent id="E2" name="Отменён"><incoming>F3</incoming></endEvent>
+  </process>
+</definitions>"""
+        out, notes = validate_and_repair(xml)
+        assert _by_id(out, "G1").get("default") is None
+        assert not any("выходом по умолчанию" in n for n in notes), notes
 
     def test_references_rebuilt_from_actual_flows(self):
         xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
@@ -1899,13 +2106,18 @@ class TestMergeParticipants:
         out, report = apply_operations(MERGE_XML, [MERGE_OP])
         assert report["status"] == "success", report["skipped"]
         repaired, notes = validate_and_repair(out)
-        assert notes == []
+        # Фикстура намеренно «склейка ролей-пулов» sequence-потоком в стартовое
+        # событие другого пула: после слияния такой поток внутри процесса
+        # невалиден, и починка убирает его, а не оставляет битый XML.
+        assert all("недопустимый поток" in n for n in notes), notes
         inventory = build_inventory(repaired)
         assert [p["name"] for p in inventory["participants"]] == ["Склад"]
         assert {"W_pick", "S_take"} <= {e["id"] for e in inventory["elements"]}
         assert {f["id"] for f in inventory["flows"]} == {
-            "WF1", "WF2", "WF3", "XF", "SF1", "SF2"}
+            "WF1", "WF2", "WF3", "SF1", "SF2"}
         assert _dangling(repaired) == []
+        # Идемпотентность: убранное не плодится при повторном проходе.
+        assert validate_and_repair(repaired)[1] == []
 
     def test_lane_name_can_be_given(self):
         out, report = apply_operations(MERGE_XML, [
@@ -1939,7 +2151,14 @@ class TestMergeParticipants:
         assert report["status"] == "success", report["skipped"]
         assert _by_id(out, "W_extra") is not None
         assert _root(out).find(".//bpmn:participant[@id='Pool_wh']", NS) is None
-        assert validate_and_repair(out)[1] == []
+        # Единственная оставшаяся правка починки — исходный дефект фикстуры:
+        # межпуловой XF вёл в стартовое событие, и после слияния это поток
+        # внутри одного процесса в старт. Его аплайер убирает, схема после
+        # второго прохода целая.
+        notes = validate_and_repair(out)[1]
+        assert notes and all("недопустимый поток" in n for n in notes)
+        assert any("XF" in n for n in notes)
+        assert validate_and_repair(validate_and_repair(out)[0])[1] == []
 
     def test_unknown_pool_is_refused(self):
         _, report = apply_operations(MERGE_XML, [
@@ -2097,6 +2316,260 @@ class TestSerialization:
         out, report = apply_operations(single_pool_xml, [])
         assert report == {"status": "success", "applied": [], "skipped": []}
         assert build_inventory(out) == build_inventory(single_pool_xml)
+
+
+class TestFlowEndsAndAttachments:
+    """Концы потока и attachedToRef — то, чего не видел ни скоринг, ни оракул.
+
+    Фикстура намеренно легальная: правки аплайера не имеют права трогать
+    корректную схему, и первый тест это фиксирует.
+    """
+
+    XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_int">
+  <collaboration id="Collaboration_i">
+    <participant id="Pool_a" name="Склад" processRef="Process_a"/>
+    <participant id="Pool_b" name="Перевозчик" processRef="Process_b"/>
+    <messageFlow id="MF_hand" sourceRef="A_ship" targetRef="B_start"/>
+  </collaboration>
+  <process id="Process_a" name="Склад" isExecutable="true">
+    <laneSet id="LaneSet_a"><lane id="Lane_a" name="Кладовщик">
+      <flowNodeRef>A_ship</flowNodeRef></lane></laneSet>
+    <startEvent id="A_start" name="Заявка"><outgoing>AF1</outgoing></startEvent>
+    <sequenceFlow id="AF1" sourceRef="A_start" targetRef="A_ship"/>
+    <userTask id="A_ship" name="Передать груз">
+      <documentation>Передача под подпись</documentation>
+      <incoming>AF1</incoming><outgoing>AF2</outgoing></userTask>
+    <sequenceFlow id="AF2" sourceRef="A_ship" targetRef="A_end"/>
+    <boundaryEvent id="A_timer" name="Просрочка" attachedToRef="A_ship">
+      <timerEventDefinition><timeDuration>PT2H</timeDuration></timerEventDefinition>
+      <outgoing>AF3</outgoing></boundaryEvent>
+    <sequenceFlow id="AF3" sourceRef="A_timer" targetRef="A_escalate"/>
+    <userTask id="A_escalate" name="Эскалировать">
+      <incoming>AF3</incoming><outgoing>AF4</outgoing></userTask>
+    <sequenceFlow id="AF4" sourceRef="A_escalate" targetRef="A_sub"/>
+    <subProcess id="A_sub" name="Приёмка">
+      <incoming>AF4</incoming><outgoing>AF5</outgoing>
+      <startEvent id="AS_start" name="Вход"><outgoing>ASF1</outgoing></startEvent>
+      <sequenceFlow id="ASF1" sourceRef="AS_start" targetRef="AS_check"/>
+      <userTask id="AS_check" name="Проверить пломбы">
+        <incoming>ASF1</incoming><outgoing>ASF2</outgoing></userTask>
+      <sequenceFlow id="ASF2" sourceRef="AS_check" targetRef="AS_end"/>
+      <endEvent id="AS_end" name="Выход"><incoming>ASF2</incoming></endEvent>
+    </subProcess>
+    <sequenceFlow id="AF5" sourceRef="A_sub" targetRef="A_end"/>
+    <endEvent id="A_end" name="Готово"><incoming>AF5</incoming></endEvent>
+  </process>
+  <process id="Process_b" name="Перевозчик" isExecutable="true">
+    <startEvent id="B_start" name="Груз передан"><outgoing>BF1</outgoing></startEvent>
+    <sequenceFlow id="BF1" sourceRef="B_start" targetRef="B_take"/>
+    <userTask id="B_take" name="Принять в кузов">
+      <incoming>BF1</incoming><outgoing>BF2</outgoing></userTask>
+    <sequenceFlow id="BF2" sourceRef="B_take" targetRef="B_end"/>
+    <endEvent id="B_end" name="Доставка начата"><incoming>BF2</incoming></endEvent>
+  </process>
+</definitions>"""
+
+    # Межпуловая «линия маршрута» — болезнь раздутых ролей-пулов: лечится
+    # превращением в сообщение, а не удалением.
+    CROSS_FLOW_XML = XML.replace(
+        '<messageFlow id="MF_hand"',
+        '<sequenceFlow id="XF_cross" sourceRef="A_escalate" targetRef="B_take"/>\n'
+        '    <messageFlow id="MF_hand"')
+
+    # Тот же поток, но внутри одного процесса: в стартовое событие он не входит.
+    INTO_START_XML = XML.replace(
+        '<messageFlow id="MF_hand"',
+        '<sequenceFlow id="XF_bad" sourceRef="A_ship" targetRef="A_start"/>\n'
+        '    <messageFlow id="MF_hand"')
+
+    def test_legal_scheme_is_not_touched(self):
+        repaired, notes = validate_and_repair(self.XML)
+        assert notes == []
+        before = sorted(e.get("id") for e in _root(self.XML).iter() if e.get("id"))
+        after = sorted(e.get("id") for e in _root(repaired).iter() if e.get("id"))
+        assert before == after
+
+    def test_connect_into_start_and_boundary_is_refused(self):
+        for target, hint in (("A_start", "стартовое"), ("A_timer", "граничное")):
+            _, report = apply_operations(self.XML, [
+                {"op": "connect", "source": "A_escalate", "target": target}])
+            skip = report["skipped"][0]
+            assert skip["op"] == "connect"
+            assert target in skip["reason"]
+            assert hint in skip["hint"]
+
+    def test_connect_out_of_end_event_is_refused(self):
+        _, report = apply_operations(self.XML, [
+            {"op": "connect", "source": "A_end", "target": "A_escalate"}])
+        assert "исходящего потока не бывает" in report["skipped"][0]["reason"]
+
+    def test_message_flow_may_trigger_foreign_start(self):
+        """Сообщение в чужое стартовое событие — легальный запуск пула."""
+        _, report = apply_operations(self.XML, [
+            {"op": "connect", "source": "A_escalate", "target": "B_start",
+             "flow_type": "message"}])
+        assert report["status"] == "success", report["skipped"]
+
+    def test_insert_after_end_event_is_refused(self):
+        _, report = apply_operations(self.XML, [
+            {"op": "add_task", "id": "new_T", "name": "Шаг",
+             "participant": "Склад", "after": "A_end"}])
+        skip = report["skipped"][0]
+        assert "A_end" in skip["reason"] and "не будет" in skip["reason"]
+        assert "из конечного события" in skip["hint"]
+
+    def test_cross_pool_sequence_becomes_message_flow(self):
+        repaired, notes = validate_and_repair(self.CROSS_FLOW_XML)
+        assert any("стал потоком-сообщением" in n for n in notes), notes
+        root = _root(repaired)
+        moved = root.find(".//bpmn:collaboration/bpmn:messageFlow[@id='XF_cross']", NS)
+        assert moved is not None and moved.get("sourceRef") == "A_escalate"
+        # Идемпотентно: сообщение в чужой процесс больше не правится.
+        assert validate_and_repair(repaired)[1] == []
+
+    def test_sequence_into_start_inside_one_pool_is_dropped(self):
+        repaired, notes = validate_and_repair(self.INTO_START_XML)
+        assert any("недопустимый поток XF_bad" in n for n in notes), notes
+        assert _flow(_root(repaired), "XF_bad") is None
+        assert validate_and_repair(repaired)[1] == []
+
+    def test_delete_takes_attached_boundary_with_it(self):
+        out, report = apply_operations(self.XML, [{"op": "delete", "id": "A_ship"}])
+        assert report["status"] == "success", report["skipped"]
+        applied = report["applied"][0]
+        assert "A_timer" in applied["note"]
+        assert _by_id(out, "A_timer") is None
+        assert "attachedToRef" not in ET.tostring(_root(out), encoding="unicode")
+
+    def test_move_carries_boundary_into_target_pool(self):
+        out, report = apply_operations(self.XML, [
+            {"op": "move_to_participant", "id": "A_ship",
+             "participant": "Перевозчик"}])
+        assert report["status"] == "success", report["skipped"]
+        assert "граничные события перенесены" in report["applied"][0]["note"]
+        root = _root(out)
+        assert _process(root, "Process_b").find("bpmn:boundaryEvent", NS) is not None
+        assert _process(root, "Process_a").find("bpmn:boundaryEvent", NS) is None
+
+    def test_orphan_boundary_is_demoted_or_removed(self):
+        """Импортный XML с attachedToRef вникуда: с определением — промежуточное
+        событие, без определения — удаляется."""
+        with_def = self.XML.replace('<messageFlow id="MF_hand"',
+                                    '<boundaryEvent id="B_orphan" name="Сирота" '
+                                    'attachedToRef="нет_такого"><timerEventDefinition/>'
+                                    '</boundaryEvent>\n    <messageFlow id="MF_hand"')
+        repaired, notes = validate_and_repair(with_def)
+        assert any("осталось без хозяина — переведено" in n for n in notes), notes
+        assert _by_id(repaired, "B_orphan").tag == f"{{{BPMN_NS}}}intermediateCatchEvent"
+
+        no_def = self.XML.replace('<messageFlow id="MF_hand"',
+                                  '<boundaryEvent id="B_hollow" name="Пустышка" '
+                                  'attachedToRef="нет_такого"/>\n    '
+                                  '<messageFlow id="MF_hand"')
+        repaired, notes = validate_and_repair(no_def)
+        assert any("без определения — удалено" in n for n in notes), notes
+        assert _by_id(repaired, "B_hollow") is None
+
+    def test_duplicate_documentation_is_not_stacked(self):
+        out, report = apply_operations(self.XML, [
+            {"op": "add_documentation", "id": "A_ship",
+             "text": "Передача под подпись"}])
+        assert "такая документация у элемента уже есть" in report["applied"][0]["note"]
+        docs = _by_id(out, "A_ship").findall("bpmn:documentation", NS)
+        assert len(docs) == 1
+
+    def test_move_to_current_lane_reports_noop(self):
+        _, report = apply_operations(self.XML, [
+            {"op": "move_to_lane", "id": "A_ship", "lane": "Lane_a"}])
+        assert "уже стоит в этой дорожке" in report["applied"][0]["note"]
+
+    def test_second_boundary_of_same_kind_is_refused(self):
+        _, report = apply_operations(self.XML, [
+            {"op": "add_boundary_event", "id": "new_Be", "attached_to": "A_ship",
+             "event_type": "timer", "name": "Ещё один срок"}])
+        reason = report["skipped"][0]["reason"]
+        assert "уже прицеплено timer-событие" in reason and "A_timer" in reason
+
+        # Событие другого типа легально, но обязано получить ветку обработки:
+        # без неё пакет откатывает его как висячий (правило было и раньше).
+        boundary = [{"op": "add_boundary_event", "id": "new_Be",
+                     "attached_to": "A_ship", "event_type": "error",
+                     "name": "Отказ"}]
+        _, without_branch = apply_operations(self.XML, boundary)
+        assert without_branch["status"] == "failed"
+
+        out, other = apply_operations(self.XML, boundary + [
+            {"op": "add_task", "id": "new_Esc", "name": "Вернуть заявку",
+             "participant": "Склад"},
+            {"op": "connect", "source": "new_Be", "target": "new_Esc"},
+            {"op": "connect", "source": "new_Esc", "target": "A_end"}])
+        assert other["status"] == "success", other["skipped"]
+        assert _by_id(out, "new_Be").get("attachedToRef") == "A_ship"
+
+    def test_failed_merge_reports_rolled_back_operations(self):
+        """Откат пакета не должен стирать уже «применённые» правки из отчёта."""
+        _, report = apply_operations(MERGE_FLOATING_XML, [
+            {"op": "rename", "id": "W_pick", "name": "Собрать и упаковать"},
+            MERGE_OP])
+        assert report["status"] == "failed"
+        assert report["applied"] == []
+        rolled = [s for s in report["skipped"] if s["op"] == "rename"]
+        assert rolled and "откачено вместе с пакетом" in rolled[0]["reason"]
+
+    def test_inventory_shows_lane_attachment_definition_and_nesting(self):
+        inventory = build_inventory(self.XML)
+        by_id = {e["id"]: e for e in inventory["elements"]}
+        assert by_id["A_ship"]["lane"] == "Lane_a"
+        assert "documentation" in by_id["A_ship"]
+        assert by_id["A_timer"]["attached_to"] == "A_ship"
+        assert by_id["A_timer"]["definition"] == "timer"
+        assert by_id["A_timer"]["timer"] == "PT2H"
+        assert by_id["AS_check"]["subprocess"] == "A_sub"
+        assert "subprocess" not in by_id["A_ship"]
+
+    def test_inventory_is_capped_and_stays_referentially_whole(self):
+        inventory = build_inventory(_wide_xml(300))
+        assert len(inventory["elements"]) == INVENTORY_MAX_ELEMENTS
+        assert inventory["limits"]["elements_omitted"] > 0
+        known = {e["id"] for e in inventory["elements"]} | {
+            p["id"] for p in inventory["participants"]}
+        assert all(f["source"] in known and f["target"] in known
+                   for f in inventory["flows"])
+
+    def test_empty_pool_is_not_an_unrouted_node(self):
+        """Пустой пул нельзя «присоединить connect» — у него свой блок подсказок."""
+        assert "остался без шагов" in POOL_EMPTY_NOTE_MARKERS
+        assert "остался без шагов" not in UNROUTED_NOTE_MARKERS
+
+    def test_new_node_can_be_placed_in_a_lane(self):
+        out, report = apply_operations(self.XML, [
+            {"op": "add_lane", "id": "new_L", "name": "Водитель",
+             "participant": "Склад"},
+            {"op": "add_task", "id": "new_T", "name": "Загрузить паллету",
+             "participant": "Склад", "lane": "new_L", "after": "A_ship"}])
+        assert report["status"] == "success", report["skipped"]
+        assert "new_T" in _lane_refs(_by_id(out, "new_L"))
+
+    def test_unknown_and_foreign_pool_lanes_are_refused_before_creation(self):
+        _, missing = apply_operations(self.XML, [
+            {"op": "add_task", "id": "new_T", "name": "Шаг",
+             "participant": "Склад", "lane": "Нет_такой_дорожки"}])
+        assert "дорожка" in missing["skipped"][0]["reason"]
+
+        # Дорожка чужого пула: узел не должен остаться в процессе без дорожки
+        # только потому, что отказ случился после его создания.
+        foreign_out, foreign = apply_operations(self.XML, [
+            {"op": "add_task", "id": "new_T", "name": "Шаг",
+             "participant": "Перевозчик", "lane": "Lane_a"}])
+        assert "другому пулу" in foreign["skipped"][0]["reason"]
+        assert _by_id(foreign_out, "new_T") is None
+
+    def test_add_task_cannot_create_an_empty_subprocess(self):
+        assert "subProcess" not in OP_SPEC["add_task"]
+        _, report = apply_operations(self.XML, [
+            {"op": "add_task", "id": "new_S", "name": "Подпроцесс",
+             "participant": "Склад", "task_type": "subProcess"}])
+        assert "нечем наполнить" in report["skipped"][0]["hint"]
 
 
 if __name__ == "__main__":  # pragma: no cover

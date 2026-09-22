@@ -145,6 +145,15 @@ class _Schema:
             process_ref = participant.get("processRef") or ""
             if process_ref:
                 self.participants_by_process[process_ref].append(participant)
+        # Дорожки по процессам: «роль, раздутая в участника» ищется как имя
+        # участника, совпавшее с дорожкой ЧУЖОГО процесса.
+        self.lane_names_by_process: Dict[str, List[str]] = {}
+        for process in self.by_tag["process"]:
+            names = [name for lane_set in _children(process, "laneSet")
+                     for lane in _children(lane_set, "lane")
+                     if (name := (lane.get("name") or "").strip())]
+            if names:
+                self.lane_names_by_process[process.get("id") or ""] = names
 
     def out_targets(self, node_id: str) -> List[str]:
         return [f.target for f in self.outgoing.get(node_id, []) if f.target]
@@ -484,6 +493,32 @@ def _check_pool_lanes(s: _Schema) -> _Check:
     return _Check(PASSED)
 
 
+def _check_role_pools(s: _Schema) -> _Check:
+    """Пул, чьё имя — дорожка чужого процесса, — роль, раздутая в участника.
+
+    Генератор такие пулы сворачивает в дорожки (`_merge_role_pools`), а
+    импортированная или нарисованная руками схема, где «Кладовщик» стоит вторым
+    «участником» рядом с «ВкусВиллом», проходила скоринг как коллаборация двух
+    организаций. Признак структурный и описания читать не требует: имя
+    участника совпало с именем дорожки другого процесса."""
+    if len(s.participants) < 2:
+        return _Check(NOT_APPLICABLE, note="пулов меньше двух")
+    offenders = []
+    for participant in s.participants:
+        name = (participant.get("name") or "").strip().casefold()
+        own = participant.get("processRef") or ""
+        if not name:
+            continue
+        if any(pid != own and name in [lane.casefold() for lane in lanes]
+               for pid, lanes in s.lane_names_by_process.items()):
+            offenders.append(participant)
+    if offenders:
+        return _Check(FAILED, _ids(offenders),
+                      note=", ".join((p.get("name") or p.get("id") or "")
+                                     for p in offenders))
+    return _Check(PASSED)
+
+
 def _check_event_types(s: _Schema) -> _Check:
     """Тип события в BPMN 2.0 — дочерний элемент (*EventDefinition); атрибута
     eventDefinitionRef у catch/throw-событий нет, поэтому читаем детей
@@ -559,6 +594,7 @@ class BPMNScorer:
             'boundary_events': {'weight': 6, 'message': 'Граничное событие прикрепляйте к задаче и ведите из него ветку обработки'},
             'task_types': {'weight': 8, 'message': 'Схема должна содержать разнообразные типы задач'},
             'pool_lanes': {'weight': 8, 'message': 'В пуле должны быть дорожки с закреплёнными элементами'},
+            'role_pools': {'weight': 8, 'message': 'Роль или подразделение — дорожка внутри пула организации, а не отдельный участник: слейте такие пулы операцией merge_participants (source — роль, target — организация, as_lane: true)'},
             'event_types': {'weight': 8, 'message': 'Схема должна включать промежуточные события с типом (таймер, сообщение)'},
             'documentation': {'weight': 7, 'message': 'Элементы должны содержать документацию'},
         }
@@ -577,6 +613,7 @@ class BPMNScorer:
             'boundary_events': _check_boundary_events,
             'task_types': _check_task_types,
             'pool_lanes': _check_pool_lanes,
+            'role_pools': _check_role_pools,
             'event_types': _check_event_types,
             'documentation': _check_documentation,
         }

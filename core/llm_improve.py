@@ -26,9 +26,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from . import llm_client
 from .llm_client import LLMError, LLMRequestTooLargeError, LLMTruncatedError
 from . import bpmn_edits
-from .bpmn_scoring import has_unguarded_cycle
+from .bpmn_scoring import BPMNScorer, has_unguarded_cycle
 
 logger = logging.getLogger(__name__)
+
+# Скоринг без состояния: правила пересчитываются на каждую схему, экземпляр
+# держит только словарь правил.
+_scorer = BPMNScorer()
 
 DATASET_PATH = os.path.join(os.path.dirname(__file__), "bpmn_dataset")
 # Кэш индекса — рядом с кодом, а не относительно CWD: путь «уплывал» между
@@ -653,7 +657,7 @@ new_G1 две ветки, одна с условием, вторая помеч�
 _USER_TEMPLATE = """ИНВЕНТАРЬ СХЕМЫ:
 {inventory}
 
-{limits_block}{practices_block}ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:
+{limits_block}{findings_block}{practices_block}ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:
 {user_prompt}
 
 Напоминание: ответ — только JSON-объект с полями "analysis" и "operations"."""
@@ -739,6 +743,27 @@ def _limits_block(inventory: Dict[str, Any]) -> str:
             + ". Правки предлагай только по показанным id.\n\n")
 
 
+MAX_SCORING_FINDINGS = 8
+
+
+def _findings_block(bpmn_xml: str) -> str:
+    """УЗКИЕ МЕСТА ПО СКОРИНГУ: за что с этой схемы уже сняли баллы.
+
+    Скоринг и есть оценивающий шаг контура — детерминированный, второй вызов
+    модели ради него не нужен. Без него пакет уходил в документацию и новые
+    шаги, пока рядом висело правило на −8 за роль, раздутую в участника: модель
+    не знала, что именно считается дефектом.
+    """
+    recommendations = _scorer.evaluate(bpmn_xml)["recommendations"]
+    if not recommendations:
+        return ""
+    lines = "".join(f"— {r}\n" for r in recommendations[:MAX_SCORING_FINDINGS])
+    if len(recommendations) > MAX_SCORING_FINDINGS:
+        lines += f"— и ещё {len(recommendations) - MAX_SCORING_FINDINGS}\n"
+    return ("УЗКИЕ МЕСТА ПО СКОРИНГУ (поднять балл важнее, чем украшать):\n"
+            + lines + "\n")
+
+
 def _format_practices(schemas: List[Dict[str, Any]]) -> str:
     """Блок ЛУЧШИЕ ПРАКТИКИ: только то, чего нет в схеме пользователя.
 
@@ -804,6 +829,7 @@ class BPMNImprovementOrchestrator:
             user_content = _USER_TEMPLATE.format(
                 inventory=json.dumps(inventory, ensure_ascii=False, indent=1),
                 limits_block=_limits_block(inventory),
+                findings_block=_findings_block(xml_content),
                 practices_block=practices_block,
                 user_prompt=user_prompt,
             )

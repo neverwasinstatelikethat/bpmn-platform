@@ -255,8 +255,9 @@ class TestContract:
         assert "no_loops" not in scorer.rules
         assert "guarded_cycles" in scorer.rules
         # 112 — веса двенадцати правил до связности участников, ещё 34 дают
-        # четыре новых правила
-        assert sum(r["weight"] for r in scorer.rules.values()) == 146
+        # четыре новых правила и 8 — семнадцатое, «роль не бывает участником»
+        assert sum(r["weight"] for r in scorer.rules.values()) == 154
+        assert "role_pools" in scorer.rules
 
 
 class TestScoringDoesNotMutateSchema:
@@ -741,3 +742,66 @@ class TestCeiling:
         # Потолок задают дорожки и документация — их дописывает зона генерации.
         assert failed == {"pool_lanes", "documentation"}
         assert result["score"] >= 85
+
+
+class TestRolePools:
+    """Пул, названный чужой дорожкой, — роль, раздутая в участника.
+
+    Скоринг замечал пустые пулы, а «Кладовщик» с одним шагом оставался вторым
+    «участником» коллаборации: генератор такие пулы сворачивает в дорожки
+    (`_merge_role_pools`), а схема, импортированная или нарисованная руками,
+    проходила с тем же баллом. Признак структурный и без догадок о тексте:
+    имя участника совпало с именем дорожки чужого процесса."""
+
+    @staticmethod
+    def _doc(pool_name="Кладовщик", lane_owner="Proc_1"):
+        lanes = (f'<laneSet id="LS"><lane id="L1" name="Кладовщик">'
+                 f'<flowNodeRef>A2</flowNodeRef></lane></laneSet>')
+        head = ('<startEvent id="S1" name="Старт"/>' + _flow("f1", "S1", "A1")
+                + '<userTask id="A1" name="Собрать заявку"/>'
+                + _flow("f2", "A1", "E1") + '<endEvent id="E1" name="Финиш"/>')
+        body = ('<startEvent id="S2" name="Старт"/>' + _flow("f3", "S2", "A2")
+                + '<userTask id="A2" name="Принять товар"/>'
+                + _flow("f4", "A2", "E2") + '<endEvent id="E2" name="Финиш"/>')
+        first = (lanes + head) if lane_owner == "Proc_1" else head
+        second = (lanes + body) if lane_owner == "Proc_2" else body
+        return (f'<?xml version="1.0" encoding="UTF-8"?>\n{HEADER}'
+                '<collaboration id="C1">'
+                '<participant id="P1" name="ВкусВилл" processRef="Proc_1"/>'
+                f'<participant id="P2" name="{pool_name}" processRef="Proc_2"/>'
+                '<messageFlow id="MF1" sourceRef="A1" targetRef="A2"/>'
+                '</collaboration>'
+                f'<process id="Proc_1" name="ВкусВилл">{first}</process>'
+                f'<process id="Proc_2" name="{pool_name}">{second}</process>'
+                '</definitions>')
+
+    def test_pool_named_like_another_pools_lane_fails(self):
+        result = scorer.evaluate(self._doc())
+        assert status(result, "role_pools") == FAILED
+        assert elements(result, "role_pools") == ["P2"]
+        # рекомендация называет операцию, которой это чинится
+        assert any("merge_participants" in rec for rec in result["recommendations"])
+
+    def test_lane_of_its_own_pool_is_not_a_duplicate(self):
+        """Дорожка внутри своего пула — обычная раскладка по ролям, а не второй
+        участник: правило срабатывает только на совпадение с чужим процессом."""
+        assert status(scorer.evaluate(self._doc(lane_owner="Proc_2")),
+                      "role_pools") == PASSED
+
+    def test_distinct_participants_pass(self):
+        assert status(scorer.evaluate(self._doc(pool_name="Поставщик")),
+                      "role_pools") == PASSED
+
+    def test_scheme_without_collaboration_is_not_applicable(self):
+        assert status(scorer.evaluate(simple_xml()), "role_pools") == NOT_APPLICABLE
+
+    def test_real_live_scheme_reports_its_role_pools(self):
+        """Артефакт живого прогона: четыре роли стоят отдельными пулами рядом с
+        «ВкусВиллом» — именно их оракул харнесса звал «ролей больше, чем
+        оправдано текстом»."""
+        result = scorer.evaluate(WAREHOUSE.read_text(encoding="utf-8"))
+        assert elements(result, "role_pools") == [
+            "Participant_4", "Participant_5", "Participant_6", "Participant_8"]
+
+    def test_rule_cost_is_like_the_rest(self):
+        assert 6 <= scorer.rules["role_pools"]["weight"] <= 15

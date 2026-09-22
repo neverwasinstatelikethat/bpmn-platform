@@ -622,6 +622,43 @@ PROMPT_EXAMPLE_XML = (
     '</definitions>')
 
 
+ROLE_POOL_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"'
+    ' id="D_role_pool">'
+    '<collaboration id="Collaboration_rp">'
+    '<participant id="Pool_vv" name="ВкусВилл" processRef="Process_vv"/>'
+    '<participant id="Pool_ks" name="Кладовщик" processRef="Process_ks"/>'
+    '<messageFlow id="MF1" sourceRef="A1" targetRef="K1"/>'
+    '<messageFlow id="MF2" sourceRef="K1" targetRef="A2"/>'
+    '</collaboration>'
+    # «Кладовщик» — и участник, и дорожка чужого процесса: тот самый дефект,
+    # за который скоринг снимает баллы, а планировщик обязан его увидеть.
+    '<process id="Process_vv" name="ВкусВилл" isExecutable="true">'
+    '<laneSet id="LaneSet_vv"><lane id="Lane_1" name="Кладовщик">'
+    '<flowNodeRef>A2</flowNodeRef></lane></laneSet>'
+    '<startEvent id="S1" name="Заявка"><outgoing>F1</outgoing></startEvent>'
+    '<sequenceFlow id="F1" sourceRef="S1" targetRef="A1"/>'
+    '<userTask id="A1" name="Собрать заявку">'
+    '<incoming>F1</incoming><outgoing>F2</outgoing></userTask>'
+    '<sequenceFlow id="F2" sourceRef="A1" targetRef="A2"/>'
+    '<userTask id="A2" name="Принять товар">'
+    '<incoming>F2</incoming><outgoing>F3</outgoing></userTask>'
+    '<sequenceFlow id="F3" sourceRef="A2" targetRef="E1"/>'
+    '<endEvent id="E1" name="Товар принят"><incoming>F3</incoming></endEvent>'
+    '</process>'
+    '<process id="Process_ks" name="Кладовщик" isExecutable="true">'
+    '<startEvent id="KS1" name="Смена началась"><outgoing>KF1</outgoing>'
+    '</startEvent>'
+    '<sequenceFlow id="KF1" sourceRef="KS1" targetRef="K1"/>'
+    '<userTask id="K1" name="Оприходовать накладную">'
+    '<incoming>KF1</incoming><outgoing>KF2</outgoing></userTask>'
+    '<sequenceFlow id="KF2" sourceRef="K1" targetRef="KE1"/>'
+    '<endEvent id="KE1" name="Смена закрыта"><incoming>KF2</incoming></endEvent>'
+    '</process>'
+    '</definitions>')
+
+
 def _prompt_example_plan():
     """Достаёт JSON-пример из системного промпта планировщика."""
     text = llm_improve._SYSTEM_PROMPT
@@ -706,3 +743,30 @@ class TestPromptContract:
         _improve(orchestrator, single_pool_xml)
         assert "Часть схемы не показана" in fake.prompts[0]
         assert "elements_omitted" in fake.prompts[0]
+
+    def test_scoring_findings_reach_the_planner_and_stop_at_the_retry(
+            self, orchestrator, monkeypatch):
+        """Скоринг и есть оценивающий шаг контура: план обязан видеть, за что у
+        схемы сняли баллы (иначе пакет уходит в документацию рядом с правилом на
+        −8), а повтор добивает пропуски и новых сюжетов не ищет."""
+        plan = _wrap(json.dumps({"analysis": "разбор", "operations": [
+            {"op": "add_participant", "id": "new_P", "name": "Архив"}]},
+            ensure_ascii=False))
+        fake = FakeLLM(monkeypatch, plan,
+                       _wrap('{"analysis": "добил", "operations": []}'))
+        _improve(orchestrator, ROLE_POOL_XML)
+        assert "УЗКИЕ МЕСТА ПО СКОРИНГУ" in fake.prompts[0]
+        assert "merge_participants" in fake.prompts[0]
+        assert "УЗКИЕ МЕСТА ПО СКОРИНГУ" not in fake.prompts[1]
+
+    def test_scheme_without_findings_gets_no_block(self, orchestrator, monkeypatch,
+                                                   single_pool_xml):
+        class _NoFindings:
+            @staticmethod
+            def evaluate(_xml):
+                return {"recommendations": []}
+
+        monkeypatch.setattr(llm_improve, "_scorer", _NoFindings())
+        fake = FakeLLM(monkeypatch, '{"analysis": "ок", "operations": []}')
+        _improve(orchestrator, single_pool_xml)
+        assert "УЗКИЕ МЕСТА ПО СКОРИНГУ" not in fake.prompts[0]

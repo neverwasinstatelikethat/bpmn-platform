@@ -540,6 +540,25 @@ class _Index:
         return None, None, name
 
 
+    def lane_home(self, key: Any) -> Tuple[Optional[ET.Element],
+                                           Optional[ET.Element]]:
+        """Роль по имени дорожки: (процесс, дорожка), если такая дорожка одна.
+
+        Модель называет участником то, что на схеме уже дорожка организации
+        («руководитель смены»), а пула с таким именем нет. Отказывать такому
+        «пулу» — значит терять весь шаг: он не создавался, и ведущий к нему
+        поток откатывался вместе с веткой. Как и с пулами, спорить нельзя:
+        две одноимённые дорожки — не угадываем.
+        """
+        wanted = str(key or "").strip().casefold()
+        if not wanted:
+            return None, None
+        hits = [(self.enclosing_process(lane), lane) for lane in self.lanes
+                if str(lane.get("name") or "").strip().casefold() == wanted]
+        hits = [hit for hit in hits if hit[0] is not None]
+        return hits[0] if len(hits) == 1 else (None, None)
+
+
 def _subprocess_of(index: _Index, elem: ET.Element) -> str:
     """Ид ближайшего subProcess-контейнера (пусто — узел верхнего уровня).
 
@@ -1053,10 +1072,21 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     if not name:
         raise _Skip("не задано имя элемента", "укажите name")
     process = index.resolve_process(op.get("participant"))
-    if process is None:
-        raise _pool_skip(index, op.get("participant"))
     lane_key = str(op.get("lane") or "").strip()
     lane = None
+    lane_alias_note = ""
+    alias = (op.get("participant") or "").strip() if isinstance(
+        op.get("participant"), str) else ""
+    if process is None and alias and not lane_key:
+        # «Участник» может быть ролью, которая на схеме уже дорожка: читаем
+        # это по имени дорожки, а не по догадке о структуре.
+        process, lane = index.lane_home(alias)
+        if process is not None:
+            lane_alias_note = (f"«{alias}» — дорожка пула "
+                               f"«{index.participant_name(process)}»: шаг "
+                               "ляжет в неё")
+    if process is None:
+        raise _pool_skip(index, op.get("participant"))
     if lane_key:
         # Дорожку валидируем до создания узла: отказ в середине оставил бы
         # элемент в процессе без дорожки, а в отчёте — частичную правку.
@@ -1133,7 +1163,7 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     after_id = op.get("after")
     outlet_id = _check_outlet(op, index, process, tag,
                               str(after_id or "").strip())
-    notes: List[str] = [alias_note] if alias_note else []
+    notes: List[str] = [x for x in (alias_note, lane_alias_note) if x]
     if tag in ("startEvent", "endEvent"):
         # Событие без рёбер — висячий узел, который скоринг считает дефектом
         # связей, поэтому пробуем сразу привязать его к потоку. Явный `to`

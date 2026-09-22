@@ -2635,3 +2635,55 @@ class TestPoolNamesAndRouteIntegrity:
                  build_inventory(out)["flows"] if f["kind"] == "sequence"}
         assert flows["A_ship"] == "A_end"
         assert flows["A_escalate"] == "A_sub"
+
+
+class TestRoleLaneIsAnAddress:
+    """«Участник» в операции модели может быть ролью, которая на схеме уже
+    дорожка.
+
+    Живые прогоны улучшения: `add_task` с participant «руководитель смены»
+    отвергался как «пул не определён», шаг не создавался, а за ним откачивалась
+    и ветка граничного события, который на этот шаг вёл. Имя дорожки — не
+    догадка о структуре: это то, чем схему уже нарисовали.
+    """
+
+    ROLE_LANE_XML = MERGE_XML.replace('<lane id="Lane_wh" name="Кладовщик">',
+                                      '<lane id="Lane_wh" name="Менеджер смены">')
+
+    def test_task_with_a_lane_name_lands_in_that_lane(self):
+        out, report = apply_operations(self.ROLE_LANE_XML, [
+            {"op": "add_task", "id": "new_A", "name": "Оформить путевой лист",
+             "task_type": "userTask", "participant": "Менеджер смены",
+             "after": "W_pick", "to": "W_ship"}])
+        assert report["status"] == "success", report["skipped"]
+        refs = [r.text for r in _by_id(out, "Lane_wh").findall(
+            "bpmn:flowNodeRef", NS)]
+        assert "new_A" in refs
+        # маршрут цел: new_A встал между W_pick и W_ship
+        flows = {(f["source"], f["target"]) for f in
+                 build_inventory(out)["flows"] if f["kind"] == "sequence"}
+        assert ("W_pick", "new_A") in flows and ("new_A", "W_ship") in flows
+
+    def test_ambiguous_lane_name_is_still_refused(self):
+        """Две одноимённые дорожки в разных пулах — выбирать не из чего:
+        аплайер обязан отказать, а не угадать организацию."""
+        xml = self.ROLE_LANE_XML.replace(
+            '<process id="Process_shop" name="Склад" isExecutable="true">',
+            '<process id="Process_shop" name="Склад" isExecutable="true">'
+            '<laneSet id="LaneSet_shop"><lane id="Lane_shop" '
+            'name="Менеджер смены"/></laneSet>')
+        out, report = apply_operations(xml, [
+            {"op": "add_task", "id": "new_A", "name": "Оформить путевой лист",
+             "task_type": "userTask", "participant": "Менеджер смены"}])
+        assert any(s["reason"] == "пул не определён" for s in report["skipped"])
+        assert _by_id(out, "new_A") is None
+
+    def test_explicit_lane_still_wins_over_the_name_lookup(self):
+        """Если модель указала и дорожку, и несуществующий пул — чинить за неё
+        адрес не будем: отказ честнее молчаливой подмены."""
+        out, report = apply_operations(self.ROLE_LANE_XML, [
+            {"op": "add_task", "id": "new_A", "name": "Оформить путевой лист",
+             "task_type": "userTask", "participant": "Никто",
+             "lane": "Lane_wh"}])
+        assert any(s["reason"] == "пул не определён" for s in report["skipped"])
+        assert _by_id(out, "new_A") is None

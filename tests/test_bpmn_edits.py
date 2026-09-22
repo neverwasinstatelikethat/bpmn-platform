@@ -2610,6 +2610,20 @@ class TestPoolNamesAndRouteIntegrity:
         assert skip["reason"] == "пул не определён"
         assert "Цех фасовки" in skip["hint"] and "Цех отгрузки" in skip["hint"]
 
+    def test_unknown_pool_hint_names_pools_and_the_way_to_create_one(self):
+        """Живой случай повтора: `add_task` в «руководитель смены», которого на
+        схеме нет. Подсказка «укажите пул из инвентаря» не называла ни самих
+        пулов, ни того, что участника можно завести, — и повтор возвращал ровно
+        ту же операцию (improve/retry_needed 1.0 при нулевом выигрыше).
+        """
+        _, report = apply_operations(self.XML, [
+            {"op": "add_task", "id": "new_X1", "name": "Эскалация руководителю",
+             "task_type": "userTask", "participant": "руководитель смены",
+             "after": "A_escalate"}])
+        hint = report["skipped"][0]["hint"]
+        assert "Склад" in hint and "Перевозчик" in hint
+        assert "add_lane" in hint and "add_participant" in hint
+
     def test_handler_in_another_pool_leaves_no_broken_branch(self):
         """Живой случай: таймер на задаче склада, шаг-эскалация в пуле
         «Сервис-деск», `connect` между ними. Проверка межпуловости сравнивала

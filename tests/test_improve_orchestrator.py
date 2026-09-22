@@ -10,11 +10,11 @@ import json
 
 import pytest
 
-from core import llm_client
-from core import llm_improve
+from core import bpmn_edits, llm_client, llm_improve
 from core.llm_improve import (
     BPMNImprovementOrchestrator,
     ImprovementError,
+    ImprovementUnavailable,
 )
 
 
@@ -240,6 +240,9 @@ class TestPlanReporting:
         assert [s["op"] for s in planned_skips] == ["rename"]
         assert planned_skips[0]["reapplied"] is False
         assert [s["stage"] for s in report["skipped"] if s["op"] == "rename"] == ["plan", "retry"]
+        # Другой элемент с той же формулировкой отказа — второй дефект, он
+        # не схлопывается с первым.
+        assert report["repeat_rejections"] == 0
         assert report["status"] == "partial"
         assert "Не применено" in recommendations
         assert "план: rename" in recommendations
@@ -254,11 +257,65 @@ class TestPlanReporting:
         _improve(orchestrator, single_pool_xml)
 
         assert len(fake.prompts) == 2
-        assert "проверять оплату до отгрузки" in fake.prompts[1]
         temps = [call["temperature"] for call in fake.params]
         assert temps[0] == temps[1] == llm_improve.PLANNING_TEMPERATURE
-        # Практики ищутся один раз на сценарий, повтор переиспользует блок.
+        # Практики ищутся один раз на сценарий — повтор не имеет права дёргать
+        # корпус эмбеддингов ради того же текста.
         assert len(kb.queries) == 1
+        # Но в сам повтор блок практик не уходит: задача повтора — добить
+        # пропуски и узлы вне маршрута, а практики подталкивали модель
+        # предлагать новые улучшения вместо починки.
+        assert "проверять оплату до отгрузки" in fake.prompts[0]
+        assert "ЛУЧШИЕ ПРАКТИКИ" not in fake.prompts[1]
+        assert "НЕПРИМЕНЁННЫЕ ОПЕРАЦИИ" in fake.prompts[1]
+        # В повтор уходит не только причина, но и подсказка аплайера: без неё
+        # модель переводит пакет дословно (так и было в живом прогоне — те же
+        # id, те же тупики, второй вызов впустую).
+        assert '"hint"' in fake.prompts[1]
+
+    def test_retry_is_told_what_the_package_already_did(self, orchestrator,
+                                                       monkeypatch,
+                                                       single_pool_xml):
+        """Живой прогон: повтор предлагал прицепить ещё один таймер к шагу,
+        где таймер уже стоял, и ловил отказ «id занят» — дубль вместо пропуска."""
+        first = '{"analysis": "план", "operations": [' \
+                '{"op": "rename", "id": "T_ship", "name": "Отгрузить"},' \
+                '{"op": "rename", "id": "nope", "name": "Призрак"}]}'
+        second = '{"analysis": "повтор", "operations": []}'
+        fake = FakeLLM(monkeypatch, first, second)
+        _improve(orchestrator, single_pool_xml)
+
+        assert len(fake.prompts) == 2
+        assert "УЖЕ ПРИМЕНЕНО" in fake.prompts[1]
+        assert "rename T_ship" in fake.prompts[1]
+
+
+    def test_repeat_of_a_rejected_operation_is_shown_once(self, orchestrator,
+                                                         monkeypatch,
+                                                         single_pool_xml):
+        """Повтор, вернувший отказ дословно, не удваивает отчёт: в живых
+        прогонах второй раунд повторял первый целиком, и пользователь видел
+        восемь строк вместо четырёх дефектов."""
+        dangling = '{"op": "add_task", "id": "new_X", "name": "Висячий",' \
+                   ' "task_type": "userTask"}'
+        first = '{"analysis": "план", "operations": [' \
+                '{"op": "rename", "id": "T_ship", "name": "Отгрузить паллеты"}, ' \
+                + dangling + ']}'
+        second = '{"analysis": "повтор", "operations": [' + dangling + ']}'
+        fake = FakeLLM(monkeypatch, _wrap(first), _wrap(second))
+        recommendations, _, report = _improve(orchestrator, single_pool_xml)
+
+        assert len(fake.calls) == 2
+        assert report["repeat_rejections"] == 1
+        # В отчёте запись раунда остаётся: по ней харнесс видит, что
+        # корректирующий вызов был и ничего не добил.
+        assert [s["stage"] for s in report["skipped"]] == ["plan", "retry"]
+        assert report["skipped"][1]["duplicate"] is True
+        # Пользователю — один раз.
+        assert "Не применено" in recommendations
+        assert recommendations.count("add_task") == 1
+        assert "повтор: add_task" not in recommendations
+        assert "без изменений" in recommendations
 
 
 class TestWarmup:
@@ -530,3 +587,122 @@ def test_reapplied_in_the_retry_is_not_reported_as_missed(orchestrator, monkeypa
     assert "Не применено" not in analysis
     assert "Повтор добил 1 правку" in analysis
     assert "Проверить склад" in xml_after
+
+
+# --- промпт как обязательство перед аплайером -------------------------------
+
+PROMPT_EXAMPLE_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"'
+    ' id="D_prompt_example">'
+    '<collaboration id="Collaboration_pe">'
+    '<participant id="Pool_wh" name="Цех фасовки" processRef="Process_wh"/>'
+    '<participant id="Pool_courier" name="Транспортный отдел"'
+    ' processRef="Process_courier"/>'
+    '</collaboration>'
+    '<process id="Process_wh" name="Цех фасовки" isExecutable="true">'
+    '<laneSet id="LaneSet_wh"><lane id="Lane_1" name="Техник цеха">'
+    '<flowNodeRef>A2</flowNodeRef><flowNodeRef>A3</flowNodeRef></lane></laneSet>'
+    '<startEvent id="A_start" name="Наряд"><outgoing>AF0</outgoing></startEvent>'
+    '<sequenceFlow id="AF0" sourceRef="A_start" targetRef="A2"/>'
+    '<userTask id="A2" name="Заменить деталь">'
+    '<incoming>AF0</incoming><outgoing>F2</outgoing></userTask>'
+    '<sequenceFlow id="F2" sourceRef="A2" targetRef="A3"/>'
+    '<userTask id="A3" name="Запустить линию">'
+    '<incoming>F2</incoming><outgoing>AF9</outgoing></userTask>'
+    '<sequenceFlow id="AF9" sourceRef="A3" targetRef="A_end"/>'
+    '<endEvent id="A_end" name="Линия в работе"><incoming>AF9</incoming>'
+    '</endEvent>'
+    '</process>'
+    '<process id="Process_courier" name="Транспортный отдел" isExecutable="true">'
+    '<startEvent id="C_start" name="Вызов"><outgoing>CF1</outgoing></startEvent>'
+    '<sequenceFlow id="CF1" sourceRef="C_start" targetRef="C_end"/>'
+    '<endEvent id="C_end" name="Закрыт"><incoming>CF1</incoming></endEvent>'
+    '</process>'
+    '</definitions>')
+
+
+def _prompt_example_plan():
+    """Достаёт JSON-пример из системного промпта планировщика."""
+    text = llm_improve._SYSTEM_PROMPT
+    start = text.index('{"analysis"', text.index("ПРИМЕР ОТВЕТА"))
+    plan, _ = json.JSONDecoder().raw_decode(text, start)
+    return plan
+
+
+class TestPromptContract:
+    def test_forbidden_operation_names_are_really_absent(self):
+        """Промпт запрещает имена, которых в словаре нет (`add_flow`,
+        `add_userTask` — модель их выдумывала в живых прогонах). Если такое имя
+        когда-нибудь станет операцией, запрет в промпте надо снять, а не оставить
+        враньё."""
+        for name in ("add_flow", "remove_flow", "add_userTask"):
+            assert name not in bpmn_edits.OP_SPEC
+            assert name in llm_improve._SYSTEM_PROMPT
+        assert "ДОПУСТИМЫЕ ОПЕРАЦИИ" in llm_improve._SYSTEM_PROMPT
+
+    def test_example_plan_applies_without_a_single_refusal(self):
+        """Модель учится на примере из промпта: если хоть одна его правка
+        отвергается аплайером, пример учит недостижимому."""
+        plan = _prompt_example_plan()
+        out, report = bpmn_edits.apply_operations(PROMPT_EXAMPLE_XML,
+                                                  plan["operations"])
+        assert report["skipped"] == []
+        assert report["status"] == "success"
+        assert bpmn_edits.validate_and_repair(out)[1] == []
+        assert plan["analysis"]
+
+    def test_example_uses_only_documented_operations_and_fields(self):
+        for op in _prompt_example_plan()["operations"]:
+            assert op["op"] in bpmn_edits.OP_SPEC
+            spec = bpmn_edits.OP_SPEC[op["op"]]
+            for key in op:
+                assert key in spec, f"{op['op']}: поле {key} есть в примере, " \
+                                    f"но не описано в OP_SPEC"
+
+    def test_retry_prompt_drops_practices_and_routes_pool_notes(
+            self, orchestrator, monkeypatch, single_pool_xml):
+        """Повтор чинит пропуски, а не ищет новые улучшения; пустой пул — это
+        не «узел вне маршрута», и совет у него свой."""
+        plan = _wrap(json.dumps({
+            "analysis": "заводим участник",
+            "operations": [{"op": "add_participant", "id": "new_P",
+                            "name": "Архив"}]}, ensure_ascii=False))
+        fake = FakeLLM(monkeypatch, plan,
+                       _wrap('{"analysis": "добил", "operations": []}'))
+        recommendations, _, _ = _improve(orchestrator, single_pool_xml)
+
+        assert len(fake.calls) == 2
+        assert "ЛУЧШИЕ ПРАКТИКИ" in fake.prompts[0]
+        assert "ЛУЧШИЕ ПРАКТИКИ" not in fake.prompts[1]
+        assert "ПУЛЫ БЕЗ ШАГОВ" in fake.prompts[1]
+        assert "УЗЛЫ ВНЕ МАРШРУТА" not in fake.prompts[1]
+        assert "Остались пулы без единого шага" in recommendations
+
+    def test_request_too_large_is_not_reported_as_unavailable(
+            self, orchestrator, monkeypatch, single_pool_xml):
+        FakeLLM(monkeypatch, llm_client.LLMRequestTooLargeError("не влезло"))
+        with pytest.raises(ImprovementError) as exc:
+            _improve(orchestrator, single_pool_xml)
+        assert not isinstance(exc.value, ImprovementUnavailable)
+        assert "слишком велика" in str(exc.value)
+
+    def test_operations_not_a_list_is_told_to_the_user(
+            self, orchestrator, monkeypatch, single_pool_xml):
+        plan = _wrap(json.dumps({"analysis": "разбор",
+                                 "operations": {"op": "rename"}},
+                                ensure_ascii=False))
+        FakeLLM(monkeypatch, plan)
+        recommendations, improved_xml, report = _improve(orchestrator,
+                                                         single_pool_xml)
+        assert improved_xml is None
+        assert report["status"] == "analysis_only"
+        assert "не списком" in recommendations
+
+    def test_truncated_inventory_is_announced_in_the_prompt(
+            self, orchestrator, monkeypatch, single_pool_xml):
+        monkeypatch.setattr(bpmn_edits, "INVENTORY_MAX_ELEMENTS", 1)
+        fake = FakeLLM(monkeypatch, '{"analysis": "ок", "operations": []}')
+        _improve(orchestrator, single_pool_xml)
+        assert "Часть схемы не показана" in fake.prompts[0]
+        assert "elements_omitted" in fake.prompts[0]

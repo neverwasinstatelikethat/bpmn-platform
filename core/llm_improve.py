@@ -24,7 +24,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from . import llm_client
-from .llm_client import LLMError, LLMTruncatedError
+from .llm_client import LLMError, LLMRequestTooLargeError, LLMTruncatedError
 from . import bpmn_edits
 from .bpmn_scoring import has_unguarded_cycle
 
@@ -600,32 +600,71 @@ _SYSTEM_PROMPT = """Ты — эксперт по BPMN 2.0 и бизнес-ана
    её помечай `"default": true` в `connect`, а уже существующий поток помечай
    `set_default`. Необусловленную ветку без default аплайер отвергает: скоринг
    считает такую ветку ошибкой.
-7. Новый шаг обязан встать в маршрут с двух сторон: вход (через `after` либо
-   `connect` от предыдущего шага) и выход (`connect` к следующему шагу или к
-   конечному событию его пула). Шаг, связанный только с одной стороны, — это
-   тупик или недостижимый узел, из-за него качество схемы падает ниже
-   исходного, и аплайер такой шаг откатывает целиком.
+7. Новый шаг обязан встать в маршрут с двух сторон, и для этого у одной
+   операции есть оба конца: `after` ставит шаг в поток (вход), `to` ведёт его
+   дальше (исход). Отдельный `connect` нужен только там, где из узла реально
+   раздваивается маршрут или где цель шага нельзя выразить одним `to`. Шаг,
+   связанный только с одной стороны, — тупик или недостижимый узел: качество
+   схемы падает ниже исходного, и аплайер откатывает такую правку целиком.
+   Граничное событие живёт только вместе с веткой обработки: `to` шага-эскалации
+   задаётся самой операцией `add_boundary_event`, а у шага эскалации при этом
+   обязан быть свой выход (`to` или `after` на существующий шаг).
 8. Если задача пользователя — только анализ (например, «найди узкие места»,
    «проверь ошибки»), верни пустой массив "operations".
 9. Сохраняй бизнес-логику: предлагай минимально необходимые изменения.
-10. Все тексты — на языке запроса пользователя."""
+10. Все тексты — на языке запроса пользователя.
+11. Не больше """ + str(MAX_OPERATIONS) + """ операций в ответе: лишние отрезаются,
+   и план становится неполным.
+12. Название `op` берётся только из ДОПУСТИМЫХ ОПЕРАЦИЙ: `add_flow`,
+   `remove_flow` или имени вида `add_userTask` там нет — поток создаёт
+   операция `connect` (поля `source` и `target`), а вид задачи — это поле
+   `task_type` операции `add_task`. Выдуманное `op` отклоняется, и правка
+   просто не попадает в схему.
+
+ПРИМЕР ОТВЕТА (показывает порядок правок; id и имена бери из своего ИНВЕНТАРЯ).
+ИНВЕНТАРЬ (фрагмент): пулы «Цех фасовки» и «Транспортный отдел» (у \
+«Транспортного отдела» только старт и финиш); в «Цехе фасовки» дорожка Lane_1, \
+задачи A2 «Заменить деталь» и A3 «Запустить линию» в ней, поток F2 A2 → A3 без \
+условия.
+ЗАДАЧА: «заведи отсчёт длительности замены, вилку по ремфонду закрой парой \
+шлюзов, лишний пустой пул убери».
+
+{"analysis": "На замене узла нет отсчёта длительности, ветка по ремфонду не оформлена шлюзом, пул «Транспортный отдел» пустой. Добавляю граничный таймер с веткой доклада, пару шлюзов расщепления и схождения, убираю пустой пул.", "operations": [
+ {"op": "add_task", "id": "new_A9", "name": "Доложить мастеру участка", "task_type": "userTask", "participant": "Цех фасовки", "lane": "Lane_1", "to": "A_end"},
+ {"op": "add_boundary_event", "id": "new_T1", "attached_to": "A2", "event_type": "timer", "name": "Замена дольше 6 часов", "duration": "PT6H", "to": "new_A9"},
+ {"op": "add_gateway", "id": "new_G1", "name": "Деталь в ремфонде?", "gateway_type": "exclusive", "participant": "Цех фасовки", "after": "A2"},
+ {"op": "disconnect", "flow": "F2"},
+ {"op": "add_task", "id": "new_A10", "name": "Внести узел в план заказа", "task_type": "userTask", "participant": "Цех фасовки", "lane": "Lane_1"},
+ {"op": "add_gateway", "id": "new_G2", "name": "Схождение веток", "gateway_type": "exclusive", "participant": "Цех фасовки"},
+ {"op": "connect", "source": "new_G1", "target": "new_A10", "condition": "Детали нет"},
+ {"op": "connect", "source": "new_G1", "target": "new_G2", "default": true},
+ {"op": "connect", "source": "new_A10", "target": "new_G2"},
+ {"op": "connect", "source": "new_G2", "target": "A3"},
+ {"op": "add_documentation", "id": "new_G1", "text": "Ветка «детали нет» переносит узел в план заказа"},
+ {"op": "remove_participant", "participant": "Транспортный отдел"}]}
+
+Что в этом примере существенного: `after` переставляет поток A2 → A3 на новый
+шлюз, и тот сохраняет id F2 — поэтому «disconnect» именно F2; у расходящегося
+new_G1 две ветки, одна с условием, вторая помечена `default`; new_G2 — пара к
+нему, у сходящегося шлюза условий нет и исходящий поток один; каждый новый шаг
+объявляется с обеими сторонами маршрута (`after` + `to` или `to` у граничного
+события), поэтому лишних `connect` в пакете нет и ничего не откатится."""
 
 _USER_TEMPLATE = """ИНВЕНТАРЬ СХЕМЫ:
 {inventory}
 
-{practices_block}ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:
+{limits_block}{practices_block}ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:
 {user_prompt}
 
 Напоминание: ответ — только JSON-объект с полями "analysis" и "operations"."""
 
-_RETRY_TEMPLATE = """{practices_block}Улучшение применено не полностью.
+_RETRY_TEMPLATE = """Улучшение применено не полностью.
 
 ИНВЕНТАРЬ СХЕМЫ ПОСЛЕ ЧАСТИЧНОГО ПРИМЕНЕНИЯ:
 {inventory}
 
 НЕПРИМЕНЁННЫЕ ОПЕРАЦИИ И ПРИЧИНЫ:
-{skipped}
-{routing}
+{skipped}{applied}{routing}{pools}{limits_block}
 ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:
 {user_prompt}
 
@@ -641,6 +680,13 @@ def _unrouted(notes: List[str]) -> List[str]:
             if any(m in n for m in bpmn_edits.UNROUTED_NOTE_MARKERS)]
 
 
+def _empty_pools(notes: List[str]) -> List[str]:
+    """Пометки о пулах без единого шага: connect их не лечит, нужна другая
+    правка — поэтому они идут отдельным блоком, а не в «узлы вне маршрута»."""
+    return [n for n in notes
+            if any(m in n for m in bpmn_edits.POOL_EMPTY_NOTE_MARKERS)]
+
+
 def _op_key(entry: Dict[str, Any]) -> Tuple[str, str]:
     """Пара «операция — элемент»: по ней повтор узнаёт правку, которую модель
     провела во втором раунде в исправленном виде."""
@@ -654,6 +700,43 @@ def _routing_block(unrouted: List[str]) -> str:
     return ("\nУЗЛЫ ВНЕ МАРШРУТА — присоедини их операциями connect "
             "(или add_task с after), иначе схема станет хуже исходной:\n"
             + "\n".join(f"- {n}" for n in unrouted[:10]) + "\n")
+
+
+def _pools_block(pools: List[str]) -> str:
+    if not pools:
+        return ""
+    return ("\nПУЛЫ БЕЗ ШАГОВ — присоединить connect их нельзя: встрой шаги "
+            "операциями add_task/add_event в этот пул, слей merge_participants "
+            "или удали remove_participant:\n"
+            + "\n".join(f"- {p}" for p in pools[:5]) + "\n")
+
+
+def _applied_block(applied: List[Dict[str, Any]]) -> str:
+    """Что пакет уже провёл. Без этого модель в корректирующем раунде второй
+    раз предлагала ту же правку под новым id и ловила отказ «такое событие уже
+    прицеплено» — повтор тратился на дубль, а не на пропуск."""
+    if not applied:
+        return ""
+    lines = []
+    for entry in applied[:12]:
+        ident = (entry.get("id") or entry.get("source") or entry.get("flow")
+                 or entry.get("lane") or "")
+        note = (entry.get("note") or "").split(":")[0]
+        lines.append(f"- {entry.get('op')} {ident}".rstrip()
+                     + (f" — {note}" if note else ""))
+    return ("\nУЖЕ ПРИМЕНЕНО В ЭТОМ ПАКЕТЕ — эти правки повторять не нужно:\n"
+            + "\n".join(lines) + "\n")
+
+
+def _limits_block(inventory: Dict[str, Any]) -> str:
+    """Инвентарь срезан по потоку — модель обязана знать, что часть схемы ей
+    не показана, и не предлагать правки «по несуществующим» id."""
+    limits = inventory.get("limits") or {}
+    if not limits:
+        return ""
+    return ("Часть схемы не показана из-за размера: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(limits.items()))
+            + ". Правки предлагай только по показанным id.\n\n")
 
 
 def _format_practices(schemas: List[Dict[str, Any]]) -> str:
@@ -720,6 +803,7 @@ class BPMNImprovementOrchestrator:
         def _plan_step() -> Dict[str, Any]:
             user_content = _USER_TEMPLATE.format(
                 inventory=json.dumps(inventory, ensure_ascii=False, indent=1),
+                limits_block=_limits_block(inventory),
                 practices_block=practices_block,
                 user_prompt=user_prompt,
             )
@@ -734,6 +818,14 @@ class BPMNImprovementOrchestrator:
                 "План изменений обрезан по лимиту токенов и не применён. "
                 "Уточните запрос или разбейте его на части."
             ) from e
+        except LLMRequestTooLargeError as e:
+            # Схема больше, чем вмещает контекст: это не «сервис лег», и
+            # Retry-After здесь только морочит клиента — править надо вход.
+            raise ImprovementError(
+                "Схема слишком велика для ИИ-улучшения: её описание не "
+                "помещается в контекст модели. Уменьшите схему (разбейте "
+                "процесс на части) или улучшайте по фрагменту."
+            ) from e
         except LLMError as e:
             raise ImprovementUnavailable(
                 "Сервис улучшения временно недоступен. Попробуйте позже."
@@ -747,6 +839,10 @@ class BPMNImprovementOrchestrator:
         analysis = str(plan.get("analysis") or "").strip() or "Анализ завершён."
         planned = plan.get("operations") or []
         if not isinstance(planned, list):
+            # План без массива операций — не «анализ», а сбой формата: без
+            # этой строки пользователь увидел бы красивый отказ.
+            analysis += ("\n\nМодель вернула операции не списком — изменения "
+                         "не применялись, только анализ.")
             planned = []
         operations = planned[:MAX_OPERATIONS]
         truncated_operations = max(0, len(planned) - len(operations))
@@ -798,10 +894,11 @@ class BPMNImprovementOrchestrator:
         if rolled_back != xml_after:
             xml_after, repair_notes = rolled_back, []
         unrouted = _unrouted(repair_notes)
-        if report["skipped"] or unrouted:
+        empty_pools = _empty_pools(repair_notes)
+        if report["skipped"] or unrouted or empty_pools:
             try:
                 xml_after, report = await self._retry_skipped(
-                    xml_after, user_prompt, practices_block, report, unrouted)
+                    xml_after, user_prompt, report, unrouted, empty_pools)
             except LLMTruncatedError as e:
                 logger.warning("Корректирующий повтор обрезан по лимиту "
                                "токенов: %s", e)
@@ -824,6 +921,11 @@ class BPMNImprovementOrchestrator:
                          "скоринг считает их тупиками, пока не добавлена "
                          "связь:\n"
                          + "\n".join(f"- {n}" for n in unrouted[:5]))
+        empty_pools = _empty_pools(repair_notes)
+        if empty_pools:
+            analysis += ("\n\nОстались пулы без единого шага: наполните их, "
+                         "слейте в дорожку или удалите:\n"
+                         + "\n".join(f"- {p}" for p in empty_pools[:5]))
 
         if not report["applied"]:
             reasons = "; ".join(s.get("reason", "") for s in report["skipped"][:3])
@@ -833,11 +935,14 @@ class BPMNImprovementOrchestrator:
             )
 
         open_skips = [s for s in report["skipped"] if not s.get("reapplied")]
-        if open_skips:
+        # Дословный повтор отказа — тот же дефект: в списке для пользователя
+        # он остаётся один раз.
+        shown = [s for s in open_skips if not s.get("duplicate")]
+        if shown:
             skipped_lines = "\n".join(
                 f"- {'план' if s.get('stage') == 'plan' else 'повтор'}: "
                 f"{s['op']}: {s['reason']}"
-                for s in open_skips[:5]
+                for s in shown[:5]
             )
             analysis += ("\n\nНе применено (требует уточнения):\n" + skipped_lines)
         redo_count = len(report["skipped"]) - len(open_skips)
@@ -845,6 +950,13 @@ class BPMNImprovementOrchestrator:
             analysis += (f"\n\nПовтор добил {redo_count} правк"
                          f"{'у' if redo_count == 1 else 'и'}, отклонённые "
                          "первым раундом.")
+        repeats = report.get("repeat_rejections") or 0
+        if repeats:
+            analysis += (f"\n\nКорректирующий повтор вернул {repeats} "
+                         "отклонённую правк"
+                         f"{'у' if repeats == 1 else 'и'} без изменений — это "
+                         "тот же дефект, а не новый, поэтому в отчёте он "
+                         "показан один раз.")
 
         return analysis, xml_after, report
 
@@ -855,22 +967,32 @@ class BPMNImprovementOrchestrator:
         return _format_practices(practices)
 
     async def _retry_skipped(self, intermediate_xml: str, user_prompt: str,
-                             practices_block: str, report: Dict[str, Any],
-                             unrouted: List[str]) -> Tuple[str, Dict[str, Any]]:
+                             report: Dict[str, Any], unrouted: List[str],
+                             empty_pools: List[str]) -> Tuple[str, Dict[str, Any]]:
         """Корректирующий раунд: по не применённым операциям и по узлам,
         оставшимся вне маршрута.
 
+        Блок практик сюда не попадает: задача повтора — добить конкретные
+        пропуски, а не искать новые улучшения, и практики только уводили модель
+        в сторону от починки.
+
         Отчёт склеивается честно — `skipped` хранит финальную судьбу каждой
         операции с пометкой раунда, иначе в анализ уходят причины не от тех
-        операций, что модель предлагала изначально.
+        операций, что модель предлагала изначально. Отказ, повторённый дословно
+        (та же операция, тот же элемент, та же причина), помечается
+        `duplicate`: пользователю он показывается один раз как тот же дефект,
+        но из отчёта не удаляется — по записям раунда видно, что корректирующий
+        вызов был и ничего не добил.
         """
         def _retry_step() -> Dict[str, Any]:
             inventory = bpmn_edits.build_inventory(intermediate_xml)
             user_content = _RETRY_TEMPLATE.format(
-                practices_block=practices_block,
                 inventory=json.dumps(inventory, ensure_ascii=False, indent=1),
                 skipped=json.dumps(report["skipped"], ensure_ascii=False, indent=1),
+                applied=_applied_block(report.get("applied") or []),
                 routing=_routing_block(unrouted),
+                pools=_pools_block(empty_pools),
+                limits_block=_limits_block(inventory),
                 user_prompt=user_prompt,
             )
             return llm_client.call_json(_SYSTEM_PROMPT, user_content,
@@ -896,8 +1018,26 @@ class BPMNImprovementOrchestrator:
             key = _op_key(skip)
             if key[1] and key in redo:
                 skip["reapplied"] = True
-        skipped = report["skipped"] + [dict(s, stage="retry", reapplied=False)
-                                       for s in retry_report["skipped"]]
+        # Модель вправе вернуть повторившийся отказ дословно: та же операция,
+        # тот же элемент, та же причина (в живых прогонах повтор повторял
+        # первый раунд целиком). Такой пропуск помечается `duplicate` и не
+        # показывается пользователю вторым строкой — это тот же дефект. Из
+        # отчёта он при этом не удаляется: по записям раунда метрика харнесса
+        # видит, что корректирующий вызов был и ничего не добил.
+        def _fingerprint(entry: Dict[str, Any]) -> tuple:
+            # Все поля идентичности, а не `_op_key`: два `connect` с одним
+            # источником и разными целями — два дефекта, а не одно «то же».
+            return (str(entry.get("op") or ""),
+                    *(str(entry.get(field) or "") for field in
+                      ("id", "source", "target", "flow")),
+                    str(entry.get("reason") or ""))
+
+        first_round = {_fingerprint(s) for s in report["skipped"]}
+        skipped = report["skipped"] + [
+            dict(s, stage="retry", reapplied=False,
+                 duplicate=_fingerprint(s) in first_round)
+            for s in retry_report["skipped"]]
+        repeats = sum(1 for s in skipped if s.get("duplicate"))
         open_skips = [s for s in skipped if not s.get("reapplied")]
         merged = {
             # Статус считается по незакрытым пропускам: скип, который повтор
@@ -909,6 +1049,9 @@ class BPMNImprovementOrchestrator:
                                                         else "failed"),
             "applied": report["applied"] + retry_report["applied"],
             "skipped": skipped,
+            # Сколько отказов повтор вернул дословно: сводка пользователя
+            # говорит об этом отдельно, а в `skipped` они не дублируются.
+            "repeat_rejections": repeats,
             "truncated_operations": (report.get("truncated_operations", 0)
                                     + retry_truncated),
         }

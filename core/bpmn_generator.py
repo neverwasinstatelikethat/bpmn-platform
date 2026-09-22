@@ -18,6 +18,10 @@
 # детерминированно, а план с нарушениями один раз переизляется с перечнем того,
 # что модель обязана исправить.
 #
+# Концы потоков проверяются тем же способом: sequence-поток не входит в
+# startEvent и boundaryEvent и не выходит из endEvent — такую дугу repair
+# убирает с заметкой, а не перекраивает в маршрут, которого модель не описывала.
+#
 # XML генерируется только семантический: координаты не выдаются — фронтенд
 # всегда прогоняет схему через bpmn-auto-layout, ему достаточно пустого
 # скелета BPMNDiagram/BPMNPlane.
@@ -29,8 +33,11 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .bpmn_edits import DEFAULT_TIMER_DURATION, EVENT_DEFINITIONS
-from .llm_client import LLMError, LLMTruncatedError, call_json
+from .bpmn_edits import (DEFAULT_TIMER_DURATION, EVENT_DEFINITIONS,
+                         SEQUENCE_FORBIDDEN_SOURCES,
+                         SEQUENCE_FORBIDDEN_TARGETS)
+from .llm_client import (LLMError, LLMRequestTooLargeError, LLMTruncatedError,
+                         call_json)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +80,9 @@ MAX_REACH_FLOWS = 2 * MAX_ELEMENTS
 # Вставляемых шлюзов схождения — не больше четверти элементов: слияние потоков
 # правит маршрут, и невозбранный аппетит здесь превратил бы схему в решето.
 MAX_MERGE_GATEWAYS = MAX_ELEMENTS // 4
+# Столько же вставок развилки: условие от не-шлюза — дефект плана, но чинить его
+# перестановкой всего маршрута нельзя.
+MAX_SPLIT_GATEWAYS = MAX_ELEMENTS // 4
 # Порог схожести названий пулов: ниже — слишком разные сущности, выше —
 # опечатки и падежи («Бухгалтерия» / «Бухгалтерией»).
 POOL_MATCH_CUTOFF = 0.6
@@ -80,6 +90,15 @@ POOL_MATCH_CUTOFF = 0.6
 # каждая лишняя итерация удваивает пользовательскую задержку, а переспрос по
 # нарушениям дешевле, чем принятая пользователем битая схема.
 MAX_RETRY_PLAN_CHARS = 12_000
+# Правка принадлежности шагов отправляет не план, а список id: лимиты держат
+# запрос в размерах, которые модель не обрезает.
+MAX_PATCH_QUESTION_CHARS = 9_000
+MAX_PATCH_ELEMENT_LINES = 60
+MAX_PATCH_MOVES = 12
+# Сколько потерянных участников описания возвращаем за один узкий вопрос и при
+# каком числе пулов вопрос про них задаём вообще.
+MAX_PATCH_MISSING = 3
+MAX_POOLS_FOR_MISSING_QUESTION = 3
 
 # ISO-8601 для хронометража таймера: длительность (PT2H), повтор (R3/PT10M).
 # Модель пишет их уверенно, но «2 часа» тоже пробует — поэтому форма
@@ -93,7 +112,10 @@ _SYSTEM_PROMPT = """Ты — аналитик бизнес-процессов. �
 
 Верни СТРОГО ОДИН JSON-объект без пояснений и без блоков кода:
 {
-  "participants": ["название пула", ...],
+  "actors": ["каждое действующее лицо описания теми же словами, что в тексте"],
+  "participants": ["название внешнего участника", \
+{"name": "название роли или подразделения", "external": false, \
+"inside": "название организации, чьей дорожкой оно было бы"}],
   "lanes": [{"id": "L1", "name": "название дорожки", "participant": "название пула"}],
   "elements": [{"id": "A1", "kind": "userTask", "name": "Название шага", \
 "participant": "название пула", "lane": "L1"}],
@@ -105,11 +127,47 @@ _SYSTEM_PROMPT = """Ты — аналитик бизнес-процессов. �
 однопольного процесса; `attached_to` и `event_definition` — для граничного \
 события; `timer` — для таймера; `documentation` — текст описания шага.
 
+Действующие лица: первым делом выпиши в `actors` всех, кто в описании действует \
+от своего имени (организация, контрагент, внешняя система, «клиент», \
+«поставщик», «система мониторинга») — теми же словами, что в тексте. Затем для \
+каждого из `actors` объяви пул или дорожку и запиши за ним его собственные \
+шаги: действующее лицо, названное в описании и пропущенное в схеме, — ошибка \
+моделирования.
+
 Пулы и дорожки:
 - Пул (participant) — независимый участник: организация, внешний контрагент \
 или внешняя система (WMS, перевозчик, получатель). Один пул — один процесс.
 - Роли сотрудников, отделы и подсистемы одной организации — это ДОРОЖКИ \
-(lanes) внутри одного пула, а не отдельные пулы.
+(lanes) внутри одного пула, а не отдельные пулы. Должность по суффиксу \
+(кладовщик, комплектатор, контролёр, экспедитор, водитель, оператор, \
+менеджер, инициатор) пулом быть не может: это всегда дорожка организации, \
+которой она подчиняется. Пулов в схеме не больше, чем организаций и внешних \
+систем в описании.
+- Действие внешнего участника принадлежит его пулу: «поставщик подтверждает \
+отгрузку», «перевозчик принимает груз», «клиент подписывает договор» — шаги \
+его пула, дописывать их в дорожки организации нельзя. Между пулами такой \
+передачей связи идёт messageFlow, и от внешнего участника обязана быть хотя \
+бы одна ветка в его пул.
+- Если роль или подразделение всё же оказались в participants, запиши их \
+объектом с `"external": false` и `"inside"` — названием организации, внутри \
+которой они работают: его шаги станут дорожкой этого пула. Самостоятельный \
+участник (контрагент, чужая система) остаётся простой строкой. Роль без \
+`inside` — незакрытое нарушение: невыбранной остаётся организация, которой \
+она принадлежит.
+- Имя пула — название из описания, а не родовое слово. Если в тексте названа \
+WMS, пул называется «WMS», а не «система»: родовое имя («система», «сервис», \
+«подразделение») съедает участника, которого проверяют по имени, и \
+превращает две организации в одну.
+- У пула не бывает дорожки с его собственным именем: такая пара — роль, \
+объявившая саму себя. Либо это подразделение организации (тогда `external: \
+false` и `inside`), либо у пула убирается дублирующая дорожка.
+- Имя пула — то же слово, что в описании: названная система «WMS» остаётся \
+«WMS», а не превращается в «Склад». Схема, где участник переименован, теряет \
+связь с описанием, и проверить её взаимодействие нечем.
+- Каждый участник, названный в описании (организация, контрагент, внешняя \
+система — в том числе аббревиатура вроде WMS, CRM, 1С), обязан присутствовать \
+в схеме: пулом со своими шагами либо, если это подразделение другой \
+организации, её дорожкой.
 - В пуле обязан быть хотя бы один шаг (задача, шлюз или промежуточное \
 событие). Пул, где только «Старт → Завершение», недопустим: либо это дорожка \
 основного пула, либо такого участника в процессе нет.
@@ -130,6 +188,13 @@ lane у элемента — id дорожки из "lanes". Элемент ст
 через него все ветки. Развилка без схождения — битая схема.
 - parallelGateway служит одновременно и для расщепления, и для слияния: \
 у него минимум два потока хотя бы с одной стороны.
+
+Шаги:
+- Одно действие описания — один шаг. «Система регистрирует алерт и создаёт \
+инцидент» — это два шага, а не один «Регистрация инцидента»; последнее действие \
+фразы («и заводит задачу на улучшение») тоже остаётся на схеме. Склеенные или \
+выброшенные действия — это процесс, которого в описании нет, а новых действий \
+придумывать всё равно нельзя.
 
 События:
 - kind элемента: один из """ + ", ".join(sorted(ALL_KINDS)) + """.
@@ -157,32 +222,33 @@ event_definition="message".
 - Каждый элемент, кроме endEvent, должен иметь исходящий sequence-поток \
 (внутри своего пула) — иначе процесс в этом пуле обрывается.
 
-Пример. «Кладовщик собирает заказ, при нехватке товара заказывает остаток; \
-сборка длится не более четырёх часов, при просрочке — эскалация руководителю; \
-после сборки служба логистики передаёт груз перевозчику»:
-{"participants": ["ВкусВилл", "Перевозчик"],
- "lanes": [{"id": "L_w", "name": "Кладовщик", "participant": "ВкусВилл"}, \
-{"id": "L_h", "name": "Руководитель смены", "participant": "ВкусВилл"}, \
-{"id": "L_l", "name": "Служба логистики", "participant": "ВкусВилл"}],
+Пример. «Начальник смены цеха заводит наряд на починку упаковочной линии; \
+техник цеха осматривает узел, при отсутствии детали в ремфонде узел вносят \
+в план заказа; замена длится не более шести часов, при просрочке — доклад \
+мастеру участка; если линию не починить своими силами, её передают подрядчику»:
+{"participants": ["Цех фасовки", "Сервисная служба"],
+ "lanes": [{"id": "L_t", "name": "Техник цеха", "participant": "Цех фасовки"}, \
+{"id": "L_m", "name": "Мастер участка", "participant": "Цех фасовки"}, \
+{"id": "L_p", "name": "Начальник смены", "participant": "Цех фасовки"}],
  "elements": [
-   {"id": "S1", "kind": "startEvent", "name": "Заказ на отгрузку", "participant": "ВкусВилл", "lane": "L_w"},
-   {"id": "A1", "kind": "userTask", "name": "Проверить остатки", "participant": "ВкусВилл", "lane": "L_w", "documentation": "Сверка остатков в WMS до сборки"},
-   {"id": "G1", "kind": "exclusiveGateway", "name": "Товара хватает?", "participant": "ВкусВилл", "lane": "L_w"},
-   {"id": "A2", "kind": "userTask", "name": "Собрать заказ", "participant": "ВкусВилл", "lane": "L_w"},
-   {"id": "A3", "kind": "userTask", "name": "Заказать остаток", "participant": "ВкусВилл", "lane": "L_w"},
-   {"id": "T1", "kind": "boundaryEvent", "name": "Прошло 4 часа", "participant": "ВкусВилл", "lane": "L_w", "attached_to": "A2", "event_definition": "timer", "timer": "PT4H"},
-   {"id": "A4", "kind": "userTask", "name": "Эскалировать руководителю", "participant": "ВкусВилл", "lane": "L_h"},
-   {"id": "G2", "kind": "exclusiveGateway", "name": "Заказ собран", "participant": "ВкусВилл", "lane": "L_w"},
-   {"id": "A5", "kind": "serviceTask", "name": "Передать груз перевозчику", "participant": "ВкусВилл", "lane": "L_l"},
-   {"id": "E1", "kind": "endEvent", "name": "Груз передан", "participant": "ВкусВилл", "lane": "L_l"},
-   {"id": "S2", "kind": "startEvent", "name": "Заявка на приёмку", "participant": "Перевозчик", "lane": ""},
-   {"id": "A6", "kind": "task", "name": "Принять груз", "participant": "Перевозчик", "lane": ""},
-   {"id": "E2", "kind": "endEvent", "name": "Груз принят", "participant": "Перевозчик", "lane": ""}
+   {"id": "S1", "kind": "startEvent", "name": "Наряд на починку", "participant": "Цех фасовки", "lane": "L_p"},
+   {"id": "A1", "kind": "userTask", "name": "Осмотреть линию", "participant": "Цех фасовки", "lane": "L_t", "documentation": "Замер вибрации и температуры узла до разбора"},
+   {"id": "G1", "kind": "exclusiveGateway", "name": "Деталь в ремфонде?", "participant": "Цех фасовки", "lane": "L_t"},
+   {"id": "A2", "kind": "userTask", "name": "Заменить деталь", "participant": "Цех фасовки", "lane": "L_t"},
+   {"id": "A3", "kind": "userTask", "name": "Внести узел в план заказа", "participant": "Цех фасовки", "lane": "L_p"},
+   {"id": "T1", "kind": "boundaryEvent", "name": "Прошло 6 часов", "participant": "Цех фасовки", "lane": "L_t", "attached_to": "A2", "event_definition": "timer", "timer": "PT6H"},
+   {"id": "A4", "kind": "userTask", "name": "Доложить мастеру участка", "participant": "Цех фасовки", "lane": "L_m"},
+   {"id": "G2", "kind": "exclusiveGateway", "name": "Узел заменён", "participant": "Цех фасовки", "lane": "L_t"},
+   {"id": "A5", "kind": "serviceTask", "name": "Оформить вызов подрядчика", "participant": "Цех фасовки", "lane": "L_p"},
+   {"id": "E1", "kind": "endEvent", "name": "Линия в работе", "participant": "Цех фасовки", "lane": "L_p"},
+   {"id": "S2", "kind": "startEvent", "name": "Вызов принят", "participant": "Сервисная служба", "lane": ""},
+   {"id": "A6", "kind": "task", "name": "Приехать на объект", "participant": "Сервисная служба", "lane": ""},
+   {"id": "E2", "kind": "endEvent", "name": "Наряд закрыт", "participant": "Сервисная служба", "lane": ""}
  ],
  "flows": [
    {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence", "condition": ""},
    {"id": "F2", "source": "A1", "target": "G1", "kind": "sequence", "condition": ""},
-   {"id": "F3", "source": "G1", "target": "A2", "kind": "sequence", "condition": "Хватает"},
+   {"id": "F3", "source": "G1", "target": "A2", "kind": "sequence", "condition": "Деталь есть"},
    {"id": "F4", "source": "G1", "target": "A3", "kind": "sequence", "condition": "", "default": true},
    {"id": "F5", "source": "A3", "target": "A2", "kind": "sequence", "condition": ""},
    {"id": "F6", "source": "T1", "target": "A4", "kind": "sequence", "condition": ""},
@@ -195,10 +261,11 @@ event_definition="message".
    {"id": "F12", "source": "A6", "target": "E2", "kind": "sequence", "condition": ""}
  ]}
 
-Здесь «Кладовщик», «Руководитель смены» и «Служба логистики» — дорожки одного \
-пула, потому что роли одной организации не бывают отдельными пулами; перевозчик \
-— отдельный пул, и связь с ним идёт потоком-сообщением. G1 расщепляет маршрут, \
-G2 его снова сливает, T1 — таймер-ожидание на задаче сборки с веткой эскалации.
+Здесь «Техник цеха», «Мастер участка» и «Начальник смены» — дорожки одного \
+пула, потому что роли одной организации не бывают отдельными пулами; сервисная \
+служба — отдельный пул, и связь с ней идёт потоком-сообщением. G1 расщепляет \
+маршрут, G2 его снова сливает, T1 — таймер-ожидание на задаче замены с веткой \
+доклада мастеру.
 
 Прочее:
 - Отвечай на языке описания процесса (названия шагов, пулов и дорожек — как \
@@ -225,6 +292,53 @@ _RETRY_TEMPLATE = """Ты уже построил структуру BPMN по �
 
 План, который нужно исправить:
 {plan}
+"""
+
+
+_OWNERSHIP_SYSTEM_PROMPT = """Ты разбираешься, кому что принадлежит в \
+BPMN-процессе по его описанию. Верни СТРОГО ОДИН JSON-объект без пояснений:
+{"moves": [{"element": "id шага", "participant": "название пула"}], \
+"roles": [{"pool": "название пула", "inside": "название организации"}], \
+"missing": [{"pool": "название пула", "external": true, "steps": ["id шага"]}]}
+moves — переносы шагов в пустые пулы: неси только тот шаг, действие в описании \
+которого делает именно названный участник («поставщик подтверждает отгрузку» — \
+шаг «Получить подтверждение отгрузки» принадлежит пулу «Поставщик»). Не \
+выдумывай участников, не двигай startEvent и endEvent.
+roles — те перечисленные пулы, которые по описанию являются ролью, отделом или \
+подразделением организации: inside — название этой организации словами из \
+описания (самостоятельный участник, клиент или внешняя система ролью не \
+является). Посмотреть обязана каждый перечисленный кандидат: молчаливый пропуск \
+— не «роль не найдена», а нерешённый случай. Пустым inside не оставляй: если пул \
+не роль, просто не включай его в roles.
+missing — участники, названные в описании, но отсутствующие среди пулов плана: \
+{"pool": "имя словами из описания", "external": true, "steps": ["id шага, \
+который делает он"]}. Бери имя участника из текста и только те шаги, действие в \
+описании которых совершает он; чужие шаги не отдавай и выдумывать участников не \
+нужно. Должность, отдел или подсистема организации, которая в плане уже есть, — \
+не участник: верни её ролью, `"external": false` и `"inside"` с названием этой \
+организации, и её шаги станут дорожкой её пула. Раздувать коллаборацию лишним \
+пулом — ошибка моделирования, а не спасение участника.
+Что не относится к случаю — оставляй пустым списком."""
+
+
+_OWNERSHIP_TEMPLATE = """Пустые пулы, участники которых названы в описании \
+(в них нет ни одного шага):
+{vacant}
+
+Шаги плана с их теперешним участником:
+{elements}
+
+Пулы, которые могут быть ролью, отделом или внутренней системой (роль, не участник):
+{role_pools}
+
+Все пулы плана: {pools}
+
+{missing}
+
+Описание процесса:
+{text}
+
+Верни moves, roles и missing. Только JSON.
 """
 
 
@@ -262,31 +376,77 @@ class BPMNGenerator:
                     "Сократите его и попробуйте снова."
                 )
 
+            trace: List[Dict[str, Any]] = []
             structure = self._extract_structure(text)
-            gaps = plan_gaps(structure)
+            gaps = plan_gaps(structure, text)
+            trace.append({
+                "node": "первый ответ модели",
+                "gaps": list(gaps),
+                "pools": len(structure.get("participants") or []),
+                "elements": len(structure.get("elements") or []),
+                "flows": len(structure.get("flows") or []),
+            })
             attempts, retry_note = 1, ""
-            if gaps:
+            # Переспрос переписывает весь план — дорогое и рискованное действие
+            # (живые прогоны показывали потерянные шаги). Ради одного лишь
+            # расхождения с `actors` его не заводим: там дешевле и надёжнее
+            # узкий вопрос о том, чьи это шаги (`_clarify_ownership`).
+            if plan_gaps(structure, text, with_actors=False):
                 attempts = 2
                 retry = self._retry_structure(text, structure, gaps)
+                reask: Dict[str, Any] = {"node": "переспрос плана",
+                                         "gaps_before": len(gaps)}
+                trace.append(reask)
                 if retry is None:
                     retry_note = "Повторный запрос модели не выполнен"
+                    reask.update(kept="первый ответ", outcome=retry_note)
                 else:
-                    candidate_gaps = plan_gaps(retry)
+                    candidate_gaps = plan_gaps(retry, text)
                     # Первый план остаётся при равенстве: второй вызов обязан
                     # улучшать, а не просто менять местами те же ошибки.
-                    if len(candidate_gaps) < len(gaps):
-                        retry_note = (f"Повторный запрос модели: нарушений было "
-                                      f"{len(gaps)}, стало {len(candidate_gaps)}")
-                        structure, gaps = retry, candidate_gaps
-                    else:
+                    lost = _plan_content(structure) - _plan_content(retry)
+                    reask.update(gaps_after=len(candidate_gaps),
+                                 lost_steps=lost)
+                    if len(candidate_gaps) >= len(gaps):
                         retry_note = (f"Повторный запрос модели не улучшил план "
                                       f"({len(gaps)} нарушений) — оставлен первый")
-            repaired, notes = repair_structure(structure)
+                        reask["kept"] = "первый ответ"
+                    elif lost > 0:
+                        # Нарушения снимаются вырезанными шагами — схема станет
+                        # «правильнее» и перестанет описывать процесс. Такой
+                        # план лучше первого только на бумаге.
+                        retry_note = (f"Повторный запрос модели: нарушений было "
+                                      f"{len(gaps)}, стало {len(candidate_gaps)}, "
+                                      f"но план потерял {lost} шаг(ов) — оставлен "
+                                      "первый")
+                        reask["kept"] = "первый ответ"
+                    else:
+                        retry_note = (f"Повторный запрос модели: нарушений было "
+                                      f"{len(gaps)}, стало {len(candidate_gaps)}")
+                        reask["kept"] = "переспрос"
+                        structure, gaps = retry, candidate_gaps
+                    reask["outcome"] = retry_note
+            # Пустой пул названного участника и роль, объявившая сама себя, —
+            # работа для модели, а не для эвристики: переносить шаги и превращать
+            # пулы в дорожки без её слова нельзя.
+            structure, patch_notes = self._clarify_ownership(text, structure)
+            trace.append({"node": "вопрос о принадлежности",
+                          "notes": list(patch_notes)})
+            if any("перенесён в пул" in n or "роль «" in n or "добавлен на схему" in n
+                   for n in patch_notes):
+                gaps = plan_gaps(structure, text)
+            repair_steps: List[Dict[str, Any]] = []
+            repaired, notes = repair_structure(structure, repair_steps)
+            trace.append({"node": "починка структуры", "steps": repair_steps})
             if retry_note:
                 notes.append(retry_note)
+            notes.extend(patch_notes)
             for note in notes:
                 logger.info("Починка структуры: %s", note)
             bpmn_xml = self._generate_bpmn_xml(repaired)
+            trace.append({"node": "генерация XML",
+                          "elements": len(repaired.get("elements") or []),
+                          "flows": len(repaired.get("flows") or [])})
 
             return {
                 "status": "success",
@@ -295,6 +455,7 @@ class BPMNGenerator:
                 "notes": notes,
                 "gaps": gaps,
                 "attempts": attempts,
+                "trace": trace,
                 "time_elapsed": time.time() - start_time,
             }
         except GenerationError as e:
@@ -314,6 +475,17 @@ class BPMNGenerator:
                 "error": "Ответ модели обрезан по лимиту токенов — сократите "
                          "описание процесса и попробуйте снова.",
                 "step": "llm_truncated",
+                "time_elapsed": time.time() - start_time,
+            }
+        except LLMRequestTooLargeError as e:
+            # Запрос корректен, но не влезает в контекст: «попробуйте позже»
+            # здесь было бы ложным обещанием.
+            logger.error("Описание не поместилось в контекст модели: %s", e)
+            return {
+                "status": "error",
+                "error": "Описание процесса не помещается в контекст модели — "
+                         "сократите его и попробуйте снова.",
+                "step": "llm_too_large",
                 "time_elapsed": time.time() - start_time,
             }
         except LLMError as e:
@@ -372,6 +544,211 @@ class BPMNGenerator:
             logger.warning("Повтор генерации не удался, остаётся первый план: %s", e)
             return None
         return data if isinstance(data, dict) else None
+
+    def _clarify_ownership(self, text: str,
+                           structure: Dict[str, Any]) -> Tuple[Dict[str, Any],
+                                                               List[str]]:
+        """Чей шаг и чья роль — отдельным узким вопросом, а не ещё одним планом.
+
+        Живые прогоны показали: переписывая план целиком, модель теряла шаги,
+        пустой пул внешнего участника оставался пустым (и починка удаляла
+        названного в описании участника со схемы), а роли доезжали до пользователя
+        пулами. Здесь ответ маленький — «A8 это шаг Поставщика», «HR роль
+        ВкусВилла», — решает его модель, а код проверяет адрес: существующий шаг,
+        названный пустой пул, организация среди других пулов.
+        """
+        vacant = _vacant_named_pools(structure, text)
+        pools = _plan_pool_names(structure)
+        role_pools = _role_candidate_pools(structure)
+        elements = _raw_dicts(structure.get("elements"))
+        by_id = {_raw_text(e.get("id")): e for e in elements}
+        steps = [f"{_raw_text(e.get('id'))} «{_raw_text(e.get('name'))}» — "
+                 f"сейчас в «{_raw_text(e.get('participant'))}»"
+                 for e in elements
+                 if _raw_text(e.get("kind") or e.get("type"))
+                 not in ("startEvent", "endEvent")]
+        # Процесс на несколько действующих лиц, умещённый в один пул, выглядит
+        # как потерянный участник, но отдельный вызов ради него живые прогоны
+        # не окупили: на вопрос «чьих действий тут нет от имени ВкусВилла» модель
+        # отвечала пустым missing (12 из 18 провалов), а пользователь платил за
+        # это полной задержкой генерации. Требование перечислить действующих лиц
+        # переехало в первый же вызов (см. `actors` в `_SYSTEM_PROMPT`).
+        absent = missing_actors(structure)
+        if not vacant and not role_pools:
+            # Расхождение с `actors` само по себе нового вызова не добивается:
+            # пять прогонов подряд показывали, что на вопрос о чужих шагах модель
+            # отвечает пустым `missing` (12 случаев из 18), а пользователю это
+            # +0,6 обращения и +4 с. Нарушение при этом остаётся в `gaps` —
+            # пользователь его видит, а если уточнение всё же идёт по другому
+            # поводу, имена пропущенных участников в него вписаны (`absent`).
+            return structure, []
+        # Пропущенных участников спрашиваем у плана, где их ещё мало, — или когда
+        # они противоречат собственному списку `actors`: там имена уже взяты из
+        # описания, и дорисовать что-то сверх него модель не может.
+        ask_missing = bool(absent) or len(pools) < MAX_POOLS_FOR_MISSING_QUESTION
+        question = _OWNERSHIP_TEMPLATE.format(
+            vacant="\n".join(
+                f"«{v['pool']}» — "
+                + ("кандидаты по названию: "
+                   + ", ".join(c["id"] for c in v["candidates"][:6])
+                   if v["candidates"] else
+                   "шагов с таким именем в названиях нет, выбери шаги по смыслу")
+                for v in vacant) or "нет",
+            elements="\n".join(steps[:MAX_PATCH_ELEMENT_LINES]),
+            role_pools=", ".join(f"«{p}»" for p in role_pools[:12]) or "нет",
+            pools=", ".join(f"«{p}»" for p in pools),
+            missing=(
+                ("Ты сама выписал(а) этих действующих лиц из описания, но в плане "
+                 "у них нет ни пула, ни дорожки: "
+                 + ", ".join(f"«{a}»" for a in absent[:MAX_PATCH_MISSING])
+                 + ". Назови в missing для каждого его шаги из плана — те, чьё "
+                 "действие в описании делает именно он.") if absent else
+                "Проверь описание и назови в missing каждое действующее лицо, "
+                "которое действует от своего имени («поставщик подтверждает», "
+                "«система регистрирует», «клиент подаёт»), с id шагов плана, "
+                "которые оно и делает. Пустой missing означает, что таких лиц "
+                "в описании нет." if ask_missing else
+                "Про отсутствующих участников спрашивать не нужно: верни пустой "
+                "список missing."),
+            text=text)
+        if len(question) > MAX_PATCH_QUESTION_CHARS:
+            notes: List[str] = ["Уточнение принадлежности не выполнено: вопрос не "
+                                f"помещается в запрос ({len(question)} символов)"]
+            _claim_steps_by_name(structure, text, notes)
+            return structure, notes
+        try:
+            data = call_json(_OWNERSHIP_SYSTEM_PROMPT, question, temperature=0.0,
+                             max_tokens=2000)
+        except (LLMError, ValueError) as e:
+            logger.warning("Уточнение принадлежности не удалось: %s", e)
+            notes = ["Уточнение принадлежности не выполнено"]
+            _claim_steps_by_name(structure, text, notes)
+            return structure, notes
+        if not isinstance(data, dict):
+            notes = []
+            _claim_steps_by_name(structure, text, notes)
+            return structure, notes
+        notes = []
+        moves = data.get("moves")
+        targets = {_norm_name(v["pool"]): v["pool"] for v in vacant}
+        for move in (moves if isinstance(moves, list) else [])[:MAX_PATCH_MOVES]:
+            if not isinstance(move, dict):
+                continue
+            elem_id = _raw_text(move.get("element"))
+            pool = _raw_text(move.get("participant"))
+            elem = by_id.get(elem_id)
+            if elem is None:
+                notes.append(f"перенос «{elem_id}» отклонён: такого шага в плане "
+                             "нет")
+                continue
+            if targets.get(_norm_name(pool)) is None:
+                notes.append(f"перенос {elem_id} → «{pool}» отклонён: этого пула "
+                             "среди пустых не было")
+                continue
+            if _raw_text(elem.get("kind") or elem.get("type")) in (
+                    "startEvent", "endEvent"):
+                notes.append(f"перенос {elem_id} отклонён: стартовое и конечное "
+                             "событие переносить нельзя")
+                continue
+            elem["participant"] = pool
+            # Дорожка указана чужого пула: снимаем её — дорожку нового пула
+            # починка подберёт по своим правилам.
+            elem["lane"] = ""
+            notes.append(f"шаг {elem_id} «{_raw_text(elem.get('name'))}» "
+                         f"перенесён в пул «{pool}»: это его действие по "
+                         "описанию")
+
+        candidates = {_norm_name(p): p for p in role_pools}
+        organizations = {_norm_name(p) for p in pools}
+        declared_roles = data.get("roles")
+        for role in (declared_roles if isinstance(declared_roles, list)
+                    else [])[:MAX_PATCH_MOVES]:
+            if not isinstance(role, dict):
+                continue
+            pool = _raw_text(role.get("pool"))
+            inside = _raw_text(role.get("inside"))
+            canonical = candidates.get(_norm_name(pool))
+            if canonical is None:
+                notes.append(f"«{pool}» ролью не объявлен: среди кандидатов такого "
+                             "пула не было")
+                continue
+            if not inside or _norm_name(inside) == _norm_name(pool):
+                notes.append(f"роль «{pool}» не объявлена: модель не назвала "
+                             "организацию, которой она принадлежит")
+                continue
+            if _norm_name(inside) not in organizations:
+                if not _mentioned(inside, _text_words(text)):
+                    notes.append(f"роль «{pool}» не объявлена: организации "
+                                f"«{inside}» в описании нет")
+                    continue
+                # Приёмник назван моделью и взят из описания: без него роли
+                # остаются пулами, а заводим мы его по слову модели, не по своей
+                # догадке.
+                structure.setdefault("participants", []).append(inside)
+                organizations.add(_norm_name(inside))
+                notes.append(f"пул «{inside}» — организация из описания: ей "
+                             "принадлежат объявленные роли")
+            _mark_role(structure, canonical, inside)
+            notes.append(f"пул «{canonical}» — роль «{inside}» по описанию: его "
+                         "шаги станут дорожкой этого пула")
+        # Что модель забрала себе как «участника, которого в плане не было»:
+        # имя обязано звучать в описании, шаг — существовать, а пул-донор —
+        # остаться с действиями. Без этих рамок вопрос возвращал бы выдуманных
+        # участников и пустые пулы.
+        def step_count(pool: str) -> int:
+            return len([e for e in elements
+                        if _norm_name(_raw_text(e.get("participant")))
+                        == _norm_name(pool)
+                        and _raw_text(e.get("kind") or e.get("type"))
+                        not in ("startEvent", "endEvent")])
+
+        known = {_norm_name(p) for p in pools}
+        missing = data.get("missing")
+        for item in (missing if isinstance(missing, list) else [])[:MAX_PATCH_MISSING]:
+            if not isinstance(item, dict):
+                continue
+            pool = _raw_text(item.get("pool"))
+            if not pool or _norm_name(pool) in known:
+                continue
+            if not _mentioned(pool, _text_words(text)):
+                notes.append(f"участник «{pool}» не добавлен: в описании его нет")
+                continue
+            claimed = []
+            for elem_id in (item.get("steps") or [])[:MAX_PATCH_MISSING]:
+                elem = by_id.get(_raw_text(elem_id))
+                if elem is None or _raw_text(
+                        elem.get("kind") or elem.get("type")) in (
+                        "startEvent", "endEvent"):
+                    continue
+                donor = _raw_text(elem.get("participant"))
+                if step_count(donor) <= 1 and _norm_name(donor) != _norm_name(pool):
+                    notes.append(f"шаг {_raw_text(elem.get('id'))} в «{pool}» не "
+                                 "перенесён: после переноса его пул остался без "
+                                 "действий")
+                    continue
+                claimed.append(elem)
+            if not claimed:
+                notes.append(f"участник «{pool}» не добавлен: его шагов в плане "
+                             "модель не назвала")
+                continue
+            inside = _raw_text(item.get("inside"))
+            as_role = item.get("external") is False and bool(inside)
+            new_pool: Dict[str, Any] = {"name": pool, "external": not as_role}
+            if as_role:
+                new_pool["inside"] = inside
+            structure.setdefault("participants", []).append(new_pool)
+            known.add(_norm_name(pool))
+            for elem in claimed:
+                elem["participant"] = pool
+                elem["lane"] = ""
+            notes.append(f"участник «{pool}» добавлен на схему: назван в описании, "
+                         f"его {len(claimed)} шаг(ов) были записаны чужим пулом")
+
+        # Что модель не забрала на себя, но в плане написано её собственными
+        # словами, переносится здесь: иначе пустой пул доживёт до починки и
+        # участник из описания исчезнет со схемы.
+        _claim_steps_by_name(structure, text, notes)
+        return structure, notes
 
     # --- шаг 2: XML ---
 
@@ -521,27 +898,371 @@ def _raw_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def plan_gaps(raw: Dict[str, Any]) -> List[str]:
-    """Нарушения методологии в ответе модели, читаемые без починки."""
+def _plan_content(raw: Dict[str, Any]) -> int:
+    """Содержание плана — шаги без учёта стартового и конечного событий.
+
+    Тем же признаком пустой пул считает `plan_gaps`, поэтому мера одинаковая с
+    двух сторон маршрута: переспрос, снявший нарушения вырезанными шагами, не
+    считается улучшением.
+    """
+    if not isinstance(raw, dict):
+        return 0
+    return len([e for e in _raw_dicts(raw.get("elements"))
+                if _raw_text(e.get("kind") or e.get("type"))
+                not in ("startEvent", "endEvent")])
+
+
+# Аббревиатуры, которые участником быть не могут: атрибуты, форматы и
+# организационно-правовые формы, а не организации и системы.
+_NON_PARTICIPANT_ACRONYMS = {
+    "SLA", "KPI", "OKR", "API", "URL", "URI", "XML", "JSON", "HTML", "BPMN",
+    "PDF", "XLSX", "XLS", "DOCX", "SQL", "HTTP", "HTTPS", "SMTP", "IMAP",
+    "JWT", "UUID", "GUID", "ООО", "АО", "ПАО", "ГУП", "МУП", "РФ", "СРО",
+    "КБ", "АУ", "НК", "ОК",
+}
+_ACRONYM_RE = re.compile(r"\b[A-ZА-ЯЁ]{2,}\b")
+
+
+def _text_words(text: str) -> List[str]:
+    return [w for w in (_norm_name(m) for m in re.findall(r"[\w]+", text)) if w]
+
+
+def _name_parts(name: str) -> List[str]:
+    """Значимые части имени: «Бюджетный контролёр» — это два слова, и по одному
+    из него участник в тексте не ищется."""
+    return [t for t in (_norm_name(w) for w in re.findall(r"[\w]+", name)) if t]
+
+
+def _mentioned(name: str, words: List[str]) -> bool:
+    """Упомянуто ли имя в описании с любым окончанием.
+
+    Точное сравнение ломает русскую морфологию: «Получатель» в тексте живёт как
+    «получателю», и схема считалась бы потерянной. Основы сравниваются с
+    запасом в пару символов, короткие слова (аббревиатуры) — только целиком.
+    Составное имя считается упомянутым, только если в тексте есть каждая его
+    часть: иначе «Бюджетный контролёр» не находили бы даже те схемы, где он
+    есть, и переспрос требовал бы переименования там, где всё в порядке.
+    """
+    parts = _name_parts(name)
+    if not parts:
+        return False
+    for part in parts:
+        if part in words:
+            continue
+        # У коротких названий основа почти совпадает с самим словом: «банк» в
+        # тексте живёт «банком» и «банка», и отбрасывать два символа нечего.
+        stem = part[:-1] if len(part) >= 4 else ""
+        if stem and any(word.startswith(stem) for word in words):
+            continue
+        return False
+    return True
+
+
+def _participant_gaps(pools: List[str], lanes: List[Dict[str, Any]],
+                      text: str) -> List[str]:
+    """Два дрейфа имён участников, которые починка не устранит.
+
+    Выдумывать содержание нельзя, поэтому оба идут в переспрос конкретной
+    фразой: схема, где названная в описании система «WMS» наречена «Складом»,
+    теряет прослеживаемость, а схема без «WMS» теряет обещанное взаимодействие.
+    """
+    if not (text or "").strip():
+        return []
+    words = _text_words(text)
+    named = {_norm_name(p) for p in pools} | {
+        _norm_name(_raw_text(lane.get("name"))) for lane in lanes}
+    named.discard("")
+    gaps: List[str] = []
+    for pool in pools:
+        if not _mentioned(pool, words):
+            gaps.append(f"пул «{pool}» не упоминается в описании: назови "
+                        "участника тем словом, которое в тексте, и обнови "
+                        "participant у его шагов")
+    for token in sorted({m for m in _ACRONYM_RE.findall(text)
+                         if m not in _NON_PARTICIPANT_ACRONYMS}):
+        low = token.lower()
+        if any(low == name or low in name or (name in low and len(name) >= 3)
+               for name in named):
+            continue
+        gaps.append(f"в описании назван участник «{token}», а в схеме его нет: "
+                    f"заведи пул «{token}» с его шагами, либо дорожку, если "
+                    "это подсистема другой организации")
+    return gaps
+
+
+# Срок, названный в описании: «в течение четырёх часов», «по истечении двух
+# дней». Требование «дней» через запятую от «в течение» не даёт ловить
+# «не больше 14 дней» — там срок условие признания брака, а не ожидание.
+_WAIT_UNIT = r"(?:секунд|минут|час|дн|недел|месяц)"
+_DEADLINE_RE = re.compile(
+    rf"(?:в течение|в течении|на протяжении|в срок|по истечени|по прошествии|"
+    rf"после истечени)\s+[^.;,]{{0,24}}?{_WAIT_UNIT}\w*", re.I)
+
+
+def _deadline_gaps(elements: List[Dict[str, Any]], text: str) -> List[str]:
+    """Ожидание с названным сроком обязано быть таймером.
+
+    Правила моделирования это требуют, но починка таймер не поставит: по какой
+    ветке процесс уходит после истечения, знает только модель. Значит нарушение
+    едет в переспрос конкретным сроком из текста, а не в таймер, дорисованный
+    эвристикой ради метрики.
+    """
+    if not (text or "").strip():
+        return []
+    match = _DEADLINE_RE.search(text)
+    if not match:
+        return []
+    for elem in elements:
+        if _raw_text(elem.get("kind") or elem.get("type")) not in TYPED_EVENT_KINDS:
+            continue
+        definition = _raw_text(elem.get("event_definition")
+                               or elem.get("event_type")).lower()
+        if definition == "timer" or _raw_text(elem.get("timer")
+                                              or elem.get("duration")):
+            return []
+    clause = re.sub(r"\s+", " ", match.group(0)).strip()
+    return [f"описание задаёт ожидание («{clause}»), а в плане нет ни одного "
+            "таймера: добавь boundaryEvent с event_definition=\"timer\" и "
+            "attached_to на шаге ожидания (или промежуточное таймерное событие) "
+            "и ветку обработки по истечении"]
+
+
+def _plan_pool_names(raw: Dict[str, Any]) -> List[str]:
+    return [p for p in (_raw_text(i.get("name") if isinstance(i, dict) else i)
+                        for i in (raw.get("participants") or [])) if p]
+
+
+def _step_claimed_pools(raw: Dict[str, Any]) -> Set[str]:
+    """Пулы, у которых есть хотя бы один шаг. Стартовое и конечное событие
+    шагом не считается; неизвестный модели тип узла трактуем как шаг."""
+    return {_norm_name(_raw_text(e.get("participant")))
+            for e in _raw_dicts(raw.get("elements"))
+            if _raw_text(e.get("kind") or e.get("type"))
+            not in ("startEvent", "endEvent")}
+
+
+def _receives_merged_steps(pool: str, pools: List[str],
+                           lanes: List[Dict[str, Any]]) -> bool:
+    """Пул, который починка наполнит сама: другой пул объявил дорожку с его
+    именем, и `_merge_role_pools` перенесёт его шаги сюда. Звать этот пул
+    пустым — ложное нарушение."""
+    wanted = _norm_name(pool)
+    for other in pools:
+        if _norm_name(other) == wanted:
+            continue
+        lane = _lane_named_like_pool(other, lanes)
+        if lane is not None and _norm_name(
+                _raw_text(lane.get("participant"))) == wanted:
+            return True
+    return False
+
+
+def _vacant_pools(raw: Dict[str, Any]) -> List[str]:
+    """Пулы без единого шага, которым эти шаги не придут из чужого пула."""
+    if not isinstance(raw, dict):
+        return []
+    pools = _plan_pool_names(raw)
+    lanes = _raw_dicts(raw.get("lanes"))
+    claimed = _step_claimed_pools(raw)
+    return [p for p in pools if _norm_name(p) not in claimed
+            and not _receives_merged_steps(p, pools, lanes)]
+
+
+def _mark_role(structure: Dict[str, Any], canonical: str, inside: str) -> None:
+    """Объявить участника ролью языком плана: `_declare_role_lanes` и
+    `_merge_role_pools` понимают пару `external: false` + `inside`."""
+    participants = structure.get("participants")
+    if not isinstance(participants, list):
+        return
+    for index, item in enumerate(participants):
+        name = _raw_text(item.get("name") if isinstance(item, dict) else item)
+        if _norm_name(name) == _norm_name(canonical):
+            participants[index] = {"name": canonical, "external": False,
+                                   "inside": inside}
+            return
+
+
+def _role_candidate_pools(raw: Dict[str, Any]) -> List[str]:
+    """Пулы, которые могут оказаться ролью: без дорожек вообще или с дорожкой,
+    названной как сам пул. Пул с дорожками других имён — организация, и
+    спрашивать про неё незачем.
+
+    Одних «самоимённых» дорожек для вопроса мало: живые прогоны показали роли
+    («Бухгалтерия», «Отдел качества»), которые модель завела пулами вообще без
+    дорожек — их тоже надо называть моделью, а не угадывать по коду.
+    """
+    pools = _plan_pool_names(raw)
+    if len(pools) < 2:
+        # Сворачивать некуда: единственному пулу не быть ролью другого, а вопрос
+        # о нём стоил бы пользователю полную задержку генерации.
+        return []
+    lanes = _raw_dicts(raw.get("lanes"))
+    claimed = _step_claimed_pools(raw)
+    by_pool: Dict[str, List[str]] = {}
+    for lane in lanes:
+        by_pool.setdefault(_norm_name(_raw_text(lane.get("participant"))), []) \
+            .append(_norm_name(_raw_text(lane.get("name"))))
+    out: List[str] = []
+    for pool in pools:
+        norm = _norm_name(pool)
+        if norm not in claimed or _receives_merged_steps(pool, pools, lanes):
+            continue
+        own = by_pool.get(norm, [])
+        if not own or all(n == norm for n in own):
+            out.append(pool)
+    return out
+
+
+def _vacant_named_pools(raw: Dict[str, Any], text: str) -> List[Dict[str, Any]]:
+    """Пустые пулы, названные в описании, с шагами-кандидатами из чужих пулов.
+
+    Кандидат — шаг, в названии которого есть это имя: «Получить подтверждение
+    отгрузки от поставщика» почти наверняка действие «Поставщика», записанное
+    чужим участником. Один источник и для формулировки нарушения, и для
+    точечной правки, чтобы правила не разъезжались между двумя местами.
+    """
+    if not (text or "").strip():
+        return []
+    words = _text_words(text)
+    elements = _raw_dicts(raw.get("elements"))
+    out: List[Dict[str, Any]] = []
+    for pool in _vacant_pools(raw):
+        if not _mentioned(pool, words):
+            continue
+        candidates = [{
+            "id": _raw_text(e.get("id")),
+            "name": _raw_text(e.get("name")),
+            "participant": _raw_text(e.get("participant")),
+        } for e in elements
+            if _raw_text(e.get("kind") or e.get("type"))
+            not in ("startEvent", "endEvent")
+            and _norm_name(_raw_text(e.get("participant"))) != _norm_name(pool)
+            and _mentioned(pool, _text_words(_raw_text(e.get("name"))))]
+        out.append({"pool": pool, "candidates": candidates})
+    return out
+
+
+def _claim_steps_by_name(structure: Dict[str, Any], text: str,
+                         notes: List[str]) -> None:
+    """Однозначная пара «пустой пул — шаг, названный в его честь» переносится без
+    ответа модели.
+
+    Узкий вопрос возвращается не всегда: транспорт падает, ответ пуст, шаг модель
+    указывает в другом пуле. Тогда починка удаляла пустой пул, а вместе с ним и
+    участника, названного в описании (`expected_participants` из схемы уезжал).
+    Переносим только там, где прочтение одно: кандидат один и донор после переноса
+    остаётся с шагом. Двусмысленные пулы — решение за моделью.
+    """
+    elements = _raw_dicts(structure.get("elements"))
+    # Роль, которую модель уже объявила (`inside` или `external: false`), — не
+    # контрагент: её шаги станут дорожкой чужого пула, и наполнять её собственным
+    # шагом нельзя.
+    declared_roles = {_norm_name(_raw_text(
+        item.get("name") if isinstance(item, dict) else item))
+        for item in (structure.get("participants") or [])
+        if isinstance(item, dict) and (_raw_text(item.get("inside"))
+                                       or item.get("external") is False)}
+
+    def steps_of(pool: str) -> List[Dict[str, Any]]:
+        return [e for e in elements
+                if _norm_name(_raw_text(e.get("participant"))) == _norm_name(pool)
+                and _raw_text(e.get("kind") or e.get("type"))
+                not in ("startEvent", "endEvent")]
+
+    for entry in _vacant_named_pools(structure, text):
+        pool, candidates = entry["pool"], entry["candidates"]
+        if _norm_name(pool) in declared_roles or len(candidates) != 1:
+            continue
+        elem = next((e for e in elements
+                     if _raw_text(e.get("id")) == candidates[0]["id"]), None)
+        if elem is None:
+            continue
+        donor = _raw_text(elem.get("participant"))
+        if len(steps_of(donor)) < 2:
+            notes.append(f"шаг {candidates[0]['id']} в пул «{pool}» не перенесён: "
+                         f"после переноса «{donor}» остался без действий")
+            continue
+        elem["participant"] = pool
+        elem["lane"] = ""
+        notes.append(f"шаг {candidates[0]['id']} «{candidates[0]['name']}» перенесён "
+                     f"в пул «{pool}»: он назван в его имени, а участник из "
+                     "описания без шагов был бы удалён починкой")
+
+
+def _same_actor(declared: str, known: Any) -> bool:
+    """То же действующее лицо или нет: «Система WMS» против «WMS», «Служба
+    поддержки» против «Поддержка». Сверка толерантная — и у оракула, и здесь,
+    иначе модель ловилась бы на падежах, а не на потерянных участниках."""
+    a, b = _norm_name(_raw_text(declared)), _norm_name(_raw_text(known))
+    return bool(a) and bool(b) and (a == b or a in b or b in a)
+
+
+def missing_actors(raw: Dict[str, Any]) -> List[str]:
+    """Действующие лица из `actors`, у которых в плане нет ни пула, ни дорожки.
+
+    `actors` — выписка самой модели из описания, поэтому претензия здесь не
+    выдуманная кодом подпись, а противоречие плана самому себе.
+    """
+    if not isinstance(raw, dict):
+        return []
+    pools = _plan_pool_names(raw)
+    lanes = [_raw_text(l.get("name")) for l in _raw_dicts(raw.get("lanes"))]
+    out: List[str] = []
+    for actor in [a for a in (raw.get("actors") or [])
+                  if isinstance(a, str)][:MAX_PARTICIPANTS]:
+        name = _raw_text(actor)
+        if not name or name in out:
+            continue
+        if any(_same_actor(name, known) for known in pools + lanes):
+            continue
+        out.append(name)
+    return out
+
+
+def plan_gaps(raw: Dict[str, Any], text: str = "",
+              with_actors: bool = True) -> List[str]:
+    """Нарушения методологии в ответе модели, читаемые без починки.
+
+    `text` — описание процесса: по нему проверяются имена участников (см.
+    `_participant_gaps`). Без текста эти правила молчат, а не угадывают.
+    """
     gaps: List[str] = []
     if not isinstance(raw, dict):
         return ["план не является JSON-объектом"]
 
-    pools = [_raw_text(i.get("name") if isinstance(i, dict) else i)
-             for i in (raw.get("participants") or [])]
-    pools = [p for p in pools if p]
+    pools = _plan_pool_names(raw)
     lanes = _raw_dicts(raw.get("lanes"))
     elements = _raw_dicts(raw.get("elements"))
     flows = _raw_dicts(raw.get("flows"))
+    gaps.extend(_participant_gaps(pools, lanes, text))
+    gaps.extend(_deadline_gaps(elements, text))
 
-    # Пустой пул: ни одного шага у участника. Стартовое и конечное событие
-    # шагом не считаются — тип неизвестного элементу модели узла трактуем как
-    # шаг: без починки мы не знаем, чем он оказался, и выдумывать не будем.
-    claimed = {_norm_name(_raw_text(e.get("participant"))) for e in elements
-               if _raw_text(e.get("kind") or e.get("type"))
-               not in ("startEvent", "endEvent")}
-    for pool in pools:
-        if _norm_name(pool) not in claimed:
+    # `actors` — выписка самой модели из описания, и расхождение с ней ловит
+    # потерянного участника там, где коду выдумывать имя нельзя. Эти нарушения
+    # не переписывают план целиком: их чинит узкий вопрос о принадлежности шагов
+    # (`_clarify_ownership`), поэтому `with_actors=False` отдаёт список без них.
+    if with_actors:
+        for name in missing_actors(raw):
+            gaps.append(f"ты сама назвала «{name}» действующим лицом описания, но "
+                        "в плане нет ни пула, ни дорожки с таким именем: объяви "
+                        "его участником и запиши за ним его шаги из описания")
+
+    # Пустой пул: ни одного шага у участника (см. `_vacant_pools` — пул, который
+    # починка наполнит слиянием, пустым не считается). Формулировка решает, что
+    # модель сделает с пулом: «такого участника нет» она читает как разрешение
+    # удалить его вместе с его шагами, которые просто записались в чужом пуле.
+    named_vacant = {v["pool"]: v["candidates"]
+                    for v in _vacant_named_pools(raw, text)}
+    for pool in _vacant_pools(raw):
+        if pool in named_vacant:
+            candidates = ", ".join(
+                f"{c['id']} «{c['name']}»" for c in named_vacant[pool][:3])
+            gaps.append(f"пул «{pool}» без единого шага — в нём только старт "
+                        "и финиш. Участник назван в описании, поэтому убирать "
+                        "его нельзя: верни его действия в его пул (participant"
+                        "=«pool»), а не записывай их чужим участником"
+                        + (f": возможно, это {candidates}" if candidates else ""))
+        else:
             gaps.append(f"пул «{pool}» без единого шага — в нём только старт и "
                         "финиш; либо это дорожка основного пула, либо такого "
                         "участника нет")
@@ -558,6 +1279,45 @@ def plan_gaps(raw: Dict[str, Any]) -> List[str]:
                             "роли одной организации живут дорожками одного пула")
                 break
 
+    # Пул, у которого все дорожки названы его собственным именем, — роль,
+    # объявившая саму себя: «Бюджетный контролёр» с дорожкой «Бюджетный
+    # контролёр». Такого участника сливать некуда — приёмника в плане нет, и
+    # угадывать организацию по названию должности нельзя.
+    lanes_by_pool: Dict[str, List[str]] = {}
+    for lane in lanes:
+        lanes_by_pool.setdefault(
+            _norm_name(_raw_text(lane.get("participant"))), []).append(
+                _norm_name(_raw_text(lane.get("name"))))
+    for pool in pools:
+        names = lanes_by_pool.get(_norm_name(pool), [])
+        if names and all(n == _norm_name(pool) for n in names) \
+                and not _receives_merged_steps(pool, pools, lanes):
+            gaps.append(f"пул «{pool}» объявил дорожку с таким же именем: "
+                        "дорожка ничего не добавляет. Если это роль или "
+                        "подразделение организации из текста — запиши его объектом "
+                        "с external=false и inside; если это самостоятельный "
+                        "участник (контрагент, клиент, внешняя система) — оставь "
+                        "пул и убери одноимённую дорожку. Удалять названного в "
+                        "описании участника нельзя")
+
+    # Объявление роли обязано быть завершённым: external=false без inside — это
+    # всё тот же раздутый участник, а inside на несуществующий пул — опечатка,
+    # из-за которой шаги некуда переносить.
+    pool_norms = {_norm_name(p) for p in pools}
+    for item in (raw.get("participants") or []):
+        if not isinstance(item, dict) or item.get("external") is not False:
+            continue
+        name = _raw_text(item.get("name"))
+        inside = _raw_text(item.get("inside"))
+        if not inside:
+            gaps.append(f"участник «{name}» помечен ролью (external=false), но "
+                        "не сказал, чьей: укажи inside — название организации "
+                        "из текста")
+        elif _norm_name(inside) not in pool_norms:
+            gaps.append(f"участник «{name}» указывает inside=«{inside}», а "
+                        "такого пула в плане нет: назови организацию из её "
+                        "шагов")
+
     out_count: Dict[str, int] = {}
     in_count: Dict[str, int] = {}
     for flow in flows:
@@ -566,6 +1326,32 @@ def plan_gaps(raw: Dict[str, Any]) -> List[str]:
             continue
         out_count[source] = out_count.get(source, 0) + 1
         in_count[target] = in_count.get(target, 0) + 1
+
+    # Незаконные концы потоков: repair такую дугу убирает, но куда модель на
+    # самом деле вела маршрут — знает только она, поэтому нарушение уходит в
+    # переспрос списком конкретных потоков.
+    kind_by_id: Dict[str, str] = {}
+    pool_by_id: Dict[str, str] = {}
+    for elem in elements:
+        elem_id = _raw_text(elem.get("id"))
+        if elem_id:
+            kind_by_id[elem_id] = _raw_text(elem.get("kind") or elem.get("type"))
+            pool_by_id[elem_id] = _raw_text(elem.get("participant"))
+    for flow in flows:
+        if "message" in _raw_text(flow.get("kind") or flow.get("type")).lower():
+            continue
+        source, target = _raw_text(flow.get("source")), _raw_text(flow.get("target"))
+        # Sequence между пулами repair превратит в сообщение, а сообщение в
+        # чужой старт — это как раз способ запустить пул.
+        if source in pool_by_id and target in pool_by_id \
+                and pool_by_id[source] != pool_by_id[target]:
+            continue
+        reason = _illegal_flow_end(kind_by_id.get(source, ""),
+                                   kind_by_id.get(target, ""))
+        if reason:
+            gaps.append(f"поток {_raw_text(flow.get('id')) or '?'} "
+                        f"({source} → {target}) противоречит правилу: {reason}; "
+                        "перестрой маршрут без этой дуги")
 
     defaults = {_raw_text(f.get("source")) for f in flows if f.get("default")}
     for elem in elements:
@@ -603,7 +1389,52 @@ def plan_gaps(raw: Dict[str, Any]) -> List[str]:
                     gaps.append(f"у шлюза {elem_id} {len(unconditioned)} веток без "
                                 "условия: заполни condition или пометь одну "
                                 "default=true")
-    return gaps
+
+    # Ветвление, спрятанное в подписях потоков: узел раздваивает маршрут, а
+    # шлюза в плане нет ни одного. Починка не вправе выбирать тип развилки —
+    # исключающая она или параллельная, — это знает только модель.
+    branches: Dict[str, Set[str]] = {}
+    for flow in flows:
+        if _raw_text(flow.get("kind")).lower() == "message":
+            continue
+        source, target = _raw_text(flow.get("source")), _raw_text(flow.get("target"))
+        # Дуга, которую план теряет по правилу легальных концов (поток в старт,
+        # в граничное событие, из финиша), ветвлением не считается: иначе одно
+        # нарушение приходило бы списком из двух пунктов.
+        if _illegal_flow_end(kind_by_id.get(source, ""), kind_by_id.get(target, "")):
+            continue
+        if source and target:
+            branches.setdefault(source, set()).add(target)
+    explicit_split = {
+        _raw_text(elem.get("id")) for elem in elements
+        if _raw_text(elem.get("kind") or elem.get("type")) in GATEWAY_KINDS
+        and len(branches.get(_raw_text(elem.get("id")), set())) >= 2
+    }
+    if not explicit_split:
+        for elem in elements:
+            elem_id = _raw_text(elem.get("id"))
+            if len(branches.get(elem_id, ())) < 2:
+                continue
+            if _raw_text(elem.get("kind") or elem.get("type")) in GATEWAY_KINDS:
+                continue
+            gaps.append(f"узел {elem_id} ({_raw_text(elem.get('name'))}) ведёт "
+                        "сразу в несколько шагов без шлюза — развилка спрятана "
+                        "в подписях потоков; вставь gateway (exclusive или "
+                        "parallel) и веди ветки от него")
+    # Порядок = важность: переспрос один, и на плане с десятком нарушений модель
+    # доходила до подписей имён, оставляя на схеме меньше участников, чем в
+    # описании. Потерянный участник — первое, что надо исправить.
+    return sorted(gaps, key=_gap_priority)
+
+
+_GAP_PRIORITY = (("действующим лицом", 0), ("без единого шага", 1))
+
+
+def _gap_priority(gap: str) -> int:
+    for needle, rank in _GAP_PRIORITY:
+        if needle in gap:
+            return rank
+    return 2
 
 
 def _valid_timer(value: str) -> bool:
@@ -621,9 +1452,11 @@ _NOT_IN_NAME = re.compile(r"[^0-9a-zа-яё]+")
 
 def _sanitize_id(raw: Any, fallback: str) -> str:
     text = str(raw or "").strip()
-    cleaned = _ID_CLEAN.sub("_", text)
+    cleaned = _ID_CLEAN.sub("_", text) or fallback
     if not cleaned:
-        cleaned = fallback
+        # Конца потока без имени не бывает: вызывающий узнаёт про пустоту по ""
+        # и сам решает, выбросить дугу или поставить вопросительный знак.
+        return ""
     if cleaned[0].isdigit():
         cleaned = f"e_{cleaned}"
     return cleaned
@@ -763,42 +1596,131 @@ def _resolve_lane(declared: str, participant: str, lanes: List[Dict[str, Any]],
     return ""
 
 
-def repair_structure(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+def _structure_ids(participants: List[Dict[str, Any]], lanes: List[Dict[str, Any]],
+                   elements: List[Dict[str, Any]],
+                   flows: List[Dict[str, Any]]) -> Set[str]:
+    """Отпечаток плана для трейса починки.
+
+    Шаг записан как `id@пул`, а поток — как `id:источник->цель`, поэтому
+    перенос шага в другой пул и перешивка дуги видны как изменение. Иначе шаг
+    починки, который только и делал, что переставлял элементы, выглядел бы
+    бездействием.
+    """
+    out: Set[str] = set()
+    for item in participants or []:
+        out.add("pool:" + str(_raw_text(item.get("name"))))
+    for item in lanes or []:
+        out.add("lane:" + str(item.get("id") or _raw_text(item.get("name"))))
+    for item in elements or []:
+        out.add(f"{item.get('id')}@{item.get('participant')}")
+    for item in flows or []:
+        out.add(f"flow:{item.get('id')}:{item.get('source')}->{item.get('target')}")
+    return out
+
+
+def repair_structure(raw: Dict[str, Any],
+                     trace: Optional[List[Dict[str, Any]]] = None,
+                     ) -> Tuple[Dict[str, Any], List[str]]:
     """Приводит произвольный ответ модели к валидной структуре.
 
     Ничего не отбрасывает целиком: битые значения чинит, невозможные связи
     удаляет по одной, отсутствующие старт/финиш добавляет. Каждая правка
     попадает в notes — пользователь обязан видеть, что ИИ поправил за него.
     Возвращает (структура, список внесённых правок).
+
+    `trace` — необязательный сборщик: харнесс `eval/` просит записать, какой
+    шаг что добавил и что убрал, чтобы провал инварианта можно было атрибутировать
+    по узлу, а не гадать по тексту пометок. Продуктовый путь список не передаёт
+    и ничего не платит.
     """
     notes: List[str] = []
     used_ids: Set[str] = set()
+    steps: List[Dict[str, Any]] = []
+    mark: List[Any] = []
 
+    def _mark(step: str, participants, lanes_, elements_, flows_) -> None:
+        mark.clear()
+        mark.append((step, _structure_ids(participants, lanes_, elements_, flows_),
+                     len(notes)))
+
+    def _close(participants, lanes_, elements_, flows_) -> None:
+        step, before, n_before = mark.pop()
+        after = _structure_ids(participants, lanes_, elements_, flows_)
+        steps.append({"step": step, "added": sorted(after - before),
+                      "removed": sorted(before - after),
+                      "notes": notes[n_before:]})
+
+    _mark("пулы", [], [], [], [])
     participants = _repair_participants(raw, notes)
+    _close(participants, [], [], [])
+
+    _mark("дорожки", participants, [], [], [])
     lanes = _repair_lanes(raw, participants, used_ids, notes)
+    _close(participants, lanes, [], [])
+
+    _mark("шаги", participants, lanes, [], [])
     elements = _repair_elements(raw, participants, lanes, used_ids, notes)
+    _close(participants, lanes, elements, [])
     if not elements:
         raise GenerationError(
             "Не удалось выделить ни одного шага процесса из описания. "
             "Опишите процесс подробнее."
         )
-    flows = _repair_flows(raw, elements, used_ids, notes)
 
+    _mark("потоки", participants, lanes, elements, [])
+    flows = _repair_flows(raw, elements, used_ids, notes)
+    _close(participants, lanes, elements, flows)
+
+    _mark("хозяева граничных событий", participants, lanes, elements, flows)
     _resolve_boundary_hosts(elements, notes)
+    _close(participants, lanes, elements, flows)
+    # Объявленные роли получают дорожки ДО слияния: сам признак «пул назван
+    # дорожкой» модель могла не проставить, но её решение уже в плане.
+    _mark("дорожки для объявленных ролей", participants, lanes, elements, flows)
+    _declare_role_lanes(participants, lanes, used_ids, notes)
+    _close(participants, lanes, elements, flows)
     # Слияние «ролей-пулов» — до отбрасывания пустых: у пула, который оказался
     # дорожкой, шаги никуда не деваются, и удалять его не за что.
+    _mark("слияние ролей-пулов", participants, lanes, elements, flows)
     _merge_role_pools(elements, flows, participants, lanes, notes)
+    _close(participants, lanes, elements, flows)
+    _mark("удаление пустых пулов", participants, lanes, elements, flows)
     _drop_vacant_pools(elements, flows, participants, lanes, notes)
+    _close(participants, lanes, elements, flows)
+    _mark("события пула", participants, lanes, elements, flows)
     _ensure_pool_events(elements, flows, participants, used_ids, notes)
+    _close(participants, lanes, elements, flows)
+    _mark("связь стартов", participants, lanes, elements, flows)
     _link_dead_starts(elements, flows, participants, used_ids, notes)
+    _close(participants, lanes, elements, flows)
+    _mark("закрытие маршрутов", participants, lanes, elements, flows)
     _close_pool_paths(elements, flows, participants, used_ids, notes)
+    _close(participants, lanes, elements, flows)
+    _mark("достижимость", participants, lanes, elements, flows)
     _ensure_reachability(elements, flows, used_ids, notes)
+    _close(participants, lanes, elements, flows)
     # Понижение шлюза — после связности и до вставки слияний: добавленные
     # достижности меняют число исходящих потоков, и «развилка» с одной веткой
     # могла получиться уже после основной починки.
+    _mark("понижение одновыходных шлюзов", participants, lanes, elements, flows)
     _demote_single_branch_gateways(elements, flows, notes)
+    _close(participants, lanes, elements, flows)
+    # Развилку вставляют до default: у нового шлюза часть веток без условия, и
+    # правило «единственная безусловная ветка — выход по умолчанию» должно её
+    # увидеть. Схождения считаются после вставки — пара шлюзов берётся из
+    # расщепителя.
+    _mark("вставка развилок", participants, lanes, elements, flows)
+    _explicit_split_gateways(elements, flows, used_ids, notes)
+    _close(participants, lanes, elements, flows)
+    _mark("выход по умолчанию", participants, lanes, elements, flows)
     _ensure_gateway_default(elements, flows, notes)
+    _close(participants, lanes, elements, flows)
+    _mark("вставка схождений", participants, lanes, elements, flows)
     _explicit_merge_gateways(elements, flows, used_ids, notes)
+    _close(participants, lanes, elements, flows)
+
+    if trace is not None:
+        trace.extend(steps)
 
     repaired = {
         "participants": participants,
@@ -826,7 +1748,16 @@ def _repair_participants(raw: Dict[str, Any],
             notes.append(f"Дубликат пула «{name}» пропущен")
             continue
         seen.add(norm)
-        participants.append({"name": name})
+        # `external`/`inside` — объявление модели: кто самостоятельный участник,
+        # а кто роль другой организации (см. `_declare_role_lanes`).
+        entry = {"name": name}
+        if isinstance(item, dict):
+            if "external" in item:
+                entry["external"] = bool(item.get("external"))
+            inside = str(item.get("inside") or "").strip()
+            if inside:
+                entry["inside"] = inside
+        participants.append(entry)
         if len(participants) >= MAX_PARTICIPANTS:
             notes.append("Лишние пулы отброшены (максимум %d)" % MAX_PARTICIPANTS)
             break
@@ -946,26 +1877,55 @@ def _repair_elements(raw: Dict[str, Any], participants: List[Dict[str, Any]],
     return elements
 
 
+# Тип события по его собственной подписи. Границы групп держат только те
+# слова, где прочтение однозначное: «получателя» (адресат шага) в группу
+# сообщений не попадает намеренно, спорные названия остаются на решение модели.
+_EVENT_TIMER_NAME_RE = re.compile(
+    r"просрочк|таймаут|таймер|sla|истечени|задержк|опозд|дедлайн", re.I)
+_EVENT_MESSAGE_NAME_RE = re.compile(
+    r"ожидани|ожидает|ждет|ответ|подтверждени|сообщени|уведомлени|приход", re.I)
+
+
+def _infer_event_definition(name: str) -> str:
+    """Определение события по его названию ('' — название молчит)."""
+    raw = _raw_text(name)
+    if not raw:
+        return ""
+    if _EVENT_TIMER_NAME_RE.search(raw):
+        return "timer"
+    if _EVENT_MESSAGE_NAME_RE.search(raw):
+        return "message"
+    return ""
+
+
 def _repair_event_type(item: Dict[str, Any], kind: str, elem_id: str,
                        element: Dict[str, Any], notes: List[str]) -> None:
     """Определение события и хронометраж таймера.
 
     Событие без определения — это пустой кружок на схеме: пользователь видит
-    «промежуточное событие» и не понимает, чего процесс ждёт. Выдумывать тип
-    нельзя (таймер это или сообщение — знает только модель), поэтому отсутствие
-    определения остаётся заметкой и нарушением в плане, а не «чинится» молча.
+    «промежуточное событие» и не понимает, чего процесс ждёт. Выдумывать шаг
+    генератор не вправе, но тип берёт там, где его назвало само событие
+    («Просрочка SLA» — таймер, «Ожидание подтверждения» — сообщение): это
+    прочтение подписи, а не новое содержание. Название, не относящееся ни к одной
+    группе, остаётся заметкой и нарушением в плане — его решает модель.
     """
     declared = _raw_text(item.get("event_definition")
                          or item.get("event_type")).lower()
     if declared not in EVENT_DEFINITIONS:
-        if declared:
-            notes.append(f"Неизвестное определение «{declared}» события {elem_id} "
-                         "снято")
-        else:
-            notes.append(f"У события {elem_id} («{element['name']}») нет "
-                         f"определения: нужно одно из "
-                         f"{', '.join(sorted(EVENT_DEFINITIONS))}")
-        return
+        inferred = _infer_event_definition(element["name"])
+        if not inferred:
+            if declared:
+                notes.append(f"Неизвестное определение «{declared}» события {elem_id} "
+                             "снято")
+            else:
+                notes.append(f"У события {elem_id} («{element['name']}») нет "
+                             f"определения: нужно одно из "
+                             f"{', '.join(sorted(EVENT_DEFINITIONS))}")
+            return
+        notes.append(f"Определение события {elem_id} «{element['name']}» взято "
+                     f"«{inferred}» по его названию: без типа событие — пустой "
+                     "кружок на схеме")
+        declared = inferred
     element["event_definition"] = declared
     if declared != "timer":
         return
@@ -978,6 +1938,32 @@ def _repair_event_type(item: Dict[str, Any], kind: str, elem_id: str,
     element["timer"] = DEFAULT_TIMER_DURATION
     notes.append(f"Хронометраж таймера {elem_id} «{declared_timer or 'не указан'}»"
                  f" не ISO-8601 — взят {DEFAULT_TIMER_DURATION}")
+
+
+_FLOW_END_REASONS = {
+    "startEvent": ("у стартового события входящих потоков не бывает — это "
+                   "триггер пула, а не шаг маршрута"),
+    "boundaryEvent": ("граничное событие запускает его хозяин через "
+                      "attachedToRef — исходящий поток от граничного события "
+                      "это ветка обработки, а входящего у него не бывает"),
+    "endEvent": "конечное событие завершает маршрут, продолжения у него нет",
+}
+
+
+def _illegal_flow_end(source_kind: str, target_kind: str) -> str:
+    """Причина, по которой sequence-поток между узлами недопустим; пусто, когда
+    дуга легальна.
+
+    Только концы: множества запрещённых живёт в `bpmn_edits` — там же, откуда
+    ими пользуется планировщик улучшения и `validate_and_repair`. Два контура с
+    одним правилом в двух формулировках разъезжаются на первом же новом типе
+    узла, поэтому список запрещённого здесь только переводится в текст.
+    """
+    if target_kind in SEQUENCE_FORBIDDEN_TARGETS:
+        return _FLOW_END_REASONS[target_kind]
+    if source_kind in SEQUENCE_FORBIDDEN_SOURCES:
+        return _FLOW_END_REASONS[source_kind]
+    return ""
 
 
 def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
@@ -999,8 +1985,9 @@ def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
         source = _sanitize_id(item.get("source") or item.get("sourceRef"), "")
         target = _sanitize_id(item.get("target") or item.get("targetRef"), "")
         if source == target:
-            notes.append(f"Поток {source} → {target} удалён: шаг не может вести "
-                         "сам в себя — повтор моделируется шлюзом с веткой назад")
+            notes.append(f"Поток {source or '?'} → {target or '?'} удалён: шаг не "
+                         "может вести сам в себя — повтор моделируется шлюзом "
+                         "с веткой назад")
             continue
         if source not in element_ids or target not in element_ids:
             notes.append(f"Поток {source or '?'} → {target or '?'} удалён: "
@@ -1020,6 +2007,17 @@ def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
         elif kind == "message" and not cross_pool:
             notes.append(f"Поток-сообщение {source} → {target} внутри пула удалён")
             continue
+
+        # Концы sequence-потока: дугу в обход правила модель рисует, когда
+        # путает события с шагами маршрута. Убираем её, а не переворачиваем —
+        # переворот выдумал бы содержание. Сообщение в чужой старт — наоборот,
+        # норма, и проверка идёт после межпуловости.
+        if kind == "sequence":
+            reason = _illegal_flow_end(element_by_id[source]["kind"],
+                                       element_by_id[target]["kind"])
+            if reason:
+                notes.append(f"Поток {source} → {target} удалён: {reason}")
+                continue
 
         # Для потока-сообщения текст условия становится именем сообщения.
         condition = str(item.get("condition") or item.get("name") or "").strip()
@@ -1093,6 +2091,13 @@ def _resolve_boundary_hosts(elements: List[Dict[str, Any]],
                          "определения нет — понижено до задачи")
 
 
+# Название дорожки в виде идентификатора («L_hr», «Lane_1»): модель слила туда
+# id вместо имени. Для близкого совпадения при слиянии ролей-пулов такая
+# «дорожка» признаком роли быть не может — по живому прогону роль «HR» уехала
+# в «Руководство подразделения» именно из-за сходства с «L_hr».
+_LANE_ID_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.\-]{0,29}$")
+
+
 def _lane_named_like_pool(pool_name: str,
                           lanes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Дорожка в другом пуле с тем же названием, что и пул.
@@ -1105,15 +2110,50 @@ def _lane_named_like_pool(pool_name: str,
         return None
     close = None
     for lane in lanes:
-        if lane["participant"] == pool_name:
+        # План читается до починки: ключей у дорожки может и не быть.
+        if _raw_text(lane.get("participant")) == pool_name:
             continue
-        lane_norm = _norm_name(lane["name"])
+        lane_norm = _norm_name(lane.get("name"))
         if lane_norm == norm:
             return lane
-        if close is None and difflib.SequenceMatcher(
-                None, lane_norm, norm).ratio() >= POOL_MATCH_CUTOFF:
+        # Идентификатор вместо имени на «похожесть» не тянется: «L_hr» ближе
+        # всех к «HR» и уводила роль в чужую дорожку. Точное имя при этом
+        # остаётся точным — «HR» бывает настоящей дорожкой.
+        if close is None and not _LANE_ID_NAME_RE.match(_raw_text(lane.get("name"))) \
+                and difflib.SequenceMatcher(
+                    None, lane_norm, norm).ratio() >= POOL_MATCH_CUTOFF:
             close = lane
     return close
+
+
+def _declare_role_lanes(participants: List[Dict[str, Any]],
+                        lanes: List[Dict[str, Any]],
+                        used_ids: Set[str],
+                        notes: List[str]) -> None:
+    """Материализует объявленную роль: у пула-роли появляется своя дорожка.
+
+    Отличить «ИТ-отдел» (подразделение) от «Перевозчика» (самостоятельный
+    участник) без описания нельзя — одношаговые пулы бывают и теми и другими.
+    Поэтому решение приносит модель (`external: false` + `inside`), а код лишь
+    создаёт дорожку: по ней `_merge_role_pools` перенесёт шаги уже проверенным
+    признаком «пул назван дорожкой», и коллаборация не раздувается участниками,
+    которых в тексте нет.
+    """
+    names = {_norm_name(p["name"]): p["name"] for p in participants}
+    for pool in participants:
+        if pool.get("external") is not False:
+            continue
+        inside = names.get(_norm_name(pool.get("inside") or ""))
+        if not inside or inside == pool["name"]:
+            continue
+        if _lane_named_like_pool(pool["name"], lanes) is not None:
+            continue
+        lane_id = _unique_id(used_ids, "Lane_role")
+        used_ids.add(lane_id)
+        lanes.append({"id": lane_id, "name": pool["name"],
+                      "participant": inside})
+        notes.append(f"«{pool['name']}» объявлен ролью пула «{inside}» — "
+                     f"создана дорожка «{pool['name']}» ({lane_id})")
 
 
 def _merge_role_pools(elements: List[Dict[str, Any]],
@@ -1144,6 +2184,16 @@ def _merge_role_pools(elements: List[Dict[str, Any]],
                 continue
             src, dst = by_id.get(flow["source"]), by_id.get(flow["target"])
             if src is None or dst is None or src["participant"] != dst["participant"]:
+                continue
+            # Слияние пулов превращает сообщение в поток внутри одного процесса,
+            # и к нему применяется правило концов: поток в чужой старт был
+            # способом запустить пул, а внутри пула он становится недопустимым.
+            reason = _illegal_flow_end(src["kind"], dst["kind"])
+            if reason:
+                flows.remove(flow)
+                notes.append(f"Поток-сообщение {flow['source']} → "
+                             f"{flow['target']} удалён после слияния пулов: "
+                             f"{reason}")
                 continue
             if (flow["source"], flow["target"]) in pairs:
                 flows.remove(flow)
@@ -1262,6 +2312,60 @@ def _splitting_gateway(before: Dict[str, List[str]],
             return element["kind"]
         queue.extend(before.get(node_id, []))
     return None
+
+
+def _explicit_split_gateways(elements: List[Dict[str, Any]],
+                             flows: List[Dict[str, Any]],
+                             used_ids: Set[str],
+                             notes: List[str]) -> None:
+    """Развилка, которую модель расставила по подписям потоков, получает шлюз.
+
+    Условие бывает только у потока от шлюза: если из шага ведут две ветки и
+    автор различил их условиями («прошла проверка» / «не прошла»), развилка в
+    плане уже есть — не хватает узла. Вставка держит топологию, подписи и
+    порядок веток без изменений, добавляется только то, что подразумевалось.
+    Без условий между ветками выбирать нечего: прочтение остаётся за моделью, и
+    вставка останавливается.
+    """
+    by_id = {e["id"]: e for e in elements}
+    outgoing: Dict[str, List[Dict[str, Any]]] = {}
+    for flow in flows:
+        if flow["kind"] == "sequence":
+            outgoing.setdefault(flow["source"], []).append(flow)
+
+    budget = MAX_SPLIT_GATEWAYS
+    for elem_id, branches in list(outgoing.items()):
+        node = by_id.get(elem_id)
+        if node is None or len(branches) < 2:
+            continue
+        if node["kind"] in GATEWAY_KINDS or node["kind"] in ("startEvent",
+                                                            "endEvent",
+                                                            "boundaryEvent"):
+            # Стартовое событие с двумя ветками — легальный неявный параллельный
+            # расход, и вставлять туда исключительный шлюз значит менять смысл.
+            continue
+        if not [f for f in branches if f.get("condition") or f.get("default")]:
+            continue
+        if budget <= 0:
+            notes.append(f"Узел {elem_id} ведёт в {len(branches)} веток без "
+                         f"шлюза: исчерпан лимит вставок ({MAX_SPLIT_GATEWAYS})")
+            continue
+        budget -= 1
+        gateway_id = _unique_id(used_ids, f"Gateway_split_{elem_id}")
+        used_ids.add(gateway_id)
+        elements.append({
+            "id": gateway_id,
+            "kind": "exclusiveGateway",
+            "name": "Выбор ветки",
+            "participant": node["participant"],
+            "lane": node.get("lane", ""),
+        })
+        for branch in branches:
+            branch["source"] = gateway_id
+        flows.append(_new_flow(used_ids, elem_id, gateway_id))
+        notes.append(f"После «{node['name']}» ({elem_id}) вставлен шлюз "
+                     f"развилки {gateway_id}: {len(branches)} ветки различаются "
+                     "условиями, а шлюза в плане не было")
 
 
 def _explicit_merge_gateways(elements: List[Dict[str, Any]],

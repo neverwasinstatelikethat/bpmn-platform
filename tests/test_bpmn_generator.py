@@ -208,8 +208,11 @@ class TestRolesAreLanesNotPools:
         fake = FakeLLM(monkeypatch, _plan())
         BPMNGenerator().generate("описание")
         prompt = fake.system_prompt
-        assert "Одно действие описания — один шаг" in prompt
+        assert "одно законченное действие одного исполнителя" in prompt
         assert "последнее действие" in prompt
+        # склейка прячется в имени: «Проверка упаковок» — это и проверка, и
+        # фиксация, и отчёт; имя-глагол такую склейку выдаёт
+        assert "отглагольное" in prompt
 
     def test_prompt_shows_one_shot_of_roles_as_lanes(self, monkeypatch):
         """Правило без примера модель выполняет неустойчиво: в живом прогоне
@@ -1747,6 +1750,80 @@ class TestOwnershipClarification:
         # и роль не переезжает в «единственную организацию плана»: хозяина по
         # имени роли угадать нельзя, это остаётся вопросом к модели
         assert result["structure"]["lanes"] == []
+
+    def test_role_question_asks_the_three_most_doomed_pools(self, monkeypatch):
+        """Длинный список кандидатов модель закрывает в ~31% случаев, короткого —
+        в ~70% (три живых прогона, 63 кейса с вопросом о ролях). Спрашиваем про
+        трёх самых обречённых — о тех, у кого меньше своих шагов, и потому
+        обходившихся пулом: они и уезжают со схемы первыми."""
+        plan = {"participants": ["ВкусВилл", "Альфа", "Бета", "Гамма",
+                                 "Дельта", "Ипсилон"],
+                "lanes": [{"id": "L1", "name": "Кладовщик",
+                           "participant": "ВкусВилл"}],
+                "elements": (
+                    [{"id": f"V{i}", "kind": "userTask", "name": f"Шаг {i}",
+                      "participant": "ВкусВилл", "lane": "L1"} for i in range(1, 7)]
+                    + [{"id": "A1", "kind": "userTask", "name": "Действие альфы",
+                        "participant": "Альфа"},
+                       {"id": "B1", "kind": "userTask", "name": "Действие беты",
+                        "participant": "Бета"},
+                       {"id": "B2", "kind": "userTask", "name": "Второе беты",
+                        "participant": "Бета"},
+                       {"id": "G1", "kind": "userTask", "name": "Действие гаммы",
+                        "participant": "Гамма"},
+                       {"id": "D1", "kind": "userTask", "name": "Дельта один",
+                        "participant": "Дельта"},
+                       {"id": "D2", "kind": "userTask", "name": "Дельта два",
+                        "participant": "Дельта"},
+                       {"id": "D3", "kind": "userTask", "name": "Дельта три",
+                        "participant": "Дельта"},
+                       {"id": "I1", "kind": "userTask", "name": "Ипсилон один",
+                        "participant": "Ипсилон"},
+                       {"id": "I2", "kind": "userTask", "name": "Ипсилон два",
+                        "participant": "Ипсилон"},
+                       {"id": "I3", "kind": "userTask", "name": "Ипсилон три",
+                        "participant": "Ипсилон"},
+                       {"id": "I4", "kind": "userTask", "name": "Ипсилон четыре",
+                        "participant": "Ипсилон"}]), "flows": []}
+        fenced = _fence(plan)
+        fake = FakeLLM(monkeypatch, fenced, fenced, '{"roles": [], "moves": [], '
+                                                    '"missing": []}')
+        BPMNGenerator().generate(
+            "ВкусВилл собирает заказ: работают кладовщик, альфа, бета, гамма, "
+            "дельта и ипсилон.")
+        asked = _role_candidates(fake.calls[-1][1]["content"])
+        assert "Альфа" in asked and "Бета" in asked and "Гамма" in asked
+        assert "Дельта" not in asked and "Ипсилон" not in asked
+
+    def test_role_answer_about_a_pool_that_was_not_listed_still_counts(
+            self, monkeypatch):
+        """Не спросили — не значит отвергнуть: ответ модели про любого кандидата
+        плана принимается, иначе короткая выборка вопросы тихо теряла бы."""
+        plan = {"participants": ["ВкусВилл", "Альфа", "Бета", "Гамма", "Дельта"],
+                "lanes": [{"id": "L1", "name": "Кладовщик",
+                           "participant": "ВкусВилл"}],
+                "elements": (
+                    [{"id": f"V{i}", "kind": "userTask", "name": f"Шаг {i}",
+                      "participant": "ВкусВилл", "lane": "L1"} for i in range(1, 7)]
+                    + [{"id": "A1", "kind": "userTask", "name": "Альфа",
+                        "participant": "Альфа"},
+                       {"id": "B1", "kind": "userTask", "name": "Бета",
+                        "participant": "Бета"},
+                       {"id": "G1", "kind": "userTask", "name": "Гамма",
+                        "participant": "Гамма"},
+                       {"id": "D1", "kind": "userTask", "name": "Дельта",
+                        "participant": "Дельта"}]), "flows": []}
+        fenced = _fence(plan)
+        roles = '{"roles": [{"pool": "Дельта", "inside": "ВкусВилл"}]}'
+        # ответа два на случай переспроса планом: где он отработает, там и
+        # пройдёт, а вопрос о ролях получит свой ответ в любом случае
+        fake = FakeLLM(monkeypatch, fenced, roles, roles)
+        result = BPMNGenerator().generate(
+            "ВкусВилл собирает заказ: кладовщик, альфа, бета, гамма и дельта.")
+        asked = _role_candidates(
+            [c[1]["content"] for c in fake.calls if "роль, не участник):" in c[1]["content"]][-1])
+        assert "Дельта" not in asked
+        assert _note(result["notes"], "пул «Дельта» — роль «ВкусВилл» по описанию")
 
     def test_generic_organization_name_is_not_invented_a_host(self, monkeypatch):
         """Две действующие организации — выбирать хозяина роли не из чего, и

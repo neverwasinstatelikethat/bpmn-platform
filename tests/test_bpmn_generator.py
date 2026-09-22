@@ -2597,6 +2597,19 @@ class TestReaskAcceptanceByPriority:
     VACANT = "пул «Кладовщик» без единого шага — в нём только старт и финиш"
     TIMER = "описание задаёт ожидание («в течение 15 минут»), таймера нет"
     MINOR = "у шлюза G1 2 ветки без условия"
+    NO_POOL = ('в описании назван участник «WMS», а в схеме его нет: заведи '
+               'пул «WMS» с его шагами')
+
+    def test_missing_system_pool_ranks_with_the_lost_actor(self):
+        """Повтор вернул пул «WMS» ценой ещё одной мелочи — и должен
+        приниматься: без этого пула `expected_participants` падал молча, а
+        разбор стоил отдельного живого прогона."""
+        assert bpmn_generator._gap_profile([self.NO_POOL, self.MINOR]) == (1, 0, 1)
+        assert bpmn_generator._reask_improves(
+            [self.NO_POOL, self.MINOR, self.MINOR],
+            [self.MINOR, self.MINOR, self.MINOR])
+        assert not bpmn_generator._reask_improves(
+            [self.MINOR, self.MINOR, self.MINOR], [self.NO_POOL, self.MINOR])
 
     def test_profiles_split_gaps_by_class(self):
         profile = bpmn_generator._gap_profile(

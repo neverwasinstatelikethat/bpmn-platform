@@ -2374,8 +2374,8 @@ def _ensure_gateway_default(elements: List[Dict[str, Any]],
 
 def _splitting_gateway(before: Dict[str, List[str]],
                        by_id: Dict[str, Dict[str, Any]],
-                       start: str) -> Optional[str]:
-    """Тип ближайшего шлюза-предка узла (None — шлюза выше по маршруту нет)."""
+                       start: str) -> Optional[Dict[str, Any]]:
+    """Ближайший шлюз-предок узла (None — шлюза выше по маршруту нет)."""
     seen: Set[str] = set()
     queue = [start]
     while queue:
@@ -2387,7 +2387,7 @@ def _splitting_gateway(before: Dict[str, List[str]],
         if element is None:
             continue
         if element["kind"] in GATEWAY_KINDS:
-            return element["kind"]
+            return element
         queue.extend(before.get(node_id, []))
     return None
 
@@ -2484,18 +2484,23 @@ def _explicit_merge_gateways(elements: List[Dict[str, Any]],
                          f"шлюза схождения: исчерпан лимит вставок "
                          f"({MAX_MERGE_GATEWAYS})")
             continue
-        kinds = {_splitting_gateway(before, by_id, b["source"])
-                 for b in branches}
+        splits = [_splitting_gateway(before, by_id, b["source"])
+                  for b in branches]
+        kinds = {(s["kind"] if s else None) for s in splits}
         if len(kinds) != 1 or None in kinds:
             notes.append(f"Узел {elem_id} принимает ветки, у которых нет общего "
                          "шлюза-расщепителя — шлюз схождения не вставлен")
             continue
+        # Имя берётся у самой развилки: «Итог: Проверка пройдена?» читателю
+        # говорит, что здесь закрывается тот вопрос, а «Схождение веток» —
+        # filling, который остаётся только безымянной развилке.
+        question = next((s.get("name") or "").strip() for s in splits if s)
         gateway_id = _unique_id(used_ids, f"Gateway_merge_{elem_id}")
         used_ids.add(gateway_id)
         elements.append({
             "id": gateway_id,
             "kind": kinds.pop(),
-            "name": "Схождение веток",
+            "name": f"Итог: {question}" if question else "Схождение веток",
             "participant": node["participant"],
             "lane": node.get("lane", ""),
         })

@@ -126,6 +126,13 @@ def _role_candidates(question):
     return question.split("роль, не участник):\n", 1)[1].split("\n", 1)[0]
 
 
+def _merge_gateways(result):
+    """Вставленные шлюзы схождения — по id, который даёт починка: имя теперь
+    наследует вопрос развилки и для проверки наличия не годится."""
+    return [e for e in result["structure"]["elements"]
+            if e["id"].startswith("Gateway_merge_")]
+
+
 def _illegal_edges(structure):
     """Sequence-потоки с запрещённым концом: вход в старт и в граничное событие,
     выход из конечного. MessageFlow не считается — он чужой старт и обязан
@@ -1430,9 +1437,9 @@ class TestGatewayConditionsAndMerge:
 
     def test_merge_gateway_inserted_before_converging_task(self, monkeypatch):
         result = _generate(monkeypatch, self._branching())
-        merges = [e for e in result["structure"]["elements"]
-                  if e["name"] == "Схождение веток"]
+        merges = _merge_gateways(result)
         assert [m["kind"] for m in merges] == ["exclusiveGateway"]
+        assert merges[0]["name"] == "Итог: Хватает товара?"
         flows = [(f["source"], f["target"]) for f in result["structure"]["flows"]]
         assert ("T2", "T4") not in flows and ("T3", "T4") not in flows
         assert [flows.count((m["id"], "T4")) for m in merges] == [1]
@@ -1441,16 +1448,14 @@ class TestGatewayConditionsAndMerge:
     def test_inserted_merge_gateway_is_not_demoted(self, monkeypatch):
         """У сходящегося шлюза один исходящий — это норма, а не повод понижать."""
         result = _generate(monkeypatch, self._branching())
-        merge = next(e for e in result["structure"]["elements"]
-                     if e["name"] == "Схождение веток")
+        merge = _merge_gateways(result)[0]
         assert _kinds(result["structure"])[merge["id"]] == "exclusiveGateway"
         assert not _note(result["notes"], "понижен до задачи")
 
     def test_parallel_split_gets_parallel_merge(self, monkeypatch):
         result = _generate(monkeypatch, self._branching(
             gateway="parallelGateway", first="", second=""))
-        merges = [e for e in result["structure"]["elements"]
-                  if e["name"] == "Схождение веток"]
+        merges = _merge_gateways(result)
         assert [m["kind"] for m in merges] == ["parallelGateway"]
 
     def test_branches_without_common_gateway_are_left_alone(self, monkeypatch):
@@ -1468,8 +1473,7 @@ class TestGatewayConditionsAndMerge:
                    _f("F5", "T4", "E1")],
         )
         result = _generate(monkeypatch, plan)
-        assert not [e for e in result["structure"]["elements"]
-                    if e["name"] == "Схождение веток"]
+        assert not _merge_gateways(result)
         assert _note(result["notes"], "нет общего шлюза-расщепителя")
 
     @staticmethod
@@ -1509,9 +1513,9 @@ class TestGatewayConditionsAndMerge:
     def test_inserted_split_pairs_with_its_merge(self, monkeypatch):
         result = _generate(monkeypatch, self._hidden_split())
         pairs = {e["name"]: e["kind"] for e in result["structure"]["elements"]
-                 if e["name"] in ("Выбор ветки", "Схождение веток")}
+                 if e["name"] in ("Выбор ветки", "Итог: Выбор ветки")}
         assert pairs == {"Выбор ветки": "exclusiveGateway",
-                         "Схождение веток": "exclusiveGateway"}
+                         "Итог: Выбор ветки": "exclusiveGateway"}
 
     def test_branches_without_conditions_keep_the_model_decision(self, monkeypatch):
         result = _generate(monkeypatch, self._hidden_split(first="", second=""))
@@ -1555,8 +1559,7 @@ class TestGatewayConditionsAndMerge:
             flows=[_f("F1", "S1", "G1"), _f("F2", "G1", "T2", condition="Да"),
                    _f("F3", "G1", "E1", condition="Нет"), _f("F4", "T2", "E1")],
         ))
-        assert not [e for e in result["structure"]["elements"]
-                    if e["name"] == "Схождение веток"]
+        assert not _merge_gateways(result)
 
 
 class TestDeclaredRoles:

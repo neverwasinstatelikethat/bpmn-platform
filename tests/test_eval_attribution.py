@@ -186,3 +186,31 @@ class TestHarnessIntegration:
         assert "из " in table.split("КТО ПОРОДИЛ ДЕФЕКТЫ", 1)[1].split(
             "ПРОВЕНАНС")[0]
         assert "виноват" in table
+
+
+class TestTouchedScope:
+    def test_element_token_does_not_blame_its_pool(self):
+        """`A2@Цех` — про элемент: шаг, добавивший в пул событие, не обязан
+        отвечать за дефекты самого пула."""
+        assert attribution._entry_tokens("A2@Цех фасовки") == {"A2"}
+        assert attribution._entry_tokens("pool:Цех фасовки") == {"Цех фасовки"}
+        assert attribution._entry_tokens("flow:F2:A2->A3") == {"F2", "A2", "A3"}
+
+    def test_pool_level_defect_is_blamed_only_on_pool_entries(self):
+        trace = _trace(**{"починка структуры": {"steps": _steps(
+            {"step": "события пула", "added": ["StartEvent_1@Оператор склада"],
+             "removed": []})}})
+        checks = {"roles_as_lanes": _check("roles_as_lanes",
+                                          ids=["Оператор склада"])}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["roles_as_lanes"].startswith(attribution.OWNER_MODEL_FIRST)
+
+    def test_dropped_pool_is_still_blamed_on_the_step_that_dropped_it(self):
+        trace = _trace(**{"починка структуры": {"steps": _steps(
+            {"step": "удаление пустых пулов", "added": [],
+             "removed": ["pool:Поставщик"]})}})
+        checks = {"expected_participants": _check("expected_participants",
+                                                 ids=["Поставщик"])}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["expected_participants"] == \
+            "починка:удаление пустых пулов"

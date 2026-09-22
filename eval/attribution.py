@@ -49,8 +49,10 @@ def _entry_tokens(entry: str) -> Set[str]:
         flow_id, _, rest = text[5:].partition(":")
         source, _, target = rest.partition("->")
         return {part for part in (flow_id, source, target) if part}
-    element, _, pool = text.partition("@")
-    return {part for part in (element, pool) if part}
+    # `A2@Цех` — про элемент A2, а не про пул «Цех»: имя пула в токене нужно,
+    # чтобы увидеть перенос шага между пулами. Иначе добавление стартового
+    # события в чужой пул приписывало бы этому шагу все дефекты самого пула.
+    return {text.partition("@")[0]}
 
 
 def _touched(step: Mapping[str, Any]) -> Set[str]:

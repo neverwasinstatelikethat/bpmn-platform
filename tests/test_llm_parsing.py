@@ -137,6 +137,44 @@ class TestExtractJson:
         with pytest.raises(ValueError):
             extract_json("")
 
+    def test_missing_colon_between_key_and_value_is_healed(self):
+        """Живой прогон 2026-09-22: генерация упала целиком из-за одного
+        пропущенного двоеточия на 3153-м символе («Expecting ':' delimiter»).
+        Ключи и значения в таком ответе на месте — терять схему из-за
+        синтаксиса нельзя."""
+        raw = '{"participants": ["ВкусВилл"] "elements": []}'
+        assert extract_json(raw) == {"participants": ["ВкусВилл"],
+                                     "elements": []}
+
+    def test_missing_comma_in_array_stays_an_array(self):
+        """Пропущенный разделитель чинится запятой раньше, чем двоеточием: в
+        массиве два элемента рядом — это два элемента, а не «ключ: значение»."""
+        raw = '{"steps": ["Собрать" "Отгрузить"]}'
+        assert extract_json(raw)["steps"] == ["Собрать", "Отгрузить"]
+
+    def test_key_without_colon_falls_back_to_colon_heal(self):
+        """Где запятая не спасает (объект, а не массив), принимается вариант с
+        двоеточием — оба проверяются разбором, угадывать не приходится."""
+        assert extract_json('{"participants": [], "actors" ["ВкусВилл"]}') == {
+            "participants": [], "actors": ["ВкусВилл"]}
+
+    def test_dangling_comma_before_close_is_healed(self):
+        assert extract_json('{"a": 1, "b": [2,],}') == {"a": 1, "b": [2]}
+
+    def test_valid_answer_is_untouched(self):
+        raw = '{"analysis": "ветки \\"a\\" \\"b\\" сошлись", "operations": []}'
+        assert extract_json(raw)["analysis"] == 'ветки "a" "b" сошлись'
+
+    def test_unrepairable_answer_still_fails(self):
+        """Починка не вправе превращать мусор в план: синтаксис чиним, а
+        содержание — нет."""
+        with pytest.raises(ValueError):
+            extract_json('{"a": , }')
+
+    def test_truncated_answer_is_still_reported_as_truncated(self):
+        with pytest.raises(LLMTruncatedError):
+            extract_json('{"participants": ["ВкусВилл", "Поставщик", "Склад')
+
 
 class TestExtractXml:
     def test_default_namespace_form(self, single_pool_xml):

@@ -10,7 +10,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from gigachat import GigaChat
@@ -351,6 +351,51 @@ def _close_truncated(candidate: str) -> Optional[str]:
     return repaired
 
 
+_JSON_STRING_RE = r'"(?:[^"\\]|\\.)*"'
+# Конец значения, за которым сразу идёт следующий токен: модель то и дело теряет
+# запятую между элементами или двоеточие между ключом и значением. Левая часть —
+# строка или закрывающая скобка (`] "elements": …` — живой случай 2026-09-22).
+_VALUE_END = r"(?:" + _JSON_STRING_RE + r"|[}\]])"
+_TOKEN_START = r"(?:\"|[{\[-]|\btrue\b|\bfalse\b|\bnull\b|\d)"
+_NO_COMMA = re.compile(r"(" + _VALUE_END + r")(\s+)(?=" + _TOKEN_START + r")")
+_NO_COLON = re.compile(r"(" + _JSON_STRING_RE + r")(\s+)(?=" + _TOKEN_START + r")")
+_DANGLING_COMMA = re.compile(r",(\s*[}\]])")
+
+
+def _heal_json(text: str) -> List[Tuple[str, str]]:
+    """Варианты ответа с пропущенным разделителем.
+
+    Чинится только разделитель: ключи, значения и порядок полей остаются те же,
+    ничего не додумывается. Запятая пробуется раньше двоеточия — два значения
+    рядом в массиве это два значения, а не «ключ: значение», — и каждый вариант
+    всё равно проверяет `json.loads`: «починка» не вправе превратить мусор в
+    план.
+    """
+    out: List[Tuple[str, str]] = []
+    commas = _NO_COMMA.sub(r"\1, ", text)
+    if commas != text:
+        out.append(("пропущена запятая", commas))
+    colons = _NO_COLON.sub(r"\1: ", text)
+    if colons != text:
+        out.append(("пропущено двоеточие", colons))
+    trailing = _DANGLING_COMMA.sub(r"\1", text)
+    if trailing != text:
+        out.append(("висячая запятая", trailing))
+    return out
+
+
+def _json_variants(text: str):
+    """Порядок разбора: дословный ответ, починки разделителей, и только потом
+    дозакрывание оборванного хвоста.
+
+    Дозакрытие — последний аргумент, а не первый: оно меняет состав ответа,
+    тогда как починка разделителя меняет только синтаксис.
+    """
+    yield "как есть", text
+    yield from _heal_json(text)
+    yield "усечение", _close_truncated(text)
+
+
 def extract_json(raw: str) -> Dict[str, Any]:
     """Извлекает объект из произвольного обрамления: блоки кода, <think>,
     текст вокруг, оборванный ответ."""
@@ -372,7 +417,7 @@ def extract_json(raw: str) -> Dict[str, Any]:
 
     errors = []
     for candidate in candidates:
-        for variant in (candidate, _close_truncated(candidate)):
+        for name, variant in _json_variants(candidate):
             if not variant:
                 continue
             try:
@@ -383,7 +428,7 @@ def extract_json(raw: str) -> Dict[str, Any]:
             if not isinstance(parsed, dict):
                 errors.append("корневой элемент не объект")
                 continue
-            if variant != candidate:
+            if name == "усечение":
                 # Разобрали только то, что довели до конца: ответ оборвался.
                 # Молча вернуть урезанный объект — значит применить план,
                 # которого модель не досказала.
@@ -391,6 +436,8 @@ def extract_json(raw: str) -> Dict[str, Any]:
                     "JSON ответа неполон: пришлось дозакрывать структуру — "
                     "вероятно, ответ обрезан по лимиту токенов"
                 )
+            if name != "как есть":
+                logger.warning("JSON ответа починен: %s", name)
             return parsed
     raise ValueError("не удалось выделить валидный JSON: " + "; ".join(errors[:3]))
 

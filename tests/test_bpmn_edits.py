@@ -2574,3 +2574,64 @@ class TestFlowEndsAndAttachments:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class TestPoolNamesAndRouteIntegrity:
+    """Два дефекта живого прогона, из-за которых пакет или не доезжал до схемы,
+    или доезжал и портил её (−16 баллов на production_incident)."""
+
+    XML = TestFlowEndsAndAttachments.XML
+
+    @staticmethod
+    def _pool_of(xml_text, elem_id):
+        return {e["id"]: e["participant"]
+                for e in build_inventory(xml_text)["elements"]}[elem_id]
+
+    def test_pool_named_from_the_description_is_resolved(self):
+        """«Перевозчик ВкусВилла» и «Перевозчик» — один участник: раньше
+        аплайер отвергал правку из-за формулировки, и модель гоняла тот же
+        пакет по кругу."""
+        out, report = apply_operations(self.XML, [
+            {"op": "add_task", "id": "new_B9", "name": "Оформить путевой лист",
+             "task_type": "userTask", "participant": "Перевозчик ВкусВилла",
+             "after": "B_take"}])
+        assert report["skipped"] == []
+        assert self._pool_of(out, "new_B9") == "Перевозчик"
+
+    def test_ambiguous_pool_is_refused_and_names_the_candidates(self):
+        """Два пула подходят под одно слово — угадывать нельзя, но отказ обязан
+        дать модели список, из которого она выбирает за один повтор."""
+        xml = (self.XML.replace('name="Склад"', 'name="Цех фасовки"')
+               .replace('name="Перевозчик"', 'name="Цех отгрузки"'))
+        _, report = apply_operations(xml, [
+            {"op": "add_task", "id": "new_X1", "name": "Проверить пломбы",
+             "task_type": "userTask", "participant": "Цех"}])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "пул не определён"
+        assert "Цех фасовки" in skip["hint"] and "Цех отгрузки" in skip["hint"]
+
+    def test_handler_in_another_pool_leaves_no_broken_branch(self):
+        """Живой случай: таймер на задаче склада, шаг-эскалация в пуле
+        «Сервис-деск», `connect` между ними. Проверка межпуловости сравнивала
+        два «неизвестно» и пропускала дугу, вычитка её снимала — и событие
+        оставалось без ветки обработки."""
+        ops = [
+            {"op": "add_task", "id": "new_A6", "name": "Сообщить подразделениям",
+             "task_type": "userTask", "participant": "Перевозчик",
+             "to": "B_end"},
+            {"op": "add_boundary_event", "id": "new_B2", "attached_to": "A_escalate",
+             "event_type": "timer", "name": "Передача дольше двух часов",
+             "duration": "PT2H"},
+            {"op": "connect", "source": "new_B2", "target": "new_A6"},
+        ]
+        out, report = apply_operations(self.XML, ops)
+        assert any("между разными пулами" in s["reason"]
+                   for s in report["skipped"])
+        ids = {e.get("id") for e in _root(out).iter() if e.get("id")}
+        assert not {"new_A6", "new_B2"} & ids, "отказанная дуга не оставляет хвостов"
+        assert validate_and_repair(out)[1] == []
+        # Маршрут хозяина не пострадал: откатан только вклад пакета.
+        flows = {f["source"]: f["target"] for f in
+                 build_inventory(out)["flows"] if f["kind"] == "sequence"}
+        assert flows["A_ship"] == "A_end"
+        assert flows["A_escalate"] == "A_sub"

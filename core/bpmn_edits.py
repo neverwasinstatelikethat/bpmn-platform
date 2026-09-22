@@ -4,6 +4,7 @@
 # Принципы: каждая операция валидируется отдельно; невалидная — пропускается
 # с причиной и подсказкой в отчёте, пакет целиком не падает. Никакой магии
 # и эвристик: что не удаётся применить однозначно — сообщаем наверх.
+import difflib
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -425,12 +426,66 @@ class _Index:
             node = self.parents.get(node)
         return False
 
+    def pool_processes(self) -> List[Tuple[str, ET.Element]]:
+        """Пары «имя пула → процесс»: участники collaboration и сами процессы.
+
+        Одно и то же имя приходит и от `<participant>`, и от `<process>` — две
+        записи об одном пуле, поэтому кандидаты дедуплицируются по процессу.
+        """
+        out: List[Tuple[str, ET.Element]] = []
+        for participant in self.participants:
+            ref = participant.get("processRef")
+            process = next((p for p in self.processes
+                            if p.get("id") == ref), None)
+            name = str(participant.get("name") or "").strip()
+            if process is not None and name:
+                out.append((name, process))
+        for process in self.processes:
+            name = str(process.get("name") or "").strip()
+            if name and all(p is not process for _, p in out):
+                out.append((name, process))
+        return out
+
+    def fuzzy_matches(self, key: str) -> List[ET.Element]:
+        """Пулы, чьё имя означает то же участниковое лицо, что и `key`.
+
+        Модель берёт название из описания («Склад»), а в инвентаре пул
+        называется иначе («ВкусВилл», «Система WMS») — правка из-за одной
+        формулировки отвергалась, и пакет уходил в повтор впустую. Разрешаем
+        только однозначно: слово в слово, один набор слов внутри другого или
+        почти совпадение. Два кандидата — не угадываем, а просим уточнить:
+        выдуманный пул стоил бы схеме больше, чем отказ.
+        """
+        wanted = _pool_words(key)
+        if not wanted or min(len(w) for w in wanted) < 3:
+            return []
+        hits: List[ET.Element] = []
+        for name, process in self.pool_processes():
+            words = _pool_words(name)
+            if not words:
+                continue
+            close = (wanted == words or wanted <= words or words <= wanted
+                     or difflib.SequenceMatcher(
+                         None, " ".join(sorted(wanted)),
+                         " ".join(sorted(words))).ratio() >= FUZZY_POOL_RATIO)
+            if close and all(h is not process for h in hits):
+                hits.append(process)
+        return hits
+
+    def pool_candidates(self, key: Optional[str]) -> List[str]:
+        """Имена-кандидаты для подсказки: отказ обязан называть, что подходит."""
+        names = {self.participant_name(process) or process.get("id") or ""
+                 for process in self.fuzzy_matches(str(key or ""))}
+        return sorted(name for name in names if name)
+
     def resolve_process(self, key: Optional[str]) -> Optional[ET.Element]:
         """Участник по id, имени или id процесса → элемент процесса.
 
         Имя процесса участвует наравне с именем участника: инвентарь отдаёт
         `participant_name`, а для схемы без collaboration это именно имя
-        процесса — иначе аплайер отвергал бы то, что сам же показал модели."""
+        процесса — иначе аплайер отвергал бы то, что сам же показал модели.
+        Точного совпадения нет — см. `fuzzy_matches`.
+        """
         if not key:
             if len(self.processes) == 1:
                 return self.processes[0]
@@ -445,7 +500,8 @@ class _Index:
         for process in self.processes:
             if key in (process.get("id"), process.get("name")):
                 return process
-        return None
+        matches = self.fuzzy_matches(str(key))
+        return matches[0] if len(matches) == 1 else None
 
     def is_taken(self, candidate: str) -> bool:
         """Занят ли id в схеме: элементы, потоки и дорожки делят одно
@@ -973,6 +1029,24 @@ def _link_outlet(index: _Index, source_id: str, outlet_id: str,
     return f"исход потока '{flow.get('id')}' → '{outlet_id}'"
 
 
+def _pool_skip(index: "_Index", key: Any) -> "_Skip":
+    """Отказ «пул не определён» с перечислением того, что подходило бы.
+
+    Если нестрогих кандидатов несколько, молчаливый отказ заставил бы модель
+    гадать дальше; список имён переводит повтор в один точный выбор.
+    """
+    candidates = index.pool_candidates(key)
+    if candidates:
+        return _Skip(
+            "пул не определён",
+            f"под «{key}» подходит несколько пулов: "
+            + ", ".join(f"«{c}»" for c in candidates)
+            + " — назовите один из них",
+        )
+    return _Skip("пул не определён",
+                 "укажите participant именем или id пула из инвентаря")
+
+
 def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     op_id = _require_new_id(op.get("id"), index)
     name = (op.get("name") or "").strip()
@@ -980,10 +1054,7 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
         raise _Skip("не задано имя элемента", "укажите name")
     process = index.resolve_process(op.get("participant"))
     if process is None:
-        raise _Skip(
-            "пул не определён",
-            "укажите participant именем или id пула из инвентаря",
-        )
+        raise _pool_skip(index, op.get("participant"))
     lane_key = str(op.get("lane") or "").strip()
     lane = None
     if lane_key:
@@ -1136,10 +1207,7 @@ def _op_add_lane(op: Dict[str, Any], index: _Index) -> List[str]:
         raise _Skip("не задано имя дорожки", "укажите name")
     process = index.resolve_process(op.get("participant"))
     if process is None:
-        raise _Skip(
-            "пул не определён",
-            "укажите participant именем или id пула из инвентаря",
-        )
+        raise _pool_skip(index, op.get("participant"))
     lane_set = _ensure_lane_set(index, process)
     lane = ET.Element(_q("lane"), {"id": op_id, "name": name})
     index.adopt(lane_set, lane)
@@ -1256,6 +1324,27 @@ def _gateway_branches(index: _Index, gateway_id: str) -> List[ET.Element]:
     return [f for f in index.sequence_flows if f.get("sourceRef") == gateway_id]
 
 
+def _endpoint_process(index: "_Index", elem: ET.Element) -> Optional[ET.Element]:
+    """Пузел узла так, как его видит дерево, а не снимок индекса.
+
+    `process_of` строится на разбор XML и пополняется при вставках, но у
+    свежего узла его там ещё может не быть — и тогда проверка «sequence-поток
+    не ходит между пулами» сравнивает два None и пропускает дугу. Вычитка
+    такой поток снимает, а на схеме остаётся граничное событие без ветки
+    обработки: принятое улучшение портило схему (замерено живым прогоном,
+    −16 баллов). Граничное событие при этом смотрим через хозяина: его маршрут
+    живёт в пуле того, к чему он прицеплен.
+    """
+    process = index.process_of.get(elem.get("id") or "")
+    if process is not None:
+        return process
+    if _local(elem.tag) == "boundaryEvent" or elem.get("attachedToRef"):
+        host = index.elements.get(elem.get("attachedToRef") or "")
+        if host is not None:
+            return index.enclosing_process(host)
+    return index.enclosing_process(elem)
+
+
 def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     source_id = op.get("source") or ""
     target_id = op.get("target") or ""
@@ -1281,8 +1370,8 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
         if _local(source.tag) not in GATEWAY_TAGS:
             raise _Skip(f"'{source_id}' не является шлюзом",
                         "default ставят только шлюзу, у задачи ветки по умолчанию нет")
-    source_process = index.process_of.get(source_id)
-    target_process = index.process_of.get(target_id)
+    source_process = _endpoint_process(index, source)
+    target_process = _endpoint_process(index, target)
     if flow_type == "sequence" and source_process is not target_process:
         raise _Skip(
             "sequenceFlow между разными пулами недопустим",
@@ -1793,6 +1882,16 @@ CREATES_ID_OPS = ADD_NODE_OPS | {"add_lane"}
 # событие → соединили поток»: каждый проход снимает хотя бы одно звено, а без
 # прогресса цикл обрывается сразу.
 MAX_PACKAGE_PASSES = 3
+
+# Имя пула из описания разрешается в пул инвентаря, только когда оно близкое:
+# ниже этого порога начинается угадывание содержания.
+FUZZY_POOL_RATIO = 0.8
+_POOL_WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+
+
+def _pool_words(text: Any) -> Set[str]:
+    """Слова названия пула в нижнем регистре — по ним ищется совпадение."""
+    return {w.lower() for w in _POOL_WORD_RE.findall(str(text or ""))}
 
 # Поля, по которым правка опознаётся в отчёте. Они же — ключ сравнения
 # «пропуск первого раунда закрыт повтором» в оркестраторе: без них нельзя

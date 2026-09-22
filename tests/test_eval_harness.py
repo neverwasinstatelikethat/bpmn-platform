@@ -20,7 +20,8 @@ from pathlib import Path
 import pytest
 
 from eval import harness, metrics, scenarios
-from eval.invariants import check_structure, check_xml, summarize
+from eval.invariants import (ALL_CHECKS, CORE_INVARIANTS, check_structure,
+                             check_xml, summarize)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVED_WAREHOUSE_XML = REPO_ROOT / "reports" / "warehouse-delivery" / "process.bpmn"
@@ -169,6 +170,24 @@ def test_default_flow_counts_as_condition():
     assert results["gateway_split_join"].ok
 
 
+def test_live_mode_does_not_borrow_the_quality_of_a_fixture(monkeypatch):
+    """Фикстура в live-прогоне — только слот: ответ берётся у модели, и называть
+    случай «эталонным» значило бы приписывать живой схеме свойства записанного
+    плана (на этом отчёт читателя водил за нос)."""
+    fixture = next(f for f in _fixtures("plan", "good")
+                   if f["id"] == "warehouse_delivery.good.plan")
+    scenario = scenarios.get(fixture["scenario"])
+    structure, notes = harness.repair_structure(fixture["plan"])
+    xml = harness.generate_xml(structure)
+    monkeypatch.setattr(harness, "_live_plan",
+                        lambda text: (structure, notes, xml, []))
+    case = harness.run_generation_case(scenario, fixture, mode="live")
+    assert case.quality == "live" and case.label == "живой ответ модели"
+    assert case.fixture == fixture["id"]
+    replayed = harness.run_generation_case(scenario, fixture)
+    assert replayed.quality == fixture["quality"]
+
+
 def test_structure_and_xml_of_generated_schema_agree():
     """Починенная структура и сгенерированный XML не должны расходиться:
     расхождение — баг emission, и харнесс обязан его показать."""
@@ -179,6 +198,150 @@ def test_structure_and_xml_of_generated_schema_agree():
     assert case.ok, case.error
     assert case.disagreements == []
     assert case.scenario_pass is True
+
+
+# Каркас двухпуловой схемы — ровно та же схема, что собирает
+# `_flow_ends_plan`: messageFlow Клиента приходит в startEvent ВкусВилла,
+# это штатный способ запустить пул. Поток обязан лежать внутри `process`,
+# иначе оракул его не увидит.
+FLOW_ENDS_XML = """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             id="Definitions_flow_ends">
+  <collaboration id="Collaboration_1">
+    <participant id="Pool_wv" name="ВкусВилл" processRef="Process_wv"/>
+    <participant id="Pool_client" name="Клиент" processRef="Process_client"/>
+    <messageFlow id="MF1" sourceRef="S2" targetRef="S1"/>
+  </collaboration>
+  <process id="Process_wv" name="ВкусВилл" isExecutable="true">
+    <startEvent id="S1" name="Поступил заказ"/>
+    <userTask id="A1" name="Собрать заказ"/>
+    <boundaryEvent id="B1" name="Просрочка" attachedToRef="A1">
+      <timerEventDefinition/>
+    </boundaryEvent>
+    <endEvent id="E1" name="Заказ выдан"/>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="A1"/>
+    <sequenceFlow id="F2" sourceRef="A1" targetRef="E1"/>
+    <sequenceFlow id="F3" sourceRef="B1" targetRef="A1"/>
+    {extra}
+  </process>
+  <process id="Process_client" name="Клиент" isExecutable="true">
+    <startEvent id="S2" name="Заказ оформлен"/>
+    <userTask id="A2" name="Дождаться сборки"/>
+    <endEvent id="E2" name="Заказ получен"/>
+    <sequenceFlow id="F4" sourceRef="S2" targetRef="A2"/>
+    <sequenceFlow id="F5" sourceRef="A2" targetRef="E2"/>
+  </process>
+</definitions>"""
+
+
+def _xml_with(extra_flow: str = "") -> str:
+    return FLOW_ENDS_XML.format(extra=extra_flow)
+
+
+def _flow_ends_plan(*extra_flows):
+    """Структурный двойник `FLOW_ENDS_XML` — чтобы один и тот же дефект
+    проверялся на обеих точках входа."""
+    return {
+        "participants": ["ВкусВилл", "Клиент"],
+        "lanes": [],
+        "elements": [
+            {"id": "S1", "kind": "startEvent", "name": "Поступил заказ", "participant": "ВкусВилл"},
+            {"id": "A1", "kind": "userTask", "name": "Собрать заказ", "participant": "ВкусВилл"},
+            {"id": "B1", "kind": "boundaryEvent", "name": "Просрочка", "participant": "ВкусВилл",
+             "attached_to": "A1", "event_definition": "timer"},
+            {"id": "E1", "kind": "endEvent", "name": "Заказ выдан", "participant": "ВкусВилл"},
+            {"id": "S2", "kind": "startEvent", "name": "Заказ оформлен", "participant": "Клиент"},
+            {"id": "A2", "kind": "userTask", "name": "Дождаться сборки", "participant": "Клиент"},
+            {"id": "E2", "kind": "endEvent", "name": "Заказ получен", "participant": "Клиент"},
+        ],
+        "flows": [
+            {"id": "MF1", "kind": "message", "source": "S2", "target": "S1"},
+            {"id": "F1", "kind": "sequence", "source": "S1", "target": "A1"},
+            {"id": "F2", "kind": "sequence", "source": "A1", "target": "E1"},
+            {"id": "F3", "kind": "sequence", "source": "B1", "target": "A1"},
+            {"id": "F4", "kind": "sequence", "source": "S2", "target": "A2"},
+            {"id": "F5", "kind": "sequence", "source": "A2", "target": "E2"},
+            *extra_flows,
+        ],
+    }
+
+
+def test_repaired_share_measures_only_the_packages_own_repair():
+    """`improve/pass@1` мерит итоговую схему и наследует провалы генерации;
+    `repaired_share` отвечает за то, что в зоне ответственности пакета: убрал ли
+    пакет дефекты, которые в базовой схеме были."""
+    broken = _xml_with('<sequenceFlow id="FX" sourceRef="E1" targetRef="S1"/>')
+    case = harness.ImproveCase(scenario="s", fixture="f", label="", quality="live",
+                               mode="replay", repeat=0)
+    case.checks_before = check_xml(broken, {})
+    case.checks_after = check_xml(broken, {})
+    assert case.repaired_share == 0.0            # ничего не починено
+    case.checks_after = check_xml(_xml_with(), {})
+    assert case.repaired_share == 1.0            # дефект базовой схемы убран
+    case.checks_before = check_xml(_xml_with(), {})
+    assert case.repaired_share is None           # чинить было нечего — не считаем
+
+
+def test_legal_flow_endpoints_pass_on_both_entries():
+    """Каркас легален: в startEvent приходит только messageFlow, а у endEvent
+    исходящего управляющего потока нет."""
+    for results in (check_structure(_flow_ends_plan(), {}), check_xml(_xml_with(), {})):
+        check = results["flow_ends_legal"]
+        assert check.applicable and check.ok, check.reason
+
+
+def test_sequence_flow_into_start_or_boundary_event_fails():
+    """Граничное событие запускается хозяином по attachedToRef, а в старт
+    поток управления не входит — оракул обязан видеть оба дефекта."""
+    check = check_structure(_flow_ends_plan(
+        {"id": "FBAD1", "kind": "sequence", "source": "A2", "target": "S1"},
+        {"id": "FBAD2", "kind": "sequence", "source": "A1", "target": "B1"},
+    ), {})["flow_ends_legal"]
+    assert check.applicable and not check.ok
+    assert check.ids == ("FBAD1", "FBAD2")
+    assert "startEvent" in check.reason and "граничное событие" in check.reason
+
+
+def test_sequence_flow_out_of_end_event_fails_xml():
+    """Поток «endEvent → задача» доходит до bpmn-js — в XML его тоже видно."""
+    check = check_xml(_xml_with(
+        '<sequenceFlow id="FBAD" sourceRef="E1" targetRef="A1"/>'),
+        {})["flow_ends_legal"]
+    assert check.applicable and not check.ok
+    assert check.ids == ("FBAD",)
+    assert "endEvent" in check.reason
+
+
+def test_flow_without_id_is_reported_by_its_endpoints():
+    """Поток без id — не повод потерять нарушение: пару концов отдаём как id
+    (тот же приём, что в `gateway_split_join`)."""
+    check = check_structure(_flow_ends_plan(
+        {"kind": "sequence", "source": "E1", "target": "A1"}),
+        {})["flow_ends_legal"]
+    assert not check.ok and check.ids == ("E1->A1",)
+
+
+def test_dangling_flow_endpoint_is_left_to_no_unrouted():
+    """Ссылка вникуда — забота `no_unrouted`: одно и то же нарушение дважды
+    в метрику не попадает."""
+    results = check_structure(_flow_ends_plan(
+        {"id": "FGHOST", "kind": "sequence", "source": "E1", "target": "нет-такого-id"}), {})
+    assert results["flow_ends_legal"].applicable
+    assert results["flow_ends_legal"].ids == ()
+
+
+def test_flow_ends_legal_is_declared_for_both_entry_points():
+    """Имя — в списке инвариантов (из него строится `pass@1/<имя>`) и в обеих
+    сводках: структура и XML измеряют одно и то же."""
+    assert "flow_ends_legal" in CORE_INVARIANTS
+    assert "flow_ends_legal" in ALL_CHECKS
+    xml_results = check_xml(_xml_with(
+        '<sequenceFlow id="FBAD" sourceRef="A1" targetRef="S1"/>'), {})
+    for summary in (summarize(check_structure(_flow_ends_plan(
+            {"id": "FBAD", "kind": "sequence", "source": "A1", "target": "S1"}), {})),
+            summarize(xml_results)):
+        failed = {f["name"]: f for f in summary["failed"]}
+        assert "flow_ends_legal" in failed, summary
+        assert failed["flow_ends_legal"]["ids"] == ["FBAD"]
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +441,12 @@ def test_improvement_replay_metrics():
     clean = cases["production_incident/production_incident.good.improve"]
     assert clean.applied_share == 1.0 and not clean.retried
     assert clean.score_delta >= 0
+    # Разбор отказа улучшения читается из отчёта: без базовой схемы прогон не
+    # отличает унаследованный от генерации провал от того, что принёс пакет,
+    # а без списка применённых операций не видно, какая правка двигала балл.
+    dump = clean.as_dict()
+    assert dump["checks_before"] and dump["applied_details"]
+    assert dump["summary_before"]["applicable"] >= 1
 
 
 def test_generation_error_is_a_result_not_a_crash():
@@ -313,6 +482,26 @@ def test_unknown_plan_fields_do_not_break_the_loop():
     assert case.checks_xml
 
 
+def test_report_lets_a_participant_failure_be_explained(monkeypatch):
+    """Отказ `expected_participants` обязан читаться из отчёта, а не из нового
+    прогона: нужны и нарушения плана до починки, и те имена, среди которых
+    оракул искал участника. Без них «модель не назвала контрагента»
+    неотличимо от «назвала, а починка вынесла пустой пул»."""
+    scenario = scenarios.get("purchase_approval")
+    bad = next(f for f in _fixtures("plan", "bad")
+               if f["scenario"] == scenario.id)
+    case = harness.run_generation_case(scenario, bad)
+    assert case.gaps, "план с пустым пулом обязан иметь нарушение до починки"
+    assert any("без единого шага" in g or "действующим лицом" in g
+               for g in case.gaps), case.gaps
+    named = case.participants_named
+    assert named == [p["name"] if isinstance(p, dict) else str(p)
+                     for p in case.structure.get("participants") or []] + \
+        [l["name"] for l in case.structure.get("lanes") or []]
+    assert case.as_dict()["participants_named"] == named
+    assert case.as_dict()["gaps"] == case.gaps
+
+
 def test_write_baseline_then_compare_is_clean(tmp_path):
     """Baseline, записанный фактическим прогоном, на следующем прогоне не даёт
     регрессий — иначе им мерить нельзя."""
@@ -326,6 +515,44 @@ def test_write_baseline_then_compare_is_clean(tmp_path):
     rerun = harness.run(mode="replay", scenarios_spec="all", repeat=1,
                         baseline_path=baseline_path)
     assert rerun.regressions == []
+
+
+def test_baseline_of_another_mode_is_not_compared(tmp_path):
+    """Replay и live измеряют разное число кейсов разной моделью: сверка
+    режимов между собой выдаёт «регрессию» ровно тогда, когда контур становится
+    лучше (живой прогон против replay-baseline дал девять ложных падений).
+    Baseline сопоставим только внутри своего режима."""
+    baseline_path = tmp_path / "live.json"
+    harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                repeat=1).write_baseline(baseline_path)
+    stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+    stored["mode"] = "live"
+    baseline_path.write_text(json.dumps(stored, ensure_ascii=False),
+                             encoding="utf-8")
+
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                         repeat=1, baseline_path=baseline_path)
+    assert report.regressions == []
+    assert "несопоставимы" in report.baseline_note
+    assert "несопоставимы" in harness.render_table(report)
+
+
+def test_same_mode_baseline_still_reports_a_real_drop(tmp_path):
+    """Пропуск сверки по режиму не должен превратиться в «сверки нет вообще»:
+    то же падение метрики в своём режиме обязано быть замечено."""
+    baseline_path = tmp_path / "current.json"
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                         repeat=1)
+    report.write_baseline(baseline_path)
+    stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+    stored["metrics"]["pass@1/scenario"] = 1.0
+    baseline_path.write_text(json.dumps(stored, ensure_ascii=False),
+                             encoding="utf-8")
+
+    rerun = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                        repeat=1, baseline_path=baseline_path)
+    assert rerun.baseline_note == ""
+    assert [r.name for r in rerun.regressions] == ["pass@1/scenario"]
 
 
 def test_baseline_survives_change_of_repeat(tmp_path):

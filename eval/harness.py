@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import inspect
 import json
 import os
 import time
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping,
                     Optional, Sequence, Tuple)
 
-from . import invariants, metrics
+from . import attribution, invariants, metrics, provenance
 from .invariants import Check
 from .scenarios import Scenario, select
 
@@ -86,20 +87,38 @@ def _resolve_method(class_name: str, *candidates: str) -> Optional[Callable[...,
     return None
 
 
-def repair_structure(plan: Mapping[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+def repair_structure(plan: Mapping[str, Any],
+                     trace: Optional[List[Dict[str, Any]]] = None,
+                     ) -> Tuple[Dict[str, Any], List[str]]:
     """Починка структуры устойчива к смене сигнатуры: кортеж (структура,
-    пометки) или только структура — разбираются оба варианта."""
+    пометки) или только структура — разбираются оба варианта.
+
+    `trace` — сборщик отпечатка шагов починки для атрибуции дефектов. Его
+    передают ядру только если функция починки действительно принимает такой
+    параметр: харнесс не фиксирует под собой сигнатуру, а спрашивает её.
+    """
     fn = _resolve("core.bpmn_generator", "repair_structure", "repair_plan",
                   "normalize_structure")
     if fn is None:
         raise HarnessError("в core/bpmn_generator нет функции починки структуры "
                            "(repair_structure/repair_plan)")
-    result = fn(dict(plan))
+    args: List[Any] = [dict(plan)]
+    if trace is not None and "trace" in _signature_names(fn):
+        args.append(trace)
+    result = fn(*args)
     if isinstance(result, tuple):
         structure = result[0] if len(result) > 0 else {}
         notes = list(result[1]) if len(result) > 1 and result[1] else []
         return structure or {}, notes
     return (result or {}), []
+
+
+def _signature_names(fn: Any) -> List[str]:
+    """Имена параметров функции ([] уbuilt-in без сигнатуры)."""
+    try:
+        return list(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):  # noqa: PERF203 — один вызов на кейс
+        return []
 
 
 def generate_xml(structure: Mapping[str, Any]) -> str:
@@ -207,7 +226,10 @@ class GenCase:
     ok: bool = False
     error: str = ""
     notes: List[str] = field(default_factory=list)
+    gaps: List[str] = field(default_factory=list)
     structure: Dict[str, Any] = field(default_factory=dict)
+    trace: List[Dict[str, Any]] = field(default_factory=list)
+    attribution: Dict[str, str] = field(default_factory=dict)
     xml: str = ""
     checks_structure: Dict[str, Check] = field(default_factory=dict)
     checks_xml: Dict[str, Check] = field(default_factory=dict)
@@ -254,7 +276,21 @@ class GenCase:
         self.elements = len(self.structure.get("elements") or [])
         self.message_flows = len([f for f in (self.structure.get("flows") or [])
                                   if str(f.get("kind", "")).lower() == "message"])
+        self.attribution = attribution.attribute_generation(
+            self.checks_xml, self.checks_structure, self.trace, self.gaps)
         self.ok = True
+
+    @property
+    def participants_named(self) -> List[str]:
+        """Имена, которые оракул считает участниками: пулы и дорожки.
+
+        Отчёт без них не отвечает на главный вопрос отказа `expected_participants`
+        — не назвала ли модель контрагента вообще."""
+        out = [str(p.get("name", "")) for p in (self.structure.get("participants") or [])
+               if isinstance(p, dict)]
+        out += [str(l.get("name", "")) for l in (self.structure.get("lanes") or [])
+                if isinstance(l, dict)]
+        return [o for o in out if o]
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -262,11 +298,14 @@ class GenCase:
             "quality": self.quality, "mode": self.mode, "repeat": self.repeat,
             "ok": self.ok, "error": self.error, "scenario_pass": self.scenario_pass,
             "score": self.score, "failed_rules": self.failed_rules,
-            "repairs": self.repairs, "notes": self.notes,
+            "repairs": self.repairs, "notes": self.notes, "gaps": self.gaps,
+            "participants_named": self.participants_named,
             "pools": self.pools, "elements": self.elements,
             "message_flows": self.message_flows,
             "latency_ms": round(self.latency_ms, 1), "llm_calls": self.llm_calls,
             "structure_vs_xml": self.disagreements,
+            "attribution": self.attribution,
+            "trace": self.trace,
             "checks_xml": {k: v.as_dict() for k, v in self.checks_xml.items()},
             "checks_structure": {k: v.as_dict()
                                  for k, v in self.checks_structure.items()},
@@ -294,6 +333,7 @@ class ImproveCase:
     score_after: Optional[float] = None
     checks_before: Dict[str, Check] = field(default_factory=dict)
     checks_after: Dict[str, Check] = field(default_factory=dict)
+    attribution: Dict[str, str] = field(default_factory=dict)
     latency_ms: float = 0.0
     llm_calls: int = 0
     xml_after: str = ""
@@ -319,6 +359,26 @@ class ImproveCase:
             return None
         return all(c.ok for c in invariants.applicable_checks(self.checks_after))
 
+    @property
+    def repaired_share(self) -> Optional[float]:
+        """Доля дефектов БАЗОВОЙ схемы, которые пакет убрал.
+
+        `pass_after` мерит итоговую схему целиком и наследует провалы генерации:
+        для него «улучшение не сработало» и «улучшать было нечего — схема сломана
+        выше» дают одно число. Эта метрика отвечает только за зону ответственности
+        пакета и возвращает None, когда чинить было нечего (не раздувает
+        выборку).
+        """
+        if not self.checks_before or not self.checks_after:
+            return None
+        before = [c for c in invariants.applicable_checks(self.checks_before)
+                  if not c.ok]
+        if not before:
+            return None
+        still_bad = {c.name for c in invariants.applicable_checks(self.checks_after)
+                     if not c.ok}
+        return float(sum(1 for c in before if c.name not in still_bad)) / len(before)
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "scenario": self.scenario, "fixture": self.fixture, "label": self.label,
@@ -328,11 +388,19 @@ class ImproveCase:
             "applied_share": self.applied_share, "corrective_retry": self.retried,
             "score_before": self.score_before, "score_after": self.score_after,
             "score_delta": self.score_delta,
-            "skipped_details": self.skipped, "repair_notes": self.repair_notes,
+            "skipped_details": self.skipped, "applied_details": self.applied,
+            "repair_notes": self.repair_notes,
+            "attribution": self.attribution,
             "pass_after": self.pass_after,
+            "repaired_share": self.repaired_share,
             "summary_after": invariants.summarize(self.checks_after)
             if self.checks_after else {},
             "checks_after": {k: v.as_dict() for k, v in self.checks_after.items()},
+            # Базовая схема рядом с итоговой: без неё прогон не отвечает на
+            # вопрос, унаследован провал от генерации или его принёс пакет.
+            "summary_before": invariants.summarize(self.checks_before)
+            if self.checks_before else {},
+            "checks_before": {k: v.as_dict() for k, v in self.checks_before.items()},
             "latency_ms": round(self.latency_ms, 1), "llm_calls": self.llm_calls,
         }
 
@@ -367,8 +435,25 @@ def llm_call_counter() -> Iterator[Dict[str, int]]:
         llm_client._complete = original
 
 
-def _live_plan(text: str) -> Tuple[Dict[str, Any], List[str], str]:
-    """План, пометки починки и XML от живого контура (тот же путь, что у /api/generate)."""
+def _plan_gaps(plan: Mapping[str, Any], text: str) -> List[str]:
+    """Нарушения плана до починки — ответ того же `plan_gaps`, что и контур.
+
+    Служит для разбора отказов: без них нельзя отличить «модель не назвала
+    участника» от «назвала, а починка вынесла»."""
+    fn = _resolve("core.bpmn_generator", "plan_gaps", "check_plan",
+                  "validate_plan")
+    if fn is None:
+        return []
+    try:
+        return [str(g) for g in (fn(dict(plan), text) or [])]
+    except Exception:  # noqa: BLE001 — диагностика не имеет ронять прогон
+        return []
+
+
+def _live_plan(text: str) -> Tuple[Dict[str, Any], List[str], str, List[str],
+                                   List[Dict[str, Any]]]:
+    """План, пометки починки, XML, нарушения плана и трейс узлов живого контура
+    (тот же путь, что у /api/generate)."""
     cls = getattr(_module("core.bpmn_generator"), "BPMNGenerator", None)
     if cls is None:
         raise HarnessError("в core/bpmn_generator нет класса BPMNGenerator")
@@ -377,7 +462,8 @@ def _live_plan(text: str) -> Tuple[Dict[str, Any], List[str], str]:
         error = (result or {}).get("error") or "генератор вернул неизвестный ответ"
         raise _CaseFailure(error)
     return (result.get("structure") or {}, list(result.get("notes") or []),
-            result.get("bpmn") or "")
+            result.get("bpmn") or "", [str(g) for g in (result.get("gaps") or [])],
+            [dict(t) for t in (result.get("trace") or [])])
 
 
 def run_generation_case(scenario: Scenario, fixture: Optional[Mapping[str, Any]] = None,
@@ -386,12 +472,18 @@ def run_generation_case(scenario: Scenario, fixture: Optional[Mapping[str, Any]]
 
     Провал сцены (`GenerationError`, пустой план, падение аплайера) — значение
     метрики, а не падение харнесса: случай записывается с текстом причины.
+
+    В live-режиме фикстура даёт только слот прогона: ответ модели берётся
+    живой, поэтому и метка случая — «live», а не «эталон» из фикстуры. Иначе
+    отчёт приписывал бы записи модели свойства записанного плана.
     """
+    live_answer = mode == "live"
     case = GenCase(
         scenario=scenario.id,
         fixture=(fixture or {}).get("id", "live"),
-        label=(fixture or {}).get("label", "ответ живого контура"),
-        quality=(fixture or {}).get("quality", "live"),
+        label=("живой ответ модели" if live_answer
+               else (fixture or {}).get("label", "ответ живого контура")),
+        quality="live" if live_answer else (fixture or {}).get("quality", "live"),
         mode=mode, repeat=repeat,
     )
     expectations = scenario.expectations()
@@ -399,14 +491,22 @@ def run_generation_case(scenario: Scenario, fixture: Optional[Mapping[str, Any]]
     try:
         if mode == "live":
             with llm_call_counter() as counter:
-                structure, notes, xml = _live_plan(scenario.text)
+                structure, notes, xml, gaps, trace = _live_plan(scenario.text)
+            case.trace = trace
             case.llm_calls = counter["calls"]
         else:
             if not fixture or "plan" not in fixture:
                 raise _CaseFailure("у фикстуры нет поля plan")
-            structure, notes = repair_structure(fixture["plan"])
+            gaps = _plan_gaps(fixture["plan"], scenario.text)
+            steps: List[Dict[str, Any]] = []
+            structure, notes = repair_structure(fixture["plan"], steps)
+            # Трейс фикстуры честен ровно наполовину: кто прислал план — модель
+            # или автор фикстуры — харнесс не знает, поэтому владельцем отсутствия
+            # считается сама фикстура (атрибуция решает это по пустому трейсу).
+            case.trace = [{"node": "починка структуры", "steps": steps}]
             xml = generate_xml(structure)
         case.structure, case.notes, case.xml = structure, notes, xml
+        case.gaps = gaps
         case.measure(expectations)
     except HarnessError:
         raise
@@ -476,6 +576,8 @@ def run_improvement_case(scenario: Scenario, fixture: Mapping[str, Any],
             case.repair_notes, case.retried = notes, retried
         if case.xml_after:
             case.checks_after = invariants.check_xml(case.xml_after, expectations)
+            case.attribution = attribution.attribute_improvement(
+                case.checks_before, case.checks_after, case.applied, case.skipped)
             case.score_after = score_xml(case.xml_after).get("score")
         case.ok = bool(case.applied)
     except HarnessError:
@@ -581,6 +683,8 @@ def build_improvement_suite() -> metrics.EvaluationSuite:
                  description="дельта балла после применения пакета", unit="балл")
     suite.metric("improve/pass@1", lambda case: case.pass_after,
                  description="инварианты улучшенной схемы")
+    suite.metric("improve/defects_repaired", lambda case: case.repaired_share,
+                 description="доля дефектов базовой схемы, которые пакет убрал")
     suite.metric("improve/no_regression",
                  lambda case: None if case.score_delta is None
                  else float(case.score_delta >= 0),
@@ -633,6 +737,8 @@ class RunReport:
     spread: Dict[str, Optional[float]]
     regressions: List[metrics.Regression]
     baseline_path: str = ""
+    baseline_note: str = ""
+    provenance: Dict[str, Any] = field(default_factory=dict)
 
     def metrics_flat(self) -> Dict[str, Optional[float]]:
         """Метрики для baseline и сверки.
@@ -671,7 +777,9 @@ class RunReport:
                         "flat": self.metrics_flat()},
             "spread": self.spread,
             "baseline": self.baseline_path,
+            "baseline_note": self.baseline_note,
             "regressions": [r.as_dict() for r in self.regressions],
+            "provenance": self.provenance,
             "cases": [c.as_dict() for c in self.cases],
             "improvements": [c.as_dict() for c in self.improve_cases],
         }
@@ -726,7 +834,10 @@ def render_table(report: RunReport) -> str:
         if case.error:
             lines.append(f"        ошибка: {case.error}")
         for failure in invariants.summarize(case.checks_xml).get("failed", []):
-            lines.append(f"        ✗ {failure['name']}: {failure['reason']}")
+            owner = case.attribution.get(failure["name"], "")
+            lines.append(f"        ✗ {failure['name']}"
+                         + (f" → виноват {owner}" if owner else "")
+                         + f": {failure['reason']}")
         if case.disagreements:
             lines.append("        ⚠ структура и XML расходятся: "
                          + ", ".join(case.disagreements))
@@ -745,11 +856,29 @@ def render_table(report: RunReport) -> str:
             lines.append(f"        ⊘ {skip.get('stage', 'план')}/{skip.get('op')}: "
                          f"{skip.get('reason')}")
         for failure in invariants.summarize(case.checks_after).get("failed", []):
-            lines.append(f"        ✗ {failure['name']}: {failure['reason']}")
+            owner = case.attribution.get(failure["name"], "")
+            lines.append(f"        ✗ {failure['name']}"
+                         + (f" → виноват {owner}" if owner else "")
+                         + f": {failure['reason']}")
+    lines += ["", "КТО ПОРОДИЛ ДЕФЕКТЫ"]
+    lines += ["  " + line for line in attribution.format_tally(
+        attribution.tally(*[c.attribution for c in report.cases],
+                          *[c.attribution for c in report.improve_cases]))]
+    lines += ["", "ПРОВЕНАНС КЕЙСОВ"]
+    # Метрика стоит ровно столько, сколько стоит её набор: кейс, ответ которого
+    # есть в few-shot промпта, мерит копирование, а не контур.
+    if not report.provenance:
+        lines.append("  разбор не выполнялся")
+    else:
+        lines += ["  " + line
+                  for line in provenance.format_findings(report.provenance)]
     lines.append("")
     if report.regressions:
         lines.append("РЕГРЕССИИ ОТНОСИТЕЛЬНО BASELINE")
         lines += ["  " + r.describe() for r in report.regressions]
+    elif report.baseline_note:
+        lines.append("BASELINE")
+        lines.append("  " + report.baseline_note)
     elif report.baseline_path:
         lines.append("Регрессий относительно baseline нет.")
     else:
@@ -808,22 +937,30 @@ def run(mode: str = "replay", scenarios_spec: str = "all", repeat: int = 1,
     for scenario in chosen:
         scenario_plans = [f for f in plans if f["scenario"] == scenario.id]
         bases: List[Tuple[Optional[Mapping[str, Any]], GenCase]] = []
-        for fixture in scenario_plans:
-            for index in range(repeat):
-                case = run_generation_case(scenario, fixture, mode=mode, repeat=index)
-                gen_cases.append(case)
-                bases.append((fixture, case))
         if mode == "live":
-            live_case = run_generation_case(scenario, None, mode=mode)
-            gen_cases.append(live_case)
-            bases.append((None, live_case))
+            # Фикстуры в live — не ответы модели, а слоты прогона. Гонять живой
+            # запрос по разу на фикстуру значило бы взвешивать сценарий числом
+            # его записей (у warehouse_delivery их три, у product_return две) и
+            # платить за это лишними ~20 с на слот.
+            for index in range(repeat):
+                case = run_generation_case(scenario, None, mode=mode, repeat=index)
+                gen_cases.append(case)
+                bases.append((None, case))
+        else:
+            for fixture in scenario_plans:
+                for index in range(repeat):
+                    case = run_generation_case(scenario, fixture, mode=mode,
+                                               repeat=index)
+                    gen_cases.append(case)
+                    bases.append((fixture, case))
 
         scenario_improves = [f for f in improves if f["scenario"] == scenario.id]
         for fixture in scenario_improves:
             base_id = fixture.get("base_plan")
             base_plan = fixture_by_id(base_id, fixtures) if base_id else None
             candidates = [b for b in bases
-                          if base_plan is None or b[0] is base_plan]
+                          if base_plan is None or mode == "live"
+                          or b[0] is base_plan]
             base = next((c for _, c in candidates if c.ok), None)
             if base is None:
                 improve_cases.append(ImproveCase(
@@ -850,11 +987,23 @@ def run(mode: str = "replay", scenarios_spec: str = "all", repeat: int = 1,
         cases=gen_cases, improve_cases=improve_cases,
         generation=generation, improvement=improvement,
         spread=spread_stats(gen_cases), regressions=[],
+        provenance=provenance.audit(chosen, fixtures),
         baseline_path=str(baseline_path) if baseline_path else "")
     baseline = load_baseline(baseline_path)
     if baseline:
-        report.regressions = detect_regressions(report.metrics_flat(), baseline,
-                                                threshold=threshold)
+        base_mode = str(baseline.get("mode") or "")
+        if base_mode and base_mode != mode:
+            # Метрики режимов несопоставимы: live гоняет больше кейсов и
+            # настоящую модель, replay — записанные ответы. Сравнение дало бы
+            # «регрессию» ровно в тот момент, когда контур стал лучше.
+            report.baseline_note = (
+                f"baseline собран в режиме «{base_mode}», прогон — «{mode}»: "
+                "метрики несопоставимы, сверка пропущена. Для live заведите "
+                "отдельный baseline (--baseline eval/baselines/live.json) "
+                "после 3–5 прогонов, чтобы не ловить шум")
+        else:
+            report.regressions = detect_regressions(report.metrics_flat(),
+                                                   baseline, threshold=threshold)
     return report
 
 

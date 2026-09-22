@@ -1751,14 +1751,11 @@ class TestOwnershipClarification:
         # имени роли угадать нельзя, это остаётся вопросом к модели
         assert result["structure"]["lanes"] == []
 
-    def test_role_question_asks_the_roles_that_hold_the_steps(self, monkeypatch):
+    def test_role_question_asks_the_three_most_doomed_pools(self, monkeypatch):
         """Длинный список кандидатов модель закрывает в ~31% случаев, короткого —
         в ~70% (три живых прогона, 63 кейса с вопросом о ролях). Спрашиваем про
-        трёх кандидатов с большим числом своих шагов: живой прогон #40 показал,
-        что краткий список по «меньше шагов» тратился на пустых контрагентов
-        («перевозчик», «получатель»), хозяина которых модель назвать не может, а
-        роли-обёртки с шагами — те, кто раздувает число пулов, — оставались без
-        вопроса: `roles_as_lanes` падал именно на них."""
+        трёх самых обречённых — о тех, у кого меньше своих шагов, и потому
+        обходившихся пулом: они и уезжают со схемы первыми."""
         plan = {"participants": ["ВкусВилл", "Альфа", "Бета", "Гамма",
                                  "Дельта", "Ипсилон"],
                 "lanes": [{"id": "L1", "name": "Кладовщик",
@@ -1795,8 +1792,8 @@ class TestOwnershipClarification:
             "ВкусВилл собирает заказ: работают кладовщик, альфа, бета, гамма, "
             "дельта и ипсилон.")
         asked = _role_candidates(fake.calls[-1][1]["content"])
-        assert "Ипсилон" in asked and "Дельта" in asked and "Бета" in asked
-        assert "Альфа" not in asked and "Гамма" not in asked
+        assert "Альфа" in asked and "Бета" in asked and "Гамма" in asked
+        assert "Дельта" not in asked and "Ипсилон" not in asked
 
     def test_role_answer_about_a_pool_that_was_not_listed_still_counts(
             self, monkeypatch):

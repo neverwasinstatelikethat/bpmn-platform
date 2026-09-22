@@ -2632,6 +2632,19 @@ class TestReaskAcceptanceByPriority:
     MINOR = "у шлюза G1 2 ветки без условия"
     NO_POOL = ('в описании назван участник «WMS», а в схеме его нет: заведи '
                'пул «WMS» с его шагами')
+    ROLE_WITHOUT_ORG = ('участник «Система мониторинга» помечен ролью '
+                        '(external=false), но не сказал, чьей')
+
+    def test_role_without_an_organization_ranks_as_a_lost_participant(self):
+        """Пустая роль без организации никуда не девается: пул без шагов
+        снимается починкой, и участник исчезает со схемы. Повтор, который
+        «починил» названную систему именно так, приниматься не должен."""
+        assert bpmn_generator._gap_profile(
+            [self.ROLE_WITHOUT_ORG]) == (1, 0, 0)
+        assert not bpmn_generator._reask_improves(
+            [self.MINOR, self.MINOR], [self.ROLE_WITHOUT_ORG, self.MINOR])
+        assert bpmn_generator._reask_improves(
+            [self.ROLE_WITHOUT_ORG, self.MINOR], [self.MINOR, self.MINOR])
 
     def test_missing_system_pool_ranks_with_the_lost_actor(self):
         """Повтор вернул пул «WMS» ценой ещё одной мелочи — и должен

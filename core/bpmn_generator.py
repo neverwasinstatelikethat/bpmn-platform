@@ -406,7 +406,18 @@ class BPMNGenerator:
                     # улучшать, а не просто менять местами те же ошибки.
                     lost = _plan_content(structure) - _plan_content(retry)
                     reask.update(gaps_after=len(candidate_gaps),
-                                 lost_steps=lost)
+                                 lost_steps=lost,
+                                 profile_before=_gap_profile(gaps),
+                                 profile_after=_gap_profile(candidate_gaps),
+                                 # Счётчик сам по себе не объясняет отказ: без
+                                 # того, что повтор принёс и что унёс, каждый
+                                 # разбор стоит отдельного живого прогона.
+                                 fixed=_trace_gaps(
+                                     [g for g in gaps
+                                      if g not in candidate_gaps])[:6],
+                                 added=_trace_gaps(
+                                     [g for g in candidate_gaps
+                                      if g not in gaps])[:6])
                     if not _reask_improves(gaps, candidate_gaps):
                         retry_note = (f"Повторный запрос модели не улучшил план "
                                       f"({len(gaps)} нарушений) — оставлен первый")
@@ -559,7 +570,7 @@ class BPMNGenerator:
         """
         vacant = _vacant_named_pools(structure, text)
         pools = _plan_pool_names(structure)
-        role_pools = _role_candidate_pools(structure)
+        role_pools = _role_candidate_pools(structure, text)
         elements = _raw_dicts(structure.get("elements"))
         by_id = {_raw_text(e.get("id")): e for e in elements}
         steps = [f"{_raw_text(e.get('id'))} «{_raw_text(e.get('name'))}» — "
@@ -631,6 +642,7 @@ class BPMNGenerator:
         notes = []
         moves = data.get("moves")
         targets = {_norm_name(v["pool"]): v["pool"] for v in vacant}
+        in_the_plan = {_norm_name(p) for p in pools}
         for move in (moves if isinstance(moves, list) else [])[:MAX_PATCH_MOVES]:
             if not isinstance(move, dict):
                 continue
@@ -642,8 +654,14 @@ class BPMNGenerator:
                              "нет")
                 continue
             if targets.get(_norm_name(pool)) is None:
-                notes.append(f"перенос {elem_id} → «{pool}» отклонён: этого пула "
-                             "среди пустых не было")
+                # Причина отказа обязана быть настоящей: «среди пустых не было»
+                # одинаково выглядит и когда пул полон, и когда его нет вовсе, а
+                # это разные ответы модели и разные правки плана.
+                notes.append(
+                    f"перенос {elem_id} → «{pool}» отклонён: "
+                    + ("в нём уже есть свои шаги — вопрос только про пустые пулы"
+                       if _norm_name(pool) in in_the_plan else
+                       "такого пула в плане нет"))
                 continue
             if _raw_text(elem.get("kind") or elem.get("type")) in (
                     "startEvent", "endEvent"):
@@ -1082,7 +1100,7 @@ def _mark_role(structure: Dict[str, Any], canonical: str, inside: str) -> None:
             return
 
 
-def _role_candidate_pools(raw: Dict[str, Any]) -> List[str]:
+def _role_candidate_pools(raw: Dict[str, Any], text: str = "") -> List[str]:
     """Пулы, которые могут оказаться ролью: без дорожек вообще или с дорожкой,
     названной как сам пул. Пул с дорожками других имён — организация, и
     спрашивать про неё незачем.
@@ -1090,6 +1108,12 @@ def _role_candidate_pools(raw: Dict[str, Any]) -> List[str]:
     Одних «самоимённых» дорожек для вопроса мало: живые прогоны показали роли
     («Бухгалтерия», «Отдел качества»), которые модель завела пулами вообще без
     дорожек — их тоже надо называть моделью, а не угадывать по коду.
+
+    Пустой пул, названный в описании, — тот же случай: наполнить его нечем,
+    убрать нельзя, и роль организации остаётся единственным выходом. Модель
+    предлагала его сама и получала отказ «среди кандидатов такого пула не
+    было». Выдуманный пустой пул кандидатом не становится: сворачивать его в
+    дорожку значило бы легализовать участника, которого в тексте нет.
     """
     pools = _plan_pool_names(raw)
     if len(pools) < 2:
@@ -1098,6 +1122,8 @@ def _role_candidate_pools(raw: Dict[str, Any]) -> List[str]:
         return []
     lanes = _raw_dicts(raw.get("lanes"))
     claimed = _step_claimed_pools(raw)
+    vacant = {_norm_name(p) for p in _vacant_pools(raw)}
+    words = _text_words(text)
     by_pool: Dict[str, List[str]] = {}
     for lane in lanes:
         by_pool.setdefault(_norm_name(_raw_text(lane.get("participant"))), []) \
@@ -1105,7 +1131,10 @@ def _role_candidate_pools(raw: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     for pool in pools:
         norm = _norm_name(pool)
-        if norm not in claimed or _receives_merged_steps(pool, pools, lanes):
+        if norm not in claimed and not (norm in vacant
+                                        and _mentioned(pool, words)):
+            continue
+        if _receives_merged_steps(pool, pools, lanes):
             continue
         own = by_pool.get(norm, [])
         if not own or all(n == norm for n in own):
@@ -1448,6 +1477,12 @@ def _gap_profile(gaps: List[str]) -> Tuple[int, ...]:
     """Число нарушений по классам важности (от главных к мелким)."""
     return tuple(sum(1 for g in gaps if _gap_priority(g) == rank)
                  for rank in range(_GAP_RANKS))
+
+
+def _trace_gaps(gaps: List[str]) -> List[str]:
+    """Нарушения для трейса — обрезанные: читать их будет человек, а полный
+    текст каждого замечания удваивает размер отчёта харнесса."""
+    return [g if len(g) <= 140 else g[:137] + "…" for g in gaps]
 
 
 def _reask_improves(gaps: List[str], candidate: List[str]) -> bool:
@@ -2167,10 +2202,26 @@ def _declare_role_lanes(participants: List[Dict[str, Any]],
     которых в тексте нет.
     """
     names = {_norm_name(p["name"]): p["name"] for p in participants}
+    role_inside = {_norm_name(p["name"]): _norm_name(p.get("inside") or "")
+                   for p in participants if p.get("external") is False}
+
+    def organization(name: str) -> Optional[str]:
+        """Организация для объявленной роли: цепочка `inside` сворачивается до
+        корня. Дорожка внутри пула, который сам уедет в чужой, повисла бы на
+        несуществующем процессе, а кольцо («Оператор» внутри «Смены», «Смена»
+        внутри «Оператора») ролей не создаёт вовсе."""
+        current, seen = name, {name}
+        while role_inside.get(current):
+            current = role_inside[current]
+            if current in seen:
+                return None
+            seen.add(current)
+        return names.get(current)
+
     for pool in participants:
         if pool.get("external") is not False:
             continue
-        inside = names.get(_norm_name(pool.get("inside") or ""))
+        inside = organization(_norm_name(pool["name"]))
         if not inside or inside == pool["name"]:
             continue
         if _lane_named_like_pool(pool["name"], lanes) is not None:

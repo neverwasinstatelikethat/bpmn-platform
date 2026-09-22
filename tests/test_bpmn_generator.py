@@ -120,6 +120,12 @@ def _note(notes, fragment):
     return any(fragment in note for note in notes)
 
 
+def _role_candidates(question):
+    """Строка кандидатов на роль из вопроса о принадлежности: проверять надо её,
+    а не весь вопрос — список всех пулов плана назван там тоже."""
+    return question.split("роль, не участник):\n", 1)[1].split("\n", 1)[0]
+
+
 def _illegal_edges(structure):
     """Sequence-потоки с запрещённым концом: вход в старт и в граничное событие,
     выход из конечного. MessageFlow не считается — он чужой старт и обязан
@@ -1685,21 +1691,97 @@ class TestOwnershipClarification:
         assert "Верни moves, roles и missing" in fake.calls[-1][1]["content"]
         assert "каждый перечисленный кандидат" in fake.calls[-1][0]["content"]
 
-    def test_move_to_a_pool_that_was_not_asked_about_is_refused(self, monkeypatch):
-        plan = _fence(self._plan())
-        fake = FakeLLM(monkeypatch, plan, plan,
-                       '{"moves": [{"element": "A1", "participant": "ВкусВилл"}]}')
-        result = BPMNGenerator().generate(self.TEXT)
-        assert _note(result["notes"], "этого пула среди пустых не было")
-        moved = next(e for e in result["structure"]["elements"] if e["id"] == "A1")
-        assert moved["participant"] == "ВкусВилл"
-
     def test_move_of_an_unknown_element_is_refused(self, monkeypatch):
         plan = _fence(self._plan())
         fake = FakeLLM(monkeypatch, plan, plan,
                        '{"moves": [{"element": "nope", "participant": "Поставщик"}]}')
         result = BPMNGenerator().generate(self.TEXT)
         assert _note(result["notes"], "такого шага в плане нет")
+
+    def test_move_to_a_pool_with_its_own_steps_says_so(self, monkeypatch):
+        plan = _fence(self._plan())
+        FakeLLM(monkeypatch, plan, plan,
+                '{"moves": [{"element": "A1", "participant": "ВкусВилл"}]}')
+        result = BPMNGenerator().generate(self.TEXT)
+        assert _note(result["notes"], "в нём уже есть свои шаги")
+        moved = next(e for e in result["structure"]["elements"] if e["id"] == "A1")
+        assert moved["participant"] == "ВкусВилл"
+
+    def test_move_to_an_absent_pool_says_there_is_no_such_pool(self, monkeypatch):
+        """Отказ обязан называть настоящую причину: «этого пула среди пустых не
+        было» звучит как «пул есть, но не пуст», а пула-то как раз и нет — по
+        такой заметке живой прогон не разобрать, про что спрашивать модель."""
+        plan = _fence(self._plan())
+        FakeLLM(monkeypatch, plan, plan,
+                '{"moves": [{"element": "A2", "participant": "Экспедитор"}]}')
+        result = BPMNGenerator().generate(self.TEXT)
+        assert _note(result["notes"], "такого пула в плане нет")
+        moved = next(e for e in result["structure"]["elements"] if e["id"] == "A2")
+        # отказ отказом, а шаг без пула не остаётся: «Поставщик» он забирает по
+        # своему названию, а не по выдуманному «Экспедитору»
+        assert moved["participant"] != "Экспедитор"
+
+    def test_vacant_pool_named_in_text_can_be_declared_a_role(self, monkeypatch):
+        """Пустой пул, названный в описании, — тупик: шаги взять не откуда,
+        удалять нельзя. Единственный честный выход — роль организации, и модель
+        предлагает его сама («оператор склада» ролью не объявлен: кандидатов не
+        было). Пустой пул обязан быть среди кандидатов, иначе ответ модели
+        выбрасывается."""
+        plan = {"participants": ["ВкусВилл", "Кладовщик"],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Завести заявку",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask",
+                     "name": "Принять товар по накладной",
+                     "participant": "ВкусВилл"}], "flows": []}
+        fenced = _fence(plan)
+        fake = FakeLLM(monkeypatch, fenced, fenced,
+                       '{"roles": [{"pool": "Кладовщик", "inside": "ВкусВилл"}]}')
+        result = BPMNGenerator().generate(
+            "ВкусВилл заводит заявку, кладовщик принимает товар по накладной.")
+        assert "Кладовщик" in _role_candidates(fake.calls[-1][1]["content"])
+        assert [p["name"] for p in result["structure"]["participants"]] == \
+            ["ВкусВилл"], result["notes"]
+        lanes = {l["name"]: l["participant"] for l in result["structure"]["lanes"]}
+        assert lanes.get("Кладовщик") == "ВкусВилл"
+        assert _note(result["notes"], "роль «ВкусВилл» по описанию")
+
+    def test_vacant_pool_absent_from_text_is_not_a_role_candidate(
+            self, monkeypatch):
+        """Пустой пул, которого в описании нет, — выдумка, и сворачивать её в
+        дорожку нельзя: иначе вопрос легализовал бы участника, которого модель
+        придумала."""
+        plan = {"participants": ["ВкусВилл", "Робот-курьер"],
+                "elements": [{"id": "A1", "kind": "userTask", "name": "Заявка",
+                              "participant": "ВкусВилл"}], "flows": []}
+        fenced = _fence(plan)
+        fake = FakeLLM(monkeypatch, fenced, fenced,
+                       '{"roles": [{"pool": "Робот-курьер", "inside": "ВкусВилл"}]}')
+        result = BPMNGenerator().generate("ВкусВилл заводит заявку.")
+        assert "Робот-курьер" not in _role_candidates(
+            fake.calls[-1][1]["content"])
+        assert _note(result["notes"], "среди кандидатов такого пула не было")
+        assert "Робот-курьер" not in [
+            p["name"] for p in result["structure"]["participants"]]
+
+    def test_role_of_a_role_lands_on_the_organization(self):
+        """Цепочка «Кладовщик — роль Склада, Склад — роль ВкусВилла» обязана
+        приземлиться на организацию: дорожка внутри пула, который сам уедет в
+        чужой, повиснет на несуществующем процессе."""
+        participants = [{"name": "ВкусВилл"},
+                        {"name": "Склад", "external": False, "inside": "ВкусВилл"},
+                        {"name": "Кладовщик", "external": False, "inside": "Склад"}]
+        lanes: list = []
+        bpmn_generator._declare_role_lanes(participants, lanes, set(), [])
+        assert {l["name"]: l["participant"] for l in lanes} == {
+            "Склад": "ВкусВилл", "Кладовщик": "ВкусВилл"}
+
+    def test_mutual_role_declaration_creates_no_lane(self):
+        participants = [{"name": "Оператор", "external": False, "inside": "Смена"},
+                        {"name": "Смена", "external": False, "inside": "Оператор"}]
+        lanes: list = []
+        bpmn_generator._declare_role_lanes(participants, lanes, set(), [])
+        assert lanes == []
 
     def test_missing_participant_declared_a_role_becomes_a_lane(self, monkeypatch):
         """Живой прогон вернул «кладовщик принимает товар» в `missing`

@@ -46,6 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="возвращать код 1, если детектор нашёл падение метрик")
     parser.add_argument("--no-report", action="store_true",
                         help="не писать JSON-отчёт в eval/reports")
+    parser.add_argument("--dump-schemes", default="",
+                        help="папка, куда положить BPMN-схемы прогона для "
+                             "ручного разбора (пусто — не выгружать)")
     parser.add_argument("--fixtures-dir", default=str(harness.FIXTURES_DIR),
                         help="каталог фикстур (по умолчанию eval/fixtures)")
     return parser
@@ -69,6 +72,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.no_report:
         path = harness.write_report(report)
         print(f"\nОтчёт: {path.relative_to(Path(__file__).resolve().parents[1])}")
+    if args.dump_schemes:
+        written = harness.dump_schemes(report, Path(args.dump_schemes))
+        print(f"\nСхемы для разбора: {len(written)} в {args.dump_schemes}")
     if args.write_baseline:
         path = report.write_baseline(Path(args.baseline_path))
         print(f"Baseline записан: {path}")

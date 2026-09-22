@@ -404,6 +404,31 @@ def test_regression_detector_respects_direction_and_threshold():
     assert [r.name for r in detector.compare({"x": 0.0}, {"x": 1.0})] == ["x"]
 
 
+def test_regression_detector_skips_unmeasured_metrics():
+    """Подмножество сценариев без improve-кейсов даёт None в метрике. Это «нет
+    данных»: сравнение не должно ни падать, ни молча объявлять ухудшение."""
+    detector = metrics.RegressionDetector()
+    assert detector.compare({"improve/defects_repaired": 0.0},
+                            {"improve/defects_repaired": None}) == []
+    assert detector.compare({"pass@1/has_timer": None},
+                            {"pass@1/has_timer": 0.4}) == []
+
+
+def test_dump_schemes_writes_readable_names_with_the_verdict(tmp_path):
+    report = harness.run(mode="replay", scenarios_spec="support_ticket")
+    written = harness.dump_schemes(report, tmp_path / "схемы")
+    assert written, "прогон обязан оставить схемы для разбора глазами"
+    names = sorted(p.name for p in written)
+    assert any(n.endswith("_pass.bpmn") or n.endswith("_fail.bpmn")
+               for n in names), names
+    # Разбор начинается с провалов — по имени файла видно, что читать первым.
+    failed = [c for c in report.cases if c.xml and not c.scenario_pass]
+    if failed:
+        assert any("_fail.bpmn" in n for n in names)
+    assert (tmp_path / "схемы").is_dir()
+    assert written[0].read_text(encoding="utf-8").lstrip().startswith("<?xml")
+
+
 # ---------------------------------------------------------------------------
 # прогоны харнесса
 # ---------------------------------------------------------------------------

@@ -260,10 +260,15 @@ class RegressionDetector:
             if name not in current:
                 continue
             base, now = _as_number(raw_base), _as_number(current[name])
-            if base is None or now is None or base == 0.0:
+            if base is None or now is None:
+                # Метрику не с чем сравнивать: в одном из прогонов она не
+                # померена (в выбранном подмножестве сценариев не было
+                # improve-кейсов). Это «нет данных», а не «лучше» и не «хуже».
+                continue
+            if base == 0.0:
                 # ноль в baseline: относительная доля бессмысленна,
                 # сравниваем только явное ухудшение с абсолютным порогом
-                if base == 0.0 and now != 0.0:
+                if now != 0.0:
                     worse = (now > 0) if self.direction_of(name) == HIGHER else (now < 0)
                     if worse:
                         out.append(Regression(name=name, baseline=base, current=now,

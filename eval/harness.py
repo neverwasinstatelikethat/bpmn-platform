@@ -18,6 +18,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1015,3 +1016,37 @@ def write_report(report: RunReport, reports_dir: Path = REPORTS_DIR) -> Path:
     path.write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=1),
                     encoding="utf-8")
     return path
+
+
+def _safe_name(text: str) -> str:
+    return re.sub(r"[^0-9A-Za-zа-яё_.-]+", "_", text)[:120]
+
+
+def dump_schemes(report: "RunReport", out_dir: Path) -> List[Path]:
+    """Схемы прогона на диск — чтобы их можно было открыть глазами.
+
+    Метрика честно говорит «в сцене нет развилки», но не говорит, как схема
+    выглядит: пригодный BPMN и «правильный по инвариантам, но нечитаемый»
+    различаются только взглядом. Имя несёт итог сцены, поэтому разбирают сначала
+    провалы.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[Path] = []
+    for case in report.cases:
+        if not case.xml:
+            continue
+        verdict = "pass" if case.scenario_pass else "fail"
+        path = out_dir / _safe_name(
+            f"{case.key}_r{case.repeat}_{verdict}.bpmn")
+        path.write_text(case.xml, encoding="utf-8")
+        written.append(path)
+    for case in report.improve_cases:
+        if not case.xml_after:
+            continue
+        path = out_dir / _safe_name(
+            f"improve_{case.scenario}_{case.repeat}_"
+            f"{case.score_before}->{case.score_after}.bpmn")
+        path.write_text(case.xml_after, encoding="utf-8")
+        written.append(path)
+    return written

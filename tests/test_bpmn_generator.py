@@ -459,6 +459,16 @@ class TestTwoStageGeneration:
         assert "Состав процесса (утверждён" in fake.calls[1][1]["content"]
         assert "«Склад»" in fake.calls[1][1]["content"]
 
+    def test_the_flow_prompt_forbids_an_idle_pool(self):
+        """Утверждённый состав обязывает маршрут наполнить каждый пул: без
+        этого правила модель записывает действие контрагента в пул ждущей
+        организации («ждёт подтверждения от перевозчика» → шаг диспетчера),
+        пул контрагента остаётся пустым, и починка удаляет названного в
+        описании участника со схемы."""
+        rule = " ".join(bpmn_generator._FLOW_SYSTEM_PROMPT.split())
+        assert "Ни один утверждённый пул не остаётся без своего шага" in rule
+        assert "ждать — не значит делать" in rule
+
     def test_parse_roster_leaves_a_hostless_role_an_open_violation(self):
         """Хозяина роли угадываем не: роль без организации остаётся пулом с
         `external: false`, и это нарушение rank 0, а не тихая дорожка-сирота."""
@@ -1535,6 +1545,32 @@ class TestVacantPools:
         gaps = bpmn_generator.plan_gaps(
             raw, "ВкусВилл собирает заказ, кладовщик проверяет остатки.")
         assert any("Кладовщик" in g for g in gaps)
+
+    def test_the_gap_names_the_pool_the_model_has_to_fill(self):
+        """Нарушение про пустой пул предписывает модели конкретное поле со
+        конкретным значением: `participant="Кладовщик"`. Пока там стоял
+        незаменённый плейсхолдер из примера схемы (`participant=«pool»`),
+        модель должна была угадать имя своего же пула — и в переспрос шаги не
+        приезжали."""
+        raw = _plan_dict(
+            participants=["ВкусВилл", "Кладовщик"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ", "L_m"),
+                _e("T1", "userTask", "Проверить остатки", "L_m"),
+                _e("E1", "endEvent", "Осмотрен", "L_m"),
+                _e("S2", "startEvent", "Старт", "", "Кладовщик"),
+                _e("E2", "endEvent", "Завершение", "", "Кладовщик"),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1"),
+                   _f("F3", "S2", "E2")],
+        )
+        gaps = bpmn_generator.plan_gaps(
+            raw, "ВкусВилл собирает заказ, кладовщик проверяет остатки.")
+        hint = [g for g in gaps if "без единого шага" in g and "Кладовщик" in g]
+        assert hint
+        assert 'participant="Кладовщик"' in hint[0]
+        assert "«pool»" not in hint[0]
 
     def test_pool_without_steps_removed_with_its_events(self, monkeypatch):
         result = _generate(monkeypatch, self._vacant())

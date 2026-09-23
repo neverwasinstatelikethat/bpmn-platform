@@ -429,6 +429,22 @@ def test_dump_schemes_writes_readable_names_with_the_verdict(tmp_path):
     assert written[0].read_text(encoding="utf-8").lstrip().startswith("<?xml")
 
 
+def test_plan_dump_carries_the_flows_that_explain_a_hidden_split(tmp_path):
+    """Без потоков в дампе офлайн неотличимо: «развилку спрятала модель» или
+    «контур видел различимые ветки и не вставил шлюз». Выбор между правкой
+    промпта и правкой починки по XML не делается — прогон #52 на `has_branching`
+    встал ровно на этом вопросе."""
+    report = harness.run(mode="replay", scenarios_spec="support_ticket")
+    harness.dump_schemes(report, tmp_path / "планы")
+    plans = sorted((tmp_path / "планы").glob("*.plan.json"))
+    assert plans, "рядом со схемой обязан лежать план"
+    dumps = [json.loads(p.read_text(encoding="utf-8")) for p in plans]
+    assert all("flows" in d for d in dumps)
+    with_flows = next(d for d in dumps if d["flows"])
+    assert {"id", "source", "target", "kind", "condition"} <= set(
+        with_flows["flows"][0])
+
+
 # ---------------------------------------------------------------------------
 # прогоны харнесса
 # ---------------------------------------------------------------------------

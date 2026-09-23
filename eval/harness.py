@@ -1044,6 +1044,10 @@ def dump_schemes(report: "RunReport", out_dir: Path) -> List[Path]:
         # План рядом со схемой: по XML не отличить «модель не назвала
         # контрагента» от «назвала, а починка свернула пул в дорожку», а без
         # такого файла каждый разбор стоил отдельного живого прогона.
+        # `flows` здесь обязаны быть: «развилка спрятана в подписях потоков»
+        # лечится вставкой шлюза только когда ветки уже различимы по
+        # `condition`/`default`, и без потоков офлайн неотличимо, чья это работа —
+        # контура или модели (прогон #52, has_branching).
         plan = out_dir / f"{stem}.plan.json"
         plan.write_text(json.dumps(
             {"participants": case.structure.get("participants"),
@@ -1052,6 +1056,10 @@ def dump_schemes(report: "RunReport", out_dir: Path) -> List[Path]:
              "elements": [{k: e.get(k) for k in
                            ("id", "kind", "name", "participant", "lane")}
                           for e in (case.structure.get("elements") or [])],
+             "flows": [{k: f.get(k) for k in
+                        ("id", "source", "target", "kind", "condition",
+                         "default", "name", "attached_to")}
+                       for f in (case.structure.get("flows") or [])],
              "gaps": case.gaps},
             ensure_ascii=False, indent=1), encoding="utf-8")
         written.append(plan)

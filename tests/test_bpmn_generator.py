@@ -469,6 +469,16 @@ class TestTwoStageGeneration:
         assert "Ни один утверждённый пул не остаётся без своего шага" in rule
         assert "ждать — не значит делать" in rule
 
+    def test_the_prompt_forbids_an_incoming_flow_into_a_boundary_event(self):
+        """Правило таймера объясняло, чем граничное событие является, и требовало
+        ветку обработки, но не запрещало вести в него поток. Модель рисовала
+        «задача → boundaryEvent» как обычный шаг: `loan_application` r0/r1 в
+        прогоне #51 потерял на этом таймер, а переспрос принёс те же две дуги —
+        починка их срезает, и патч выглядит хуже базового плана, хотя правка была
+        про нужный таймер."""
+        rule = " ".join(bpmn_generator._SYSTEM_PROMPT.split())
+        assert "входящего потока у него не бывает" in rule
+
     def test_parse_roster_leaves_a_hostless_role_an_open_violation(self):
         """Хозяина роли угадываем не: роль без организации остаётся пулом с
         `external: false`, и это нарушение rank 0, а не тихая дорожка-сирота."""

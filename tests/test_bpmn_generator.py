@@ -3032,6 +3032,16 @@ class TestPlanPatch:
         assert [f["id"] for f in patched["flows"]] == ["F1", "F2", "F9"]
         assert any("добавлен элемент B1" in n for n in notes)
 
+    def test_the_retry_prompt_forbids_rewriting_a_step_into_an_event(self):
+        """Живые отказы #48: на нарушение «в плане нет таймера» модель отвечает
+        `fixes` с `event_definition`/`timer`/`attached_to` поверх существующего
+        userTask. Такой элемент остаётся шагом с полями события — нарушение не
+        закрыто, гейт честно отказывает, и единственная переспросная попытка
+        потрачена. Правило названо в промпте явно."""
+        template = " ".join(bpmn_generator._RETRY_TEMPLATE.split())
+        assert "kind=boundaryEvent" in template
+        assert "Превращать шаг маршрута в граничное событие" in template
+
     def test_the_trace_names_what_the_patch_offered(self):
         """Отказ «нарушений меньше не стало» — это три разных случая: модель
         молчала, чинила не то нарушение, или назвала участника без его шагов.

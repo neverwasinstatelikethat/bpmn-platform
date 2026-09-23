@@ -30,7 +30,7 @@ class TestDetector:
     def test_every_prompt_example_is_parsed(self):
         samples = {s["id"]: s for s in provenance.examples()}
         assert set(samples) == {"generation_plan", "improve_package",
-                                "roster_composition"}
+                                "roster_composition", "retry_patch"}
         assert samples["generation_plan"]["payload"]["participants"]
         assert samples["improve_package"]["payload"]["operations"]
         # Имена образца — то, что модель способна переписать дословно.
@@ -40,6 +40,22 @@ class TestDetector:
         # ответа, а не с напечатанной рядом схемы ответа.
         assert samples["roster_composition"]["payload"]["roles"]
         assert "Цех фасовки" in samples["roster_composition"]["names"]
+        # Схема заплатки тоже называет имена: модель читает их как подсказку
+        # ответа, и «Перевозчик» с «Водителем» в этом месте были ответом сцены.
+        assert samples["retry_patch"]["payload"]["participants"]
+        assert "Сервисная служба" in samples["retry_patch"]["names"]
+
+    def test_retry_schema_naming_an_expected_pool_is_caught(self, monkeypatch):
+        """Промпт переспроса — четвёртый образец, и он проверяется наравне с
+        остальными: правка схемы заплатки не должна возвращать в него имена из
+        ответов оракула."""
+        monkeypatch.setattr(bpmn_generator, "_RETRY_TEMPLATE",
+                            str(bpmn_generator._RETRY_TEMPLATE)
+                            + '\n"participants": [{"name": "Перевозчик"}]')
+        report = provenance.audit(
+            [s for s in all_scenarios() if s.id == "warehouse_delivery"], [])
+        hits = [f for f in report["findings"] if f["example"] == "retry_patch"]
+        assert hits and hits[0]["value"] == "Перевозчик", hits
 
     def test_roster_prompt_naming_an_expected_pool_is_caught(self, monkeypatch):
         """Правило состава обязано быть неймодomenным: «перевозчик» в правиле —

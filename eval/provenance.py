@@ -40,6 +40,11 @@ IMPROVE_MARKER = "ПРИМЕР ОТВЕТА"
 # текстом попадают в находки, но имена снимаются с ответа).
 ROSTER_ID = "roster_composition"
 ROSTER_EXAMPLE_HEAD = "Пример («"
+# Промпт переспроса отдаёт модели не пример ответа, а СХЕМУ заплатки с
+# подписанными примерами имён — для неё это то же самое, что few-shot:
+# «Перевозчик» и «Водитель» в этой схеме были ответом сцены warehouse_delivery,
+# и `expected_participants` мерил копирование, а не контур.
+RETRY_ID = "retry_patch"
 
 
 def words(text: Any) -> Set[str]:
@@ -148,6 +153,18 @@ def examples() -> List[Dict[str, Any]]:
         "payload": roster_payload,
         "names": _payload_names(roster_payload),
     })
+
+    # Схема заплатки: имена стоят в самой схеме, и примера ответа там нет —
+    # разбирать надо весь текст промпта переспроса.
+    retry_prompt = str(bpmn_generator._RETRY_TEMPLATE)
+    retry_payload = _json_object(str(bpmn_generator._RETRY_PATCH_SCHEMA))
+    found.append({
+        "id": RETRY_ID,
+        "where": "core.bpmn_generator._RETRY_TEMPLATE",
+        "text": retry_prompt,
+        "payload": retry_payload,
+        "names": _payload_names(retry_payload),
+    })
     return found
 
 
@@ -179,7 +196,8 @@ def scenario_findings(scenario: Scenario,
     """Чем именно сценарий пересекается с образцом промпта."""
     out: List[Dict[str, Any]] = []
     by_id = {e["id"]: e for e in samples}
-    composition = [by_id.get("generation_plan"), by_id.get(ROSTER_ID)]
+    composition = [by_id.get("generation_plan"), by_id.get(ROSTER_ID),
+                   by_id.get(RETRY_ID)]
 
     for gen in composition:
         if gen is None:

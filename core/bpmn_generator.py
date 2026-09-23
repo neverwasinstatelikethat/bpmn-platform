@@ -384,6 +384,44 @@ def _skeleton_block(participants: List[Any], lanes: List[Dict[str, Any]]) -> str
     return "\n".join(lines)
 
 
+def _owner_in_name(name: str, pools: List[str]) -> str:
+    """Хозяин, названный зависимым словом самого имени: «Руководитель дежурства»
+    при пуле «Дежурство», «Инженер сервиса-деска» при пуле «Сервис-деск».
+
+    Разбор по-русский, а не по списку должностей: головное слово имени — тот,
+    КТО (руководитель, инженер, отдел), зависимое — ЧЕЙ. Если «чей» совпадает с
+    другим участником состава, этот «кто» уже не равноправный партнёр
+    коллаборации, а его подразделение или должность: по методологии это дорожка,
+    и модель сама перечислила обе стороны в одном своём ответе. Совпадение по
+    головному слову в обратную сторону («Бюро» и «Бюро кредитных историй») —
+    это не хозяин, а усечённый дубль, и он таким разбором не находится.
+    """
+    parts = _name_parts(name)
+    if len(parts) < 2:
+        return ""
+    dependants = parts[1:]
+    best = ""
+    for other in pools:
+        if _norm_name(other) == _norm_name(name):
+            continue
+        wanted = _name_parts(other)
+        if not wanted or len(wanted) > len(dependants):
+            continue
+        if any(_same_word(w, d) for w in wanted for d in dependants) and all(
+                any(_same_word(w, d) for d in dependants) for w in wanted):
+            if len(other) > len(best):
+                best = other
+    return best
+
+
+def _same_word(left: str, right: str) -> bool:
+    """то же слово в разных падежах: «дежурство» ↔ «дежурства»."""
+    if left == right:
+        return True
+    short, long = sorted((left, right), key=len)
+    return len(short) >= 4 and long.startswith(short[:-1])
+
+
 def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
                                                            List[str]]:
     """Состав модели → каркас плана: пулы, дорожки, список действующих лиц.
@@ -428,16 +466,39 @@ def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
         participants.append(clean)
         return clean
 
+    listed: List[str] = []
     for key in ("organizations", "systems", "counterparties", "participants"):
         value = data.get(key)
         for item in (value if isinstance(value, list) else [])[:MAX_PARTICIPANTS]:
-            add_pool(item if not isinstance(item, dict) else item.get("name"))
-            if len(participants) >= MAX_PARTICIPANTS:
-                break
+            name = _pool_name(item)
+            if name and name not in listed:
+                listed.append(name)
+
+    # Часть названных «организаций» — на самом деле должности и подразделения
+    # другой названной организации (хозяин прочитан из зависимого слова самого
+    # имени). Они уходят в roles, а не в пулы: иначе коллаборация раздувается,
+    # и процесс фрагментируется на пулы по числу должностей.
+    role_entries: List[Dict[str, str]] = []
+    top: List[str] = []
+    for name in listed:
+        owner = _owner_in_name(name, listed)
+        if owner:
+            role_entries.append({"name": name, "host": owner})
+            notes.append(f"«{name}» — подразделение или должность «{owner}» по "
+                         "его же имени: на схеме это дорожка, а не участник")
+        else:
+            top.append(name)
+    for name in top:
+        add_pool(name)
+        if len(participants) >= MAX_PARTICIPANTS:
+            break
 
     lanes: List[Dict[str, Any]] = []
     roles = data.get("roles")
-    for idx, role in enumerate(roles if isinstance(roles, list) else []):
+    declared = [{"name": _pool_name(role if isinstance(role, dict) else role),
+                 "host": _raw_text(role.get("host")) if isinstance(role, dict)
+                 else ""} for role in (roles if isinstance(roles, list) else [])]
+    for idx, role in enumerate(declared + role_entries):
         if len(participants) + len(lanes) >= MAX_PARTICIPANTS * 2:
             break
         name = _raw_text(role.get("name") if isinstance(role, dict) else role)
@@ -473,12 +534,20 @@ def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
 
 
 def _merge_skeleton(skeleton: Dict[str, Any], plan: Dict[str, Any],
-                    text: str) -> Tuple[Dict[str, Any], List[str]]:
+                    text: str,
+                    allow_extra_pools: bool = True) -> Tuple[Dict[str, Any],
+                                                             List[str]]:
     """Ответ маршрута поверх утверждённого состава.
 
     Каркас задаёт пулы и дорожки, но модель вправе найти участника, которого
     состав пропустил, — если его имя звучит в описании. Выдуманного участника не
     принимаем: иначе «не заводить лишних пулов» работает в одну сторону.
+
+    На переспросе этой права нет (`allow_extra_pools=False`): состав к этому
+    моменту выбран дважды (стадией состава и первым ответом маршрута), а ответ
+    модели планом целиком — частый случай. Без запрета прогон #45 принёс
+    `purchase_approval` 7 пулов при 2 оправданных текстом: проверка «имя звучит
+    в описании» пропускает в пулы любое слово описанием.
     """
     notes: List[str] = []
     words = _text_words(text)
@@ -520,6 +589,10 @@ def _merge_skeleton(skeleton: Dict[str, Any], plan: Dict[str, Any],
         if not _mentioned(pool, words):
             notes.append(f"пул «{pool}» не добавлен: в описании такого имени нет, "
                          "а состав процесса уже утверждён")
+            continue
+        if not allow_extra_pools:
+            notes.append(f"пул «{pool}» не добавлен: состав утверждён, а "
+                         "переспрос чинит маршрут, а не число участников")
             continue
         extra.append(pool)
         known.add(_norm_name(pool))
@@ -677,10 +750,19 @@ def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
                                    if isinstance(patch.get("remove_flows"), list)
                                    else [])}
     if drop:
+        # Срезать дугу переспросу можно только там, где нарушение назвало её:
+        # иначе «починка» сокращает маршрут, и развилка с исчезнувшим плечом
+        # выглядит нарушенным `has_branching` (прогон #45: 0.833 → 0.625).
+        mentioned = " ".join(gaps)
+        allowed = {flow for flow in drop if flow and flow in mentioned}
+        if len(allowed) < len(drop):
+            notes.append(f"поток(и) не удалены: нарушения их не называют — "
+                         f"переспрос срезал бы маршрут ({', '.join(sorted(drop - allowed))})")
         kept = [f for f in flows if isinstance(f, dict)
-                and _raw_text(f.get("id")) not in drop]
-        notes.append(f"убрано потоков: {len(flows) - len(kept)} по нарушению "
-                     "связей")
+                and _raw_text(f.get("id")) not in allowed]
+        if len(kept) != len(flows):
+            notes.append(f"убрано потоков: {len(flows) - len(kept)} по "
+                         "названному нарушению связей")
         flows = kept
     for flow in (patch.get("add_flows")
                  if isinstance(patch.get("add_flows"), list)
@@ -875,7 +957,8 @@ class BPMNGenerator:
                         # утверждённым: правка перестает зависеть от того, что
                         # модель успела испортить по дороге.
                         retry, retry_notes = _merge_skeleton(
-                            meta["skeleton"], retry, text)
+                            meta["skeleton"], retry, text,
+                            allow_extra_pools=False)
                         meta["notes"].extend(retry_notes)
                     candidate_gaps = plan_gaps(retry, text)
                     # Первый план остаётся при равенстве: второй вызов обязан

@@ -385,6 +385,62 @@ class TestTwoStageGeneration:
         reask = next(t for t in result["trace"] if t["node"] == "переспрос плана")
         assert reask["kept"] == "переспрос", reask
 
+    def test_retry_may_not_add_a_pool_the_composition_does_not_have(self):
+        """Ответ планом целиком на переспросе не открывает состав: пулы там уже
+        выбраны дважды, и единственное право повтора — маршрут. Прогон #45
+        принёс `purchase_approval` 7 пулов при 2 оправданных текстом именно
+        через это исключение."""
+        skeleton = {"participants": ["ВкусВилл"],
+                    "lanes": [{"id": "L1", "name": "Менеджер",
+                               "participant": "ВкусВилл"}],
+                    "actors": ["ВкусВилл", "Менеджер"]}
+        plan = {"participants": ["ВкусВилл", "Поставщик"], "lanes": [],
+                "elements": [{"id": "A1", "kind": "userTask", "name": "Заявка",
+                              "participant": "ВкусВилл", "lane": "L1"}],
+                "flows": []}
+        merged_first, _ = bpmn_generator._merge_skeleton(
+            skeleton, plan, "ВкусВилл заводит заявку, поставщик подтверждает.")
+        merged_retry, notes = bpmn_generator._merge_skeleton(
+            skeleton, plan, "ВкусВилл заводит заявку, поставщик подтверждает.",
+            allow_extra_pools=False)
+        assert "Поставщик" in [bpmn_generator._pool_name(p) for p in merged_first["participants"]]
+        assert [bpmn_generator._pool_name(p) for p in merged_retry["participants"]] == ["ВкусВилл"]
+        assert any("переспрос чинит маршрут" in n for n in notes)
+
+    def test_host_named_by_a_dependant_word_of_the_name_becomes_a_lane(self):
+        """«Руководитель дежурства» при пуле «Дежурство» — должность, а не
+        второй участник: хозяина читаем из зависимого слова самого имени,
+        которое модель назвала."""
+        skeleton, notes = bpmn_generator.parse_roster(
+            {"organizations": ["Дежурство", "Сервис-деск",
+                               "Руководитель дежурства",
+                               "Инженер сервиса-деска"],
+             "systems": ["Система мониторинга"], "counterparties": [],
+             "roles": []},
+            "Дежурство принимает сигнал от системы мониторинга, руководитель "
+            "дежурства эскалирует, инженер сервиса-деска информирует "
+            "подразделения.")
+        assert [bpmn_generator._pool_name(p) for p in skeleton["participants"]] == [
+            "Дежурство", "Сервис-деск", "Система мониторинга"]
+        assert [(lane["name"], lane["participant"])
+                for lane in skeleton["lanes"]] == [
+                    ("Руководитель дежурства", "Дежурство"),
+                    ("Инженер сервиса-деска", "Сервис-деск")]
+        assert any("подразделение или должность" in n for n in notes)
+
+    def test_truncated_duplicate_is_not_mistaken_for_a_host(self):
+        """«Бюро» и «Бюро кредитных историй» — не хозяин и роль, а усечённый
+        дубль: по головному слову правило хозяина не срабатывает."""
+        skeleton, _notes = bpmn_generator.parse_roster(
+            {"organizations": ["Банк", "Бюро", "Бюро кредитных историй"],
+             "systems": [], "counterparties": ["Клиент"], "roles": []},
+            "Банк, клиент и бюро кредитных историй участвуют в выдаче; бюро "
+            "шлёт ответ банку.")
+        pools = [bpmn_generator._pool_name(p) for p in skeleton["participants"]]
+        assert "Бюро" in pools and "Бюро кредитных историй" in pools
+        assert [(lane["name"], lane["participant"])
+                for lane in skeleton["lanes"]] == []
+
     def test_roles_become_lanes_before_the_route_is_written(self, monkeypatch):
         fake = FakeLLM(monkeypatch, self.ROSTER, self._flow())
         result = BPMNGenerator().generate(self.TEXT)
@@ -2990,6 +3046,19 @@ class TestPlanPatch:
             gaps=["участник «Робот-курьер» помечен ролью (external=false)"])
         assert [p for p in patched["participants"]] == ["Дежурство"]
         assert any("в описании такого имени нет" in n for n in notes)
+
+    def test_flow_removal_needs_a_gap_that_names_the_flow(self):
+        """Переспрос не вправе сокращать маршрут «просто так»: срезанное плечо
+        — это уже пропавшая развилка, а не починка."""
+        patched, notes = self._patch({"remove_flows": ["F2"]})
+        assert [f["id"] for f in patched["flows"]] == ["F1", "F2"]
+        assert any("нарушения их не называют" in n for n in notes)
+
+        named, notes2 = self._patch(
+            {"remove_flows": ["F2"]},
+            gaps=["поток F2 (A1 → E1) противоречит правилу: у шлюза нет плеча"])
+        assert [f["id"] for f in named["flows"]] == ["F1"]
+        assert any("убрано потоков: 1" in n for n in notes2)
 
     def test_a_full_plan_answer_is_still_accepted_as_a_replacement(self):
         """Модель ответит планом целиком и будет: это не отказ и не тихая

@@ -477,7 +477,7 @@ class TestTwoStageGeneration:
         починка их срезает, и патч выглядит хуже базового плана, хотя правка была
         про нужный таймер."""
         rule = " ".join(bpmn_generator._SYSTEM_PROMPT.split())
-        assert "входящего потока у него не бывает" in rule
+        assert "Входящего потока у него не бывает" in rule
 
     def test_parse_roster_leaves_a_hostless_role_an_open_violation(self):
         """Хозяина роли угадываем не: роль без организации остаётся пулом с
@@ -3510,7 +3510,7 @@ class TestPlanGapsAndRetry:
         question = next(c[1]["content"] for c in fake.calls
                         if "Пулы, которые могут быть ролью" in c[1]["content"])
         role_line = question.split("Пулы, которые могут быть ролью", 1)[1]
-        role_line = role_line.split("\n\n", 1)[0]
+        role_line = role_line.split("Все пулы плана", 1)[0]
         assert "Водитель" in role_line
         assert "Перевозчик" in role_line, "пустой пул не предложен хозяином роли"
         # Имени мало: вопрос обязан сказать, что пустой пул — возможный хозяин,

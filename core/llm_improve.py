@@ -668,7 +668,7 @@ _RETRY_TEMPLATE = """Улучшение применено не полность
 {inventory}
 
 НЕПРИМЕНЁННЫЕ ОПЕРАЦИИ И ПРИЧИНЫ:
-{skipped}{applied}{routing}{pools}{limits_block}
+{skipped}{applied}{routing}{pools}{docs}{limits_block}
 ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:
 {user_prompt}
 
@@ -713,6 +713,55 @@ def _pools_block(pools: List[str]) -> str:
             "операциями add_task/add_event в этот пул, слей merge_participants "
             "или удали remove_participant:\n"
             + "\n".join(f"- {p}" for p in pools[:5]) + "\n")
+
+
+def _docs_block(ids: List[str]) -> str:
+    if not ids:
+        return ""
+    return ("\nНОВЫЕ УЗЛЫ БЕЗ ОПИСАНИЯ — скоринг меряет долю элементов с "
+            "документацией, и каждый добавленный шаг без описания роняет балл "
+            "схемы: добавь add_documentation для каждого id выше, текстом из "
+            "описания процесса (не выдумывая данных):\n"
+            + "\n".join(f"- {i}" for i in ids[:10]) + "\n")
+
+
+def _rule_passes(xml: str, rule: str) -> Optional[bool]:
+    """Проходит ли правило скоринга на схеме (None — схему не прочитать или
+    правила нет: скоринг не имеет права ронять улучшение своей ошибкой разбора)."""
+    try:
+        details = _scorer.evaluate(xml).get("details") or {}
+    except Exception:  # noqa: BLE001
+        return None
+    if rule not in details:
+        return None
+    return bool(details[rule])
+
+
+def _added_ids(report: Dict[str, Any]) -> List[str]:
+    """Узлы, которые этот пакет добавил на схему."""
+    return sorted({str(entry.get("id")) for entry in (report.get("applied") or [])
+                   if entry.get("id")
+                   and str(entry.get("op") or "") in bpmn_edits.ADD_NODE_OPS})
+
+
+def _documentation_diluted(base_xml: str, new_xml: str,
+                           added: List[str]) -> List[str]:
+    """Новые узлы, из-за которых правило `documentation` перестало проходить.
+
+    Скоринг меряет долю элементов с описанием, поэтому шаг, добавленный без
+    описания, разбавляет её и роняет балл: прогон #48 — три корректных пакета на
+    warehouse_delivery (0 отклонённых операций, все инварианты зелёные) дали
+    `score_delta` −2.5 и `no_regression` 0.5. Гарантия «принятое улучшение не
+    делает схему хуже» обязана покрывать и разбавление, а текст описания знает
+    только модель — додумывать его контур не вправе.
+    """
+    if not added:
+        return []
+    if _rule_passes(base_xml, "documentation") is not True:
+        return []
+    if _rule_passes(new_xml, "documentation") is not False:
+        return []
+    return list(added)
 
 
 def _applied_block(applied: List[Dict[str, Any]]) -> str:
@@ -959,10 +1008,15 @@ class BPMNImprovementOrchestrator:
         xml_after, repair_notes = await _drop_stranded(xml_after, repair_notes)
         unrouted = _unrouted(repair_notes)
         empty_pools = _empty_pools(repair_notes)
-        if report["skipped"] or unrouted or empty_pools:
+        # Разбавление documentation — то же ухудшение, только меряется долей:
+        # пакет добавляет шаг, а описание к нему пишет только модель.
+        undocumented = _documentation_diluted(xml_content, xml_after,
+                                              _added_ids(report))
+        if report["skipped"] or unrouted or empty_pools or undocumented:
             try:
                 xml_after, report = await self._retry_skipped(
-                    xml_after, user_prompt, report, unrouted, empty_pools)
+                    xml_after, user_prompt, report, unrouted, empty_pools,
+                    undocumented)
             except LLMTruncatedError as e:
                 logger.warning("Корректирующий повтор обрезан по лимиту "
                                "токенов: %s", e)
@@ -975,6 +1029,8 @@ class BPMNImprovementOrchestrator:
                 xml_after, repair_notes = rolled_back, []
             xml_after, repair_notes = await _drop_stranded(xml_after,
                                                            repair_notes)
+            undocumented = _documentation_diluted(xml_content, xml_after,
+                                                  _added_ids(report))
         report["repair_notes"] = repair_notes
 
         # Висячий шаг — не улучшение: модель не указала, между какими шагами
@@ -992,6 +1048,11 @@ class BPMNImprovementOrchestrator:
             analysis += ("\n\nОстались пулы без единого шага: наполните их, "
                          "слейте в дорожку или удалите:\n"
                          + "\n".join(f"- {p}" for p in empty_pools[:5]))
+        if undocumented:
+            analysis += ("\n\nНовые узлы остались без описания: скоринг меряет "
+                         "долю элементов с документацией, поэтому без него "
+                         "улучшение снимает балл схеме:\n"
+                         + "\n".join(f"- {i}" for i in undocumented[:5]))
 
         if not report["applied"]:
             reasons = "; ".join(s.get("reason", "") for s in report["skipped"][:3])
@@ -1034,7 +1095,9 @@ class BPMNImprovementOrchestrator:
 
     async def _retry_skipped(self, intermediate_xml: str, user_prompt: str,
                              report: Dict[str, Any], unrouted: List[str],
-                             empty_pools: List[str]) -> Tuple[str, Dict[str, Any]]:
+                             empty_pools: List[str],
+                             undocumented: Optional[List[str]] = None,
+                             ) -> Tuple[str, Dict[str, Any]]:
         """Корректирующий раунд: по не применённым операциям и по узлам,
         оставшимся вне маршрута.
 
@@ -1058,6 +1121,7 @@ class BPMNImprovementOrchestrator:
                 applied=_applied_block(report.get("applied") or []),
                 routing=_routing_block(unrouted),
                 pools=_pools_block(empty_pools),
+                docs=_docs_block(undocumented or []),
                 limits_block=_limits_block(inventory),
                 user_prompt=user_prompt,
             )

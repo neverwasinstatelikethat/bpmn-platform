@@ -25,6 +25,7 @@
 # XML генерируется только семантический: координаты не выдаются — фронтенд
 # всегда прогоняет схему через bpmn-auto-layout, ему достаточно пустого
 # скелета BPMNDiagram/BPMNPlane.
+import copy
 import difflib
 import json
 import logging

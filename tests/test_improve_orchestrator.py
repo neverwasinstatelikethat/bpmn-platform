@@ -12,6 +12,7 @@ import re
 import pytest
 
 from core import bpmn_edits, llm_client, llm_improve
+from core.bpmn_scoring import BPMNScorer
 from core.llm_improve import (
     BPMNImprovementOrchestrator,
     ImprovementError,
@@ -212,6 +213,79 @@ class TestPartialAndFailures:
             _improve(orchestrator, single_pool_xml)
         assert "обрезан" in str(exc.value)
         assert "не применён" in str(exc.value)
+
+
+class TestDocumentationDilution:
+    """Скоринг меряет ДОЛЮ элементов с описанием, поэтому шаг, добавленный без
+    описания, роняет балл принятого улучшения: прогон #48 — три корректных
+    пакета (0 отклонённых операций, все инварианты зелёные) при `score_delta`
+    −2.5 и `no_regression` 0.5. Гарантия «принятое изменение не делает схему
+    хуже» обязана добить и это корректирующим повтором, а текст знает только
+    модель — додумывать его контур не вправе."""
+
+    HALF_DOC = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" '
+        'id="Definitions_doc" targetNamespace="http://bpmn.io/schema/bpmn">'
+        '<process id="Process_doc" name="Документооборот" isExecutable="true">'
+        '<startEvent id="D_start" name="Дело заведено">'
+        '<documentation>Входящий номер присваивает канцелярия.</documentation>'
+        '<outgoing>DF1</outgoing></startEvent>'
+        '<sequenceFlow id="DF1" sourceRef="D_start" targetRef="D_reg"/>'
+        '<userTask id="D_reg" name="Зарегистрировать дело">'
+        '<documentation>Дело заводится в журнале учёта.</documentation>'
+        '<incoming>DF1</incoming><outgoing>DF2</outgoing></userTask>'
+        '<sequenceFlow id="DF2" sourceRef="D_reg" targetRef="D_archive"/>'
+        '<userTask id="D_archive" name="Подшить в дело">'
+        '<incoming>DF2</incoming><outgoing>DF3</outgoing></userTask>'
+        '<sequenceFlow id="DF3" sourceRef="D_archive" targetRef="D_end"/>'
+        '<endEvent id="D_end" name="Дело в работе">'
+        '<incoming>DF3</incoming></endEvent>'
+        '</process></definitions>')
+
+    def _doc_status(self, xml: str) -> str:
+        return BPMNScorer().evaluate(xml)["details"]["documentation"]
+
+    def test_a_step_without_prose_triggers_the_corrective_round(
+            self, orchestrator, monkeypatch):
+        # Ровно половина элементов с описанием: правило проходит по границе, и
+        # один новый узел без него роняет долю ниже порога.
+        assert self._doc_status(self.HALF_DOC) is True
+        plan = _wrap(json.dumps({
+            "analysis": "нет сверки комплектности",
+            "operations": [
+                {"op": "add_task", "id": "new_D_check",
+                 "name": "Проверить комплектность", "task_type": "userTask",
+                 "after": "D_reg", "to": "D_archive"}]}, ensure_ascii=False))
+        fix = _wrap(json.dumps({
+            "analysis": "дописываем описание",
+            "operations": [
+                {"op": "add_documentation", "id": "new_D_check",
+                 "text": "Комплектность сверяется по описи дела."}]}))
+        fake = FakeLLM(monkeypatch, plan, fix)
+        _, improved_xml, report = _improve(orchestrator, self.HALF_DOC,
+                                           prompt="добавь сверку")
+        assert "НОВЫЕ УЗЛЫ БЕЗ ОПИСАНИЯ" in fake.prompts[1], fake.prompts[1]
+        assert "new_D_check" in fake.prompts[1]
+        assert report["applied"][-1]["op"] == "add_documentation"
+        assert self._doc_status(improved_xml) is True
+
+    def test_the_user_sees_an_undocumented_addition_the_round_could_not_fix(
+            self, orchestrator, monkeypatch):
+        """Если повтор не добил описание, это видно пользователю: иначе отчёт
+        говорит «улучшение принято», а балл схемы упал."""
+        plan = _wrap(json.dumps({
+            "analysis": "нет сверки комплектности",
+            "operations": [
+                {"op": "add_task", "id": "new_D_check",
+                 "name": "Проверить комплектность", "task_type": "userTask",
+                 "after": "D_reg", "to": "D_archive"}]}, ensure_ascii=False))
+        empty = _wrap('{"analysis": "описания не нужны", "operations": []}')
+        FakeLLM(monkeypatch, plan, empty)
+        recommendations, improved_xml, _report = _improve(
+            orchestrator, self.HALF_DOC, prompt="добавь сверку")
+        assert "без описания" in recommendations, recommendations
+        assert self._doc_status(improved_xml) is False
 
 
 class TestPlanReporting:

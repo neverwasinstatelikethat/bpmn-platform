@@ -69,10 +69,14 @@ TYPED_EVENT_KINDS = {"intermediateCatchEvent", "intermediateThrowEvent",
                      "boundaryEvent"}
 
 MAX_TEXT_CHARS = 10_000
-MAX_PARTICIPANTS = 10
-MAX_LANES = 30
-MAX_ELEMENTS = 60
-MAX_FLOWS = 120
+# Страховка транспорта, а не правило моделирования: размер ответа и так ограничен
+# `MAX_PLAN_TOKENS`, поэтому до этих чисел честная схема дойти не может. Они стоят
+# только для того, чтобы абсурдный ответ не положил генерацию XML, и ничего не
+# отрезают молча — см. `_over_budget`.
+MAX_PARTICIPANTS = 40
+MAX_LANES = 120
+MAX_ELEMENTS = 300
+MAX_FLOWS = 600
 NAME_LIMIT = 120
 DOCUMENTATION_LIMIT = 400
 # Исправлений достижимости не больше, чем элементов: иначе генератор
@@ -457,13 +461,14 @@ def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
             # имя участника. Без этого хозяин роли теряется, а роль становится
             # пулом — см. прогон #43.
             rescued = _actor_name_from_text(clean, words)
-            if not rescued:
+            if rescued:
+                notes.append(f"участник «{clean}» назван тем словом, которым его "
+                             f"зывает описание: «{rescued}»")
+                clean = rescued
+            elif not _generic_actor_name(clean):
                 notes.append(f"участник «{clean}» не взят в состав: в описании "
                              "такого имени нет")
                 return ""
-            notes.append(f"участник «{clean}» назван тем словом, которым его "
-                         f"зывает описание: «{rescued}»")
-            clean = rescued
         norm = _norm_name(clean)
         if norm in taken:
             # Хозяин уже в составе — это не отказ, а тот же самый пул.
@@ -480,7 +485,7 @@ def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
     listed: List[str] = []
     for key in ("organizations", "systems", "counterparties", "participants"):
         value = data.get(key)
-        for item in (value if isinstance(value, list) else [])[:MAX_PARTICIPANTS]:
+        for item in (value if isinstance(value, list) else []):
             name = _pool_name(item)
             if name and name not in listed:
                 listed.append(name)
@@ -501,8 +506,6 @@ def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
             top.append(name)
     for name in top:
         add_pool(name)
-        if len(participants) >= MAX_PARTICIPANTS:
-            break
 
     lanes: List[Dict[str, Any]] = []
     roles = data.get("roles")
@@ -510,17 +513,23 @@ def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
                  "host": _raw_text(role.get("host")) if isinstance(role, dict)
                  else ""} for role in (roles if isinstance(roles, list) else [])]
     for idx, role in enumerate(declared + role_entries):
-        if len(participants) + len(lanes) >= MAX_PARTICIPANTS * 2:
-            break
         name = _raw_text(role.get("name") if isinstance(role, dict) else role)
         host = _raw_text(role.get("host") if isinstance(role, dict) else "")
         if not name or _norm_name(name) in taken:
             continue
-        if not _mentioned(name, words):
+        attested = _mentioned(name, words)
+        canonical = add_pool(host) if (attested or not _generic_actor_name(name)) \
+            else ""
+        if not attested and not (canonical and not _generic_actor_name(name)):
+            # Свобода кончается на составе: дорожка внутри принятой организации —
+            # разделение её работы, а нового участника соглашения описание обязано
+            # называть (иначе разрешение ролей оборачивается раздуванием пулов:
+            # #36 и #41 измеряли именно это). Роль без хозяина под коротким
+            # брифом тоже не принимается: без организации она стала бы пулом,
+            # который собственный план-гейт считает нарушением.
             notes.append(f"роль «{name}» не взята в состав: в описании такого "
                          "имени нет")
             continue
-        canonical = add_pool(host)
         if not canonical and host:
             # Хозяин не принят (родовое слово или имя не из описания): роль
             # остаётся незакрытым нарушением, а не сиротской дорожкой.
@@ -2236,8 +2245,7 @@ def missing_actors(raw: Dict[str, Any]) -> List[str]:
     pools = _plan_pool_names(raw)
     lanes = [_raw_text(l.get("name")) for l in _raw_dicts(raw.get("lanes"))]
     out: List[str] = []
-    for actor in [a for a in (raw.get("actors") or [])
-                  if isinstance(a, str)][:MAX_PARTICIPANTS]:
+    for actor in [a for a in (raw.get("actors") or []) if isinstance(a, str)]:
         name = _raw_text(actor)
         if not name or name in out:
             continue
@@ -2961,9 +2969,6 @@ def _repair_participants(raw: Dict[str, Any],
             if inside:
                 entry["inside"] = inside
         participants.append(entry)
-        if len(participants) >= MAX_PARTICIPANTS:
-            notes.append("Лишние пулы отброшены (максимум %d)" % MAX_PARTICIPANTS)
-            break
     if not participants:
         participants.append({"name": "Процесс"})
         notes.append("Пул не указан — создан пул «Процесс»")
@@ -2985,9 +2990,6 @@ def _repair_lanes(raw: Dict[str, Any], participants: List[Dict[str, Any]],
         if not declared_id and not declared_name:
             notes.append("Дорожка без имени и идентификатора пропущена")
             continue
-        if len(lanes) >= MAX_LANES:
-            notes.append(f"Лишние дорожки отброшены (максимум {MAX_LANES})")
-            break
 
         subject = f"Дорожка {declared_id or declared_name}"
         participant = _resolve_participant(
@@ -3028,9 +3030,6 @@ def _repair_elements(raw: Dict[str, Any], participants: List[Dict[str, Any]],
     for item in raw_elements:
         if not isinstance(item, dict):
             continue
-        if len(elements) >= MAX_ELEMENTS:
-            notes.append("Лишние элементы отброшены (максимум %d)" % MAX_ELEMENTS)
-            break
 
         elem_id = _sanitize_id(item.get("id"), f"Elem_{len(elements) + 1}")
         while elem_id in used_ids:
@@ -3182,9 +3181,6 @@ def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
     for item in raw_flows:
         if not isinstance(item, dict):
             continue
-        if len(flows) >= MAX_FLOWS:
-            notes.append("Лишние потоки отброшены (максимум %d)" % MAX_FLOWS)
-            break
         source = _sanitize_id(item.get("source") or item.get("sourceRef"), "")
         target = _sanitize_id(item.get("target") or item.get("targetRef"), "")
         if source == target:

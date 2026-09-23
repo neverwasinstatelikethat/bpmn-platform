@@ -538,6 +538,69 @@ class TestTwoStageGeneration:
                                              "external": False}]
         assert skeleton["lanes"] == []
 
+    def test_a_role_inside_an_accepted_org_needs_no_word_in_the_brief(self):
+        """Должность внутри уже принятой организации — разделение труда, а не
+        новый участник соглашения, и требовать её слово в описании нельзя: в
+        коротком брифе («Воронка продаж для B2B компании») должностей нет вовсе,
+        и автоматика снимала все роли, оставляя процесс без разделения."""
+        skeleton, notes = bpmn_generator.parse_roster(
+            {"organizations": ["Альфа"],
+             "roles": [{"name": "Менеджер по продажам", "host": "Альфа"},
+                       {"name": "Руководитель отдела продаж", "host": "Альфа"}]},
+            "Альфа ведёт воронку продаж от первой заявки клиента до закрытия "
+            "сделки, и работа распределяется внутри одного подразделения.")
+        assert [lane["name"] for lane in skeleton["lanes"]] == [
+            "Менеджер по продажам", "Руководитель отдела продаж"]
+        assert all(lane["participant"] == "Альфа" for lane in skeleton["lanes"])
+        assert not [n for n in notes if "не взята в состав" in n], notes
+
+    def test_a_role_without_an_organization_is_still_not_a_pool(self):
+        """Свобода кончается там, где начинается состав: роль без хозяина — это
+        второй процесс на схеме, и имя для него обязано звучать в описании.
+        Иначе «разрешение ролей» оборачивается раздуванием пулов (#36, #41)."""
+        skeleton, notes = bpmn_generator.parse_roster(
+            {"organizations": ["Альфа"],
+             "roles": [{"name": "Маркетолог", "host": ""}]},
+            "Альфа ведёт воронку продаж от заявки до закрытия сделки внутри "
+            "одного подразделения.")
+        assert [lane["name"] for lane in skeleton["lanes"]] == []
+        assert any("не взята в состав" in n for n in notes), notes
+
+    def test_a_role_named_by_a_generic_word_stays_refused(self):
+        """«Сотрудник» как дорожка не добавляет схеме ничего: родовое слово
+        остаётся отказом и при принятом хозяине."""
+        skeleton, notes = bpmn_generator.parse_roster(
+            {"organizations": ["Альфа"],
+             "roles": [{"name": "Сотрудник", "host": "Альфа"}]},
+            "Альфа ведёт воронку продаж от заявки до закрытия сделки.")
+        assert skeleton["lanes"] == []
+        assert any("не взята в состав" in n for n in notes), notes
+
+    def test_a_bare_brief_still_may_not_invent_a_counterparty(self):
+        """Свобода дана структуре, а не составу: на брифе из пяти слов нового
+        контрагента принимать нельзя — иначе «роль разрешена» превращается в те
+        самые 9 пулов на процесс (#36, #41)."""
+        skeleton, notes = bpmn_generator.parse_roster(
+            {"organizations": ["Альфа"],
+             "counterparties": ["Бета-логистик", "Гамма-консалтинг"]},
+            "Воронка продаж для B2B компании Альфа")
+        assert [p if isinstance(p, str) else p["name"]
+                for p in skeleton["participants"]] == ["Альфа"]
+        assert any("не взят в состав" in n for n in notes), notes
+
+    def test_a_long_description_still_demands_the_names_it_used(self):
+        """Расслабление привязано к длине: подробное описание уже даёт имена, и
+        выдуманного контрагента принимать нельзя (#53 — «Производственная
+        площадка», «закупочный отдел»)."""
+        text = ("Склад принимает поставку от перевозчика, кладовщик проверяет "
+                "целостность упаковок и фиксирует расхождения в учётной системе, "
+                "после чего менеджер оформляет возврат поставщику.")
+        skeleton, _notes = bpmn_generator.parse_roster(
+            {"organizations": ["Склад"], "counterparties": ["Производственная площадка"]},
+            text)
+        assert [p if isinstance(p, str) else p["name"]
+                for p in skeleton["participants"]] == ["Склад"]
+
     def test_parse_roster_refuses_names_that_the_text_does_not_carry(self):
         skeleton, notes = bpmn_generator.parse_roster(
             {"organizations": ["Склад", "Фаб грез"],
@@ -695,24 +758,24 @@ class TestLaneRepair:
         assert lane_of["E1"] == "L_m_x"
         assert "e_1" in {e["id"] for e in repaired["elements"]}
 
-    def test_lane_limit_keeps_plan_bounded_and_reports(self):
+    def test_a_detailed_lane_breakdown_survives_the_repair(self):
+        """Развёрнутая схема — это ответ модели, а не повод для обрезки: 25
+        дорожек внутри одного пула проходят починку целиком. Лимиты остались
+        только как страховка транспорта — иначе молча резалась бизнес-логика."""
         lanes = [{"id": f"L{i}", "name": f"Роль {i}", "participant": "ВкусВилл"}
-                 for i in range(bpmn_generator.MAX_LANES + 5)]
+                 for i in range(25)]
+        elements = [_e("S1", "startEvent", "Заявка", "L0")] + [
+            _e(f"T{i}", "userTask", f"Проверить {i}", f"L{i}")
+            for i in range(23)] + [
+            _e("E1", "endEvent", "Готово", "L22")]
         repaired, notes = repair_structure(_plan_dict(
-            lanes=lanes,
-            elements=[
-                _e("S1", "startEvent", "Заявка", "L0"),
-                _e("T1", "userTask", "Проверить", f"L{bpmn_generator.MAX_LANES + 4}"),
-                _e("E1", "endEvent", "Готово", "L0"),
-            ],
-            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1")],
-        ))
-        assert len(repaired["lanes"]) == bpmn_generator.MAX_LANES
-        assert _note(notes, "Лишние дорожки отброшены")
-        # Запретная ссылка не создаёт новую дорожку: элемент в первую дорожку пула.
-        assert next(e for e in repaired["elements"]
-                    if e["id"] == "T1")["lane"] == "L0"
-        assert _note(notes, "не создана")
+            lanes=lanes, elements=elements,
+            flows=[_f("F0", "S1", "T0")]
+            + [_f(f"F{i}", f"T{i}", f"T{i + 1}") for i in range(22)]
+            + [_f("F23", "T22", "E1")]))
+        assert len(repaired["lanes"]) == 25
+        assert len(repaired["elements"]) == 25
+        assert not [n for n in notes if "отброшен" in n], notes
 
 
 class TestSingleBranchGateway:
@@ -1509,17 +1572,18 @@ class TestSilentRepairsAreNarrated:
         assert _note(notes, "не найдена") or _note(notes, "не объявлена")
         assert _note(notes, "удалён")
 
-    def test_limits_are_reported(self, monkeypatch):
+    def test_a_long_route_is_not_cut_by_the_contour(self, monkeypatch):
+        """65 шагов ответа модели доезжают до схемы. Прежний MAX_ELEMENTS = 60
+        резал подробный маршрут молча, и «качество» мерилось по обрезанному
+        плану; верхняя граница теперь транспортная и честной генерацией
+        недостижима (размер ответа держит MAX_PLAN_TOKENS)."""
         elements = [_e(f"E{i}", "task", f"Шаг {i}", "L_m") for i in range(65)]
         elements[0]["kind"] = "startEvent"
         elements[-1]["kind"] = "endEvent"
         result = _generate(monkeypatch, _plan(elements=elements))
         ids = {e["id"] for e in result["structure"]["elements"]}
-        # Лимит режет план модели; события, которых в плане нет, добавляются
-        # сверху — иначе процесс останется без входа или выхода.
-        assert ids & {f"E{i}" for i in range(65)} == \
-            {f"E{i}" for i in range(bpmn_generator.MAX_ELEMENTS)}
-        assert _note(result["notes"], "Лишние элементы отброшены")
+        assert ids >= {f"E{i}" for i in range(65)}
+        assert not [n for n in result["notes"] if "отброшен" in n], result["notes"]
 
     def test_text_limits_are_reported(self, monkeypatch):
         long_name = "О" * 200

@@ -27,13 +27,32 @@ def _scenario(**overrides) -> Scenario:
 
 
 class TestDetector:
-    def test_both_prompt_examples_are_parsed(self):
+    def test_every_prompt_example_is_parsed(self):
         samples = {s["id"]: s for s in provenance.examples()}
-        assert set(samples) == {"generation_plan", "improve_package"}
+        assert set(samples) == {"generation_plan", "improve_package",
+                                "roster_composition"}
         assert samples["generation_plan"]["payload"]["participants"]
         assert samples["improve_package"]["payload"]["operations"]
         # Имена образца — то, что модель способна переписать дословно.
         assert "Заменить деталь" in samples["generation_plan"]["names"]
+        # Промпт состава отдаёт модели и правила, и ответ примера: и то, и то
+        # она способна переписать, поэтому имена снимаются с разобранного
+        # ответа, а не с напечатанной рядом схемы ответа.
+        assert samples["roster_composition"]["payload"]["roles"]
+        assert "Цех фасовки" in samples["roster_composition"]["names"]
+
+    def test_roster_prompt_naming_an_expected_pool_is_caught(self, monkeypatch):
+        """Правило состава обязано быть неймодomenным: «перевозчик» в правиле —
+        это подсказка ответа сцены `warehouse_delivery`, а не способность
+        контура. Так промпт правился один раз, и проверка это ловит."""
+        monkeypatch.setattr(bpmn_generator, "_ROSTER_SYSTEM_PROMPT",
+                            bpmn_generator._ROSTER_SYSTEM_PROMPT
+                            + '\nпример: «перевозчик»')
+        report = provenance.audit(
+            [s for s in all_scenarios() if s.id == "warehouse_delivery"], [])
+        hits = [f for f in report["findings"]
+                if f["example"] == "roster_composition"]
+        assert [f["value"] for f in hits] == ["Перевозчик"], hits
 
     def test_lost_marker_blinds_the_audit_loudly(self, monkeypatch):
         """Промпт без маркера образца — не «пересечений нет», а «проверять
@@ -56,7 +75,11 @@ class TestDetector:
             provenance.examples())
         hit = [f for f in findings
                if f["kind"] == "требование скопировать имя пула"]
-        assert [f["value"] for f in hit] == ["Цех фасовки"]
+        # «Цех фасовки» — организатор и в плане-образце, и в правиле состава:
+        # оба промпта дают модели это имя, и оба обязаны попасть в находки.
+        assert {f["value"] for f in hit} == {"Цех фасовки"}
+        assert {f["example"] for f in hit} == {"generation_plan",
+                                               "roster_composition"}
 
     def test_short_pool_name_is_checked_without_word_length_floor(self):
         """WMS короче словарного порога `words`, но именем пула быть может."""

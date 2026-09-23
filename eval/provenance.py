@@ -35,6 +35,11 @@ NAME_OVERLAP = 0.5
 
 GEN_MARKERS = ("Пример. ", "\n\nЗдесь ")
 IMPROVE_MARKER = "ПРИМЕР ОТВЕТА"
+# Промпт состава модель читает целиком: и правила, и пример. Маркер — начало
+# блока с ответом примера; без него проверять нечего (правила состава тоже
+# текстом попадают в находки, но имена снимаются с ответа).
+ROSTER_ID = "roster_composition"
+ROSTER_EXAMPLE_HEAD = "Пример («"
 
 
 def words(text: Any) -> Set[str]:
@@ -76,7 +81,8 @@ def _json_object(text: str) -> Optional[Dict[str, Any]]:
 def _payload_names(payload: Optional[Dict[str, Any]]) -> Set[str]:
     """Имена элементов/операций образца — то, что модель способна переписать."""
     names: Set[str] = set()
-    for key in ("elements", "operations", "lanes", "participants"):
+    for key in ("elements", "operations", "lanes", "participants",
+                "organizations", "systems", "counterparties", "roles"):
         for item in (payload or {}).get(key) or []:
             if isinstance(item, dict):
                 value = item.get("name")
@@ -123,6 +129,25 @@ def examples() -> List[Dict[str, Any]]:
         "payload": _json_object(block),
         "names": _payload_names(_json_object(block)),
     })
+
+    # Промпт состава модель читает целиком: и правила, и пример. Поэтому
+    # текстом образца считается весь промпт — имя пула утекает и в правило,
+    # — а имена берутся из разобранного ответа примера: до него в промпте
+    # напечатана схема ответа с плейсхолдерами, и первый объект — не ответ.
+    roster_prompt = str(bpmn_generator._ROSTER_SYSTEM_PROMPT)
+    if ROSTER_EXAMPLE_HEAD not in roster_prompt:
+        raise ValueError(
+            f"в промпте состава нет маркера {ROSTER_EXAMPLE_HEAD!r} — провенанс "
+            "нечего проверять; обновите eval/provenance.py вместе с промптом")
+    roster_payload = _json_object(roster_prompt[
+        roster_prompt.index(ROSTER_EXAMPLE_HEAD) + len(ROSTER_EXAMPLE_HEAD):])
+    found.append({
+        "id": ROSTER_ID,
+        "where": "core.bpmn_generator._ROSTER_SYSTEM_PROMPT",
+        "text": roster_prompt,
+        "payload": roster_payload,
+        "names": _payload_names(roster_payload),
+    })
     return found
 
 
@@ -153,10 +178,12 @@ def scenario_findings(scenario: Scenario,
                       samples: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Чем именно сценарий пересекается с образцом промпта."""
     out: List[Dict[str, Any]] = []
-    gen = next((e for e in samples if e["id"] == "generation_plan"), None)
-    imp = next((e for e in samples if e["id"] == "improve_package"), None)
+    by_id = {e["id"]: e for e in samples}
+    composition = [by_id.get("generation_plan"), by_id.get(ROSTER_ID)]
 
-    if gen is not None:
+    for gen in composition:
+        if gen is None:
+            continue
         ratio = containment(words(scenario.text), words(gen["text"]))
         if ratio >= TEXT_CONTAINMENT:
             out.append(_finding(scenario.id, "описание как в образце",
@@ -167,6 +194,7 @@ def scenario_findings(scenario: Scenario,
                     scenario.id, "требование скопировать имя пула", gen["id"],
                     str(participant), 1.0))
 
+    imp = by_id.get("improve_package")
     if imp is not None and scenario.improve_prompt:
         ratio = containment(words(scenario.improve_prompt), words(imp["text"]))
         if ratio >= TEXT_CONTAINMENT:

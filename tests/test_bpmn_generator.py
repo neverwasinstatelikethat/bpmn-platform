@@ -3503,6 +3503,71 @@ class TestPlanGapsAndRetry:
         role_line = role_line.split("\n\n", 1)[0]
         assert "Водитель" in role_line
         assert "Перевозчик" in role_line, "пустой пул не предложен хозяином роли"
+        # Имени мало: вопрос обязан сказать, что пустой пул — возможный хозяин,
+        # и что из этого следует (шаги роли переездут дорожкой).
+        assert "Хозяин роли может быть среди пустых пулов" in role_line
+        assert "inside" in role_line
+
+    def test_a_role_whose_host_is_vacant_rescues_that_host(self, monkeypatch):
+        """Ответ «Водитель — роль Перевозчика» складывается в ПУСТОЙ пул
+        перевозчика и уносит туда шаги: пустой пул иначе удаляется починкой, и
+        участник из описания исчезает со схемы. Один этот перенос закрывает сразу
+        два нарушения (`expected_participants` и `roles_as_lanes`) — прогон #50
+        терял «Перевозчика» именно так.
+
+        Проверено вызовом починки, а не глазами по нотам: ответ модели сначала
+        размечается в `_clarify_ownership`, а дорожка и перенос шагов появляются
+        в `repair_structure`.
+        """
+        structure = {
+            "participants": ["Склад", "Перевозчик",
+                             {"name": "Водитель", "external": False}],
+            "actors": ["Склад", "Перевозчик", "Водитель"], "lanes": [],
+            "elements": [
+                {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                 "participant": "Склад"},
+                {"id": "A1", "kind": "userTask", "name": "Отобрать груз",
+                 "participant": "Склад"},
+                {"id": "E1", "kind": "endEvent", "name": "Готово",
+                 "participant": "Склад"},
+                {"id": "P1", "kind": "startEvent", "name": "Старт",
+                 "participant": "Перевозчик"},
+                {"id": "P2", "kind": "endEvent", "name": "Финиш",
+                 "participant": "Перевозчик"},
+                {"id": "D1", "kind": "startEvent", "name": "Наряд",
+                 "participant": "Водитель"},
+                {"id": "D2", "kind": "userTask", "name": "Привезти груз",
+                 "participant": "Водитель"},
+                {"id": "D3", "kind": "endEvent", "name": "Доставлено",
+                 "participant": "Водитель"}],
+            "flows": [{"id": "F1", "source": "S1", "target": "A1",
+                       "kind": "sequence"},
+                      {"id": "F2", "source": "A1", "target": "E1",
+                       "kind": "sequence"},
+                      {"id": "F3", "source": "P1", "target": "P2",
+                       "kind": "sequence"},
+                      {"id": "F4", "source": "D1", "target": "D2",
+                       "kind": "sequence"},
+                      {"id": "F5", "source": "D2", "target": "D3",
+                       "kind": "sequence"}]}
+        text = ("Склад собирает заказ. Перевозчик получает заявку, водитель "
+                "доставляет груз со склада.")
+        monkeypatch.setattr(bpmn_generator, "call_json", lambda s, q, **kw: {
+            "moves": [], "roles": [{"pool": "Водитель", "inside": "Перевозчик"}],
+            "missing": []})
+        marked, notes = BPMNGenerator()._clarify_ownership(text, structure)
+        assert any("Водитель" in n and "Перевозчик" in n for n in notes), notes
+        repaired, rep_notes = bpmn_generator.repair_structure(marked, trace=[])
+        pools = [p["name"] if isinstance(p, dict) else p
+                 for p in repaired["participants"]]
+        assert sorted(pools) == ["Перевозчик", "Склад"], pools
+        assert ("Водитель", "Перевозчик") in [(l["name"], l["participant"])
+                                              for l in repaired["lanes"]]
+        moved = [(e["participant"], e.get("lane")) for e in repaired["elements"]
+                 if e["id"] == "D2"]
+        assert moved and moved[0][0] == "Перевозчик", moved
+        assert any("слит" in str(n) and "Перевозчик" in str(n)
+                   for n in rep_notes), rep_notes
 
     def test_clean_plan_is_not_asked_twice(self, monkeypatch):
         fake = FakeLLM(monkeypatch, _plan())

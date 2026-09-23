@@ -569,7 +569,7 @@ _RETRY_PATCH_SCHEMA = """{"fixes": [{"id": "A2", "participant": "названи�
  "add_flows": [{"id": "F9", "source": "A2", "target": "B1", \
 "condition": "Да", "kind": "sequence"}],
  "remove_flows": ["F3"],
- "participants": ["Перевозчик"],
+ "participants": [{"name": "Перевозчик", "external": true, "steps": ["A8"]}],
  "lanes": [{"id": "L9", "name": "Водитель", "participant": "Перевозчик"}]}"""
 
 _RETRY_TEMPLATE = """Ты уже построил структуру BPMN по описанию ниже, но в ней \
@@ -587,6 +587,8 @@ _RETRY_TEMPLATE = """Ты уже построил структуру BPMN по �
 - `remove_flows` — только потоки: узел плана удалён быть не может.
 - `participants` и `lanes` заполняй только если нарушение про участника, пул
   или дорожку. Иначе оставь списки пустыми: состав процесса утверждён.
+  Новому участнику обязательно нужны `steps` — id шагов из плана, которые он по
+  описанию и делает: пул без действий не доживает до схемы, починка его удаляет.
 
 Нарушения в текущем плане:
 {gaps}
@@ -616,7 +618,8 @@ def _participant_gap(gaps: List[str]) -> bool:
 
 
 def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
-                     gaps: List[str], notes: List[str]) -> Dict[str, Any]:
+                     gaps: List[str], text: str,
+                     notes: List[str]) -> Dict[str, Any]:
     """Заплатка поверх плана: правит названное, остальное оставляет как есть.
 
     Ответ планом целиком тоже поддерживается — модель отвечает так и будет, —
@@ -694,10 +697,55 @@ def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
     fixed["flows"] = flows
 
     if _participant_gap(gaps):
-        for key in ("participants", "lanes"):
+        for key in ("lanes",):
             if isinstance(patch.get(key), list):
                 fixed[key] = list(plan.get(key) or []) + patch[key]
                 notes.append(f"состав дополнен по нарушению про участника: {key}")
+        # Участник без шагов до схемы не доезжает: `_drop_vacant_pools` удаляет
+        # пустой пул, и названный в описании контрагент исчезает — ровно та
+        # потеря, ради которой нарушение и занесено в список. Поэтому добавляется
+        # пара «участник + его шаги», а не голое имя.
+        added = patch.get("participants")
+        if isinstance(added, list):
+            pool_names = {_norm_name(name) for name in _plan_pool_names(fixed)}
+            elements_by_id = {_raw_text(e.get("id")): e for e in elements
+                              if isinstance(e, dict)}
+            for item in added[:MAX_PATCH_MISSING]:
+                name = _pool_name(item)
+                if not name or _norm_name(name) in pool_names:
+                    continue
+                if not _mentioned(name, _text_words(text)):
+                    notes.append(f"участник «{name}» из заплатки не взят: в "
+                                 "описании такого имени нет")
+                    continue
+                steps = (item.get("steps") if isinstance(item, dict) else []) or []
+                moved = []
+                for step_id in steps[:MAX_PATCH_MOVES]:
+                    elem = elements_by_id.get(_raw_text(step_id))
+                    if elem is None or _raw_text(
+                            elem.get("kind") or elem.get("type")) in (
+                            "startEvent", "endEvent"):
+                        continue
+                    moved.append(elem)
+                if not moved:
+                    notes.append(f"участник «{name}» не добавлен: его шаги в "
+                                 "заплатке не названы, а пул без действий "
+                                 "починка удаляет")
+                    continue
+                extra: Dict[str, Any] = {"name": name}
+                if isinstance(item, dict):
+                    if item.get("external") is False:
+                        extra["external"] = False
+                    host = _raw_text(item.get("inside"))
+                    if host:
+                        extra["inside"] = host
+                fixed["participants"] = list(fixed.get("participants") or []) + [extra]
+                pool_names.add(_norm_name(name))
+                for elem in moved:
+                    elem["participant"] = name
+                    elem["lane"] = ""
+                notes.append(f"участник «{name}» добавлен с {len(moved)} его "
+                             "шагом(ами): нарушение про участника закрыто")
     elif isinstance(patch.get("participants"), list) or isinstance(
             patch.get("lanes"), list):
         notes.append("состав не изменён: нарушений про участников в списке не "
@@ -1071,7 +1119,7 @@ class BPMNGenerator:
         if not isinstance(data, dict):
             return None, []
         notes: List[str] = []
-        patched = apply_plan_patch(structure, data, gaps, notes)
+        patched = apply_plan_patch(structure, data, gaps, text, notes)
         return patched, notes
 
     def _clarify_ownership(self, text: str,

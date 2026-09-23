@@ -2908,10 +2908,11 @@ class TestPlanPatch:
         "flows": [{"id": "F1", "source": "S1", "target": "A1"},
                   {"id": "F2", "source": "A1", "target": "E1"}]}
 
-    def _patch(self, patch, gaps=()):
+    def _patch(self, patch, gaps=(), text="Дежурство осматривает узел, "
+                                            "подрядчик чинит линию."):
         notes: list = []
         base = copy.deepcopy(self.BASE)
-        return bpmn_generator.apply_plan_patch(base, patch, list(gaps),
+        return bpmn_generator.apply_plan_patch(base, patch, list(gaps), text,
                                                notes), notes
 
     def test_untouched_elements_survive_the_retry_byte_for_byte(self):
@@ -2960,12 +2961,35 @@ class TestPlanPatch:
         step = next(e for e in patched["elements"] if e["id"] == "A1")
         assert step["name"] == "Осмотреть и починить узел"
 
-    def test_participant_gap_opens_the_composition(self):
-        patched, _notes = self._patch(
-            {"participants": ["Подрядчик"]},
+    def test_participant_gap_opens_the_composition_with_its_steps(self):
+        """Закрыть нарушение про участника можно только парой «пул + его шаги»:
+        голое имя починка удалит вместе с пустым пулом.»"""
+        patched, notes = self._patch(
+            {"participants": [{"name": "Подрядчик", "external": True,
+                               "steps": ["A1"]}]},
             gaps=['ты сама назвала «Подрядчик» действующим лицом описания, '
                   "но в плане нет ни пула, ни дорожки с таким именем"])
-        assert patched["participants"] == ["Дежурство", "Подрядчик"]
+        assert patched["participants"][-1] == {"name": "Подрядчик"}
+        step = next(e for e in patched["elements"] if e["id"] == "A1")
+        assert step["participant"] == "Подрядчик"
+        assert any("добавлен с 1 его шагом" in n for n in notes)
+
+    def test_added_participant_without_steps_is_not_added(self):
+        """Пул без действий не доживает до схемы, поэтому и в заплатке он
+        имеет смысл только вместе с шагами."""
+        patched, notes = self._patch(
+            {"participants": [{"name": "Подрядчик", "steps": []}]},
+            gaps=['ты сама назвала «Подрядчик» действующим лицом описания, '
+                  "но в плане нет ни пула, ни дорожки с таким именем"])
+        assert [p for p in patched["participants"]] == ["Дежурство"]
+        assert any("его шаги в заплатке не названы" in n for n in notes)
+
+    def test_added_participant_absent_from_the_description_is_refused(self):
+        patched, notes = self._patch(
+            {"participants": [{"name": "Робот-курьер", "steps": ["A1"]}]},
+            gaps=["участник «Робот-курьер» помечен ролью (external=false)"])
+        assert [p for p in patched["participants"]] == ["Дежурство"]
+        assert any("в описании такого имени нет" in n for n in notes)
 
     def test_a_full_plan_answer_is_still_accepted_as_a_replacement(self):
         """Модель ответит планом целиком и будет: это не отказ и не тихая

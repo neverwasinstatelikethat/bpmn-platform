@@ -2757,7 +2757,7 @@ def _structure_ids(participants: List[Dict[str, Any]], lanes: List[Dict[str, Any
     """
     out: Set[str] = set()
     for item in participants or []:
-        out.add("pool:" + str(_raw_text(item.get("name"))))
+        out.add("pool:" + str(_pool_name(item)))
     for item in lanes or []:
         out.add("lane:" + str(item.get("id") or _raw_text(item.get("name"))))
     for item in elements or []:
@@ -2786,6 +2786,16 @@ def repair_structure(raw: Dict[str, Any],
     used_ids: Set[str] = set()
     steps: List[Dict[str, Any]] = []
     mark: List[Any] = []
+    # Базис отпечатка — то, что модель объявила сама. Первые этапы сравнивались с
+    # пустым множеством, и в `added` попадал весь план: харнесс приписывал контуру
+    # («починка:пулы», «починка:шаги») должности-пулы и шаги, которые написала
+    # модель — прогон #53, 4 провала `roles_as_lanes` были разобраны заново.
+    # `removed` не меняется: снять починка может только то, что до неё дожил.
+    declared = _structure_ids(
+        (raw.get("participants") or []) if isinstance(raw, dict) else [],
+        (raw.get("lanes") or []) if isinstance(raw, dict) else [],
+        (raw.get("elements") or []) if isinstance(raw, dict) else [],
+        (raw.get("flows") or []) if isinstance(raw, dict) else [])
 
     def _mark(step: str, participants, lanes_, elements_, flows_) -> None:
         mark.clear()
@@ -2795,7 +2805,7 @@ def repair_structure(raw: Dict[str, Any],
     def _close(participants, lanes_, elements_, flows_) -> None:
         step, before, n_before = mark.pop()
         after = _structure_ids(participants, lanes_, elements_, flows_)
-        steps.append({"step": step, "added": sorted(after - before),
+        steps.append({"step": step, "added": sorted((after - before) - declared),
                       "removed": sorted(before - after),
                       "notes": notes[n_before:]})
 

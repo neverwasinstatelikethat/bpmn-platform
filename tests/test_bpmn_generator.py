@@ -1441,6 +1441,30 @@ class TestEmittedXml:
         assert all({"step", "added", "removed", "notes"} <= set(step)
                    for step in steps)
 
+    def test_the_repair_trace_does_not_charge_declared_content_to_the_contour(
+            self, monkeypatch):
+        """Пул, который модель объявила сама, не считается «добавленным починкой».
+
+        Первые шаги проходили с пустым базисом, и `added` «пулы»/«дорожки»/«шаги»
+        перечислял весь план: харнесс приписывал `roles_as_lanes` контуру
+        («починка:пулы») там, где должность пулом написала модель. Прогон #53 —
+        4 таких кейса. Отпечаток обязан отделать то, что в плане уже было.
+        """
+        result = _generate(monkeypatch, self._vacant_for_trace())
+        steps = next(e for e in result["trace"]
+                     if e["node"] == "починка структуры")["steps"]
+        by_name = {step["step"]: step for step in steps}
+        for stage in ("пулы", "дорожки", "шаги"):
+            tokens = set(by_name[stage]["added"])
+            assert "pool:ВкусВилл" not in tokens, stage
+            assert not any(t.endswith("@ВкусВилл") and t.startswith("T")
+                           for t in tokens), (stage, sorted(tokens)[:6])
+            assert "lane:L_m" not in tokens, stage
+        # А вот что контур сделал сам — в отпечатке остаётся: удалённый пустой
+        # пул моделью объявлен, но снимает его починка.
+        assert any(t.startswith("pool:Кладовщик") or "Кладовщик" in t
+                   for t in by_name["удаление пустых пулов"]["removed"])
+
     @staticmethod
     def _vacant_for_trace():
         return _plan(

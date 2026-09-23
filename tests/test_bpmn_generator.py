@@ -3464,6 +3464,46 @@ class TestPlanGapsAndRetry:
         assert _note(result["notes"], "но план потерял")
         assert bpmn_generator._plan_content(result["structure"]) == 3
 
+    def test_the_question_offers_a_vacant_pool_as_the_role_host(self, monkeypatch):
+        """Действия контрагента модель записывает за его же ролью: в прогоне #50
+        `warehouse_delivery` пул «Перевозчик» остался без шагов, а его шаги ушли в
+        пул «Водитель» — отсюда сразу два падения (`expected_participants` и
+        `roles_as_lanes`), один дефект. Вопрос о принадлежности обязан показать
+        пустой пул как возможного хозяина роли: связь «Водитель → Перевозчик»
+        знает описание, а не список должностей в коде."""
+        roster = ('{"organizations": ["Склад"], "systems": [], '
+                  '"counterparties": ["Перевозчик", "Водитель"], "roles": []}')
+        plan = {"participants": ["Склад", "Перевозчик", "Водитель"],
+                "actors": ["Склад", "Перевозчик", "Водитель"],
+                "lanes": [],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                     "participant": "Склад"},
+                    {"id": "A1", "kind": "userTask", "name": "Отобрать груз",
+                     "participant": "Склад"},
+                    {"id": "P1", "kind": "startEvent", "name": "Старт",
+                     "participant": "Перевозчик"},
+                    {"id": "P2", "kind": "endEvent", "name": "Финиш",
+                     "participant": "Перевозчик"},
+                    {"id": "D1", "kind": "startEvent", "name": "Наряд",
+                     "participant": "Водитель"},
+                    {"id": "D2", "kind": "userTask", "name": "Привезти груз",
+                     "participant": "Водитель"},
+                    {"id": "D3", "kind": "endEvent", "name": "Доставлено",
+                     "participant": "Водитель"}],
+                "flows": []}
+        fake = FakeLLM(monkeypatch, roster, _fence(plan),
+                       '{"moves": [], "roles": [], "missing": []}')
+        BPMNGenerator().generate(
+            "Склад собирает заказ. Перевозчик получает заявку, водитель "
+            "доставляет груз со склада.")
+        question = next(c[1]["content"] for c in fake.calls
+                        if "Пулы, которые могут быть ролью" in c[1]["content"])
+        role_line = question.split("Пулы, которые могут быть ролью", 1)[1]
+        role_line = role_line.split("\n\n", 1)[0]
+        assert "Водитель" in role_line
+        assert "Перевозчик" in role_line, "пустой пул не предложен хозяином роли"
+
     def test_clean_plan_is_not_asked_twice(self, monkeypatch):
         fake = FakeLLM(monkeypatch, _plan())
         result = BPMNGenerator().generate("ВкусВилл согласует заявку")

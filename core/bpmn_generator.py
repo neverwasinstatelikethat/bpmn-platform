@@ -289,6 +289,220 @@ event_definition="message".
 в тексте).
 """
 
+# Стадия состава: отдельный маленький ответ вместо того, чтобы модель решала
+# «кто участник, а кто роль» одновременно с ~20 элементами маршрута. Живые
+# прогоны #40–#42 на этом месте и ломались: пул на каждую должность, каждый со
+# своим стартом и финишем, — процесс фрагментировался, и вместе с фрагментацией
+# падали `roles_as_lanes`, `has_branching`, `min_steps`, `expected_participants`.
+MAX_ROSTER_TOKENS = 1_500
+_ROSTER_SYSTEM_PROMPT = """Ты — аналитик бизнес-процессов. По описанию процесса
+определи ЕГО СОСТАВ: кто участвует, что из этого организация, система,
+контрагент, а что — роль или подразделение внутри организации. Маршрут, шаги и
+потоки рисовать не нужно.
+
+Верни СТРОГО ОДИН JSON-объект без пояснений и без блоков кода:
+{"organizations": ["название организации-участника"],
+ "systems": ["система, у которой есть свои действия (WMS, CRM, 1С)"],
+ "counterparties": ["внешний контрагент: клиент, поставщик, перевозчик, \
+получатель"],
+ "roles": [{"name": "должность, роль, отдел или подсистема", \
+"host": "организация, которой это принадлежит"}]}
+
+- Пулом бывает только то, что действует от своего имени и имеет собственные
+действия: организация, контрагент, самостоятельная система.
+- Должность, роль сотрудника, отдел и подсистема организации — это roles. Так
+же поступают слова на -щик, -ник, -тель, -лог, «оператор», «менеджер»,
+«специалист», «служба», «отдел», «бюро», «комитет», если в тексте они делают
+часть работы другой организации: «кладовщик», «комплектатор», «контролёр
+качества», «экспедитор», «водитель», «оператор склада», «служба логистики».
+- host — название организации из этого же описания, которой роль принадлежит.
+Если организации, которой роль принадлежит, в списке нет, выпиши её названием
+из текста: не угадывай и не оставляй host пустым без причины.
+- Host остаётся пустым ("") только когда по описанию решить нельзя: это
+самостоятельный участник или чужая роль. Пустой host честнее догадки — такой
+случай будет переспрошен.
+- Имена бери теми же словами, что в описании: «WMS» не становится «системой»,
+«Склад» не заменяется именем компании. Родовое слово («организация»,
+«подразделение», «система» без имени) участником не считается.
+- Действующее лицо, у которого в описании есть свои действия, обязано попасть
+в один из списков; забыть контрагента — ошибка состава.
+
+Пример («Начальник смены цеха заводит наряд на починку упаковочной линии,
+техник цеха осматривает узел, при просрочке — доклад мастеру участка, если
+линию не починить своими силами, её передают подрядчику из сервисной
+службы»):
+{"organizations": ["Цех фасовки"], "systems": [],
+ "counterparties": ["Сервисная служба"],
+ "roles": [{"name": "Начальник смены", "host": "Цех фасовки"},
+           {"name": "Техник цеха", "host": "Цех фасовки"},
+           {"name": "Мастер участка", "host": "Цех фасовки"}]}
+"""
+
+# Стадия маршрута идёт по тем же правилам моделирования, что и одношаговый путь
+# (иначе два вызова соблюдали бы разные правила), но с закреплением состава.
+_FLOW_SYSTEM_PROMPT = _SYSTEM_PROMPT + """
+Состав процесса (пулы и дорожки) заказчик уже утвердил и прислал в запросе.
+`participants` и `lanes` верни ровно этим списком: новых пулов не заводим,
+роль не становится участником, а подразделение — вторым процессом. Всё
+внимание — шагам, событиям, шлюзам и потокам внутри утверждённого состава:
+каждое действующее лицо описания должно остаться на схеме, а действия людей
+одной организации — идти sequence-потоком в её пуле.
+"""
+
+
+def _pool_name(entry: Any) -> str:
+    """Имя участника плана: пул бывает и строкой, и объектом с `external`."""
+    if isinstance(entry, dict):
+        return _raw_text(entry.get("name"))
+    return _raw_text(entry)
+
+
+def _skeleton_block(participants: List[Any], lanes: List[Dict[str, Any]]) -> str:
+    """Состав процесса для запроса маршрута: пулы и дорожки с id."""
+    lines = ["Состав процесса (утверждён, менять нельзя):", "пулы: " + (
+        ", ".join(f"«{_pool_name(p)}»" for p in participants) or "—")]
+    if lanes:
+        lines.append("дорожки: " + ", ".join(
+            f"{lane.get('id')} «{lane.get('name')}» в «{lane.get('participant')}»"
+            for lane in lanes))
+    else:
+        lines.append("дорожки: нет")
+    return "\n".join(lines)
+
+
+def parse_roster(data: Dict[str, Any], text: str) -> Tuple[Dict[str, Any],
+                                                           List[str]]:
+    """Состав модели → каркас плана: пулы, дорожки, список действующих лиц.
+
+    Роль без хозяина остаётся пулом с `external: false` — это нарушение rank 0
+    («роль, не назвавшая организацию»), и закрывает его переспрос, а не догадка
+    кода: хозяина роли по названию должности живые прогоны угадывать запретили
+    (откат `_sole_role_host`, прогон #37).
+    """
+    notes: List[str] = []
+    words = _text_words(text)
+    participants: List[Any] = []
+    taken: Set[str] = set()
+    by_norm: Dict[str, str] = {}
+
+    def add_pool(name: Any) -> str:
+        clean = _raw_text(name)
+        norm = _norm_name(clean)
+        if not clean:
+            return ""
+        if norm in taken:
+            # Хозяин уже в составе — это не отказ, а тот же самый пул.
+            return by_norm.get(norm, clean)
+        if _generic_actor_name(clean):
+            notes.append(f"участник «{clean}» не взят в состав: родовое слово, а "
+                         "не название из описания")
+            return ""
+        if not _mentioned(clean, words):
+            notes.append(f"участник «{clean}» не взят в состав: в описании такого "
+                         "имени нет")
+            return ""
+        taken.add(norm)
+        by_norm[norm] = clean
+        participants.append(clean)
+        return clean
+
+    for key in ("organizations", "systems", "counterparties", "participants"):
+        value = data.get(key)
+        for item in (value if isinstance(value, list) else [])[:MAX_PARTICIPANTS]:
+            add_pool(item if not isinstance(item, dict) else item.get("name"))
+            if len(participants) >= MAX_PARTICIPANTS:
+                break
+
+    lanes: List[Dict[str, Any]] = []
+    roles = data.get("roles")
+    for idx, role in enumerate(roles if isinstance(roles, list) else []):
+        if len(participants) + len(lanes) >= MAX_PARTICIPANTS * 2:
+            break
+        name = _raw_text(role.get("name") if isinstance(role, dict) else role)
+        host = _raw_text(role.get("host") if isinstance(role, dict) else "")
+        if not name or _norm_name(name) in taken:
+            continue
+        if not _mentioned(name, words):
+            notes.append(f"роль «{name}» не взята в состав: в описании такого "
+                         "имени нет")
+            continue
+        canonical = add_pool(host)
+        if not canonical and host:
+            # Хозяин не принят (родовое слово или имя не из описания): роль
+            # остаётся незакрытым нарушением, а не сиротской дорожкой.
+            notes.append(f"роль «{name}» осталась без организации: хозяин «{host}» "
+                         "не название из описания")
+        if not canonical:
+            taken.add(_norm_name(name))
+            participants.append({"name": name, "external": False})
+            continue
+        lane_id = f"L{len(lanes) + 1}"
+        lanes.append({"id": lane_id, "name": name,
+                      "participant": canonical})
+        taken.add(_norm_name(name))
+        notes.append(f"«{name}» — роль «{canonical}»: на схеме это дорожка её пула")
+
+    actors = [_pool_name(p) for p in participants] + [
+        lane["name"] for lane in lanes]
+    if not participants:
+        return {}, notes
+    return ({"participants": participants, "lanes": lanes,
+             "actors": [a for a in actors if a]}, notes)
+
+
+def _merge_skeleton(skeleton: Dict[str, Any], plan: Dict[str, Any],
+                    text: str) -> Tuple[Dict[str, Any], List[str]]:
+    """Ответ маршрута поверх утверждённого состава.
+
+    Каркас задаёт пулы и дорожки, но модель вправе найти участника, которого
+    состав пропустил, — если его имя звучит в описании. Выдуманного участника не
+    принимаем: иначе «не заводить лишних пулов» работает в одну сторону.
+    """
+    notes: List[str] = []
+    words = _text_words(text)
+    merged = dict(plan)
+    plan_pools = _plan_pool_names(plan)
+    skeleton_pools = [_pool_name(p) for p in skeleton["participants"]]
+    known = {_norm_name(p) for p in skeleton_pools}
+    extra: List[Any] = []
+    for pool in (skeleton_pools + [p for p in plan_pools
+                                   if _norm_name(p) not in known]):
+        if _norm_name(pool) in known:
+            continue
+        if not _mentioned(pool, words):
+            notes.append(f"пул «{pool}» не добавлен: в описании такого имени нет, "
+                         "а состав процесса уже утверждён")
+            continue
+        extra.append(pool)
+        known.add(_norm_name(pool))
+    merged["participants"] = list(skeleton["participants"]) + extra
+    skeleton_lane_ids = {lane["id"] for lane in skeleton["lanes"]}
+    skeleton_lane_names = {_norm_name(lane["name"]) for lane in skeleton["lanes"]}
+    lanes = list(skeleton["lanes"])
+    for lane in _raw_dicts(plan.get("lanes")):
+        if (lane.get("id") in skeleton_lane_ids
+                or _norm_name(lane.get("name")) in skeleton_lane_names
+                or _norm_name(lane.get("name")) in {_norm_name(p) for p in
+                                                    merged["participants"]}):
+            continue
+        lanes.append(dict(lane))
+    merged["lanes"] = lanes
+    merged["actors"] = ([a for a in (skeleton.get("actors") or [])
+                         if isinstance(a, str)]
+                        + [a for a in (_raw_dicts_plan_actors(plan))
+                           if a not in (skeleton.get("actors") or [])])
+    if extra:
+        notes.append("модель маршрута добавила участников, которых нет в составе: "
+                     + ", ".join(f"«{p}»" for p in extra))
+    return merged, notes
+
+
+def _raw_dicts_plan_actors(plan: Dict[str, Any]) -> List[str]:
+    actors = plan.get("actors")
+    return [a.strip() for a in (actors if isinstance(actors, list) else [])
+            if isinstance(a, str) and a.strip()]
+
+
 # Переспрос идёт с тем же системным промптом: правила моделирования обязаны
 # жить в одном месте, иначе второй вызов начнёт соблюдать другие правила.
 # Формулировка ниже — только про то, что править нельзя содержание.
@@ -394,7 +608,8 @@ class BPMNGenerator:
                 )
 
             trace: List[Dict[str, Any]] = []
-            structure = self._extract_structure(text)
+            meta: Dict[str, Any] = {"notes": [], "frozen": False}
+            structure = self._extract_structure(text, meta)
             gaps = plan_gaps(structure, text)
             trace.append({
                 "node": "первый ответ модели",
@@ -402,6 +617,8 @@ class BPMNGenerator:
                 "pools": len(structure.get("participants") or []),
                 "elements": len(structure.get("elements") or []),
                 "flows": len(structure.get("flows") or []),
+                "состав": "утверждён отдельным вызовом" if meta["frozen"]
+                          else "один вызов",
             })
             attempts, retry_note = 1, ""
             # Переспрос переписывает весь план — дорогое и рискованное действие
@@ -410,7 +627,8 @@ class BPMNGenerator:
             # узкий вопрос о том, чьи это шаги (`_clarify_ownership`).
             if plan_gaps(structure, text, with_actors=False):
                 attempts = 2
-                retry = self._retry_structure(text, structure, gaps)
+                retry = self._retry_structure(text, structure, gaps,
+                                              frozen=meta["frozen"])
                 reask: Dict[str, Any] = {"node": "переспрос плана",
                                          "gaps_before": len(gaps)}
                 trace.append(reask)
@@ -468,6 +686,7 @@ class BPMNGenerator:
             trace.append({"node": "починка структуры", "steps": repair_steps})
             if retry_note:
                 notes.append(retry_note)
+            notes.extend(meta["notes"])
             notes.extend(patch_notes)
             for note in notes:
                 logger.info("Починка структуры: %s", note)
@@ -544,18 +763,94 @@ class BPMNGenerator:
 
     # --- шаг 1: структура от LLM ---
 
-    def _extract_structure(self, text: str) -> Dict[str, Any]:
+    def _extract_structure(self, text: str,
+                           meta: Dict[str, Any]) -> Dict[str, Any]:
+        """Состав процесса, затем маршрут внутри него.
+
+        Один выдох «реши, кто участник, и за это же нарисуй 20 элементов»
+        живые прогоны #40–#42 платили пулом на каждую должность: каждый такой
+        пул — отдельный процесс со своим стартом и финишем, и вместе с
+        фрагментацией исчезали развилка, контрагент и число шагов. Состав
+        решает маленькая отдельная стадия, а маршрут получает его каркасом и
+        новых пулов не заводит.
+        """
+        meta.setdefault("notes", [])
+        meta.setdefault("frozen", False)
+        skeleton: Dict[str, Any] = {}
+        roster = self._extract_roster(text)
+        if roster is not None and any(key in roster
+                                      for key in ("elements", "flows", "lanes")):
+            # Модель ответила на узкий вопрос планом целиком. Выбрасывать его и
+            # переспрашивать маршрут — значит платить двумя вызовами за то, что
+            # уже есть: принимаем как одношаговый путь.
+            meta["roster"] = "план целиком"
+            return roster
+        if roster is not None:
+            skeleton, notes = parse_roster(roster, text)
+            meta["notes"].extend(notes)
+        if not skeleton.get("participants"):
+            # Состава нет (модель не ответила на этот вызов или состав пуст):
+            # генерация обязана остаться одношаговой, а не превратиться в отказ.
+            return self._extract_plan(text)
+        plan = self._extract_flow(text, skeleton)
+        if plan is None:
+            return self._extract_plan(text)
+        merged, merge_notes = _merge_skeleton(skeleton, plan, text)
+        meta["notes"].extend(merge_notes)
+        meta["frozen"] = True
+        return merged
+
+    def _extract_roster(self, text: str) -> Optional[Dict[str, Any]]:
+        try:
+            data = call_json(_ROSTER_SYSTEM_PROMPT,
+                             f"Описание процесса:\n{text}",
+                             temperature=0.0, max_tokens=MAX_ROSTER_TOKENS)
+        except (LLMTruncatedError, LLMRequestTooLargeError):
+            raise
+        except LLMError as e:
+            # Только сбой транспорта уводит на одношаговый путь: обрезка и
+            # переполнение контекста — объяснимый пользователю отказ, а
+            # не разобранный JSON — тот же сбой разбора, что и раньше.
+            logger.warning("Состав процесса не выделен, генерация идёт одним "
+                           "вызовом: %s", e)
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _extract_plan(self, text: str) -> Dict[str, Any]:
         data = call_json(_SYSTEM_PROMPT, f"Описание процесса:\n{text}",
                          temperature=0.2, max_tokens=MAX_PLAN_TOKENS)
         if not isinstance(data, dict):
             raise ValueError("ответ модели не объект")
         return data
 
+    def _extract_flow(self, text: str,
+                      skeleton: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        question = (
+            _skeleton_block(skeleton["participants"], skeleton["lanes"])
+            + "\n\nКаждому элементу указывай `participant` названием пула из "
+              "этого списка и `lane` — id дорожки из него же (пустая строка, "
+              "если дорожки нет).\n\nОписание процесса:\n" + text)
+        try:
+            data = call_json(_FLOW_SYSTEM_PROMPT, question, temperature=0.2,
+                             max_tokens=MAX_PLAN_TOKENS)
+        except (LLMError, ValueError) as e:
+            logger.warning("Маршрут по утверждённому составу не построен, "
+                           "идём одним вызовом: %s", e)
+            return None
+        if not isinstance(data, dict) or not (data.get("elements") or []):
+            return None
+        return data
+
     def _retry_structure(self, text: str, structure: Dict[str, Any],
-                         gaps: List[str]) -> Optional[Dict[str, Any]]:
+                         gaps: List[str], frozen: bool = False,
+                         ) -> Optional[Dict[str, Any]]:
         """Один переспрос по нарушениям. None — если повтор не мог ничего дать
         (план не влезает в контекст) или модель недоступна: план с нарушениями
-        честнее отказа генерации, а починка и так отработает."""
+        честнее отказа генерации, а починка и так отработает.
+
+        `frozen` — состав утверждён стадией состава: переспрос обязан чинить
+        маршрутом и пулами в рамках списка, иначе он возвращал бы роли пулами.
+        """
         payload = json.dumps(structure, ensure_ascii=False, default=str)
         if len(payload) > MAX_RETRY_PLAN_CHARS:
             logger.info("Повтор генерации пропущен: план %d символов, лимит %d",
@@ -563,7 +858,7 @@ class BPMNGenerator:
             return None
         try:
             data = call_json(
-                _SYSTEM_PROMPT,
+                _FLOW_SYSTEM_PROMPT if frozen else _SYSTEM_PROMPT,
                 _RETRY_TEMPLATE.format(
                     gaps="\n".join(f"- {g}" for g in gaps),
                     text=text, plan=payload),

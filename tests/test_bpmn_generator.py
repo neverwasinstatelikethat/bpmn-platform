@@ -41,6 +41,18 @@ class FakeLLM:
     def system_prompt(self):
         return self.calls[0][0]["content"]
 
+    @property
+    def plan_prompt(self):
+        """Системный промпт вызова, который просит ПЛАН (элементы и потоки).
+
+        Первым вызовом теперь идёт состав процесса, и правила маршрута надо
+        искать не в нём — иначе проверка ловила бы любой промпт подряд.
+        """
+        for call in self.calls:
+            if '"elements"' in call[0]["content"]:
+                return call[0]["content"]
+        return self.calls[0][0]["content"]
+
 
 def _plan_dict(**overrides) -> dict:
     """Эталонный план модели: роли — дорожки одного пула «ВкусВилл»."""
@@ -189,7 +201,7 @@ class TestRolesAreLanesNotPools:
     def test_prompt_separates_pools_from_lanes(self, monkeypatch):
         fake = FakeLLM(monkeypatch, _plan())
         BPMNGenerator().generate("описание")
-        prompt = fake.system_prompt
+        prompt = fake.plan_prompt
         assert '"lanes"' in prompt and '"lane"' in prompt
         assert "ДОРОЖКИ" in prompt
         assert "РАЗНЫХ пулов" in prompt
@@ -207,7 +219,7 @@ class TestRolesAreLanesNotPools:
         в один шаг, а последнее действие фразы выбрасывала."""
         fake = FakeLLM(monkeypatch, _plan())
         BPMNGenerator().generate("описание")
-        prompt = fake.system_prompt
+        prompt = fake.plan_prompt
         assert "одно законченное действие одного исполнителя" in prompt
         assert "последнее действие" in prompt
         # склейка прячется в имени: «Проверка упаковок» — это и проверка, и
@@ -219,7 +231,7 @@ class TestRolesAreLanesNotPools:
         роли разъезжались по пулам даже с правилами в промпте."""
         fake = FakeLLM(monkeypatch, _plan())
         BPMNGenerator().generate("описание")
-        prompt = fake.system_prompt
+        prompt = fake.plan_prompt
         assert 'Пример' in prompt
         assert '"participants": ["Цех фасовки", "Сервисная служба"]' in prompt
         assert "роли одной организации" in prompt
@@ -280,6 +292,135 @@ def test_camel_case_brand_is_not_cut_into_a_participant():
         _plan_dict(),
         "ВкусВилл собирает заказ, перевозчик вывозит его на адрес.")
     assert not any("«Вкус»" in g or "«Вилл»" in g for g in gaps)
+
+
+class TestTwoStageGeneration:
+    """Состав процесса утверждается отдельным вызовом, маршрут пишется по нему.
+
+    Живые прогоны #40–#42: один выдох «реши, кто участник, и нарисуй 20
+    элементов» стоил пула на каждую должность, а каждый такой пул — отдельный
+    процесс со своим стартом и финишем.
+    """
+
+    TEXT = ("Кладовщик склада собирает груз, экспедитор перевозчика выдаёт его "
+            "под подпись.")
+
+    ROSTER = ('{"organizations": ["Склад"], "counterparties": ["Перевозчик"], '
+              '"roles": [{"name": "Кладовщик", "host": "Склад"}, '
+              '{"name": "Экспедитор", "host": "Перевозчик"}]}')
+
+    def _flow(self) -> str:
+        return _fence({
+            "participants": ["Склад", "Перевозчик"],
+            "lanes": [{"id": "L1", "name": "Кладовщик", "participant": "Склад"},
+                      {"id": "L2", "name": "Экспедитор",
+                       "participant": "Перевозчик"}],
+            "elements": [
+                {"id": "S1", "kind": "startEvent", "name": "Заявка собрана",
+                 "participant": "Склад", "lane": "L1"},
+                {"id": "T1", "kind": "userTask", "name": "Собрать груз",
+                 "participant": "Склад", "lane": "L1"},
+                {"id": "E1", "kind": "endEvent", "name": "Груз на складе",
+                 "participant": "Склад", "lane": "L1"},
+                {"id": "S2", "kind": "startEvent", "name": "Груз передан",
+                 "participant": "Перевозчик", "lane": "L2"},
+                {"id": "T2", "kind": "userTask", "name": "Выдать груз",
+                 "participant": "Перевозчик", "lane": "L2"},
+                {"id": "E2", "kind": "endEvent", "name": "Подпись получена",
+                 "participant": "Перевозчик", "lane": "L2"},
+            ],
+            "flows": [{"id": "F1", "source": "S1", "target": "T1"},
+                      {"id": "F2", "source": "T1", "target": "E1"},
+                      {"id": "M1", "source": "T1", "target": "T2",
+                       "kind": "message"},
+                      {"id": "F3", "source": "S2", "target": "T2"},
+                      {"id": "F4", "source": "T2", "target": "E2"}]})
+
+    def test_roles_become_lanes_before_the_route_is_written(self, monkeypatch):
+        fake = FakeLLM(monkeypatch, self.ROSTER, self._flow())
+        result = BPMNGenerator().generate(self.TEXT)
+
+        names = [p["name"] if isinstance(p, dict) else p
+                 for p in result["structure"]["participants"]]
+        assert "Кладовщик" not in names and "Экспедитор" not in names
+        assert sorted(names) == sorted(["Склад", "Перевозчик"])
+        assert [(lane["name"], lane["participant"])
+                for lane in result["structure"]["lanes"]] == [
+                    ("Кладовщик", "Склад"), ("Экспедитор", "Перевозчик")]
+        # Маршрут просится у того же промпта с закреплением состава, и состав
+        # ему передан текстом: своих пулов он не заводит.
+        assert fake.calls[1][0]["content"] == bpmn_generator._FLOW_SYSTEM_PROMPT
+        assert "Состав процесса (утверждён" in fake.calls[1][1]["content"]
+        assert "«Склад»" in fake.calls[1][1]["content"]
+
+    def test_parse_roster_leaves_a_hostless_role_an_open_violation(self):
+        """Хозяина роли угадываем не: роль без организации остаётся пулом с
+        `external: false`, и это нарушение rank 0, а не тихая дорожка-сирота."""
+        skeleton, _notes = bpmn_generator.parse_roster(
+            {"organizations": ["Склад"],
+             "roles": [{"name": "Кладовщик", "host": "Склад"},
+                       {"name": "Дежурный инженер", "host": ""}]},
+            "Кладовщик собирает груз на складе, дежурный инженер принимает "
+            "сигнал.")
+        assert skeleton["participants"] == ["Склад",
+                                          {"name": "Дежурный инженер",
+                                           "external": False}]
+        assert [(l["name"], l["participant"]) for l in skeleton["lanes"]] == [
+            ("Кладовщик", "Склад")]
+        assert any("помечен ролью" in g
+                   for g in bpmn_generator.plan_gaps(skeleton))
+
+    def test_parse_roster_refuses_names_that_the_text_does_not_carry(self):
+        skeleton, notes = bpmn_generator.parse_roster(
+            {"organizations": ["Склад", "Фаб грез"],
+             "roles": [{"name": "Гувернёр", "host": "Фаб грез"},
+                       {"name": "Система", "host": "Склад"}]},
+            "Склад отгружает товар.")
+        assert [p if isinstance(p, str) else p["name"]
+                for p in skeleton["participants"]] == ["Склад"]
+        assert skeleton["lanes"] == []
+        assert any("Фаб грез" in n for n in notes)
+
+    def test_route_may_not_add_a_participant_absent_from_the_description(self):
+        skeleton = {"participants": ["Склад"],
+                    "lanes": [{"id": "L1", "name": "Кладовщик",
+                               "participant": "Склад"}],
+                    "actors": ["Склад", "Кладовщик"]}
+        plan = {"participants": ["Склад", "Марсиане"], "lanes": [],
+                "elements": [], "flows": []}
+        merged, notes = bpmn_generator._merge_skeleton(
+            skeleton, plan, "Склад отгружает товар.")
+        assert [p if isinstance(p, str) else p["name"]
+                for p in merged["participants"]] == ["Склад"]
+        assert any("«Марсиане» не добавлен" in n for n in notes)
+
+    def test_route_participant_named_in_the_text_survives(self):
+        """Состав мог пропустить контрагента, который в тексте назван: выбросить
+        его — значит потерять участника, которого проверяет `expected_participants`."""
+        skeleton = {"participants": ["Склад"], "lanes": [], "actors": ["Склад"]}
+        plan = {"participants": ["Склад", "Перевозчик"], "lanes": [],
+                "elements": [], "flows": []}
+        merged, _notes = bpmn_generator._merge_skeleton(
+            skeleton, plan, "Склад отгружает товар, перевозчик вывозит его.")
+        assert [p if isinstance(p, str) else p["name"]
+                for p in merged["participants"]] == ["Склад", "Перевозчик"]
+
+    def test_failed_composition_stage_keeps_generation_one_shot(self, monkeypatch):
+        """Сбой отдельной стадии не имеет права превращать генерацию в отказ."""
+        plan = _plan()
+        fake = FakeLLM(monkeypatch, llm_client.LLMError("состава нет"), plan)
+        result = BPMNGenerator().generate("ВкусВилл согласует заявку")
+        assert result["status"] == "success"
+        assert [p["name"] for p in result["structure"]["participants"]] == \
+            ["ВкусВилл"]
+        assert len(fake.calls) == 2
+
+    def test_answer_with_elements_is_not_asked_to_route_again(self, monkeypatch):
+        """Если на узкий вопрос состава модель ответила планом целиком, второй
+        вызов за маршрутом — платить дважды за то, что уже есть."""
+        fake = FakeLLM(monkeypatch, _plan())
+        result = BPMNGenerator().generate("ВкусВилл согласует заявку")
+        assert result["status"] == "success" and len(fake.calls) == 1
 
 
 class TestUnknownParticipant:
@@ -2855,9 +2996,10 @@ class TestPlanGapsAndRetry:
         result = BPMNGenerator().generate("ВкусВилл: заявка, согласование, "
                                              "отгрузка со склада")
         assert result["attempts"] == 2 and len(fake.calls) == 2
-        # Второй вызов идёт с тем же системным промптом: правила моделирования
-        # не должны разъезжаться между попытками.
-        assert fake.calls[1][0]["content"] == fake.calls[0][0]["content"]
+        # Второй вызов идёт с теми же правилами моделирования, что и вызов,
+        # строивший план: состав здесь не закреплялся (модель на узкий вопрос
+        # ответила планом целиком), поэтому промпт остаётся `_SYSTEM_PROMPT`.
+        assert fake.calls[1][0]["content"] == bpmn_generator._SYSTEM_PROMPT
         user_prompt = fake.calls[1][1]["content"]
         assert "Нарушения в текущем плане" in user_prompt
         assert "без единого шага" in user_prompt

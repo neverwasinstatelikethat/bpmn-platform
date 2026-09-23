@@ -927,6 +927,68 @@ class TestNodeOutlet:
 
 
 # ---------------------------------------------------------------------------
+# Межпуловая нога нового узла
+# ---------------------------------------------------------------------------
+
+class TestCrossPoolLegBecomesAMessage:
+    """«Вставь после шага чужого пула» — это передача сообщения, а не сломанный
+    маршрут. Ровно так же читает межпуловой поток `validate_and_repair` (шаг 1b)
+    и генератор планов. До этого аплайер отказывал, и пакет терял правку целиком:
+    прогон #46 на `production_incident` — `defects_repaired` 0.0 при восьми
+    применённых операциях, потому что SLA-событие постмортема не доехало.
+
+    Отказ остаётся там, где сообщения не бывает: шлюз, граничное событие, старт
+    как источник.
+    """
+
+    def test_step_after_a_foreign_task_arrives_by_message(
+            self, two_pool_xml):
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_T_notify",
+             "name": "Уведомить о заказе", "task_type": "userTask",
+             "participant": "Магазин", "after": "C_request", "to": "S_end"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        node = _by_id(out, "new_T_notify")
+        assert node.tag == f"{{{BPMN_NS}}}userTask"
+        assert "new_T_notify" in [c.get("id") for c in _process(_root(out),
+                                                                "Process_shop")]
+        legs = [f for f in _root(out).findall(".//bpmn:messageFlow", NS)
+                if f.get("sourceRef") == "C_request"
+                and f.get("targetRef") == "new_T_notify"]
+        assert len(legs) == 1
+        # Внутри своего пула маршрут остался sequence-потоком.
+        assert _root(out).findall(".//bpmn:sequenceFlow[@sourceRef='new_T_notify']"
+                                  "[@targetRef='S_end']", NS)
+        assert validate_and_repair(out)[1] == []
+
+    def test_outlet_into_a_foreign_pool_leaves_a_message(self, two_pool_xml):
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_T_reserve",
+             "name": "Забронировать товар", "task_type": "userTask",
+             "participant": "Магазин", "after": "S_accept", "to": "C_request"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        assert _root(out).findall(".//bpmn:messageFlow[@sourceRef='new_T_reserve']"
+                                  "[@targetRef='C_request']", NS)
+        assert validate_and_repair(out)[1] == []
+        assert any("потоком-сообщением" in a["note"] for a in report["applied"]), \
+            report["applied"]
+
+    def test_a_start_event_of_another_pool_is_still_not_a_sender(
+            self, two_pool_xml):
+        """Не всякую межпуловую дугу стоит превращать в сообщение: старт
+        сообщение принимает, но не отдаёт, и тут правка остаётся отказом."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_T_bad", "name": "Из чужого старта",
+             "task_type": "userTask", "participant": "Магазин",
+             "after": "C_start", "to": "S_end"},
+        ])
+        assert report["applied"] == []
+        assert "в другом пуле" in report["skipped"][0]["reason"]
+
+
+# ---------------------------------------------------------------------------
 # Словарь операций и неквадратичность
 # ---------------------------------------------------------------------------
 
@@ -1450,12 +1512,20 @@ class TestParticipants:
         }])
         assert report["skipped"][0]["reason"] == "пул не определён"
 
-    def test_cross_pool_insert_is_skipped(self, two_pool_xml):
-        _, report = apply_operations(two_pool_xml, [{
+    def test_cross_pool_insert_stays_in_its_own_pool(self, two_pool_xml):
+        """Вставка после шага чужого пула не переносит узел в тот пул и не
+        отказывает молча: узел остаётся своим, а вход — сообщение (тот же приём
+        у `validate_and_repair`, шаг 1b). Без продолжения он откатывается как
+        тупик, и это честный ответ: правка не оставляет висячего шага."""
+        out, report = apply_operations(two_pool_xml, [{
             "op": "add_task", "id": "new_T1", "name": "Не туда",
             "participant": "Магазин", "after": "C_request",
         }])
-        assert report["skipped"][0]["reason"] == "элемент 'after' находится в другом пуле"
+        skip = [s for s in report["skipped"] if s.get("id") == "new_T1"]
+        assert skip and "тупик" in skip[0]["reason"], report["skipped"]
+        assert _by_id(out, "new_T1") is None
+        # Чужой пул не тронут: сообщение не разорвало маршрут «Клиента».
+        assert _flow(_root(out), "CF2") is not None
 
 
 # ---------------------------------------------------------------------------

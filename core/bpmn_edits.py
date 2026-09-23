@@ -82,6 +82,19 @@ ADD_TASK_TAGS = TASK_TAGS - {"subProcess", "callActivity"}
 SEQUENCE_FORBIDDEN_TARGETS = {"startEvent", "boundaryEvent"}
 SEQUENCE_FORBIDDEN_SOURCES = {"endEvent"}
 
+# Кто участвует в межпуловом потоке-сообщении: сообщение отдаёт шаг или бросающее
+# (в т. ч. конечное) событие, принимает — шаг, ловящее или стартовое событие.
+# Шлюз и граничное событие в сообщении не участвуют: у шлюза нет своего пула за
+# пределами маршрута, а граничное событие запускает его хозяин через attachedToRef.
+MESSAGE_SOURCE_TAGS = TASK_TAGS | {"intermediateThrowEvent", "endEvent"}
+MESSAGE_TARGET_TAGS = TASK_TAGS | {"intermediateCatchEvent", "startEvent"}
+
+
+def _message_leg_ok(source_tag: str, target_tag: str) -> bool:
+    """Межпуловая дуга — это ещё не сообщение: пары узлов, где сообщения не
+    бывает, остаются отказом."""
+    return source_tag in MESSAGE_SOURCE_TAGS and target_tag in MESSAGE_TARGET_TAGS
+
 EVENT_TYPE_TO_TAG = {
     "start": "startEvent",
     "end": "endEvent",
@@ -1014,11 +1027,16 @@ def _check_outlet(op: Dict[str, Any], index: _Index, process: ET.Element,
             "ведите поток к шагу или конечному событию его пула",
         )
     if index.process_of.get(outlet_id) is not process:
-        raise _Skip(
-            "цель исхода лежит в другом пуле",
-            "sequence-поток остаётся внутри процесса, между пулами — "
-            "отдельный connect с flow_type=message",
-        )
+        # Исход в чужой пул — передача сообщения, а не разорванный маршрут:
+        # узел остаётся в своём процессе, а дуга уходит на уровень коллаборации
+        # (тот же приём у `validate_and_repair`, шаг 1b).
+        if not _message_leg_ok(source_tag, outlet_tag):
+            raise _Skip(
+                "цель исхода лежит в другом пуле",
+                "sequence-поток остаётся внутри процесса, между пулами — "
+                "отдельный connect с flow_type=message",
+            )
+        return outlet_id
     after_elem = index.elements.get(after_id) if after_id else None
     scope = (index.has_subprocess_ancestor(after_elem) if after_elem is not None
              else index.has_subprocess_ancestor(process))
@@ -1044,6 +1062,11 @@ def _link_outlet(index: _Index, source_id: str, outlet_id: str,
                 and flow.get("targetRef") == outlet_id):
             return (f"исход к '{outlet_id}' уже даёт вставка after — "
                     "второй поток не создан")
+    if index.process_of.get(outlet_id) is not process:
+        flow = _create_message_flow(index, source_id, outlet_id)
+        return (f"исход к '{outlet_id}' между пулами стал потоком-сообщением "
+                f"'{flow.get('id')}': sequenceFlow не пересекает границу "
+                "процесса")
     flow = _create_sequence_flow(index, source_id, outlet_id, process, None)
     return f"исход потока '{flow.get('id')}' → '{outlet_id}'"
 
@@ -1208,11 +1231,24 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     elif after_id:
         target_process = index.process_of.get(after_id)
         if target_process is not None and target_process is not process:
-            raise _Skip(
-                "элемент 'after' находится в другом пуле",
-                "вставляйте элемент в тот же пул, где стоит 'after'",
-            )
-        notes.extend(_insert_after(elem, after_id, index))
+            # «Вставь после шага чужого пула» — это вход по сообщению: узел
+            # живёт в своём процессе, а дуга уходит на коллаборацию. Отказ здесь
+            # съедал правку целиком (прогон #46: SLA-событие постмортема так и не
+            # доехало до схемы, `defects_repaired` 0.0).
+            anchor = index.elements.get(str(after_id).strip())
+            anchor_tag = _local(anchor.tag) if anchor is not None else ""
+            if not _message_leg_ok(anchor_tag, tag):
+                raise _Skip(
+                    "элемент 'after' находится в другом пуле",
+                    "вставляйте элемент в тот же пул, где стоит 'after'",
+                )
+            index.adopt(process, elem)
+            flow = _create_message_flow(index, str(after_id).strip(), op_id)
+            notes.append(f"вход из '{after_id}' между пулами стал потоком-"
+                         f"сообщением '{flow.get('id')}': sequenceFlow не "
+                         "пересекает границу процесса")
+        else:
+            notes.extend(_insert_after(elem, after_id, index))
     else:
         index.adopt(process, elem)
     if outlet_id:
@@ -2535,6 +2571,13 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
     # и забывают вести дальше, а недостижимый шлюз выглядит валидным в отчёте
     # операций. Чинить эвристикой нельзя (непонятно, к какому именно концу
     # процесса вести), поэтому это сообщение наверх.
+    #
+    # Вход считается и по потоку-сообщению: узел, который начинает работу по
+    # сообщению из чужого пула, достижим, — но `incoming`/`outgoing` таких ссылок
+    # не содержат (в них только sequence-потоки), так что коллаборацию смотрим
+    # отдельно. Тем же признаком меряет связность `_routing_gap`.
+    msg_in = {f.get("targetRef") for f in index.message_flows}
+    msg_out = {f.get("sourceRef") for f in index.message_flows}
     for elem_id, elem in index.elements.items():
         tag = _local(elem.tag)
         if tag in ("startEvent", "endEvent") or elem.get("attachedToRef"):
@@ -2543,10 +2586,12 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
         if parent is None or _local(parent.tag) != "process":
             continue
         label = f"узел «{elem.get('name') or elem_id}» ({elem_id})"
-        if elem.findall(_q("incoming")) and not elem.findall(_q("outgoing")):
+        has_in = bool(elem.findall(_q("incoming"))) or elem_id in msg_in
+        has_out = bool(elem.findall(_q("outgoing"))) or elem_id in msg_out
+        if has_in and not has_out:
             notes.append(f"{label} — тупик: вход есть, выхода нет. Нужен connect "
                          "от него к следующему шагу или конечному событию пула")
-        elif elem.findall(_q("outgoing")) and not elem.findall(_q("incoming")):
+        elif has_out and not has_in:
             notes.append(f"{label} недостижим: выход есть, входа нет. Нужен connect "
                          "от предыдущего шага или шлюза к нему")
 

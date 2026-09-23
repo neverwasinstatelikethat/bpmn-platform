@@ -384,6 +384,7 @@ class TestTwoStageGeneration:
         assert pools == ["Дежурство"]
         reask = next(t for t in result["trace"] if t["node"] == "переспрос плана")
         assert reask["kept"] == "переспрос", reask
+        assert reask["patch"] == "план целиком вместо заплатки", reask
 
     def test_retry_may_not_add_a_pool_the_composition_does_not_have(self):
         """Ответ планом целиком на переспросе не открывает состав: пулы там уже
@@ -2990,6 +2991,50 @@ class TestPlanPatch:
         assert after["B1"]["event_definition"] == "timer"
         assert [f["id"] for f in patched["flows"]] == ["F1", "F2", "F9"]
         assert any("добавлен элемент B1" in n for n in notes)
+
+    def test_the_trace_names_what_the_patch_offered(self):
+        """Отказ «нарушений меньше не стало» — это три разных случая: модель
+        молчала, чинила не то нарушение, или назвала участника без его шагов.
+        Счёт нарушений их не различает, и каждый разбор стоил отдельного живого
+        прогона (#46: 11 из 18 отказов именно с этим счётом)."""
+        digest = bpmn_generator._patch_digest({
+            "fixes": [{"id": "A1", "participant": "Покупатель"}],
+            "add_elements": [{"id": "B1", "kind": "boundaryEvent",
+                              "participant": "Дежурство"}],
+            "add_flows": [{"id": "F9", "source": "B1", "target": "E1"}],
+            "remove_flows": ["F3"],
+            "participants": [{"name": "Покупатель"}],
+            "lanes": [{"id": "L9", "name": "Кассир",
+                       "participant": "ВкусВилл"}]})["patch"]
+        assert digest["fixes"] == ["A1:participant"]
+        assert digest["add_elements"] == ["B1 boundaryEvent@Дежурство"]
+        assert digest["add_flows"] == ["F9 B1->E1"]
+        assert digest["remove_flows"] == ["F3"]
+        assert digest["participants"] == ["Покупатель шагов:нет"]
+        assert digest["lanes"] == ["Кассир@ВкусВилл"]
+
+    def test_a_whole_plan_answer_is_digested_as_such(self):
+        """Целый план — не заплатка, и в трейсе он читается как отказ от
+        контракта, а не как пустой список правок."""
+        assert bpmn_generator._patch_digest({"participants": [],
+                                            "elements": []}) == {
+            "patch": "план целиком вместо заплатки"}
+
+    def test_a_new_participant_may_be_named_by_his_own_steps(self):
+        """`steps` — способ назвать шаги нового участника, а не единственный:
+        заплатка называет их хозяином прямо на элементе. Отказ по форме ответа
+        терял контрагента, которого нарушение и требовало вернуть."""
+        patched, notes = self._patch(
+            {"add_elements": [{"id": "P1", "kind": "userTask",
+                               "name": "Вернуть деньги",
+                               "participant": "Покупатель"}],
+             "participants": [{"name": "Покупатель"}]},
+            gaps=['ты сама назвала «Покупатель» действующим лицом описания, но '
+                  "в плане нет ни пула, ни дорожки с таким именем"],
+            text="Покупатель приносит товар, кассир возвращает деньги.")
+        assert "Покупатель" in [bpmn_generator._pool_name(p)
+                                for p in patched["participants"]]
+        assert any("шаги заплатка уже записала за ним" in n for n in notes), notes
 
     def test_fix_for_an_element_that_is_not_violated_is_still_id_checked(self):
         """Неизвестный id правкой не становится: править можно только то, что

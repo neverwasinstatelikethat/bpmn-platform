@@ -690,6 +690,50 @@ def _participant_gap(gaps: List[str]) -> bool:
     return any(mark in lowered for mark in PARTICIPANT_GAP_MARKS)
 
 
+def _patch_digest(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Что модель прислала в ответ на нарушения — по полям, а не по счёту.
+
+    Прогон #46: 11 из 18 отказов повтора — «список нарушений не изменился». По
+    одному этому счёту неотличимы три случая: модель ответила пусто, ответила не
+    про то нарушение, или ответила верно и заплатка разбилась о проверку
+    контракта. Раньше каждый из трёх разбирался отдельным живым прогоном.
+    """
+    if not isinstance(patch, dict):
+        return {}
+    if "elements" in patch:
+        return {"patch": "план целиком вместо заплатки"}
+
+    def items(key: str) -> List[Any]:
+        value = patch.get(key)
+        return value if isinstance(value, list) else []
+
+    def text_of(item: Any, field: str) -> str:
+        return _raw_text(item.get(field)) if isinstance(item, dict) else ""
+
+    digest: Dict[str, Any] = {
+        "fixes": [f"{text_of(i, 'id')}:" + ",".join(
+            f for f in PATCH_ELEMENT_FIELDS if isinstance(i, dict) and f in i)
+            for i in items("fixes")[:8]],
+        "add_elements": [f"{text_of(i, 'id')} {text_of(i, 'kind')}"
+                         f"@{text_of(i, 'participant')}"
+                         for i in items("add_elements")[:8]],
+        "add_flows": [f"{text_of(i, 'id')} {text_of(i, 'source')}->"
+                      f"{text_of(i, 'target')}" for i in items("add_flows")[:8]],
+        "remove_flows": [_raw_text(i) for i in items("remove_flows")[:8]],
+        "lanes": [f"{text_of(i, 'name')}@{text_of(i, 'participant')}"
+                  for i in items("lanes")[:8]],
+    }
+    pools = []
+    for item in items("participants")[:8]:
+        name = _pool_name(item) or "?"
+        steps = item.get("steps") if isinstance(item, dict) else None
+        pools.append(f"{name} шагов:" + (",".join(
+            _raw_text(s) for s in steps)[:40] if isinstance(steps, list) and steps
+            else "нет"))
+    digest["participants"] = pools
+    return {"patch": {k: v for k, v in digest.items() if v}}
+
+
 def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
                      gaps: List[str], text: str,
                      notes: List[str]) -> Dict[str, Any]:
@@ -810,6 +854,18 @@ def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
                         continue
                     moved.append(elem)
                 if not moved:
+                    # `steps` — способ назвать его шаги, но не единственный:
+                    # заплатка могла назвать его хозяином прямо на элементах
+                    # (свой `add_elements` с его участником или шаг плана,
+                    # который и так записан за ним). Отбрасывать такую правку из-за
+                    # формы ответа — значит терять верного участника молча.
+                    norm = _norm_name(name)
+                    moved = [e for e in elements
+                             if isinstance(e, dict)
+                             and _norm_name(_raw_text(e.get("participant"))) == norm
+                             and _raw_text(e.get("kind") or e.get("type"))
+                             not in ("startEvent", "endEvent")][:MAX_PATCH_MOVES]
+                if not moved:
                     notes.append(f"участник «{name}» не добавлен: его шаги в "
                                  "заплатке не названы, а пул без действий "
                                  "починка удаляет")
@@ -824,10 +880,14 @@ def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
                 fixed["participants"] = list(fixed.get("participants") or []) + [extra]
                 pool_names.add(_norm_name(name))
                 for elem in moved:
+                    if _raw_text(elem.get("participant")) == name:
+                        continue
                     elem["participant"] = name
                     elem["lane"] = ""
-                notes.append(f"участник «{name}» добавлен с {len(moved)} его "
-                             "шагом(ами): нарушение про участника закрыто")
+                notes.append(
+                    f"участник «{name}» добавлен с {len(moved)} его шагом(ами): "
+                    + ("шаги заплатка уже записала за ним" if not steps
+                       else "нарушение про участника закрыто"))
     elif isinstance(patch.get("participants"), list) or isinstance(
             patch.get("lanes"), list):
         notes.append("состав не изменён: нарушений про участников в списке не "
@@ -937,11 +997,14 @@ class BPMNGenerator:
             # узкий вопрос о том, чьи это шаги (`_clarify_ownership`).
             if plan_gaps(structure, text, with_actors=False):
                 attempts = 2
+                patch_trace: Dict[str, Any] = {}
                 retry, patch_notes = self._retry_structure(
-                    text, structure, gaps, frozen=meta["frozen"])
+                    text, structure, gaps, frozen=meta["frozen"],
+                    trace=patch_trace)
                 meta["notes"].extend(patch_notes)
                 reask: Dict[str, Any] = {"node": "переспрос плана",
-                                         "gaps_before": len(gaps)}
+                                         "gaps_before": len(gaps),
+                                         **patch_trace}
                 trace.append(reask)
                 if retry is None:
                     retry_note = "Повторный запрос модели не выполнен"
@@ -1170,6 +1233,7 @@ class BPMNGenerator:
 
     def _retry_structure(self, text: str, structure: Dict[str, Any],
                          gaps: List[str], frozen: bool = False,
+                         trace: Optional[Dict[str, Any]] = None,
                          ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
         """Один переспрос по нарушениям: (план, заметки заплатки). None — если
         повтор не мог ничего дать (план не влезает в контекст) или модель
@@ -1180,6 +1244,10 @@ class BPMNGenerator:
         маршрутом и пулами в рамках списка, иначе он возвращал бы роли пулами.
         Ответ моделью — заплатка (`apply_plan_patch`), поэтому корректные
         элементы переспроса не касаются.
+
+        `trace` — узел трейса прогона: в него пишется отпечаток заплатки, чтобы
+        отказ «нарушений меньше не стало» отличался от «заплатка разбилась о
+        контракт» без нового живого прогона.
         """
         payload = json.dumps(structure, ensure_ascii=False, default=str)
         if len(payload) > MAX_RETRY_PLAN_CHARS:
@@ -1201,6 +1269,8 @@ class BPMNGenerator:
             return None, []
         if not isinstance(data, dict):
             return None, []
+        if trace is not None:
+            trace.update(_patch_digest(data))
         notes: List[str] = []
         patched = apply_plan_patch(structure, data, gaps, text, notes)
         return patched, notes

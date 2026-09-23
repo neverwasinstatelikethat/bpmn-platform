@@ -3082,6 +3082,30 @@ class TestPlanPatch:
         return bpmn_generator.apply_plan_patch(base, patch, list(gaps), text,
                                                notes), notes
 
+    def test_a_fix_on_a_flow_id_carries_its_condition(self):
+        """Нога существующего потока — не узел, но нарушение про спрятанную
+        развилку просит именно условие ноги. До этого `condition` шёл только на
+        новых потоках (`add_flows`), и ответ модели был нечем записать."""
+        patched, notes = self._patch(
+            {"fixes": [{"id": "F2", "condition": "Узел починяем"}]},
+            gaps=['узел A1 (Осмотреть узел) ведёт сразу в несколько шагов без '
+                  "шлюза — развилка спрятана в подписях потоков (F2)"])
+        flows = {f["id"]: f for f in patched["flows"]}
+        assert flows["F2"].get("condition") == "Узел починяем"
+        assert flows["F1"] == self.BASE["flows"][0]
+        assert any("F2" in n and "услов" in n.lower() for n in notes), notes
+
+    def test_a_flow_fix_refuses_fields_a_flow_cannot_have(self):
+        """Потоку правят условие, имя и «по умолчанию»; перенос в другой пул или
+        смена хозяина — не его поля, и отказ обязан это называть."""
+        patched, notes = self._patch(
+            {"fixes": [{"id": "F2", "participant": "Подрядчик",
+                        "name": "Дальше"}]})
+        flows = {f["id"]: f for f in patched["flows"]}
+        assert "participant" not in flows["F2"]
+        assert flows["F2"]["name"] == "Дальше"
+        assert any("F2" in n and "поток" in n for n in notes), notes
+
     def test_untouched_elements_survive_the_retry_byte_for_byte(self):
         """Ни один верный элемент не меняется: заплатка физически не может
         переписать то, чего не касается."""
@@ -3288,7 +3312,11 @@ class TestPlanGapsAndRetry:
             {"id": "F5", "source": "C1", "target": "E1", "kind": "sequence"},
         ]}
         gaps = bpmn_generator.plan_gaps(plan)
-        assert any("A1" in g and "развилка спрятана" in g for g in gaps)
+        split = next(g for g in gaps if "развилка спрятана" in g)
+        assert "A1" in split
+        # Нарушение обязано назвать ноги: условие правится по id потока, а
+        # срезать дугу можно только ту, что названа в нарушении.
+        assert "F2" in split and "F3" in split, split
 
     def test_flow_to_boundary_event_is_reported_once(self):
         """Поток шага к прицепленному событию — нарушение концов, и его называет

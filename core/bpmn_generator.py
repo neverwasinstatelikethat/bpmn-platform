@@ -653,7 +653,8 @@ def _raw_dicts_plan_actors(plan: Dict[str, Any]) -> List[str]:
 # проверяет этот промпт отдельно (`eval/provenance.py`, образец `retry_patch`).
 _RETRY_PATCH_SCHEMA = """{"fixes": [{"id": "A2", "participant": "название пула", \
 "lane": "L1", "name": "новое имя", "event_definition": "timer", \
-"timer": "PT15M", "attached_to": "A1"}],
+"timer": "PT15M", "attached_to": "A1"},
+ {"id": "F2", "condition": "Да", "default": false}],
  "add_elements": [{"id": "B1", "kind": "boundaryEvent", "name": "…", \
 "participant": "…", "lane": "…", "attached_to": "A2"}],
  "add_flows": [{"id": "F9", "source": "A2", "target": "B1", \
@@ -671,8 +672,10 @@ _RETRY_TEMPLATE = """Ты уже построил структуру BPMN по �
 
 - Правки не касаются того, что в нарушениях не названо: верный элемент, верная
   связь и верное имя оставь в покое, не переписывай их «аккуратнее».
-- `fixes` — только элементы из списка нарушений, и только те поля, которые и
-  были нарушением (id элемента обязан существовать в плане).
+- `fixes` — только объекты из списка нарушений, и только те поля, которые и
+  были нарушением (id обязан существовать в плане). Узлу правят его поля, а
+  потоку — `condition`, `default` и имя: развилка, спрятанная в подписях дуг,
+  снимается именно условием на названной ноге, а не удалением потока.
 - `add_elements` / `add_flows` — узлы, которых в плане не хватает (таймер,
   шлюз схождения, недостающий шаг). Свой id не должен совпадать с id из плана;
   на него можно ссылаться в `add_flows` этого же ответа.
@@ -704,6 +707,30 @@ PATCH_ELEMENT_FIELDS = ("participant", "lane", "name", "kind",
                         "attached_to", "condition", "documentation")
 MAX_PATCH_FIXES = 12
 MAX_PATCH_ADDS = 12
+# Что можно править на уже существующем потоке. Узлом поток не становится, а
+# без его условия нарушение «развилка спрятана в подписях потоков» модель не
+# чем ответить: `add_flows` несёт условие только на новом потоке.
+PATCH_FLOW_FIELDS = (("condition", "условие"), ("default", "выход по умолчанию"),
+                     ("name", "имя"))
+
+
+def _fix_flow(flow: Dict[str, Any], fix: Dict[str, Any],
+              notes: List[str]) -> None:
+    """Правка потока из `fixes` — только его поля; остальное отказывает вслух."""
+    flow_id = _raw_text(flow.get("id"))
+    accepted = [(name, label) for name, label in PATCH_FLOW_FIELDS
+                if name in fix]
+    refused = [name for name in fix
+               if name not in ("id",) and name not in dict(PATCH_FLOW_FIELDS)]
+    for name, _label in accepted:
+        flow[name] = fix[name]
+    if accepted:
+        notes.append(f"поток {flow_id} исправлен по нарушению: "
+                     + ", ".join(label for _n, label in accepted))
+    if refused:
+        notes.append(f"правка {flow_id}: это поток, а не узел — ему правят "
+                     "условие, выход по умолчанию и имя; "
+                     + ", ".join(sorted(refused)) + " проигнорированы")
 # Нарушение про участника опознаётся по этим словам: без него состав не трогается.
 PARTICIPANT_GAP_MARKS = ("участник", "пул", "дорожк", "роль", "ролями",
                          "внешне", "контрагент")
@@ -776,13 +803,23 @@ def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
                 for e in (plan.get("elements") or [])]
     by_id = {_raw_text(e.get("id")): e for e in elements if isinstance(e, dict)}
     known_ids = set(by_id)
+    # Потоки читаются до правок: нарушение про спрятанную развилку называет ноги,
+    # а условие ноги — это поле существующего потока, а не нового.
+    flows = [dict(f) if isinstance(f, dict) else f
+             for f in (plan.get("flows") or [])]
+    flows_by_id = {_raw_text(f.get("id")): f for f in flows if isinstance(f, dict)}
 
     for fix in (patch.get("fixes") if isinstance(patch.get("fixes"), list)
                 else [])[:MAX_PATCH_FIXES]:
         if not isinstance(fix, dict):
             continue
-        elem = by_id.get(_raw_text(fix.get("id")))
+        fix_id = _raw_text(fix.get("id"))
+        elem = by_id.get(fix_id)
         if elem is None:
+            flow = flows_by_id.get(fix_id)
+            if flow is not None:
+                _fix_flow(flow, fix, notes)
+                continue
             notes.append(f"правка {fix.get('id')} отклонена: такого элемента в "
                          "плане нет — менять можно только названные в нарушениях")
             continue
@@ -812,8 +849,6 @@ def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
                      "его не хватало по нарушению")
     fixed["elements"] = elements
 
-    flows = [dict(f) if isinstance(f, dict) else f
-             for f in (plan.get("flows") or [])]
     drop = {_raw_text(x) for x in (patch.get("remove_flows")
                                    if isinstance(patch.get("remove_flows"), list)
                                    else [])}
@@ -2389,6 +2424,7 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
     # шлюза в плане нет ни одного. Починка не вправе выбирать тип развилки —
     # исключающая она или параллельная, — это знает только модель.
     branches: Dict[str, Set[str]] = {}
+    legs: Dict[str, List[str]] = {}
     for flow in flows:
         if _raw_text(flow.get("kind")).lower() == "message":
             continue
@@ -2400,6 +2436,7 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
             continue
         if source and target:
             branches.setdefault(source, set()).add(target)
+            legs.setdefault(source, []).append(_raw_text(flow.get("id")))
     explicit_split = {
         _raw_text(elem.get("id")) for elem in elements
         if _raw_text(elem.get("kind") or elem.get("type")) in GATEWAY_KINDS
@@ -2412,10 +2449,17 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
                 continue
             if _raw_text(elem.get("kind") or elem.get("type")) in GATEWAY_KINDS:
                 continue
+            # Id ног называются: править условие можно по id существующего
+            # потока, а без этой подсказки модель отвечала про развилку
+            # рассуждением о шлюзе и оставляла дуги неразличимыми (прогон #54 —
+            # 7 планов с развилкой без шлюза и без условий на ногах).
+            named = ", ".join(f"`{i}`" for i in legs.get(elem_id, [])[:4] if i)
             gaps.append(f"узел {elem_id} ({_raw_text(elem.get('name'))}) ведёт "
                         "сразу в несколько шагов без шлюза — развилка спрятана "
                         "в подписях потоков; вставь gateway (exclusive или "
-                        "parallel) и веди ветки от него")
+                        "parallel) и веди ветки от него"
+                        + (f", а не удаляй ни одну из них: fixes c "
+                           f"`condition` у потоков {named}" if named else ""))
     # Порядок = важность: переспрос один, и на плане с десятком нарушений модель
     # доходила до подписей имён, оставляя на схеме меньше участников, чем в
     # описании. Потерянный участник — первое, что надо исправить.

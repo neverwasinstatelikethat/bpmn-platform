@@ -25,6 +25,11 @@ DEFAULT_MODEL = "GigaChat"
 DEFAULT_SCOPE = "GIGACHAT_API_PERS"
 MAX_ATTEMPTS = 2
 RETRY_PAUSE_SECONDS = 3
+# Отказ по лимиту запросов — не «модель сломалась», а окно провайдера: ему даём
+# дополнительные попытки, но с общим бюджетом ожидания, чтобы синхронный запрос
+# пользователя не превратился в минутный.
+RATE_LIMIT_EXTRA_ATTEMPTS = 3
+RATE_LIMIT_WAIT_BUDGET_SECONDS = 20
 REQUEST_TIMEOUT_SECONDS = 180
 # Скопированный ответ модели в repair-запросе — только префикс: целиком он
 # удваивает контекст повторного вызова.
@@ -219,7 +224,13 @@ def _complete(messages: List[Dict[str, str]], temperature: float,
     )
     last_error = ""
     pause = RETRY_PAUSE_SECONDS
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    attempt, extra_left, rate_streak = 0, RATE_LIMIT_EXTRA_ATTEMPTS, 0
+    waited = 0.0
+    # Потолком правит 429: без него повтор не положен ни одной ошибке кроме
+    # лимитной, и «растущий» цикл превратил бы 5xx в бесконечный.
+    limit = MAX_ATTEMPTS
+    while attempt < limit:
+        attempt += 1
         if attempt > 1:
             time.sleep(pause)
             pause = RETRY_PAUSE_SECONDS
@@ -236,7 +247,22 @@ def _complete(messages: List[Dict[str, str]], temperature: float,
                 ) from e
             if isinstance(e, RateLimitError):
                 last_error = str(e)
-                pause = max(e.retry_after, RETRY_PAUSE_SECONDS)
+                if waited >= RATE_LIMIT_WAIT_BUDGET_SECONDS:
+                    break
+                # Окно провайдера шире, чем одна пауза: 429 на втором вызове
+                # означал бы «схема не собралась», хотя модель ничего не
+                # испортила — прогон #54 потерял так 5 кейсов из 24 и молча
+                # поменял выборку всех долей. Дополнительная попытка оплачивается
+                # самим лимитом, а пауза растёт экспоненциально, но в бюджете:
+                # синхронный ответ пользователя не должен превращаться в минуту.
+                if extra_left > 0:
+                    extra_left -= 1
+                    rate_streak += 1
+                    limit += 1
+                pause = min(max(e.retry_after,
+                                RETRY_PAUSE_SECONDS * (2 ** rate_streak)),
+                            RATE_LIMIT_WAIT_BUDGET_SECONDS - waited)
+                waited += pause
                 logger.warning("Попытка %s: лимит запросов (%s), пауза %s с",
                                attempt, last_error, pause)
                 continue
@@ -268,7 +294,7 @@ def _complete(messages: List[Dict[str, str]], temperature: float,
             logger.warning("Попытка %s: %s", attempt, last_error)
             continue
         return content
-    raise LLMError(f"LLM недоступна после {MAX_ATTEMPTS} попыток: {last_error}")
+    raise LLMError(f"LLM недоступна после {attempt} попыток: {last_error}")
 
 
 def call_json(system: str, user: str, *, temperature: float = 0.2,

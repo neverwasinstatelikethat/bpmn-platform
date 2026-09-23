@@ -292,6 +292,35 @@ class TestProviderRefusals:
         assert provider.calls == llm_client.MAX_ATTEMPTS
         assert not isinstance(caught.value, LLMRequestTooLargeError)
 
+    def test_rate_limit_gets_the_extra_attempts_a_5xx_never_gets(self, monkeypatch):
+        """429 — окно провайдера, а не отказ модели: давать ему больше попыток
+        можно только по нему. Живой прогон #54 потерял 5 кейсов из 24 именно
+        потому, что после двух попыток генерация считалась несобранной, — и
+        молча посчитал метрики по уцелевшей выборке."""
+        provider = _provider(monkeypatch, _response_error(
+            llm_client.RateLimitError, 429, b'{"status":429,"message":"Too Many"}'))
+        with pytest.raises(LLMError):
+            _complete()
+        assert provider.calls == (llm_client.MAX_ATTEMPTS
+                                  + llm_client.RATE_LIMIT_EXTRA_ATTEMPTS)
+
+    def test_rate_limit_recovers_as_soon_as_the_window_opens(self, monkeypatch):
+        provider = _provider(monkeypatch, _response_error(
+            llm_client.RateLimitError, 429, b"too many"), _response("{\"ok\": true}"))
+        assert llm_client.call_json("система", "запрос") == {"ok": True}
+        assert provider.calls == 2
+
+    def test_rate_limit_waits_never_exceed_the_budget(self, monkeypatch):
+        """Экспоненциальная пауза обязана упираться в бюджет, а не в минуту
+        ожидания: задержка синхронного ответа пользователя — тоже продукт."""
+        waits: list = []
+        monkeypatch.setattr(llm_client.time, "sleep", lambda s: waits.append(s))
+        _provider(monkeypatch, _response_error(
+            llm_client.RateLimitError, 429, b"too many"))
+        with pytest.raises(LLMError):
+            _complete()
+        assert sum(waits) <= llm_client.RATE_LIMIT_WAIT_BUDGET_SECONDS + 1
+
     def test_repair_round_does_not_mask_too_large(self, monkeypatch):
         """Repair-цикл `call_json` ловит только ValueError разбора: отказ
         провайдера по размеру обязан пройти сквозь него наружу."""

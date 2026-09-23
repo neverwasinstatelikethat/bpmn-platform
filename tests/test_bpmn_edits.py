@@ -2178,6 +2178,61 @@ EMPTY_LINKED_POOL_XML = EMPTY_POOL_XML.replace(
     '    <messageFlow id="MF_free" sourceRef="M_pick" targetRef="F_start"/>')
 
 
+class TestCrossPoolLegEnds:
+    """Один стандарт для межпуловой дуги: сообщение не бывает с шлюзом на конце.
+    Починка превращала ЛЮБУЮ межпуловую дугу в messageFlow, не глядя на концы, а
+    аплайер операций для пары «задача → шлюз» отказывался её создавать — два
+    разных ответа на один и тот же дефект в одном контуре."""
+
+    XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_gw">
+  <collaboration id="Collaboration_g">
+    <participant id="Pool_a" name="Заказчик" processRef="Process_a"/>
+    <participant id="Pool_b" name="Подрядчик" processRef="Process_b"/>
+  </collaboration>
+  <process id="Process_a" name="Заказчик" isExecutable="true">
+    <startEvent id="A_start" name="Заявка"><outgoing>AF1</outgoing></startEvent>
+    <sequenceFlow id="AF1" sourceRef="A_start" targetRef="A_ask"/>
+    <userTask id="A_ask" name="Запросить подтверждение">
+      <incoming>AF1</incoming><outgoing>AF2</outgoing><outgoing>AF_X</outgoing></userTask>
+    <sequenceFlow id="AF2" sourceRef="A_ask" targetRef="A_end"/>
+    <endEvent id="A_end" name="Ответ получен"><incoming>AF2</incoming></endEvent>
+    <sequenceFlow id="AF_X" sourceRef="A_ask" targetRef="B_gw"/>
+  </process>
+  <process id="Process_b" name="Подрядчик" isExecutable="true">
+    <startEvent id="B_start" name="Старт"><outgoing>BF1</outgoing></startEvent>
+    <sequenceFlow id="BF1" sourceRef="B_start" targetRef="B_gw"/>
+    <exclusiveGateway id="B_gw" name="Есть машина?">
+      <incoming>BF1</incoming><incoming>AF_X</incoming>
+      <outgoing>BF2</outgoing><outgoing>BF3</outgoing></exclusiveGateway>
+    <sequenceFlow id="BF2" sourceRef="B_gw" targetRef="B_yes"/>
+    <userTask id="B_yes" name="Подтвердить наряд">
+      <incoming>BF2</incoming><outgoing>BF4</outgoing></userTask>
+    <sequenceFlow id="BF4" sourceRef="B_yes" targetRef="B_end"/>
+    <endEvent id="B_end" name="Наряд подтверждён"><incoming>BF4</incoming></endEvent>
+    <sequenceFlow id="BF3" sourceRef="B_gw" targetRef="B_no"/>
+    <userTask id="B_no" name="Отказать">
+      <incoming>BF3</incoming><outgoing>BF5</outgoing></userTask>
+    <sequenceFlow id="BF5" sourceRef="B_no" targetRef="B_end"/>
+  </process>
+</definitions>"""
+
+    def test_gateway_endpoint_is_dropped_not_turned_into_a_message(self):
+        out, notes = validate_and_repair(self.XML)
+        root = _root(out)
+        assert [f.get("id") for f in
+                root.findall(".//bpmn:messageFlow", NS)
+                if "B_gw" in (f.get("sourceRef"), f.get("targetRef"))] == []
+        assert [f for f in root.findall(".//bpmn:sequenceFlow", NS)
+                if f.get("id") == "AF_X"] == []
+        assert any("AF_X" in n and "не бывает потоком-сообщением" in n
+                   for n in notes), notes
+
+    def test_dropped_leg_leaves_no_dangling_reference(self):
+        out, _notes = validate_and_repair(self.XML)
+        assert "<incoming>AF_X</incoming>" not in out
+        assert "<outgoing>AF_X</outgoing>" not in out
+
+
 class TestMergeParticipants:
     def test_pool_becomes_a_lane_of_the_target_process(self):
         out, report = apply_operations(MERGE_XML, [MERGE_OP])

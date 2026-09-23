@@ -2344,14 +2344,31 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
 
     # 1b. sequenceFlow между разными процессами — тот же дефект, который генератор
     # лечит превращением в сообщение: межпуловая «линия маршрута» на самом деле
-    # передача сообщения. Вид меняем, концы не трогаем — messageFlow в чужое
-    # стартовое событие легален и есть штатный способ запустить второй пул.
+    # передача сообщения. Стартовое событие чужого пула — легальный конец
+    # сообщения и штатный способ запустить второй пул. Но не для любой пары:
+    # шлюз или граничное событие концом messageFlow не бывают, и превращение
+    # такой дуги в сообщение схема рисовала, хотя аплайер операций для того же
+    # сочетания узлов отказывался её создать (два разных стандарта в одном
+    # контуре). Здесь дуга снимается: маршрут по обе стороны от неё починят
+    # шаги ниже.
     for flow in list(index.sequence_flows):
         source_process = index.process_of.get(flow.get("sourceRef") or "")
         target_process = index.process_of.get(flow.get("targetRef") or "")
         if source_process is None or target_process is None:
             continue  # концы без пула разберёт шагом выше и пересборкой ссылок
         if source_process is target_process:
+            continue
+        source_elem = index.elements.get(flow.get("sourceRef") or "")
+        target_elem = index.elements.get(flow.get("targetRef") or "")
+        if (source_elem is not None and target_elem is not None
+                and not _message_leg_ok(_local(source_elem.tag),
+                                        _local(target_elem.tag))):
+            index.detach(flow)
+            notes.append(
+                f"поток {flow.get('id')} между пулами удалён: "
+                f"{_local(source_elem.tag)} → {_local(target_elem.tag)} не "
+                "бывает потоком-сообщением, а sequenceFlow не пересекает "
+                "границу процесса")
             continue
         index.detach(flow)
         condition = flow.find(_q("conditionExpression"))

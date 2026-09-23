@@ -370,6 +370,48 @@ class TestTwoStageGeneration:
         assert any("помечен ролью" in g
                    for g in bpmn_generator.plan_gaps(skeleton))
 
+    def test_parse_roster_names_a_host_by_the_description(self):
+        """Ярлык вместо имени хозяина не стоит шести ролей.
+
+        Модель назвала организацию составным ярлыком («Организация-склад»),
+        которого в описании нет, — проверка «каждая часть имени есть в тексте»
+        отбрасывала имя из-за родового слова, хозяин терялся, и роль без хозяина
+        становилась пулом: прогон #43 дал 9 пулов, все потоки между ними стали
+        сообщениями, а оба шлюза починка понизила до задач.
+        """
+        skeleton, notes = bpmn_generator.parse_roster(
+            {"organizations": ["Организация-склад"], "systems": ["WMS"],
+             "counterparties": ["Перевозчик"],
+             "roles": [{"name": "Кладовщик", "host": "Организация-склад"},
+                       {"name": "Оператор склада", "host": "Организация-склад"},
+                       {"name": "Водитель", "host": "Перевозчик"}]},
+            "Оператор склада заводит заявку на складе в WMS, кладовщик "
+            "собирает груз, перевозчик везёт, водитель расписывается.")
+
+        assert [p if isinstance(p, str) else p["name"]
+                for p in skeleton["participants"]] == ["Склад", "WMS",
+                                                       "Перевозчик"]
+        assert all(isinstance(p, str) for p in skeleton["participants"])
+        assert [(lane["name"], lane["participant"])
+                for lane in skeleton["lanes"]] == [
+                    ("Кладовщик", "Склад"), ("Оператор склада", "Склад"),
+                    ("Водитель", "Перевозчик")]
+        assert not any("помечен ролью" in g
+                       for g in bpmn_generator.plan_gaps(skeleton))
+        assert any("назван тем словом" in n for n in notes)
+
+    def test_parse_roster_generic_host_is_still_not_a_pool(self):
+        """Родовое слово остаётся отказом и после того, как имя ярлыка
+        уточняется по описанию: «Организация» в тексте встречается чаще, чем
+        настоящее имя, и три роли уже сливались в пул с таким названием."""
+        skeleton, _notes = bpmn_generator.parse_roster(
+            {"organizations": ["Организация"],
+             "roles": [{"name": "Кладовщик", "host": "Организация"}]},
+            "Организация держит дежурство, кладовщик собирает груз.")
+        assert skeleton["participants"] == [{"name": "Кладовщик",
+                                             "external": False}]
+        assert skeleton["lanes"] == []
+
     def test_parse_roster_refuses_names_that_the_text_does_not_carry(self):
         skeleton, notes = bpmn_generator.parse_roster(
             {"organizations": ["Склад", "Фаб грез"],

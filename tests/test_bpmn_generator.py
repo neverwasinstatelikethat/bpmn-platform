@@ -7,6 +7,7 @@ tests/test_improve_orchestrator.py), поэтому проверяется на�
 Главное, что здесь закреплено: роли сотрудников — дорожки одного пула, а не
 отдельные пулы, и ни одна правка недоверенного плана не остаётся без note.
 """
+import copy
 import json
 import xml.etree.ElementTree as ET
 
@@ -335,6 +336,54 @@ class TestTwoStageGeneration:
                        "kind": "message"},
                       {"id": "F3", "source": "S2", "target": "T2"},
                       {"id": "F4", "source": "T2", "target": "E2"}]})
+
+    def test_retry_keeps_the_approved_composition_and_its_own_fix(self,
+                                                                 monkeypatch):
+        """Переспрос чинит маршрут, а состав остаётся утверждённым.
+
+        Прогон #43: чтобы добавить таймер, модель заодно перекрасила все пулы в
+        «роли без хозяина» — 6 нарушений rank 0 вместо 0, гейт справедливо
+        отказался, и таймер уехал в корзину вместе с правкой. Каркас тот же,
+        что и для первого ответа, поэтому от повтора берётся маршрут.
+        """
+        text = ("Авария на линии. Инженер дежурства осматривает узел; если узел "
+                "не починить в течение 15 минут, дежурство вызывает подрядчика.")
+        roster = ('{"organizations": ["Дежурство"], "systems": [], '
+                  '"counterparties": [], "roles": [{"name": "Инженер", '
+                  '"host": "Дежурство"}]}')
+        base = {"participants": ["Дежурство"],
+                "lanes": [{"id": "L1", "name": "Инженер",
+                           "participant": "Дежурство"}],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Авария",
+                     "participant": "Дежурство", "lane": "L1"},
+                    {"id": "A1", "kind": "userTask", "name": "Осмотреть узел",
+                     "participant": "Дежурство", "lane": "L1"},
+                    {"id": "E1", "kind": "endEvent", "name": "Линия в работе",
+                     "participant": "Дежурство", "lane": "L1"}],
+                "flows": [{"id": "F1", "source": "S1", "target": "A1"},
+                          {"id": "F2", "source": "A1", "target": "E1"}]}
+        # Тот же маршрут + таймер, но состав модель переписала в «роли без
+        # хозяина»: без закрепления каркаса это отказ по профилю нарушений.
+        retry = json.loads(json.dumps(base))
+        retry["participants"] = [{"name": "Дежурство", "external": False},
+                                 {"name": "Инженер", "external": False}]
+        retry["elements"].append(
+            {"id": "B1", "kind": "boundaryEvent", "name": "Прошло 15 минут",
+             "participant": "Дежурство", "lane": "L1", "attached_to": "A1",
+             "event_definition": "timer", "timer": "PT15M"})
+        FakeLLM(monkeypatch, roster, _fence(base), _fence(retry),
+                _fence(retry), _fence(retry))
+        result = BPMNGenerator().generate(text)
+
+        kinds = [(e["kind"], e.get("event_definition"))
+                 for e in result["structure"]["elements"]]
+        assert ("boundaryEvent", "timer") in kinds, result["notes"]
+        pools = [p["name"] if isinstance(p, dict) else p
+                 for p in result["structure"]["participants"]]
+        assert pools == ["Дежурство"]
+        reask = next(t for t in result["trace"] if t["node"] == "переспрос плана")
+        assert reask["kept"] == "переспрос", reask
 
     def test_roles_become_lanes_before_the_route_is_written(self, monkeypatch):
         fake = FakeLLM(monkeypatch, self.ROSTER, self._flow())
@@ -2841,6 +2890,92 @@ class TestDeadlineTimerGate:
         assert result["attempts"] == 2
         assert "ни одного таймера" in fake.calls[1][1]["content"]
         assert _note(result["notes"], "Повторный запрос модели: нарушений было")
+
+
+class TestPlanPatch:
+    """Переспрос чинит названное и не трогает верное."""
+
+    BASE = {
+        "participants": ["Дежурство"],
+        "lanes": [{"id": "L1", "name": "Инженер", "participant": "Дежурство"}],
+        "elements": [
+            {"id": "S1", "kind": "startEvent", "name": "Авария",
+             "participant": "Дежурство", "lane": "L1"},
+            {"id": "A1", "kind": "userTask", "name": "Осмотреть узел",
+             "participant": "Дежурство", "lane": "L1"},
+            {"id": "E1", "kind": "endEvent", "name": "Линия в работе",
+             "participant": "Дежурство", "lane": "L1"}],
+        "flows": [{"id": "F1", "source": "S1", "target": "A1"},
+                  {"id": "F2", "source": "A1", "target": "E1"}]}
+
+    def _patch(self, patch, gaps=()):
+        notes: list = []
+        base = copy.deepcopy(self.BASE)
+        return bpmn_generator.apply_plan_patch(base, patch, list(gaps),
+                                               notes), notes
+
+    def test_untouched_elements_survive_the_retry_byte_for_byte(self):
+        """Ни один верный элемент не меняется: заплатка физически не может
+        переписать то, чего не касается."""
+        patched, notes = self._patch(
+            {"add_elements": [{"id": "B1", "kind": "boundaryEvent",
+                               "name": "Прошло 15 минут",
+                               "participant": "Дежурство", "lane": "L1",
+                               "attached_to": "A1",
+                               "event_definition": "timer", "timer": "PT15M"}],
+             "add_flows": [{"id": "F9", "source": "B1", "target": "E1"}]},
+            gaps=['описание задаёт ожидание («в течение 15 минут»), а в плане '
+                  'нет ни одного таймера'])
+        before = {e["id"]: e for e in self.BASE["elements"]}
+        after = {e["id"]: e for e in patched["elements"]}
+        for elem_id in before:
+            assert after[elem_id] == before[elem_id]
+        assert after["B1"]["event_definition"] == "timer"
+        assert [f["id"] for f in patched["flows"]] == ["F1", "F2", "F9"]
+        assert any("добавлен элемент B1" in n for n in notes)
+
+    def test_fix_for_an_element_that_is_not_violated_is_still_id_checked(self):
+        """Неизвестный id правкой не становится: править можно только то, что
+        есть в плане (а что именно нельзя — подсказывает список нарушений)."""
+        patched, notes = self._patch(
+            {"fixes": [{"id": "X9", "name": "Совсем другое"}]})
+        assert [e["id"] for e in patched["elements"]] == ["S1", "A1", "E1"]
+        assert any("такого элемента в плане нет" in n for n in notes)
+
+    def test_flow_to_an_unknown_node_is_not_added(self):
+        patched, notes = self._patch(
+            {"add_flows": [{"id": "F9", "source": "A1", "target": "Z1"}]})
+        assert [f["id"] for f in patched["flows"]] == ["F1", "F2"]
+        assert any("узла с таким id в плане нет" in n for n in notes)
+
+    def test_composition_is_not_touched_without_a_participant_gap(self):
+        """Состав — решение отдельной стадии, и переспрос его не перерисует:
+        списки участников принимаются только когда нарушение про участника."""
+        patched, notes = self._patch(
+            {"participants": ["Подрядчик"],
+             "fixes": [{"id": "A1", "name": "Осмотреть и починить узел"}]})
+        assert patched["participants"] == self.BASE["participants"]
+        assert any("состав не изменён" in n for n in notes)
+        # а вот названная правка дошла:
+        step = next(e for e in patched["elements"] if e["id"] == "A1")
+        assert step["name"] == "Осмотреть и починить узел"
+
+    def test_participant_gap_opens_the_composition(self):
+        patched, _notes = self._patch(
+            {"participants": ["Подрядчик"]},
+            gaps=['ты сама назвала «Подрядчик» действующим лицом описания, '
+                  "но в плане нет ни пула, ни дорожки с таким именем"])
+        assert patched["participants"] == ["Дежурство", "Подрядчик"]
+
+    def test_a_full_plan_answer_is_still_accepted_as_a_replacement(self):
+        """Модель ответит планом целиком и будет: это не отказ и не тихая
+        поломка — замена плана, состав закрепит каркас."""
+        whole = copy.deepcopy(self.BASE)
+        whole["elements"].append({"id": "B1", "kind": "boundaryEvent",
+                                  "name": "Просрочка"})
+        patched, notes = self._patch(whole)
+        assert patched is whole
+        assert any("план целиком" in n for n in notes)
 
 
 class TestPlanGapsAndRetry:

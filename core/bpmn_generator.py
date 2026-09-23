@@ -481,10 +481,36 @@ def _merge_skeleton(skeleton: Dict[str, Any], plan: Dict[str, Any],
     plan_pools = _plan_pool_names(plan)
     skeleton_pools = [_pool_name(p) for p in skeleton["participants"]]
     known = {_norm_name(p) for p in skeleton_pools}
+    # Имя, которое состав посадил дорожкой, для маршрута не может быть пулом:
+    # «Инженер» — роль «Дежурства», и шаг, записанный на «Инженера», принадлежит
+    # его пулу-хозяину. Без этого ответа переспрос возвращал роли пулами (прогон
+    # #43: 6 нарушений rank 0 вместо 0 — и отказ вместе с таймером).
+    lane_by_name = {}
+    for lane in skeleton["lanes"]:
+        lane_by_name.setdefault(_norm_name(lane.get("name")), lane)
+    elements = _raw_dicts(plan.get("elements"))
+    rehomed: List[str] = []
+    for entry in elements:
+        declared = _norm_name(_raw_text(entry.get("participant")))
+        lane = lane_by_name.get(declared)
+        if lane is None or declared in known:
+            continue
+        if _norm_name(_raw_text(entry.get("lane"))) == _norm_name(lane["id"]):
+            continue
+        entry["participant"] = lane["participant"]
+        entry["lane"] = lane["id"]
+        if lane["name"] not in rehomed:
+            rehomed.append(lane["name"])
+    if rehomed:
+        merged["elements"] = elements
+        notes.append("шаги, записанные на роли пулом, возвращены в их пулы "
+                     "дорожками: " + ", ".join(f"«{n}»" for n in rehomed))
     extra: List[Any] = []
     for pool in (skeleton_pools + [p for p in plan_pools
                                    if _norm_name(p) not in known]):
         if _norm_name(pool) in known:
+            continue
+        if _norm_name(pool) in lane_by_name:
             continue
         if not _mentioned(pool, words):
             notes.append(f"пул «{pool}» не добавлен: в описании такого имени нет, "
@@ -522,15 +548,40 @@ def _raw_dicts_plan_actors(plan: Dict[str, Any]) -> List[str]:
 
 # Переспрос идёт с тем же системным промптом: правила моделирования обязаны
 # жить в одном месте, иначе второй вызов начнёт соблюдать другие правила.
-# Формулировка ниже — только про то, что править нельзя содержание.
-_RETRY_TEMPLATE = """Ты уже построил структуру BPMN по описанию ниже, но в ней \
-найдены нарушения методологии. Исправь план, верни СТРОГО ОДИН JSON-объект той \
-же формы, что и присланный план, без пояснений и без блоков кода.
+# Формулировка ниже — про то, что править нельзя содержание.
+#
+# Ответ — ЗАПЛАТКА, а не переписанный план. Живые прогоны заплатили за
+# «верни план целиком» потерянными шагами и перекроенным составом: починка
+# корректных элементов неотделима от их копирования, а модель при копировании
+# их меняла (прогон #43: чтобы добавить таймер, модель перекрасила все пулы в
+# «роли без хозяина», и правка уехала в корзину вместе с 6 новыми нарушениями).
+# Латка не может сломать то, чего не касается.
+_RETRY_PATCH_SCHEMA = """{"fixes": [{"id": "A2", "participant": "название пула", \
+"lane": "L1", "name": "новое имя", "event_definition": "timer", \
+"timer": "PT15M", "attached_to": "A1"}],
+ "add_elements": [{"id": "B1", "kind": "boundaryEvent", "name": "…", \
+"participant": "…", "lane": "…", "attached_to": "A2"}],
+ "add_flows": [{"id": "F9", "source": "A2", "target": "B1", \
+"condition": "Да", "kind": "sequence"}],
+ "remove_flows": ["F3"],
+ "participants": ["Перевозчик"],
+ "lanes": [{"id": "L9", "name": "Водитель", "participant": "Перевозчик"}]}"""
 
-Не выдумывай новые шаги и не выбрасывай существующие: перестраивай пулы, \
-дорожки, шлюзы, события и потоки так, чтобы перечисленные нарушения исчезли. \
-Если нарушение неустранимо без выдумывания содержания процесса — оставь \
-элементы как есть и исправь остальное.
+_RETRY_TEMPLATE = """Ты уже построил структуру BPMN по описанию ниже, но в ней \
+найдены нарушения методологии. Исправь ПЕРЕЧИСЛЕННЫЕ нарушения и верни СТРОГО \
+ОДИН JSON-объект — заплатку к плану, без пояснений и без блоков кода:
+""" + _RETRY_PATCH_SCHEMA + """
+
+- Правки не касаются того, что в нарушениях не названо: верный элемент, верная
+  связь и верное имя оставь в покое, не переписывай их «аккуратнее».
+- `fixes` — только элементы из списка нарушений, и только те поля, которые и
+  были нарушением (id элемента обязан существовать в плане).
+- `add_elements` / `add_flows` — узлы, которых в плане не хватает (таймер,
+  шлюз схождения, недостающий шаг). Свой id не должен совпадать с id из плана;
+  на него можно ссылаться в `add_flows` этого же ответа.
+- `remove_flows` — только потоки: узел плана удалён быть не может.
+- `participants` и `lanes` заполняй только если нарушение про участника, пул
+  или дорожку. Иначе оставь списки пустыми: состав процесса утверждён.
 
 Нарушения в текущем плане:
 {gaps}
@@ -538,9 +589,115 @@ _RETRY_TEMPLATE = """Ты уже построил структуру BPMN по �
 Описание процесса:
 {text}
 
-План, который нужно исправить:
+План, к которому относится заплатка (его менять не нужно):
 {plan}
 """
+
+# Поля элемента, которые переспрос вправе править. Всё остальное — не нарушение
+# методологии, а содержание процесса, и выдумывать его контур не имеет права.
+PATCH_ELEMENT_FIELDS = ("participant", "lane", "name", "kind",
+                        "event_definition", "timer", "duration",
+                        "attached_to", "condition", "documentation")
+MAX_PATCH_FIXES = 12
+MAX_PATCH_ADDS = 12
+# Нарушение про участника опознаётся по этим словам: без него состав не трогается.
+PARTICIPANT_GAP_MARKS = ("участник", "пул", "дорожк", "роль", "ролями",
+                         "внешне", "контрагент")
+
+
+def _participant_gap(gaps: List[str]) -> bool:
+    lowered = " ".join(gaps).lower()
+    return any(mark in lowered for mark in PARTICIPANT_GAP_MARKS)
+
+
+def apply_plan_patch(plan: Dict[str, Any], patch: Dict[str, Any],
+                     gaps: List[str], notes: List[str]) -> Dict[str, Any]:
+    """Заплатка поверх плана: правит названное, остальное оставляет как есть.
+
+    Ответ планом целиком тоже поддерживается — модель отвечает так и будет, —
+    но тогда состав закрепляет `_merge_skeleton`, а не этот код.
+    """
+    if "elements" in patch:
+        notes.append("переспрос вернул план целиком вместо заплатки — правка "
+                     "принята как замена, состав закрепляется каркасом")
+        return patch
+
+    fixed: Dict[str, Any] = {key: value for key, value in plan.items()}
+    elements = [dict(e) if isinstance(e, dict) else e
+                for e in (plan.get("elements") or [])]
+    by_id = {_raw_text(e.get("id")): e for e in elements if isinstance(e, dict)}
+    known_ids = set(by_id)
+
+    for fix in (patch.get("fixes") if isinstance(patch.get("fixes"), list)
+                else [])[:MAX_PATCH_FIXES]:
+        if not isinstance(fix, dict):
+            continue
+        elem = by_id.get(_raw_text(fix.get("id")))
+        if elem is None:
+            notes.append(f"правка {fix.get('id')} отклонена: такого элемента в "
+                         "плане нет — менять можно только названные в нарушениях")
+            continue
+        fields = [name for name in PATCH_ELEMENT_FIELDS if name in fix]
+        if not fields:
+            notes.append(f"правка {elem.get('id')} пуста: полей для исправления "
+                         "нет")
+            continue
+        for name in fields:
+            elem[name] = fix[name]
+        notes.append(f"{elem.get('id')} исправлен по нарушению: "
+                     + ", ".join(fields))
+
+    for item in (patch.get("add_elements")
+                 if isinstance(patch.get("add_elements"), list)
+                 else [])[:MAX_PATCH_ADDS]:
+        if not isinstance(item, dict) or not _raw_text(item.get("kind")):
+            continue
+        elem_id = _raw_text(item.get("id"))
+        if not elem_id or elem_id in known_ids:
+            notes.append(f"элемент {item.get('name') or elem_id} не добавлен: "
+                         "id уже занят или не назван")
+            continue
+        elements.append(dict(item))
+        known_ids.add(elem_id)
+        notes.append(f"добавлен элемент {elem_id} «{item.get('name')}» — "
+                     "его не хватало по нарушению")
+    fixed["elements"] = elements
+
+    flows = [dict(f) if isinstance(f, dict) else f
+             for f in (plan.get("flows") or [])]
+    drop = {_raw_text(x) for x in (patch.get("remove_flows")
+                                   if isinstance(patch.get("remove_flows"), list)
+                                   else [])}
+    if drop:
+        kept = [f for f in flows if isinstance(f, dict)
+                and _raw_text(f.get("id")) not in drop]
+        notes.append(f"убрано потоков: {len(flows) - len(kept)} по нарушению "
+                     "связей")
+        flows = kept
+    for flow in (patch.get("add_flows")
+                 if isinstance(patch.get("add_flows"), list)
+                 else [])[:MAX_PATCH_ADDS]:
+        if not isinstance(flow, dict):
+            continue
+        src, tgt = _raw_text(flow.get("source")), _raw_text(flow.get("target"))
+        if src not in known_ids or tgt not in known_ids:
+            notes.append(f"поток {src} → {tgt} не добавлен: узла с таким id в "
+                         "плане нет")
+            continue
+        flows.append(dict(flow))
+        known_ids.add(_raw_text(flow.get("id")))
+    fixed["flows"] = flows
+
+    if _participant_gap(gaps):
+        for key in ("participants", "lanes"):
+            if isinstance(patch.get(key), list):
+                fixed[key] = list(plan.get(key) or []) + patch[key]
+                notes.append(f"состав дополнен по нарушению про участника: {key}")
+    elif isinstance(patch.get("participants"), list) or isinstance(
+            patch.get("lanes"), list):
+        notes.append("состав не изменён: нарушений про участников в списке не "
+                     "было, а значит пулы и дорожки правке не подлежат")
+    return fixed
 
 
 _OWNERSHIP_SYSTEM_PROMPT = """Ты разбираешься, кому что принадлежит в \
@@ -625,7 +782,8 @@ class BPMNGenerator:
                 )
 
             trace: List[Dict[str, Any]] = []
-            meta: Dict[str, Any] = {"notes": [], "frozen": False}
+            meta: Dict[str, Any] = {"notes": [], "frozen": False,
+                                    "skeleton": None}
             structure = self._extract_structure(text, meta)
             gaps = plan_gaps(structure, text)
             trace.append({
@@ -644,8 +802,9 @@ class BPMNGenerator:
             # узкий вопрос о том, чьи это шаги (`_clarify_ownership`).
             if plan_gaps(structure, text, with_actors=False):
                 attempts = 2
-                retry = self._retry_structure(text, structure, gaps,
-                                              frozen=meta["frozen"])
+                retry, patch_notes = self._retry_structure(
+                    text, structure, gaps, frozen=meta["frozen"])
+                meta["notes"].extend(patch_notes)
                 reask: Dict[str, Any] = {"node": "переспрос плана",
                                          "gaps_before": len(gaps)}
                 trace.append(reask)
@@ -653,6 +812,18 @@ class BPMNGenerator:
                     retry_note = "Повторный запрос модели не выполнен"
                     reask.update(kept="первый ответ", outcome=retry_note)
                 else:
+                    if meta.get("skeleton"):
+                        # Переспрос переписывает план целиком, и прогон #43
+                        # показал цену: догоняя таймер, модель перекрашивала все
+                        # пулы в «роли без хозяина» (6 нарушений rank 0 вместо
+                        # 0), гейт сравнивал профили и честно отказывал — вместе
+                        # с таймером. Состав заказан отдельным вызовом, поэтому
+                        # от повтора берём маршрут, а состав остаётся
+                        # утверждённым: правка перестает зависеть от того, что
+                        # модель успела испортить по дороге.
+                        retry, retry_notes = _merge_skeleton(
+                            meta["skeleton"], retry, text)
+                        meta["notes"].extend(retry_notes)
                     candidate_gaps = plan_gaps(retry, text)
                     # Первый план остаётся при равенстве: второй вызов обязан
                     # улучшать, а не просто менять местами те же ошибки.
@@ -815,6 +986,9 @@ class BPMNGenerator:
         merged, merge_notes = _merge_skeleton(skeleton, plan, text)
         meta["notes"].extend(merge_notes)
         meta["frozen"] = True
+        # Каркас нужен и переспросу: он решает, что из ответа модели про состав
+        # остаётся в силе.
+        meta["skeleton"] = skeleton
         return merged
 
     def _extract_roster(self, text: str) -> Optional[Dict[str, Any]]:
@@ -860,30 +1034,40 @@ class BPMNGenerator:
 
     def _retry_structure(self, text: str, structure: Dict[str, Any],
                          gaps: List[str], frozen: bool = False,
-                         ) -> Optional[Dict[str, Any]]:
-        """Один переспрос по нарушениям. None — если повтор не мог ничего дать
-        (план не влезает в контекст) или модель недоступна: план с нарушениями
-        честнее отказа генерации, а починка и так отработает.
+                         ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        """Один переспрос по нарушениям: (план, заметки заплатки). None — если
+        повтор не мог ничего дать (план не влезает в контекст) или модель
+        недоступна: план с нарушениями честнее отказа генерации, а починка и так
+        отработает.
 
         `frozen` — состав утверждён стадией состава: переспрос обязан чинить
         маршрутом и пулами в рамках списка, иначе он возвращал бы роли пулами.
+        Ответ моделью — заплатка (`apply_plan_patch`), поэтому корректные
+        элементы переспроса не касаются.
         """
         payload = json.dumps(structure, ensure_ascii=False, default=str)
         if len(payload) > MAX_RETRY_PLAN_CHARS:
             logger.info("Повтор генерации пропущен: план %d символов, лимит %d",
                         len(payload), MAX_RETRY_PLAN_CHARS)
-            return None
+            return None, []
+        # `str.format` не годится: в шаблоне дословный JSON ответа, и его
+        # фигурные скобки format прочёл бы как поля подстановки.
+        question = (_RETRY_TEMPLATE
+                    .replace("{gaps}", "\n".join(f"- {g}" for g in gaps))
+                    .replace("{text}", text)
+                    .replace("{plan}", payload))
         try:
             data = call_json(
                 _FLOW_SYSTEM_PROMPT if frozen else _SYSTEM_PROMPT,
-                _RETRY_TEMPLATE.format(
-                    gaps="\n".join(f"- {g}" for g in gaps),
-                    text=text, plan=payload),
-                temperature=0.1, max_tokens=MAX_PLAN_TOKENS)
+                question, temperature=0.1, max_tokens=MAX_PLAN_TOKENS)
         except (LLMError, ValueError) as e:
             logger.warning("Повтор генерации не удался, остаётся первый план: %s", e)
-            return None
-        return data if isinstance(data, dict) else None
+            return None, []
+        if not isinstance(data, dict):
+            return None, []
+        notes: List[str] = []
+        patched = apply_plan_patch(structure, data, gaps, notes)
+        return patched, notes
 
     def _clarify_ownership(self, text: str,
                            structure: Dict[str, Any]) -> Tuple[Dict[str, Any],

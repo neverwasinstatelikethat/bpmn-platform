@@ -264,6 +264,18 @@ class TestDocumentation:
         ])
         assert report["skipped"][0]["reason"] == "элемент не найден"
 
+    def test_documentation_aimed_at_a_flow_says_so(self, single_pool_xml):
+        """`F1` есть в инвентаре — как поток. Отказ «элемент не найден» модель
+        читает как «id выдумана» и в корректирующий повтор приносит тот же id
+        (прогон #49, production_incident r0: один и тот же пропуск в плане и в
+        повторе). Причина обязана называть, чем является id."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_documentation", "id": "F1", "text": "Текст"},
+        ])
+        skip = report["skipped"][0]
+        assert "поток" in skip["reason"]
+        assert "узлу" in skip["hint"]
+
     def test_broken_documentation_does_not_break_the_batch(self, single_pool_xml):
         out, report = apply_operations(single_pool_xml, [
             {"op": "add_documentation", "id": "no_such_id", "text": "Текст"},

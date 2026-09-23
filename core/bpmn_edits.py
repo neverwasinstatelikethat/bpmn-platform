@@ -751,6 +751,24 @@ class _Skip(Exception):
         self.needs = tuple(n for n in needs if n)
 
 
+def _require_element(index: _Index, elem_id: Any) -> ET.Element:
+    """Узел по его id. Id потока — отдельный отказ: «элемент не найден» модель
+    читает как «id выдуман», хотя инвентарь поток называет, и в корректирующий
+    повтор приносит тот же id (прогон #49: один и тот же пропуск в плане и в
+    повторе)."""
+    key = str(elem_id or "")
+    elem = index.elements.get(key)
+    if elem is not None:
+        return elem
+    if key in index.flows_by_id:
+        raise _Skip(
+            f"'{key}' — поток, а не узел",
+            "узлу (задаче или шлюзу) правят имя, описание и дорожку; из потоков "
+            "по id принимает правку только add_condition",
+        )
+    raise _Skip("элемент не найден", "используйте id из инвентаря")
+
+
 def _require_new_id(op_id: Optional[str], index: _Index) -> str:
     if not op_id or not isinstance(op_id, str):
         raise _Skip("не задан id нового элемента", "укажите id с префиксом new_")
@@ -1262,9 +1280,7 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
 
 
 def _op_rename(op: Dict[str, Any], index: _Index) -> List[str]:
-    elem = index.elements.get(op.get("id") or "")
-    if elem is None:
-        raise _Skip("элемент не найден", "используйте id из инвентаря")
+    elem = _require_element(index, op.get("id"))
     name = (op.get("name") or "").strip()
     if not name:
         raise _Skip("не задано новое имя")
@@ -1273,9 +1289,7 @@ def _op_rename(op: Dict[str, Any], index: _Index) -> List[str]:
 
 
 def _op_add_documentation(op: Dict[str, Any], index: _Index) -> List[str]:
-    elem = index.elements.get(op.get("id") or "")
-    if elem is None:
-        raise _Skip("элемент не найден", "используйте id из инвентаря")
+    elem = _require_element(index, op.get("id"))
     text = (op.get("text") or "").strip()
     if not text:
         raise _Skip("не задан текст документации", "укажите text")
@@ -1310,9 +1324,7 @@ def _op_add_lane(op: Dict[str, Any], index: _Index) -> List[str]:
 
 def _op_move_to_lane(op: Dict[str, Any], index: _Index) -> List[str]:
     elem_id = op.get("id") or ""
-    elem = index.elements.get(elem_id)
-    if elem is None:
-        raise _Skip("элемент не найден", "используйте id из инвентаря")
+    elem = _require_element(index, elem_id)
     lane_key = (op.get("lane") or "").strip()
     if not lane_key:
         raise _Skip("не задана дорожка", "укажите lane — id или имя дорожки")
@@ -1383,9 +1395,7 @@ def _remove_node(index: _Index, elem: ET.Element) -> Tuple[List[str], List[str]]
 
 def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
     elem_id = op.get("id") or ""
-    elem = index.elements.get(elem_id)
-    if elem is None:
-        raise _Skip("элемент не найден", "используйте id из инвентаря")
+    elem = _require_element(index, elem_id)
     if _local(elem.tag) in ("startEvent", "endEvent"):
         raise _Skip(
             "стартовые и конечные события не удаляются",
@@ -1632,9 +1642,7 @@ def _op_disconnect(op: Dict[str, Any], index: _Index) -> List[str]:
 
 def _op_move(op: Dict[str, Any], index: _Index) -> List[str]:
     elem_id = op.get("id") or ""
-    elem = index.elements.get(elem_id)
-    if elem is None:
-        raise _Skip("элемент не найден", "используйте id из инвентаря")
+    elem = _require_element(index, elem_id)
     current = index.process_of.get(elem_id)
     target = index.resolve_process(op.get("participant"))
     if target is None:

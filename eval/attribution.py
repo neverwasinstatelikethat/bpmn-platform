@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 OWNER_MODEL_FIRST = "модель:первый ответ"
 OWNER_MODEL_REASK = "модель:переспрос"
 OWNER_REASK_REJECTED = "переспрос отвергнут, правка не у модели"
+OWNER_REASK_UNTOUCHED = "модель:повтор не тронул это нарушение"
 OWNER_CLARIFY = "вопрос о принадлежности"
 OWNER_XML = "генерация XML"
 OWNER_FIXTURE = "содержание фикстуры"
@@ -27,6 +28,22 @@ OWNER_BASE = "дефект базовой схемы"
 OWNER_APPLIER = "аплайер"
 OWNER_PACKAGE = "пакет модели"
 OWNER_UNKNOWN = "неизвестно"
+# Какие классов плана касается нарушение инварианта. Имена — из
+# `core.bpmn_generator._GAP_CLASS_OF`; сверка имён держится тестом, потому что
+# разошедшийся словарь молча вернул бы прежнюю ложь: «отвергнутый переспрос»
+# приписывался контуру и тогда, когда второй ответ модели не принёс ничего
+# (прогон #53 — 9 из 18 таких отказов, и «крупнейший владелец провалов» был
+# артефактом разметки, а не рычагом).
+_REASK_REPAIRS = {
+    "expected_participants": ("лицо без пула", "участник вне схемы",
+                              "роль без хозяина", "пустой пул",
+                              "роль-пул"),
+    "roles_as_lanes": ("роль без хозяина", "роль-пул", "лицо без пула",
+                       "пустой пул"),
+    "participant_interacts": ("участник вне схемы", "пустой пул"),
+    "has_timer": ("таймер",),
+    "has_branching": ("развилка",),
+}
 # Второе измерение для «дефект пришёл в плане»: видел ли о нём план-гейт.
 # «контур видел» чинят в `repair_structure` и переспросе, «не видел» — только
 # в `plan_gaps` (или в промпте), и это разные очереди работы.
@@ -114,15 +131,29 @@ def attribute_generation(
     notes = _clarify_notes(trace)
     reask = _reask(trace)
     from_model = any(n.get("node") == "первый ответ модели" for n in trace)
-    if not from_model:
-        # Replay: план прислал не контур, а фикстура — винить модель харнесс
-        # права не имеет.
-        model_owner = OWNER_FIXTURE
-    elif reask is not None:
-        model_owner = (OWNER_MODEL_REASK if reask.get("kept") == "переспрос"
-                       else OWNER_REASK_REJECTED)
-    else:
-        model_owner = OWNER_MODEL_FIRST
+
+    def _plan_owner(name: str) -> str:
+        """Кому принадлежит нарушение, пришедшее из плана.
+
+        Развилка не в «принят ли повтор», а в том, нёс ли он правку этого
+        нарушения: отказ от пустого повтора — второй ответ модели, а не решение
+        контура. Без повтора вовсе владелец остаётся у первого ответа.
+        """
+        if not from_model:
+            # Replay: план прислал не контур, а фикстура — винить модель харнесс
+            # права не имеет.
+            return OWNER_FIXTURE
+        if reask is None:
+            return OWNER_MODEL_FIRST
+        if reask.get("kept") == "переспрос":
+            return OWNER_MODEL_REASK
+        if reask.get("gaps_after") is None:
+            return OWNER_MODEL_FIRST
+        closed = reask.get("fixed_kinds") or {}
+        if any(closed.get(kind) for kind in _REASK_REPAIRS.get(name, ())):
+            return OWNER_REASK_REJECTED
+        return OWNER_REASK_UNTOUCHED
+
     out: Dict[str, str] = {}
 
     for name, check in checks_xml.items():
@@ -134,7 +165,7 @@ def attribute_generation(
             out[name] = OWNER_XML
             continue
         if _was_in_the_plan(ids, gaps):
-            out[name] = model_owner + OWNER_SEEN
+            out[name] = _plan_owner(name) + OWNER_SEEN
             continue
         owner = ""
         for step in reversed(steps):
@@ -146,7 +177,7 @@ def attribute_generation(
         if not owner:
             # Без id стык с нарушениями плана невозможен: утверждать, что
             # план-гейт молчал, харнесс не вправе.
-            owner = model_owner + (OWNER_BLIND if ids else "")
+            owner = _plan_owner(name) + (OWNER_BLIND if ids else "")
         out[name] = owner
     return out
 

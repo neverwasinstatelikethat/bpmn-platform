@@ -94,13 +94,63 @@ class TestGeneration:
         owner = attribution.attribute_generation(checks, {}, trace)
         assert owner["has_branching"] == attribution.OWNER_MODEL_REASK
 
-    def test_rejected_reask_says_the_contour_stopped(self):
+    def test_rejected_reask_blames_the_contour_only_when_it_threw_a_fix_away(self):
+        """Отказ принять повтор — вина контура ровно тогда, когда повтор нёс
+        правку этого нарушения. Живой прогон #53: 9 из 18 отвергнутых повторов
+        вернули тот же набор нарушений, и «крупнейший владелец провалов»
+        оказался артефактом разметки, а не рычагом."""
         trace = _trace(**{"переспрос плана": {"gaps_before": 2, "gaps_after": 2,
                                               "kept": "первый ответ",
+                                              "fixed_kinds": {"развилка": 1},
                                               "outcome": "не улучшил"}})
         checks = {"has_branching": _check("has_branching")}
         owner = attribution.attribute_generation(checks, {}, trace)
         assert owner["has_branching"] == attribution.OWNER_REASK_REJECTED
+
+    def test_reask_that_touched_nothing_is_the_models_second_answer(self):
+        trace = _trace(**{"переспрос плана": {"gaps_before": 2, "gaps_after": 2,
+                                              "kept": "первый ответ",
+                                              "fixed_kinds": {"пустой пул": 1},
+                                              "outcome": "не улучшил"}})
+        checks = {"has_branching": _check("has_branching")}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["has_branching"] == attribution.OWNER_REASK_UNTOUCHED
+
+    def test_the_missing_participant_blames_the_reask_on_participant_classes(self):
+        """Классы правок сверяются с нарушением инварианта, а не с первым
+        попавшимся: пустой пул названного участника — это и есть потерянный
+        участник, а не косметика маршрута."""
+        reask = {"gaps_before": 4, "gaps_after": 5, "kept": "первый ответ",
+                 "fixed_kinds": {"пустой пул": 1},
+                 "outcome": "не улучшил"}
+        checks = {"expected_participants": _check("expected_participants"),
+                  "has_branching": _check("has_branching")}
+        trace = _trace(**{"переспрос плана": reask})
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["expected_participants"] == attribution.OWNER_REASK_REJECTED
+        assert owner["has_branching"] == attribution.OWNER_REASK_UNTOUCHED
+
+    def test_a_reask_that_never_happened_keeps_the_first_answer_guilty(self):
+        """Отказ от повторного запроса (транспорт, негодный JSON) — не «контур
+        выбросил правку»: правки не было, и владелец остаётся у первого ответа."""
+        trace = _trace(**{"переспрос плана": {"gaps_before": 2,
+                                              "kept": "первый ответ",
+                                              "outcome": "не выполнен"}})
+        checks = {"has_branching": _check("has_branching")}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["has_branching"] == attribution.OWNER_MODEL_FIRST
+
+    def test_the_repair_classes_are_the_ones_the_generator_emits(self):
+        """Словарь атрибуции и классы плана расходятся молча и без падений:
+        несуществующий класс просто никогда не совпадёт, и харнесс вернётся к
+        той же лжи, от которой эту правку завели."""
+        from core import bpmn_generator
+        from eval.invariants import INVARIANTS
+        emitted = {kind for _needle, kind in bpmn_generator._GAP_CLASS_OF}
+        used = {kind for kinds in attribution._REASK_REPAIRS.values()
+                for kind in kinds}
+        assert used <= emitted
+        assert set(attribution._REASK_REPAIRS) <= set(INVARIANTS)
 
     def test_clarify_answer_owns_what_it_moved(self):
         trace = _trace(**{"вопрос о принадлежности": {

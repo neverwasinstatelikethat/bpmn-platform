@@ -1063,7 +1063,17 @@ class BPMNGenerator:
                                       if g not in candidate_gaps])[:6],
                                  added=_trace_gaps(
                                      [g for g in candidate_gaps
-                                      if g not in gaps])[:6])
+                                      if g not in gaps])[:6],
+                                 # Те же дельты, но числом по классам и без
+                                 # среза: атрибуция обязана отличить «повтор
+                                 # принёс правку и её выбросили» от «повтора не
+                                 # было» даже там, где текстов не видно за шестью.
+                                 fixed_kinds=_gap_kinds(
+                                     [g for g in gaps
+                                      if g not in candidate_gaps]),
+                                 added_kinds=_gap_kinds(
+                                     [g for g in candidate_gaps
+                                      if g not in gaps]))
                     if not _reask_improves(gaps, candidate_gaps):
                         retry_note = (f"Повторный запрос модели не улучшил план "
                                       f"({len(gaps)} нарушений) — оставлен первый")
@@ -2468,6 +2478,22 @@ _GAP_PRIORITY = (("действующим лицом", 0),
 # приданым для сравнения профилей.
 _GAP_RANK_DEFAULT = 2
 _GAP_RANKS = _GAP_RANK_DEFAULT + 1
+# Имя класса нарушения — для отчёта, не для приёма плана. Ранги выше решают,
+# принимать ли повтор, а классы отвечают харнессу на другой вопрос: «отклонённый
+# повтор нёс правку этого нарушения или вернулся ни с чем». Без этого отказа
+# прогона #53 приданого «переспрос отвергнут» оказалось крупнейшим владельцем
+# провалов, хотя в 9 из 18 случаев второй ответ модели не принёс ничего.
+# Ранги новых игл обязаны равняться тому, что нарушение получает сегодня
+# (ранг по умолчанию), иначе разметка молча станет новым рычагом.
+_GAP_CLASS_OF = (("действующим лицом", "лицо без пула"),
+                 ("а в схеме его нет", "участник вне схемы"),
+                 ("помечен ролью", "роль без хозяина"),
+                 ("без единого шага", "пустой пул"),
+                 ("задаёт ожидание", "таймер"),
+                 ("ни одного шлюза", "развилка"),
+                 ("развилка спрятана", "развилка"),
+                 ("объявил дорожку с таким же именем", "роль-пул"))
+_GAP_CLASS_OTHER = "маршрут"
 
 
 def _gap_priority(gap: str) -> int:
@@ -2475,6 +2501,25 @@ def _gap_priority(gap: str) -> int:
         if needle in gap:
             return rank
     return _GAP_RANK_DEFAULT
+
+
+def _gap_class(gap: str) -> str:
+    """Класс нарушения плана по его тексту (см. `_GAP_CLASS_OF`)."""
+    for needle, kind in _GAP_CLASS_OF:
+        if needle in gap:
+            return kind
+    return _GAP_CLASS_OTHER
+
+
+def _gap_kinds(gaps: List[str]) -> Dict[str, int]:
+    """Нарушения, сведённые по классам: человек читает список текстов, а
+    харнесс обязан знать число — `fixed` обрезается до шести, и правка за
+    пределами среза терялась бы из вида."""
+    out: Dict[str, int] = {}
+    for gap in gaps:
+        kind = _gap_class(gap)
+        out[kind] = out.get(kind, 0) + 1
+    return out
 
 
 def _gap_profile(gaps: List[str]) -> Tuple[int, ...]:

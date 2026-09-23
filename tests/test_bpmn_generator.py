@@ -3720,6 +3720,45 @@ class TestReaskAcceptanceByPriority:
         assert not bpmn_generator._reask_improves(
             [self.ACTOR, self.MINOR], [self.MINOR, self.ACTOR])
 
+    def test_gap_classes_name_what_the_reask_actually_closed(self):
+        """Класс нарушения — то, чем харнесс отвечает «правка была или нет».
+        Имена сверяются с текстами `plan_gaps`, иначе атрибуция молча
+        рассуждает о классах, которых генератор не производит."""
+        kind = bpmn_generator._gap_class
+        assert kind(self.ACTOR) == "лицо без пула"
+        assert kind(self.NO_POOL) == "участник вне схемы"
+        assert kind(self.ROLE_WITHOUT_ORG) == "роль без хозяина"
+        assert kind(self.VACANT) == "пустой пул"
+        assert kind(self.TIMER) == "таймер"
+        assert kind(self.MINOR) == "маршрут"
+        assert kind("описание задаёт условие («если…»), а в плане ни одного "
+                    "шлюза, который раздваивает") == "развилка"
+        assert kind("узел B1 ведёт сразу в несколько шагов без шлюза — "
+                    "развилка спрятана в подписях потоков") == "развилка"
+        assert kind("пул «Кладовщик» объявил дорожку с таким же именем: "
+                    "объяви роль или убери дорожку") == "роль-пул"
+
+    def test_class_labels_do_not_move_a_single_rank(self):
+        """Классы — только для отчёта. Ранги, по которым `_reask_improves`
+        решает приём плана, обязаны остаться прежними: сдвиг ранга был бы новым
+        рычагом, замаскированным под разметку."""
+        for gap, rank in ((self.ACTOR, 0), (self.NO_POOL, 0),
+                          (self.ROLE_WITHOUT_ORG, 0), (self.VACANT, 1),
+                          (self.TIMER, 1),
+                          ("описание задаёт условие, а в плане ни одного шлюза", 1),
+                          ("узел B1 ведёт сразу в несколько шагов без шлюза — "
+                           "развилка спрятана в подписях", 2),
+                          ("пул «Кладовщик» объявил дорожку с таким же именем", 2),
+                          (self.MINOR, 2)):
+            assert bpmn_generator._gap_priority(gap) == rank, gap
+
+    def test_gap_kinds_count_beyond_the_human_slice(self):
+        """`fixed` режется до шести текстов для читателя; число классов не
+        режется, и правка за срезом остаётся видимой атрибуции."""
+        assert bpmn_generator._gap_kinds(
+            [self.ACTOR, self.ACTOR, self.VACANT, self.MINOR]) == {
+                "лицо без пула": 2, "пустой пул": 1, "маршрут": 1}
+
     def test_generate_accepts_the_plan_that_returns_the_actor(self, monkeypatch):
         """Сквозная проверка: второй план с тем же числом нарушений, но без
         потерянного участника, становится схемой."""

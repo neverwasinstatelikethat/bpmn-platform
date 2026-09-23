@@ -2039,6 +2039,35 @@ class TestOwnershipClarification:
         assert "Верни moves, roles и missing" in fake.calls[-1][1]["content"]
         assert "каждый перечисленный кандидат" in fake.calls[-1][0]["content"]
 
+    def test_a_named_actor_is_asked_about_even_with_no_other_question(
+            self, monkeypatch):
+        """План сам выписал действующее лицо в `actors` и не дал ему пула —
+        вопрос обязуется и когда пустых пулов, ролей-кандидатов и непрозванных
+        токенов нет вовсе. Прогон #47: два случая `expected_participants`
+        пропали молчанием — контур о противоречии знал и не спросил никого."""
+        roster = ('{"organizations": ["ВкусВилл"], "systems": [], '
+                  '"counterparties": [], "roles": []}')
+        plan = {"participants": ["ВкусВилл"],
+                "actors": ["ВкусВилл", "Клиент"],
+                "lanes": [],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Оформить возврат",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask", "name": "Принести товар",
+                     "participant": "ВкусВилл"}],
+                "flows": []}
+        fake = FakeLLM(monkeypatch, roster, _fence(plan),
+                       '{"missing": [{"pool": "Клиент", "external": true, '
+                       '"steps": ["A2"]}]}')
+        result = BPMNGenerator().generate(
+            "ВкусВилл оформляет возврат, клиент приносит товар в магазин.")
+        question = next(c[1]["content"] for c in fake.calls
+                        if "Верни moves, roles и missing" in c[1]["content"])
+        assert "«Клиент»" in question, question[-500:]
+        names = [p["name"] for p in result["structure"]["participants"]]
+        assert "Клиент" in names, result["notes"]
+        assert not [g for g in result["gaps"] if "Клиент" in g], result["gaps"]
+
     def test_move_of_an_unknown_element_is_refused(self, monkeypatch):
         plan = _fence(self._plan())
         fake = FakeLLM(monkeypatch, plan, plan,
@@ -2615,19 +2644,30 @@ class TestOwnershipClarification:
 
     def test_actor_gap_alone_does_not_rewrite_the_plan(self, monkeypatch):
         """Ради расхождения с `actors` план целиком не переписывают: это чинит
-        узкий вопрос о принадлежности шагов, а переспрос стоит полную генерацию
-        и живые прогоны показывали на нём потерянные шаги."""
+        узкий вопрос о принадлежности шагов, а переспрос планом стоит полную
+        генерацию и живые прогоны показывали на нём потерянные шаги.
+
+        Сам вопрос при этом обязателен: молчание контура, который знал о
+        противоречии и не спросил никого, стоило прогону #47 двух названных
+        участников из 24 схем (`expected_participants`)."""
         sloppy = {"actors": ["ВкусВилл", "Поставщик"],
                   "participants": ["ВкусВилл"],
                   "elements": [{"id": f"A{i}", "kind": "userTask",
                                 "name": f"Шаг {i}", "participant": "ВкусВилл"}
                                for i in range(1, 7)], "flows": []}
         fenced = _fence(sloppy)
-        fake = FakeLLM(monkeypatch, fenced)
+        fake = FakeLLM(monkeypatch, fenced, '{"moves": [], "roles": [], '
+                                            '"missing": []}')
         result = BPMNGenerator().generate(
             "ВкусВилл заводит заявку, согласует её, собирает груз, отгружает, "
             "закрывает заявку. Поставщик подтверждает отгрузку.")
-        assert result["attempts"] == 1 and len(fake.calls) == 1
+        assert result["attempts"] == 1, result["notes"]
+        assert len(fake.calls) == 2, fake.calls
+        assert "Верни moves, roles и missing" in fake.calls[-1][1]["content"]
+        # Второй раз план не просили — содержание осталось тем, что модель
+        # записала сама: ни один шаг не вырезан «ради соблюдения `actors`».
+        assert {f"A{i}" for i in range(1, 7)} <= {e["id"] for e in
+                                                  result["structure"]["elements"]}
         assert [g for g in result["gaps"] if "Поставщик" in g]
 
     def test_actor_gap_is_reported_until_the_model_fixes_it(self, monkeypatch):

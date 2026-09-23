@@ -1330,7 +1330,12 @@ class BPMNGenerator:
         unclaimed = _unclaimed_tokens(pools,
                                       _raw_dicts(structure.get("lanes")), text)
         sought = list(dict.fromkeys(absent + unclaimed))
-        if not vacant and not role_pools and not unclaimed:
+        # Расхождение с собственным `actors` — повод спросить и тогда, когда
+        # больше спрашивать не о чем: контур знает, что план противоречит сам
+        # себе, а молчание стоило прогону #47 двух участников из 24 схем
+        # (вопрос при этом называет имя, а не просит «придумать действующее
+        # лицо»: имена уже отобранны из описания стадией состава).
+        if not vacant and not role_pools and not sought:
             return structure, []
         # Пропущенных участников спрашиваем у плана, где их ещё мало, — или когда
         # они противоречат собственному списку `actors`: там имена уже взяты из

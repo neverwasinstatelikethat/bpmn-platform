@@ -1019,7 +1019,14 @@ class BPMNGenerator:
             # (живые прогоны показывали потерянные шаги). Ради одного лишь
             # расхождения с `actors` его не заводим: там дешевле и надёжнее
             # узкий вопрос о том, чьи это шаги (`_clarify_ownership`).
-            if plan_gaps(structure, text, with_actors=False):
+            # Нарушения, которые переспрос физически способен закрыть. Требование
+            # «заведи пул» под утверждённым составом ему не по зубам
+            # (`_merge_skeleton(allow_extra_pools=False)` снимает новый пул), и
+            # просить о нём — значит потом читать «повтор не улучшил план» там,
+            # где улучшения не могло быть (прогон #53). Такое нарушение не
+            # выбрасывается: его закрывает идущий следом узкий вопрос.
+            asked = _askable_gaps(gaps, meta["frozen"])
+            if asked and plan_gaps(structure, text, with_actors=False):
                 attempts = 2
                 patch_trace: Dict[str, Any] = {}
                 retry, patch_notes = self._retry_structure(
@@ -1028,6 +1035,13 @@ class BPMNGenerator:
                 meta["notes"].extend(patch_notes)
                 reask: Dict[str, Any] = {"node": "переспрос плана",
                                          "gaps_before": len(gaps),
+                                         # Сколько из них просили у повтора, а
+                                         # сколько контур убрал из вопроса сам:
+                                         # без этой строки молчание контура
+                                         # читается как молчание модели.
+                                         "gaps_asked": len(asked),
+                                         "deferred_actor_gaps":
+                                             len(gaps) - len(asked),
                                          **patch_trace}
                 trace.append(reask)
                 if retry is None:
@@ -1048,35 +1062,34 @@ class BPMNGenerator:
                             allow_extra_pools=False)
                         meta["notes"].extend(retry_notes)
                     candidate_gaps = plan_gaps(retry, text)
+                    # Сравнивается то, о чём просили: нарушение, которое контур
+                    # сам убрал из вопроса, не может быть и причиной отказа.
+                    candidate_asked = _askable_gaps(candidate_gaps,
+                                                    meta["frozen"])
+                    closed = [g for g in asked if g not in candidate_asked]
+                    brought = [g for g in candidate_asked if g not in asked]
                     # Первый план остаётся при равенстве: второй вызов обязан
                     # улучшать, а не просто менять местами те же ошибки.
                     lost = _plan_content(structure) - _plan_content(retry)
                     reask.update(gaps_after=len(candidate_gaps),
                                  lost_steps=lost,
-                                 profile_before=_gap_profile(gaps),
-                                 profile_after=_gap_profile(candidate_gaps),
+                                 profile_before=_gap_profile(asked),
+                                 profile_after=_gap_profile(candidate_asked),
                                  # Счётчик сам по себе не объясняет отказ: без
                                  # того, что повтор принёс и что унёс, каждый
                                  # разбор стоит отдельного живого прогона.
-                                 fixed=_trace_gaps(
-                                     [g for g in gaps
-                                      if g not in candidate_gaps])[:6],
-                                 added=_trace_gaps(
-                                     [g for g in candidate_gaps
-                                      if g not in gaps])[:6],
+                                 fixed=_trace_gaps(closed)[:6],
+                                 added=_trace_gaps(brought)[:6],
                                  # Те же дельты, но числом по классам и без
                                  # среза: атрибуция обязана отличить «повтор
                                  # принёс правку и её выбросили» от «повтора не
                                  # было» даже там, где текстов не видно за шестью.
-                                 fixed_kinds=_gap_kinds(
-                                     [g for g in gaps
-                                      if g not in candidate_gaps]),
-                                 added_kinds=_gap_kinds(
-                                     [g for g in candidate_gaps
-                                      if g not in gaps]))
-                    if not _reask_improves(gaps, candidate_gaps):
+                                 fixed_kinds=_gap_kinds(closed),
+                                 added_kinds=_gap_kinds(brought))
+                    if not _reask_improves(asked, candidate_asked):
                         retry_note = (f"Повторный запрос модели не улучшил план "
-                                      f"({len(gaps)} нарушений) — оставлен первый")
+                                      f"({len(asked)} нарушений) — оставлен "
+                                      "первый")
                         reask["kept"] = "первый ответ"
                     elif lost > 0:
                         # Нарушения снимаются вырезанными шагами — схема станет
@@ -1288,10 +1301,16 @@ class BPMNGenerator:
             logger.info("Повтор генерации пропущен: план %d символов, лимит %d",
                         len(payload), MAX_RETRY_PLAN_CHARS)
             return None, []
+        asked = _askable_gaps(gaps, frozen)
+        if not asked:
+            # Спрашивать не о чем: всё, что нашёл план-гейт, закрытый состав
+            # переспросу не по зубам. Узкий вопрос о принадлежности идёт дальше
+            # по своему пути и своё нарушение получит.
+            return None, []
         # `str.format` не годится: в шаблоне дословный JSON ответа, и его
         # фигурные скобки format прочёл бы как поля подстановки.
         question = (_RETRY_TEMPLATE
-                    .replace("{gaps}", "\n".join(f"- {g}" for g in gaps))
+                    .replace("{gaps}", "\n".join(f"- {g}" for g in asked))
                     .replace("{text}", text)
                     .replace("{plan}", payload))
         try:
@@ -2520,6 +2539,24 @@ def _gap_kinds(gaps: List[str]) -> Dict[str, int]:
         kind = _gap_class(gap)
         out[kind] = out.get(kind, 0) + 1
     return out
+
+
+# Классы, которые требуют завести пул. Под утверждённым составом переспрос сделать
+# этого не может: `_merge_skeleton(..., allow_extra_pools=False)` снимает любой
+# новый пул, и нарушение возвращалось моделью неотвеченным (прогон #53 —
+# «пул «Служба безопасности» не добавлен: состав утверждён»). Просить о запрете
+# себе контуром — значит потом читать «повтор не улучшил план» там, где улучшения
+# не могло быть. Это нарушение не выбрасывается: его закрывает идущий следом
+# узкий вопрос о принадлежности, который `missing` принимает и при закрытом
+# составе.
+_GAPS_BEYOND_A_FROZEN_RETRY = ("лицо без пула", "участник вне схемы")
+
+
+def _askable_gaps(gaps: List[str], frozen: bool) -> List[str]:
+    """Нарушения, которые переспрос физически способен закрыть."""
+    if not frozen:
+        return list(gaps)
+    return [g for g in gaps if _gap_class(g) not in _GAPS_BEYOND_A_FROZEN_RETRY]
 
 
 def _gap_profile(gaps: List[str]) -> Tuple[int, ...]:

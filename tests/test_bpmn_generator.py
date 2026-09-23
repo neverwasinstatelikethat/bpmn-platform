@@ -3609,6 +3609,94 @@ class TestPlanGapsAndRetry:
         assert _note(result["notes"], "не улучшил план")
         assert not _note(result["notes"], "план пересобран")
 
+    # Два нарушения про нового участника: состав под замком, и переспрос физически
+    # не может их закрыть (`_merge_skeleton(allow_extra_pools=False)`), а просит их
+    # `plan_gaps`. Просить модель о том, что запретил себе контур, — значит потом
+    # читать «повтор не улучшил план» там, где улучшения не могло быть (#53).
+    OUTSIDE_ACTOR = ('в описании назван участник «Клиент», а в схеме его нет: '
+                     'заведи пул «Клиент» с его шагами')
+    SELF_NAMED_ACTOR = ('ты сама назвала «Клиент» действующим лицом описания, но '
+                        "в плане нет ни пула, ни дорожки с таким именем")
+    STILL_VACANT = ('пул «Перевозчик» без единого шага — в нём только старт и '
+                    'финиш; правь participant="Перевозчик"')
+
+    def test_askable_gaps_drop_only_the_forbidden_demand(self):
+        asked = bpmn_generator._askable_gaps(
+            [self.OUTSIDE_ACTOR, self.SELF_NAMED_ACTOR, self.STILL_VACANT],
+            frozen=True)
+        assert asked == [self.STILL_VACANT]
+        assert bpmn_generator._askable_gaps(
+            [self.OUTSIDE_ACTOR, self.STILL_VACANT], frozen=False) == [
+                self.OUTSIDE_ACTOR, self.STILL_VACANT]
+
+    def test_the_frozen_question_never_asks_for_a_new_pool(self, monkeypatch):
+        fake = FakeLLM(monkeypatch, '{"fixes": []}')
+        BPMNGenerator()._retry_structure(
+            "ВкусВилл и клиент оформляют возврат",
+            {"participants": [], "elements": [], "flows": []},
+            [self.OUTSIDE_ACTOR, self.STILL_VACANT], frozen=True, trace={})
+        question = fake.calls[0][1]["content"]
+        assert "без единого шага" in question
+        assert "а в схеме его нет" not in question
+        # Тот же переспрос при незакреплённом составе обязан просить пул:
+        # одношаговая генерация его принимает.
+        fake2 = FakeLLM(monkeypatch, '{"fixes": []}')
+        BPMNGenerator()._retry_structure(
+            "ВкусВилл и клиент оформляют возврат",
+            {"participants": [], "elements": [], "flows": []},
+            [self.OUTSIDE_ACTOR, self.STILL_VACANT], frozen=False, trace={})
+        assert "а в схеме его нет" in fake2.calls[0][1]["content"]
+
+    def test_a_defered_actor_goes_to_the_question_that_can_answer_it(
+            self, monkeypatch):
+        """Класс нарушения не выбрасывается, а переезжает: узкий вопрос о
+        принадлежности принимает `missing` и заводит пул с его шагами даже под
+        закреплённым составом."""
+        text = ("ВкусВилл оформляет возврат: менеджер принимает заявку, "
+                "перевозчик забирает упаковку, клиент получает деньги.")
+        roster = ('{"organizations": ["ВкусВилл"], "systems": [], '
+                  '"counterparties": ["Перевозчик"], '
+                  '"roles": [{"name": "Менеджер", "host": "ВкусВилл"}]}')
+        base = {"participants": ["ВкусВилл", "Перевозчик"],
+                "actors": ["ВкусВилл", "Менеджер", "Перевозчик", "Клиент"],
+                "lanes": [{"id": "L1", "name": "Менеджер",
+                           "participant": "ВкусВилл"}],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                     "participant": "ВкусВилл", "lane": "L1"},
+                    {"id": "A1", "kind": "userTask", "name": "Принять заявку",
+                     "participant": "ВкусВилл", "lane": "L1"},
+                    {"id": "A2", "kind": "userTask", "name": "Отвезти упаковку",
+                     "participant": "ВкусВилл", "lane": "L1"},
+                    {"id": "E1", "kind": "endEvent", "name": "Возврат закрыт",
+                     "participant": "ВкусВилл", "lane": "L1"},
+                    {"id": "S2", "kind": "startEvent", "name": "Груз готов",
+                     "participant": "Перевозчик"},
+                    {"id": "E2", "kind": "endEvent", "name": "Упаковка увезена",
+                     "participant": "Перевозчик"}],
+                "flows": [{"id": "F1", "source": "S1", "target": "A1"},
+                          {"id": "F2", "source": "A1", "target": "A2"},
+                          {"id": "F3", "source": "A2", "target": "E1"},
+                          {"id": "F4", "source": "S2", "target": "E2"}]}
+        patch = '{"fixes": [{"id": "A2", "participant": "Перевозчик"}]}'
+        fake = FakeLLM(monkeypatch, roster, _fence(base), patch,
+                       '{"moves": [], "roles": [], "missing": []}')
+        result = BPMNGenerator().generate(text)
+
+        reask = next(t for t in result["trace"] if t["node"] == "переспрос плана")
+        assert reask["deferred_actor_gaps"] == 1, reask
+        retry_prompt = fake.calls[2][1]["content"]
+        assert "а в схеме его нет" not in retry_prompt
+        assert "без единого шага" in retry_prompt
+        ownership_prompt = fake.calls[3][1]["content"]
+        assert "«Клиент»" in ownership_prompt, ownership_prompt
+        pools = [p["name"] if isinstance(p, dict) else p
+                 for p in result["structure"]["participants"]]
+        assert "Перевозчик" in pools and "Клиент" not in pools
+        moved = [e["participant"] for e in result["structure"]["elements"]
+                 if e["id"] == "A2"]
+        assert moved == ["Перевозчик"], result["notes"]
+
     def test_retry_failure_degrades_to_first_plan(self, monkeypatch):
         FakeLLM(monkeypatch, TestVacantPools._vacant(),
                 llm_client.LLMError("503"))

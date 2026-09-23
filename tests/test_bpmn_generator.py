@@ -2129,6 +2129,84 @@ class TestOwnershipClarification:
         assert lanes.get("Кладовщик") == "ВкусВилл"
         assert _note(result["notes"], "роль «ВкусВилл» по описанию")
 
+    def test_a_role_cannot_host_another_role(self, monkeypatch):
+        """Хозяин обязан быть пулом: «Кладовщик» — дорожка, то есть роль, и
+        назначать его организацией нельзя даже если слово звучит в описании.
+        Живой пропуск этой рамки стоил состава: ответ «Перевозчик — роль
+        водитель» заводил пул «водитель» (имя-то в тексте есть), и организация
+        уезжала в него дорожкой — то есть к своему же сотруднику."""
+        plan = {"participants": ["Склад", "Экспедитор"],
+                "lanes": [{"id": "L1", "name": "Кладовщик",
+                           "participant": "Склад"}],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Собрать груз",
+                     "participant": "Склад", "lane": "L1"},
+                    {"id": "A2", "kind": "userTask", "name": "Отгрузить паллету",
+                     "participant": "Склад", "lane": "L1"}],
+                "flows": [{"id": "F1", "source": "A1", "target": "A2"}]}
+        fenced = _fence(plan)
+        FakeLLM(monkeypatch, fenced, fenced,
+                '{"roles": [{"pool": "Экспедитор", "inside": "Кладовщик"}]}')
+        result = BPMNGenerator().generate(
+            "Склад собирает груз и отгружает паллету, кладовщик подписывает "
+            "накладную, экспедитор сопровождает груз.")
+
+        assert _note(result["notes"], "тоже роль, а не организация")
+        assert not _note(result["notes"], "организация из описания")
+        pairs = [(lane["name"], lane["participant"])
+                 for lane in result["structure"]["lanes"]]
+        assert ("Экспедитор", "Кладовщик") not in pairs
+        assert "Кладовщик" not in [
+            p["name"] if isinstance(p, dict) else p
+            for p in result["structure"]["participants"]]
+
+    def test_missing_actor_that_is_a_declared_lane_stays_a_lane(self, monkeypatch):
+        """«Кого забыть нельзя» — ответ про роль не заводит пул с именем роли.
+
+        Живой прогон #43 (warehouse r1): состав посадил «Водителя» дорожкой в
+        «Перевозчика», узкий вопрос про недостающего участника вернул
+        «Водителя» с его шагами, контур завёл из этого пул «Водитель»,
+        «Перевозчик» остался без действий, и `_drop_vacant_pools` удалил
+        названного в описании контрагента. Шаги уходят в пул-хозяин дорожки.
+        """
+        plan = {"participants": ["Склад", "Перевозчик"],
+                "lanes": [{"id": "L_d", "name": "Водитель",
+                           "participant": "Перевозчик"}],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                     "participant": "Склад", "lane": ""},
+                    {"id": "A1", "kind": "userTask", "name": "Собрать груз",
+                     "participant": "Склад", "lane": ""},
+                    {"id": "A2", "kind": "userTask", "name": "Оформить бумаги",
+                     "participant": "Склад", "lane": ""},
+                    {"id": "A3", "kind": "userTask", "name": "Привезти машину",
+                     "participant": "Склад", "lane": ""},
+                    {"id": "E1", "kind": "endEvent", "name": "Готово",
+                     "participant": "Склад", "lane": ""}],
+                "flows": [{"id": "F1", "source": "S1", "target": "A1"},
+                          {"id": "F2", "source": "A1", "target": "A2"},
+                          {"id": "F3", "source": "A2", "target": "A3"},
+                          {"id": "F4", "source": "A3", "target": "E1"}]}
+        fenced = _fence(plan)
+        FakeLLM(monkeypatch, fenced, fenced,
+                '{"missing": [{"pool": "Водитель", "external": true,'
+                ' "steps": ["A3"]}]}')
+        result = BPMNGenerator().generate(
+            "Склад собирает груз, оформляет бумаги и вызывает водителя, "
+            "водитель привозит машину от перевозчика, склад закрывает заявку.")
+
+        assert _note(result["notes"], "состав уже назвал его ролью")
+        pools = [p["name"] if isinstance(p, dict) else p
+                 for p in result["structure"]["participants"]]
+        assert "Водитель" not in pools
+        assert "Перевозчик" in pools, result["notes"]
+        step = next(e for e in result["structure"]["elements"]
+                    if e["id"] == "A3")
+        assert step["participant"] == "Перевозчик"
+        lanes = {lane["id"]: lane["participant"]
+                 for lane in result["structure"]["lanes"]}
+        assert lanes.get(step["lane"]) == "Перевозчик"
+
     def test_vacant_pool_absent_from_text_is_not_a_role_candidate(
             self, monkeypatch):
         """Пустой пул, которого в описании нет, — выдумка, и сворачивать её в

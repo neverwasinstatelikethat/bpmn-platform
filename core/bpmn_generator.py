@@ -1028,6 +1028,21 @@ class BPMNGenerator:
 
         candidates = {_norm_name(p): p for p in role_pools}
         organizations = {_norm_name(p) for p in pools}
+
+        def _role_names() -> Set[str]:
+            """Имена, которые план уже знает как роли: дорожки и участники с
+            `inside`/`external: false`. Считается заново на каждый ответ,
+            потому что ролью что-то становится и здесь же."""
+            names = {_norm_name(_raw_text(lane.get("name")))
+                     for lane in _raw_dicts(structure.get("lanes"))}
+            for item in (structure.get("participants") or []):
+                if isinstance(item, dict) and (
+                        item.get("external") is False
+                        or _raw_text(item.get("inside"))):
+                    names.add(_norm_name(_raw_text(item.get("name"))))
+            names.discard("")
+            return names
+
         declared_roles = data.get("roles")
         for role in (declared_roles if isinstance(declared_roles, list)
                     else [])[:MAX_PATCH_MOVES]:
@@ -1056,6 +1071,18 @@ class BPMNGenerator:
                     notes.append(f"роль «{pool}» не объявлена: «{inside}» — "
                                  "родовое слово, а не название организации из "
                                  "описания")
+                    continue
+                if _norm_name(inside) in _role_names():
+                    # «Водитель» — тоже сотрудник, а не организация. По одному
+                    # лишь слову «имя звучит в описании» этот ответ заводил пул
+                    # «водитель» и отправлял в него «Перевозчика» дорожкой:
+                    # организация уезжала к своему же сотруднику (тот же дефект,
+                    # что и угаданный хозяин в прогоне #37). Хозяином может быть
+                    # только то, что план знает как пул; ответ с ролью остаётся
+                    # нарушением, а не тихой инверсией состава.
+                    notes.append(f"роль «{pool}» не объявлена: «{inside}» — тоже "
+                                 "роль, а не организация: хозяином может быть "
+                                 "только пул")
                     continue
                 if not _mentioned(inside, _text_words(text)):
                     notes.append(f"роль «{pool}» не объявлена: организации "
@@ -1118,6 +1145,23 @@ class BPMNGenerator:
             if not claimed:
                 notes.append(f"участник «{pool}» не добавлен: его шагов в плане "
                              "модель не назвала")
+                continue
+            lane = _lane_by_ref(pool, _raw_dicts(structure.get("lanes")))
+            if lane is not None:
+                # Ответ назвал ролью то, что состав уже посадил в чужой пул
+                # дорожкой: «Водитель» — дорожка «Перевозчика». Пул с именем
+                # роли оставил бы хозяина без единого шага, и `_drop_vacant_pools`
+                # убрал бы названного в описании контрагента со схемы (прогон
+                # #43, warehouse r1: «Пул „Перевозчик" удалён» → нет
+                # `expected_participants`). Шаги уходят в пул-хозяин этой
+                # дорожкой: и участник на схеме, и роль не раздута в пул.
+                for elem in claimed:
+                    elem["participant"] = lane["participant"]
+                    elem["lane"] = lane["id"]
+                notes.append(
+                    f"шаги «{pool}» записаны в пул «{lane['participant']}» "
+                    f"дорожкой «{pool}»: состав уже назвал его ролью, а не "
+                    "участником")
                 continue
             inside = _raw_text(item.get("inside"))
             as_role = item.get("external") is False and bool(inside)

@@ -30,7 +30,8 @@ class TestDetector:
     def test_every_prompt_example_is_parsed(self):
         samples = {s["id"]: s for s in provenance.examples()}
         assert set(samples) == {"generation_plan", "improve_package",
-                                "roster_composition", "retry_patch"}
+                                "roster_composition", "retry_patch",
+                                "flow_route_rules"}
         assert samples["generation_plan"]["payload"]["participants"]
         assert samples["improve_package"]["payload"]["operations"]
         # Имена образца — то, что модель способна переписать дословно.
@@ -70,6 +71,19 @@ class TestDetector:
                 if f["example"] == "roster_composition"]
         assert [f["value"] for f in hits] == ["Перевозчик"], hits
 
+    def test_flow_prompt_naming_an_expected_pool_is_caught(self, monkeypatch):
+        """Правила стадии маршрута модель читает целиком — имя из ответа сцены
+        в них работает так же, как в промпте состава: правка «ждать — не значит
+        делать» обязана проверяться на утечку, а не проверять её глазами."""
+        monkeypatch.setattr(bpmn_generator, "_FLOW_SYSTEM_PROMPT",
+                            bpmn_generator._FLOW_SYSTEM_PROMPT
+                            + '\nпример: «перевозчик»')
+        report = provenance.audit(
+            [s for s in all_scenarios() if s.id == "warehouse_delivery"], [])
+        hits = [f for f in report["findings"]
+                if f["example"] == "flow_route_rules"]
+        assert [f["value"] for f in hits] == ["Перевозчик"], hits
+
     def test_lost_marker_blinds_the_audit_loudly(self, monkeypatch):
         """Промпт без маркера образца — не «пересечений нет», а «проверять
         нечего»: харнесс обязан сказать об этом прямо."""
@@ -91,11 +105,13 @@ class TestDetector:
             provenance.examples())
         hit = [f for f in findings
                if f["kind"] == "требование скопировать имя пула"]
-        # «Цех фасовки» — организатор и в плане-образце, и в правиле состава:
-        # оба промпта дают модели это имя, и оба обязаны попасть в находки.
+        # «Цех фасовки» — организатор и в плане-образце, и в правиле состава, и
+        # в правиле стадии маршрута (оно читается моделью целиком и включает
+        # промпт генерации): все три поверхности обязаны попасть в находки.
         assert {f["value"] for f in hit} == {"Цех фасовки"}
         assert {f["example"] for f in hit} == {"generation_plan",
-                                               "roster_composition"}
+                                              "roster_composition",
+                                              "flow_route_rules"}
 
     def test_short_pool_name_is_checked_without_word_length_floor(self):
         """WMS короче словарного порога `words`, но именем пула быть может."""

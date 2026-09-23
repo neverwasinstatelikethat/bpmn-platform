@@ -45,6 +45,9 @@ ROSTER_EXAMPLE_HEAD = "Пример («"
 # «Перевозчик» и «Водитель» в этой схеме были ответом сцены warehouse_delivery,
 # и `expected_participants` мерил копирование, а не контур.
 RETRY_ID = "retry_patch"
+# Стадия маршрута: правила модель читает целиком, новых имён в них быть не
+# должно — отсюда пятый образец проверки.
+FLOW_ID = "flow_route_rules"
 
 
 def words(text: Any) -> Set[str]:
@@ -165,6 +168,18 @@ def examples() -> List[Dict[str, Any]]:
         "payload": retry_payload,
         "names": _payload_names(retry_payload),
     })
+    # Промпт стадии маршрута: примера ответа в нём нет, но правила модель
+    # читает целиком — имя участника, напечатанное в правиле, работает как
+    # подсказка ответа (так уже ловился промпт состава).
+    flow_prompt = str(bpmn_generator._FLOW_SYSTEM_PROMPT)
+    found.append({
+        "id": FLOW_ID,
+        "where": "core.bpmn_generator._FLOW_SYSTEM_PROMPT",
+        "text": flow_prompt,
+        "payload": None,
+        "names": set(),
+        "rules_only": True,
+    })
     return found
 
 
@@ -197,10 +212,22 @@ def scenario_findings(scenario: Scenario,
     out: List[Dict[str, Any]] = []
     by_id = {e["id"]: e for e in samples}
     composition = [by_id.get("generation_plan"), by_id.get(ROSTER_ID),
-                   by_id.get(RETRY_ID)]
+                   by_id.get(RETRY_ID), by_id.get(FLOW_ID)]
 
     for gen in composition:
         if gen is None:
+            continue
+        # Правила промпта — не образец ответа: их лексика обязана пересекаться
+        # с любым описанием процесса («шлюз», «шаг», «заявка»), и считать там
+        # долю совпавших слов — ловить словарь вместо утечки. Из правил копируется
+        # одно имя, его и проверяет `mentions`; текст описания и дальше
+        # сверяется с образцами ответов.
+        if gen.get("rules_only"):
+            for participant in scenario.expected_participants:
+                if mentions(participant, gen["text"]):
+                    out.append(_finding(
+                        scenario.id, "требование скопировать имя пула",
+                        gen["id"], str(participant), 1.0))
             continue
         ratio = containment(words(scenario.text), words(gen["text"]))
         if ratio >= TEXT_CONTAINMENT:

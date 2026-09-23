@@ -1095,6 +1095,25 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                                f"«{index.participant_name(process)}»: шаг "
                                "ляжет в неё")
     if process is None:
+        # Пул нового узла читается из уже названной им привязки, а не угадывается
+        # по смыслу: хозяин по `attachedToRef` живёт в том же процессе, что и
+        # событие (этого требует BPMN, а не наша догадка), а вставка `after`
+        # обязана остаться в пуле своего соседа (её наружу переносит отдельная
+        # проверка ниже). Без этого отказа пакет терял ветку целиком: прогон #45
+        # — `add_boundary_event` без `participant` отсечён, следом «цель исхода
+        # не найдена» у `add_task` и «источник не найден» у `connect`,
+        # SLA-таймер до схемы не доехал.
+        #
+        # По `after` наследуем только когда пула в операции нет вовсе: названный,
+        # но неизвестный участник — не недостающая деталь, а заявка на нового
+        # участника, и молча переложить его в пул соседа значит лишить модель
+        # подсказки, из какого пула взять имя или как его завести.
+        anchor = index.elements.get(str(op.get("attached_to") or "").strip())
+        if anchor is None and not alias:
+            anchor = index.elements.get(str(op.get("after") or "").strip())
+        if anchor is not None:
+            process = index.enclosing_process(anchor)
+    if process is None:
         raise _pool_skip(index, op.get("participant"))
     if lane_key:
         # Дорожку валидируем до создания узла: отказ в середине оставил бы

@@ -565,6 +565,26 @@ class TestBoundaryEvent:
         # событие живёт в том же процессе, что и задача
         assert "new_BE_timeout" in [c.get("id") for c in _process(_root(out), "Process_order")]
 
+    def test_boundary_event_without_participant_inherits_its_hosts_pool(
+            self, two_pool_xml):
+        """Хозяин по `attachedToRef` и есть пул события: в коллаборации из двух
+        пулов отказ «пул не определён» уносил не только событие, но и всю ветку
+        его обработки (прогон #45: `add_task` → «цель исхода не найдена»,
+        `connect` → «источник не найден», SLA-таймер до схемы не доехал)."""
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_sla", "attached_to":
+             "S_accept", "event_type": "timer", "name": "Просрочка приёмки"},
+            {"op": "add_task", "id": "new_escalate", "name": "Эскалация",
+             "task_type": "userTask", "after": "new_sla"},
+            {"op": "connect", "source": "new_escalate", "target": "S_end"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        shop = _process(_root(out), "Process_shop")
+        client = _process(_root(out), "Process_client")
+        assert "new_sla" in [c.get("id") for c in shop]
+        assert "new_escalate" in [c.get("id") for c in shop]
+        assert "new_sla" not in [c.get("id") for c in client]
+
     def test_error_boundary_event_keeps_the_inventory_consistent(self, single_pool_xml):
         out, report = apply_operations(single_pool_xml, [{
             "op": "add_boundary_event", "id": "new_BE_fail", "attached_to": "T_ship",

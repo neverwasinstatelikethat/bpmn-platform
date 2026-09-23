@@ -414,6 +414,36 @@ def test_regression_detector_skips_unmeasured_metrics():
                             {"pass@1/has_timer": 0.4}) == []
 
 
+def test_a_throttled_live_run_says_it_is_not_comparable():
+    """Прогон, где провайдер отбил часть кейсов 429, меняет выборку, а не
+    качество: доли инвариантов считаются по уцелевшим, и без этой строки
+    «has_timer 0.667 → 1.0» читается как улучшение (прогон #54 — 5 кейсов из 24)."""
+    from types import SimpleNamespace as NS
+    cases = [NS(ok=True, scenario="warehouse_delivery", repeat=0),
+             NS(ok=False, scenario="vehicle_reservation", repeat=1),
+             NS(ok=False, scenario="support_ticket", repeat=2)]
+    note = harness.coverage_note(cases, "live")
+    assert "собрано 1 схем из 3" in note
+    assert "vehicle_reservation r1" in note
+    assert "не пара ни одному предыдущему" in note
+    assert harness.coverage_note(cases, "replay") == ""
+    assert harness.coverage_note(cases[:1], "live") == ""
+
+
+def test_replay_run_reports_no_coverage_warning(tmp_path):
+    """В replay транспорт не участвует — пустая строка обязана оставаться
+    пустой, иначе предупреждение обесценится."""
+    report = harness.run(mode="replay", scenarios_spec="support_ticket")
+    assert report.coverage_note == ""
+    text = harness.render_table(report)
+    assert "ПОЛНОТА ПРОГОНА" not in text
+    lost = report.cases[0]
+    report.cases = [harness.GenCase(**{**lost.__dict__, "ok": False,
+                                       "error": "429"})]
+    report.coverage_note = harness.coverage_note(report.cases, "live")
+    assert "ПОЛНОТА ПРОГОНА" in harness.render_table(report)
+
+
 def test_dump_schemes_writes_readable_names_with_the_verdict(tmp_path):
     report = harness.run(mode="replay", scenarios_spec="support_ticket")
     written = harness.dump_schemes(report, tmp_path / "схемы")

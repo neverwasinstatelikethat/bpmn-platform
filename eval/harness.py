@@ -668,6 +668,26 @@ def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
     return suite
 
 
+def coverage_note(cases: Sequence["GenCase"], mode: str) -> str:
+    """Почему прогон с отбраковкой кейсов нельзя сравнивать с предыдущим.
+
+    Живые прогоны #53/#54 теряли кейсы на 429 провайдера: доли инвариантов при
+    этом считаются по уцелевшим 19 из 24, и «has_timer 0.667 → 1.0» оказывается
+    не улучшением, а сменой выборки. Метаданные прогона обязаны говорить это
+    сами, иначе разбор начнётся с вывода, которого в данных нет.
+    """
+    if mode != "live" or not cases:
+        return ""
+    lost = [c for c in cases if not c.ok]
+    if not lost:
+        return ""
+    scenes = ", ".join(sorted({f"{c.scenario} r{c.repeat}" for c in lost})[:6])
+    return (f"собрано {len(cases) - len(lost)} схем из {len(cases)}: "
+            f"{len(lost)} не сгенерированы ({scenes}). Все доли посчитаны по "
+            "уцелевшим кейсам — этот прогон не пара ни одному предыдущему, "
+            "сверяйте с ним только число несобранных схем")
+
+
 def build_improvement_suite() -> metrics.EvaluationSuite:
     """Метрики улучшения: доля применённых операций, потребность в повторе,
     дельта балла и сохранность инвариантов после применения."""
@@ -739,6 +759,7 @@ class RunReport:
     regressions: List[metrics.Regression]
     baseline_path: str = ""
     baseline_note: str = ""
+    coverage_note: str = ""
     provenance: Dict[str, Any] = field(default_factory=dict)
 
     def metrics_flat(self) -> Dict[str, Optional[float]]:
@@ -779,6 +800,7 @@ class RunReport:
             "spread": self.spread,
             "baseline": self.baseline_path,
             "baseline_note": self.baseline_note,
+            "coverage_note": self.coverage_note,
             "regressions": [r.as_dict() for r in self.regressions],
             "provenance": self.provenance,
             "cases": [c.as_dict() for c in self.cases],
@@ -874,6 +896,10 @@ def render_table(report: RunReport) -> str:
         lines += ["  " + line
                   for line in provenance.format_findings(report.provenance)]
     lines.append("")
+    if report.coverage_note:
+        lines.append("ПОЛНОТА ПРОГОНА")
+        lines.append("  " + report.coverage_note)
+        lines.append("")
     if report.regressions:
         lines.append("РЕГРЕССИИ ОТНОСИТЕЛЬНО BASELINE")
         lines += ["  " + r.describe() for r in report.regressions]
@@ -989,7 +1015,8 @@ def run(mode: str = "replay", scenarios_spec: str = "all", repeat: int = 1,
         generation=generation, improvement=improvement,
         spread=spread_stats(gen_cases), regressions=[],
         provenance=provenance.audit(chosen, fixtures),
-        baseline_path=str(baseline_path) if baseline_path else "")
+        baseline_path=str(baseline_path) if baseline_path else "",
+        coverage_note=coverage_note(gen_cases, mode))
     baseline = load_baseline(baseline_path)
     if baseline:
         base_mode = str(baseline.get("mode") or "")

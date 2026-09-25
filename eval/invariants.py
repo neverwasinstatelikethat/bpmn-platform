@@ -75,6 +75,7 @@ NOTATION_INVARIANTS: Tuple[str, ...] = (
     "flows_within_pool",
     "message_flow_ends",
     "no_unrouted",
+    "loops_have_a_guard",
 )
 # Бизнес-слой: узкие места процесса, а не нотации. Пересказывают `BUSINESS_RULES`
 # скоринга средствами графа и ничего у него не берут.
@@ -824,6 +825,86 @@ BLOCKING_CATCH_KINDS = {"intermediateCatchEvent", "receiveTask"}
 NOT_A_WAIT_DEFINITIONS = frozenset({"link", "compensate"})
 
 
+def _sequence_cycles(g: _Graph) -> List[List[str]]:
+    """Циклы маршрута токена: обход в глубину по `seq_out` с путём-стеком.
+
+    Нога, ведущая в узел текущего пути, замыкает цикл: его участники — участок
+    пути от этого узла до вершины стека. Таких обратных ног не больше числа
+    потоков, поэтому перебор ограничен и на схеме из десятков «ромбов» не
+    взрывается.
+    """
+    cycles: List[List[str]] = []
+    state: Dict[str, int] = {}
+    for root in sorted(g.seq_out):
+        if state.get(root):
+            continue
+        state[root] = 1
+        stack: List[Tuple[str, int]] = [(root, 0)]
+        path: List[str] = [root]
+        while stack:
+            node, idx = stack[-1]
+            legs = [e.target for e in g.seq_out.get(node, []) if e.target]
+            if idx >= len(legs):
+                state[node] = 2
+                stack.pop()
+                path.pop()
+                continue
+            stack[-1] = (node, idx + 1)
+            nxt = legs[idx]
+            if state.get(nxt) == 1:
+                cycles.append(path[path.index(nxt):] + [nxt])
+            elif not state.get(nxt):
+                state[nxt] = 1
+                stack.append((nxt, 0))
+                path.append(nxt)
+    return cycles
+
+
+def _loop_guarded(g: _Graph, cycle: List[str]) -> bool:
+    """Из цикла есть выход, названный развилкой: его участник —
+    `exclusiveGateway` минимум с двумя ногами.
+
+    Ветка «повторить / уйти» и есть критерий выхода; без неё токен возвращается
+    всегда, и процесс повторяет работу, пока кто-то не вмешается извне. Подпись
+    дуги здесь сознательно не считается: её наличие спрашивает
+    `no_blind_rework`, а тут спрашивается механизм ветвления.
+    """
+    for node_id in set(cycle):
+        node = g.by_id.get(node_id)
+        if node is None or node.kind != "exclusiveGateway":
+            continue
+        if len({e.target for e in g.seq_out.get(node_id, []) if e.target}) >= 2:
+            return True
+    return False
+
+
+def _check_loops_have_a_guard(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Ни один цикл маршрута не должен быть безусловным.
+
+    Зеркало правила `guarded_cycles` (28 схем корпуса из 367 нарушают, а
+    независимой проверки у класса не было). Читательский путь другой: оракул
+    идёт по `seq_out` своего `_Graph` и берёт `kind` узла, тогда как линейка
+    перебирает теги `out_targets` над `_Schema`. Порог и признак совпадают
+    намеренно — расхождение в одном бизнес-вопросе означало бы, что продукт
+    меряет себя сам.
+    """
+    cycles = _sequence_cycles(g)
+    if not cycles:
+        return _na("loops_have_a_guard", "циклов в маршруте нет")
+    bare = [c for c in cycles if not _loop_guarded(g, c)]
+    if not bare:
+        return _pass("loops_have_a_guard",
+                     f"циклов: {len(cycles)}, у каждого внутри есть развилка "
+                     "минимум с двумя ногами")
+    ids = list(dict.fromkeys(node for cycle in bare for node in cycle))
+    return _fail("loops_have_a_guard",
+                 f"повтор без критерия выхода у {len(ids)} узлов: "
+                 + ", ".join(f"'{i}'" for i in ids[:8])
+                 + (f" … и ещё {len(ids) - 8}" if len(ids) > 8 else "")
+                 + " — из цикла нет развилки, по которой процесс мог бы его "
+                   "покинуть", ids)
+
+
 def _reachable(g: _Graph, start: str, skip: Optional[_Edge] = None) -> set:
     """Узлы, куда токен доходит из `start` по sequence-потокам (включая сам
     start; `skip` — дуга, которую считать нельзя, чтобы не замкнуть путь её же
@@ -1371,6 +1452,7 @@ def _run_checks(g: _Graph, expectations: Mapping[str, Any]) -> Dict[str, Check]:
         "flows_within_pool": _check_flows_within_pool(g, expectations),
         "message_flow_ends": _check_message_flow_ends(g, expectations),
         "no_unrouted": _check_no_unrouted(g, expectations),
+        "loops_have_a_guard": _check_loops_have_a_guard(g, expectations),
         "no_blind_rework": _check_no_blind_rework(g, expectations),
         "pools_not_pingpong": _check_pools_not_pingpong(g, expectations),
         "no_overloaded_lane": _check_no_overloaded_lane(g, expectations),

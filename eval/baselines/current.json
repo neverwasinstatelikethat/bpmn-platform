@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-09-25T17:43:47",
+ "generated_at": "2026-09-25T18:07:21",
  "mode": "replay",
  "repeat": 1,
  "scenarios": [
@@ -25,6 +25,7 @@
   "pass@1/flows_within_pool": "higher",
   "pass@1/message_flow_ends": "higher",
   "pass@1/no_unrouted": "higher",
+  "pass@1/loops_have_a_guard": "higher",
   "pass@1/no_blind_rework": "higher",
   "pass@1/pools_not_pingpong": "higher",
   "pass@1/no_overloaded_lane": "higher",
@@ -81,6 +82,7 @@
   "pass@1/flows_within_pool": 1.0,
   "pass@1/message_flow_ends": 1.0,
   "pass@1/no_unrouted": 1.0,
+  "pass@1/loops_have_a_guard": 1.0,
   "pass@1/no_blind_rework": 1.0,
   "pass@1/pools_not_pingpong": 0.875,
   "pass@1/no_overloaded_lane": 0.9090909090909091,
@@ -163,6 +165,7 @@
    "gateway_split_join",
    "has_branching",
    "has_timer",
+   "loops_have_a_guard",
    "message_flow_ends",
    "min_steps",
    "no_blind_rework",

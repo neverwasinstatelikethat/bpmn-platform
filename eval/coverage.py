@@ -66,6 +66,9 @@ NOTATION_PAIRS: Mapping[str, str] = {
     "cross_pool_flow": "flows_within_pool",
     "message_flow_ends": "message_flow_ends",
     "flow_ends_legal": "flow_ends_legal",
+    # Безусловный цикл: линейка перебирает теги `out_targets` над `_Schema`,
+    # оракул идёт по `seq_out` своего `_Graph` и берёт `kind` узла.
+    "guarded_cycles": "loops_have_a_guard",
 }
 
 

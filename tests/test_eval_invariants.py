@@ -1272,3 +1272,63 @@ class TestSignoffChainNeedsAGate:
         legal = _signoff_doc(4, gateway_after=2)
         assert status_of(legal, "approval_chain") == "passed"
         assert check_xml(legal)["signoffs_need_a_gate"].ok
+
+
+class TestLoopsHaveAGuard:
+    """Безусловный цикл — повтор без критерия выхода: токен возвращается всегда.
+
+    Зеркало правила `guarded_cycles` (28 схем корпуса его нарушают). Тесты на
+    синтетике обязательны: на eval-наборе класс не встречается, поэтому
+    «строгий оракул» был бы неотличим от «оракул, который перестал смотреть туда,
+    где должен».
+    """
+
+    LOOP_NO_GATE = ('<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "A1")
+                    + '<userTask id="A1" name="Доработать"/>' + _flow("f1", "A1", "A2")
+                    + '<userTask id="A2" name="Проверить"/>' + _flow("f2", "A2", "A1")
+                    + _flow("f3", "A2", "E")
+                    + '<endEvent id="E" name="Готово"/>')
+    LOOP_WITH_GATE = ('<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "A1")
+                      + '<userTask id="A1" name="Доработать"/>'
+                      + _flow("f1", "A1", "G1")
+                      + '<exclusiveGateway id="G1" name="Принято?"/>'
+                      + _flow("f2", "G1", "A2", condition="нет")
+                      + _flow("f3", "G1", "E", condition="да")
+                      + '<userTask id="A2" name="Замечания"/>' + _flow("f4", "A2", "A1")
+                      + '<endEvent id="E" name="Готово"/>')
+
+    def test_cycle_without_a_gateway_is_charged(self):
+        check = check_xml(_doc(self.LOOP_NO_GATE))["loops_have_a_guard"]
+        assert check.applicable and not check.ok
+        assert set(check.ids) == {"A1", "A2"}
+
+    def test_an_exclusive_gateway_inside_the_loop_clears_it(self):
+        """Ветка «повторить или уйти» и есть критерий выхода."""
+        check = check_xml(_doc(self.LOOP_WITH_GATE))["loops_have_a_guard"]
+        assert check.applicable and check.ok
+
+    def test_a_gateway_outside_the_loop_is_not_a_guard(self):
+        """Из развилки, оставшейся за циклом, наружу не выйти: обход
+        `A1 → A2 → A1` от неё не зависит."""
+        xml = ('<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "G0")
+               + '<exclusiveGateway id="G0" name="Есть работа?"/>'
+               + _flow("f1", "G0", "A1", condition="да")
+               + _flow("f2", "G0", "E", condition="нет")
+               + '<userTask id="A1" name="Доработать"/>' + _flow("f3", "A1", "A2")
+               + '<userTask id="A2" name="Проверить"/>' + _flow("f4", "A2", "A1")
+               + '<endEvent id="E" name="Готово"/>')
+        check = check_xml(_doc(xml))["loops_have_a_guard"]
+        assert check.applicable and not check.ok
+        assert set(check.ids) == {"A1", "A2"}
+
+    def test_scheme_without_a_cycle_is_not_applicable(self):
+        xml = ('<startEvent id="S" name="Начало"/>' + _flow("f1", "S", "A")
+               + '<userTask id="A" name="Шаг"/>' + _flow("f2", "A", "E")
+               + '<endEvent id="E" name="Готово"/>')
+        assert check_xml(_doc(xml))["loops_have_a_guard"].applicable is False
+
+    def test_scorer_and_oracle_charge_the_same_class(self):
+        assert status_of(_doc(self.LOOP_NO_GATE), "guarded_cycles") == "failed"
+        assert not check_xml(_doc(self.LOOP_NO_GATE))["loops_have_a_guard"].ok
+        assert status_of(_doc(self.LOOP_WITH_GATE), "guarded_cycles") == "passed"
+        assert check_xml(_doc(self.LOOP_WITH_GATE))["loops_have_a_guard"].ok

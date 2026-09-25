@@ -202,9 +202,11 @@ def test_unattached_boundary_and_open_split_are_detected():
     # сравнивать — это «не применимо», а не «пройдено». Два правых имени — те же
     # причины: узлы лежат в одном пуле, а потоков сообщения в плане нет.
     # `signoffs_need_a_gate` — потому что ручных шагов три, а цепочка
-    # согласований начинается с четырёх.
+    # согласований начинается с четырёх; `loops_have_a_guard` — потому что
+    # замкнутого обхода в этом маршруте нет.
     assert summarize(results)["not_applicable"] == [
-        "flows_within_pool", "message_flow_ends", "no_blind_rework",
+        "flows_within_pool", "loops_have_a_guard", "message_flow_ends",
+        "no_blind_rework",
         "no_overloaded_lane", "pools_not_pingpong", "roles_as_lanes",
         "signoffs_need_a_gate", "timer_schedule", "waits_have_sla"]
 

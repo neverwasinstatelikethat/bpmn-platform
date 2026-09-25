@@ -37,7 +37,12 @@ from eval.scenarios import SCENARIOS
 
 FIXTURES = Path(invariants.__file__).resolve().parent / "fixtures"
 NEW_INVARIANTS = ("no_blind_rework", "pools_not_pingpong", "no_overloaded_lane",
-                  "waits_have_sla")
+                  "waits_have_sla",
+                  # Два класса, добавленных поздними проходами: согласование без
+                  # развилки и безусловный цикл. Свидетели по набору — в
+                  # `EXPECTED_NEW_FAILURES`; без них инвариант был бы незаметен
+                  # так же, как `approval_chain` был незаметен до своего зеркала.
+                  "signoffs_need_a_gate", "loops_have_a_guard")
 
 scorer = BPMNScorer()
 
@@ -844,6 +849,8 @@ EXPECTED_DISAGREEMENTS = {
     "production_incident.bad.plan": {},
     "production_incident.good.improve": {},
     "production_incident.good.plan": {},
+    "purchase_approval.signoffs.bad.plan": {},
+    "purchase_approval.signoffs.good.improve": {},
     "purchase_approval.bad.plan": {},
     "purchase_approval.good.plan": {},
     "support_ticket.good.plan": {},
@@ -865,6 +872,10 @@ EXPECTED_NEW_FAILURES = {
     "warehouse_delivery.good.plan": ["waits_have_sla"],
     "warehouse_delivery.live.improve": ["waits_have_sla"],
     "warehouse_delivery.live.plan": ["waits_have_sla"],
+    # Единственный свидетель класса «согласования без развилки» в наборе: без
+    # этой фикстуры `signoffs_need_a_gate` был бы проверкой, которая на eval-данных
+    # не звенит никогда.
+    "purchase_approval.signoffs.bad.plan": ["signoffs_need_a_gate"],
 }
 
 

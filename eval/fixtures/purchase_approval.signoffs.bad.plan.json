@@ -1,0 +1,208 @@
+{
+  "id": "purchase_approval.signoffs.bad.plan",
+  "kind": "plan",
+  "scenario": "purchase_approval",
+  "label": "пять подписей подряд у одного исполнителя и ни одной развилки по сумме",
+  "quality": "bad",
+  "provenance": "Синтетический «плохой» ответ модели по мотивам корпуса: так выглядят 37 нарушителей `approval_chain` из 367 рукописных схем — согласования идут подряд по одной дорожке, развилки в процессе нет. Отличие от `purchase_approval.bad.plan` в маршруте, а не в составе: там ветвление есть, и метрики бизнес-слоя (`business/smells`, `improve/business_repaired_share`) класс согласований не считывали. Остальное в фикстуре на месте: два пула, шаги у обоих, обмен сообщениями, старт и финиш у каждого пула.",
+  "plan": {
+    "participants": [
+      "ВкусВилл",
+      "Поставщик"
+    ],
+    "lanes": [
+      {
+        "id": "L_buy",
+        "name": "Менеджер закупочного отдела",
+        "participant": "ВкусВилл"
+      },
+      {
+        "id": "L_store",
+        "name": "Кладовщик",
+        "participant": "ВкусВилл"
+      }
+    ],
+    "elements": [
+      {
+        "id": "S1",
+        "kind": "startEvent",
+        "name": "Потребность в закупке",
+        "participant": "ВкусВилл",
+        "lane": "L_buy"
+      },
+      {
+        "id": "A1",
+        "kind": "userTask",
+        "name": "Завести заявку",
+        "participant": "ВкусВилл",
+        "lane": "L_buy"
+      },
+      {
+        "id": "A2",
+        "kind": "userTask",
+        "name": "Проверить комплектность",
+        "participant": "ВкусВилл",
+        "lane": "L_buy"
+      },
+      {
+        "id": "A3",
+        "kind": "userTask",
+        "name": "Согласовать с руководителем направления",
+        "participant": "ВкусВилл",
+        "lane": "L_buy"
+      },
+      {
+        "id": "A4",
+        "kind": "userTask",
+        "name": "Согласовать с финансовым директором",
+        "participant": "ВкусВилл",
+        "lane": "L_buy"
+      },
+      {
+        "id": "A5",
+        "kind": "userTask",
+        "name": "Оформить контракт",
+        "participant": "ВкусВилл",
+        "lane": "L_buy"
+      },
+      {
+        "id": "A6",
+        "kind": "userTask",
+        "name": "Принять товар на склад",
+        "participant": "ВкусВилл",
+        "lane": "L_store"
+      },
+      {
+        "id": "A7",
+        "kind": "manualTask",
+        "name": "Архивировать документы",
+        "participant": "ВкусВилл",
+        "lane": "L_store"
+      },
+      {
+        "id": "E1",
+        "kind": "endEvent",
+        "name": "Закупка закрыта",
+        "participant": "ВкусВилл",
+        "lane": "L_store"
+      },
+      {
+        "id": "S2",
+        "kind": "startEvent",
+        "name": "Контракт на поставку получен",
+        "participant": "Поставщик"
+      },
+      {
+        "id": "B1",
+        "kind": "userTask",
+        "name": "Согласовать спецификацию",
+        "participant": "Поставщик"
+      },
+      {
+        "id": "B2",
+        "kind": "userTask",
+        "name": "Отгрузить товар",
+        "participant": "Поставщик"
+      },
+      {
+        "id": "E2",
+        "kind": "endEvent",
+        "name": "Поставка завершена",
+        "participant": "Поставщик"
+      }
+    ],
+    "flows": [
+      {
+        "id": "F1",
+        "source": "S1",
+        "target": "A1",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F2",
+        "source": "A1",
+        "target": "A2",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F3",
+        "source": "A2",
+        "target": "A3",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F4",
+        "source": "A3",
+        "target": "A4",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F5",
+        "source": "A4",
+        "target": "A5",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F6",
+        "source": "A5",
+        "target": "A6",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F7",
+        "source": "A6",
+        "target": "A7",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F8",
+        "source": "A7",
+        "target": "E1",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F9",
+        "source": "S2",
+        "target": "B1",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F10",
+        "source": "B1",
+        "target": "B2",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "F11",
+        "source": "B2",
+        "target": "E2",
+        "kind": "sequence",
+        "condition": ""
+      },
+      {
+        "id": "M1",
+        "source": "A5",
+        "target": "B1",
+        "kind": "message",
+        "condition": ""
+      },
+      {
+        "id": "M2",
+        "source": "B2",
+        "target": "A6",
+        "kind": "message",
+        "condition": ""
+      }
+    ]
+  }
+}

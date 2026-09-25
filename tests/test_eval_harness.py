@@ -44,6 +44,7 @@ EXPECTED_RAW_FAILS = {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
         "event_definitions", "has_branching", "no_unrouted",
         "flows_within_pool"},
+    "purchase_approval.signoffs.bad.plan": {"has_branching"},
     "purchase_approval.bad.plan": {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
         "gateway_conditions_or_default", "no_unrouted"},

@@ -15,6 +15,7 @@
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,7 @@ EXPECTED_RAW_FAILS = {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
         "event_definitions", "has_branching", "no_unrouted",
         "flows_within_pool"},
+    "purchase_approval.loop.bad.plan": {"has_branching", "loops_have_a_guard"},
     "purchase_approval.signoffs.bad.plan": {"has_branching"},
     "purchase_approval.bad.plan": {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
@@ -1291,13 +1293,71 @@ def test_cli_unknown_scenario_returns_two(capsys):
 
 
 def test_live_mode_without_credentials_fails_honestly(monkeypatch, capsys):
+    from eval import run as run_module
+
     monkeypatch.delenv("GIGACHAT_CREDENTIALS", raising=False)
     with pytest.raises(harness.HarnessError):
         harness.require_live_credentials()
-    code = cli(["--mode", "live", "--scenarios", "product_return",
-                        "--no-report"])
-    assert code == 2
+    # Локальный `.env` не должен оживать в этом тесте: здесь проверяется именно
+    # отсутствие ключей, а не то, что у разработчика лежит в рабочей копии.
+    monkeypatch.setattr(run_module, "_load_env_file", lambda *a, **k: None)
+    assert run_module.main(["--mode", "live", "--scenarios", "product_return",
+                            "--no-report"]) == 2
     assert "GIGACHAT_CREDENTIALS" in capsys.readouterr().err
+
+
+def test_live_mode_reads_keys_from_the_env_file(monkeypatch, tmp_path, capsys):
+    """Ключи из `.env` подхватываются для live — иначе живой прогон из чистой
+    оболочки падал с кодом 2, хотя ключи лежат в файле рядом с репозиторием.
+    Проверка на временном файле: содержимое настоящего `.env` в тесте не нужно.
+
+    Транспорт подменён, потому что проверяется проводка ключей до обращения к
+    провайдеру: живой вызов из юнит-теста просит сеть и живую учётку.
+    """
+    from eval import run as run_module
+
+    monkeypatch.delenv("GIGACHAT_CREDENTIALS", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("GIGACHAT_CREDENTIALS=клиент:секрет\n",
+                        encoding="utf-8")
+    asked = []
+
+    def _fake_run(**kwargs):
+        asked.append(os.environ.get("GIGACHAT_CREDENTIALS"))
+        raise run_module.HarnessError("проверяется проводка, а не транспорт")
+
+    monkeypatch.setattr(run_module.harness, "run", _fake_run)
+    monkeypatch.setattr(run_module, "ENV_FILE", env_file)
+    assert run_module.main(["--mode", "live", "--scenarios", "product_return",
+                            "--no-report"]) == 2
+    assert asked == ["клиент:секрет"], "live не подхватил ключи из файла"
+    assert "проводка" in capsys.readouterr().err
+
+
+def test_env_file_never_overrides_the_environment(monkeypatch, tmp_path):
+    """Вызов с явными ключами важнее локального `.env`: иначе прогон молча
+    считался бы чужой учёткой, и отчёт относился бы не к тем настройкам, о
+    которых просили."""
+    from eval import run as run_module
+
+    monkeypatch.setenv("GIGACHAT_CREDENTIALS", "из-окружения")
+    env_file = tmp_path / ".env"
+    env_file.write_text("GIGACHAT_CREDENTIALS=из-файла\n", encoding="utf-8")
+    run_module._load_env_file(env_file)
+    assert os.environ["GIGACHAT_CREDENTIALS"] == "из-окружения"
+
+
+def test_replay_never_touches_the_env_file(monkeypatch):
+    """Replay детерминирован: он не должен зависеть от того, что лежит у
+    кого-то в рабочей копии. Live читает файл, replay — нет."""
+    from eval import run as run_module
+
+    def _boom(*a, **k):
+        raise AssertionError("replay прочитал .env")
+
+    monkeypatch.setattr(run_module, "_load_env_file", _boom)
+    assert run_module.main(["--mode", "replay", "--scenarios",
+                            "product_return", "--no-report"]) == 0
 
 
 def test_scenarios_cover_every_process_and_fixture_is_wired():

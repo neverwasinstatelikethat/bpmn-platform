@@ -6,6 +6,9 @@
 Выход: таблица метрик и провалов в stdout + JSON-отчёт в `eval/reports/<timestamp>.json`.
 `--mode live` читает GIGACHAT_CREDENTIALS из окружения и без него честно падает
 (код 2): тихая подмена live'а на replay иначе выглядела бы как «зелёный» прогон.
+Ключи при этом подхватываются из `.env` — как их подхватывает backend
+(`main.py:14`), иначе живой прогон из чистой оболочки падал на отсутствующем
+`GIGACHAT_CREDENTIALS`, хотя ключи лежат в файле рядом с репозиторием.
 Код 1 — по `--fail-on-regression`, если относительно baseline что-то упало: CI
 так и должен отличать «правку промпта, которая ухудшила контур».
 """
@@ -18,8 +21,12 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from dotenv import load_dotenv
+
 from . import harness, metrics
 from .harness import DEFAULT_BASELINE, HarnessError
+
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
 def _force_utf8_output() -> None:
@@ -33,6 +40,17 @@ def _force_utf8_output() -> None:
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
             stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _load_env_file(env_file: Optional[Path] = None) -> None:
+    """Заполнить окружение ключами из `.env` перед live-прогоном.
+
+    `override=False`: то, что уже задано в окружении, важнее файла — иначе вызов
+    с явными `GIGACHAT_CREDENTIALS` молча получил бы значение с локального
+    диска. Отсутствующий файл dotenv переносит тихо (возвращает False), поэтому
+    в CI без `.env` live по-прежнему честно падает с кодом 2.
+    """
+    load_dotenv(env_file or ENV_FILE, override=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     _force_utf8_output()
+    if args.mode == "live":
+        _load_env_file()
     try:
         report = harness.run(
             mode=args.mode, scenarios_spec=args.scenarios, repeat=args.repeat,

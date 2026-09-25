@@ -849,6 +849,8 @@ EXPECTED_DISAGREEMENTS = {
     "production_incident.bad.plan": {},
     "production_incident.good.improve": {},
     "production_incident.good.plan": {},
+    "purchase_approval.loop.bad.plan": {},
+    "purchase_approval.loop.good.improve": {},
     "purchase_approval.signoffs.bad.plan": {},
     "purchase_approval.signoffs.good.improve": {},
     "purchase_approval.bad.plan": {},
@@ -876,6 +878,9 @@ EXPECTED_NEW_FAILURES = {
     # этой фикстуры `signoffs_need_a_gate` был бы проверкой, которая на eval-данных
     # не звенит никогда.
     "purchase_approval.signoffs.bad.plan": ["signoffs_need_a_gate"],
+    # Свидетель класса «безусловный цикл»: возврат на доработку без развилки.
+    # Порядок — как в `NEW_INVARIANTS`.
+    "purchase_approval.loop.bad.plan": ["no_blind_rework", "loops_have_a_guard"],
 }
 
 

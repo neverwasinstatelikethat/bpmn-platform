@@ -3678,10 +3678,15 @@ def _demote_single_branch_gateways(elements: List[Dict[str, Any]],
         if out_count.get(gateway["id"], 0) >= 2 or in_count.get(gateway["id"], 0) >= 2:
             continue
         kind = gateway["kind"]
-        gateway["kind"] = "task"
         name = gateway["name"]
-        if name == kind:
-            gateway["name"] = "task"
+        if name == kind or len(name.strip()) < 3:
+            # Понижение до задачи требует имени: `naming` спрашивает имя с
+            # шагов, а латинское «task» вместо названия — мусор в схеме
+            # пользователя, тот же, от которого чищаются исходники. Одинокая
+            # ветка шлюзу не противоречит, поэтому оставляем как есть
+            # (симметрично `validate_and_repair`).
+            continue
+        gateway["kind"] = "task"
         notes.append(f"Шлюз {gateway['id']} («{name}») с одним потоком с каждой "
                      "стороны понижен до задачи")
         for f in flows:

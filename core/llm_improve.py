@@ -26,7 +26,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from . import llm_client
 from .llm_client import LLMError, LLMRequestTooLargeError, LLMTruncatedError
 from . import bpmn_edits
-from .bpmn_scoring import BPMNScorer, has_unguarded_cycle
+from .bpmn_scoring import (BPMNScorer, BUSINESS_RULES, FAILED, PASSED,
+                           diff_scores, has_unguarded_cycle)
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ DATASET_PATH = os.path.join(os.path.dirname(__file__), "bpmn_dataset")
 # контейнером и терминалом, а два воркера дрались за одну запись. Формат —
 # npz + JSON-манифест вместо pickle: pickle.load чужого файла исполняет код.
 CACHE_NAME = "bpmn_rag_cache.npz"
-CACHE_METHOD = "hybrid-v3"
+CACHE_METHOD = "hybrid-v5"
 
 # Сколько разных эталонных процессов и сколько строк практик уходит в промпт.
 TOP_SCHEMAS = 3
@@ -386,31 +387,61 @@ class BPMNKnowledgeBase:
         logger.info("Загружено %s эталонных схем", len(schemas))
         return schemas
 
+    # Отрасль, а не действие: «проверка», «подпись», «качество» и «review» стоят
+    # в процессе любой темы, и на них классификатор превращал 227 эталонов из 367
+    # в `approval`, а складскую схему — в согласование (замерено: «проверк»×5 +
+    # «подпис»×3 били «склад»×3 + «логистик»×2). Словарь держит существительные
+    # темы и работает на двух языках: корпус англоязычный, запросы русские.
     _DOMAIN_KEYWORDS = {
-        "finance": ["банк", "платеж", "кредит", "счет", "транзакци", "инвойс",
-                    "finance", "bank", "payment", "credit", "invoice"],
-        "approval": ["согласован", "одобрен", "проверк", "подпис", "утвержден",
-                     "approval", "approve", "review", "sign"],
-        "manufacturing": ["производ", "завод", "сборк", "качеств",
-                          "manufacturing", "production", "assembly"],
-        "customer_service": ["клиент", "поддержк", "жалоб", "обращен",
-                             "customer", "support", "complaint", "ticket"],
-        "logistics": ["доставк", "отправк", "склад", "логистик",
-                      "delivery", "shipment", "warehouse", "logistics"],
-        "hr": ["персонал", "найм", "сотрудник", "онбординг",
-               "recruitment", "onboarding", "employee"],
-        "it": ["интеграци", "систем", "сервер", "деплой",
-               "deployment", "integration", "server", "api"],
+        "finance": ["банк", "платеж", "кредит", "счет", "транзакц", "инвойс",
+                    "бюджет", "тариф", "finance", "bank", "payment", "credit",
+                    "invoice", "billing"],
+        "approval": ["согласован", "одобрен", "утвержден", "виза", "резолюц",
+                     "эскалац", "approval", "approve", "sign-off", "escalation"],
+        "manufacturing": ["производ", "завод", "цех", "сырье", "конвейер",
+                          "manufactur", "assembly", "fabrication"],
+        "customer_service": ["поддержк", "жалоб", "обращен", "тикет", "претензи",
+                             "claim", "support", "complaint", "ticket"],
+        "logistics": ["доставк", "отправк", "склад", "логистик", "груз",
+                      "транспорт", "перевозк", "палет", "курьер", "экспедит",
+                      "delivery", "shipment", "warehouse", "logistics",
+                      "dispatch", "freight", "picking"],
+        "hr": ["персонал", "найм", "сотрудник", "онбординг", "кадр", "ваканси",
+               "recruit", "onboarding", "employee", "payroll", "hiring"],
+        "it": ["инцидент", "алерт", "мониторинг", "сервер", "деплой", "релиз",
+               "integration", "incident", "alert", "monitoring", "deploy"],
     }
 
-    def _detect_domain(self, xml: str) -> str:
-        xml_lower = xml.lower()
+    # Домен считается темой только при перевесе: 8 против 5 — это два
+    # конкурирующих признака, а не тему определивший процесс. Без перевеса схема
+    # уходит в `general`, и поиск честно перестаёт делать вид, что различил
+    # отрасли.
+    DOMAIN_MARGIN = 1.5
+
+    def _detect_domain(self, xml: str,
+                       present: Optional[Set[str]] = None) -> str:
+        xml_lower = str(xml or "").lower()
         scores = {
             domain: sum(xml_lower.count(k) for k in keywords)
             for domain, keywords in self._DOMAIN_KEYWORDS.items()
         }
         best = max(scores, key=scores.get)
-        return best if scores[best] > 0 else "general"
+        if scores[best] <= 0:
+            return "general"
+        second = sorted(scores.values())[-2]
+        if scores[best] < second * self.DOMAIN_MARGIN:
+            return "general"
+        if present is not None and best not in present:
+            # Тема, под которую в корпусе нет ни одного эталона (`it`,
+            # `manufacturing`): токен уводит ранжирование словом, которого не
+            # несёт ни один документ, и выдача определяется остатком. Честный
+            # ответ — «тему не различил», а не утверждение про пустой раздел.
+            return "general"
+        return best
+
+    def _corpus_domains(self) -> Set[str]:
+        """Домены, под которые в корпусе есть хотя бы один эталон."""
+        return {str(m.get("domain") or "") for m in self._metadata}
 
     def _detect_complexity(self, root: ET.Element) -> str:
         count = len(root.findall(".//*"))
@@ -506,13 +537,23 @@ class BPMNKnowledgeBase:
                      xml_content: Optional[str]) -> Tuple[str, str]:
         """Семантике — запрос и названия элементов, лексике — структура схемы.
         Склеивать их нельзя: признаки вида `tasks_12 low_complexity` живут в
-        том же словаре, что и документы корпуса, и тонут в шуме."""
+        том же словаре, что и документы корпуса, и тонут в шуме.
+
+        Запрос в лексическую ветку дописывали и сняли по замеру: `python -m
+        eval.retrieval` дал те же P@3/MRR@3 до и после (0.58/0.88 по эталонным
+        кейсам), потому что в просьбах контуру нет различающих слов — «найди
+        узкие места» есть в описаниях почти всех эталонов и весит по IDF почти
+        ноль. Домен в этот текст приходит ограниченный корпусом: тема, под
+        которую в датасете нет ни одного эталона (`it`, `manufacturing`),
+        уводила ранжирование словом, которого не несёт ни один документ.
+        """
         if not xml_content:
             return query, query
         root = self._parse(xml_content)
         names = " ".join(self._element_names(root))
         structural = self._extract_xml_features(root)
-        domain = self._detect_domain(xml_content)
+        corpus = self._corpus_domains()
+        domain = self._detect_domain(xml_content, corpus if corpus else None)
         return (" ".join([query, names]).strip(),
                 " ".join([structural, domain, names]).strip())
 
@@ -530,8 +571,23 @@ class BPMNKnowledgeBase:
         return total / (len(branch_scores) * best)
 
     def _extract_xml_features(self, root: Optional[ET.Element]) -> str:
-        """Структурная сигнатура схемы: только количества, они попадают
-        в лексическую ветку поиска."""
+        """Структурная сигнатура схемы: количества элементов и признаки практик.
+
+        Ключи практик — те же, что у `_PRACTICE_SIGNALS`, то есть те же, что
+        попадают в `missing_practices` промпта: подбор «процесс с такой же
+        конструкцией» и «чего в вашей схеме нет» перестают быть двумя разными
+        описаниями одной схемы.
+
+        Количества оставлены точными после замера, а не по недосмотру. Казалось,
+        что `tasks_11` и `tasks_12` — разные слова словаря TF-IDF, редкое значение
+        получает высокий IDF и ветка начинает награждать совпадение счётчиков
+        («сток формы»: на кредитной заявке top-3 дали шаблоны упражнений). Полосы
+        `few_tasks`/`many_tasks` вместо чисел это убирали — и роняли единственный
+        работавший кейс: `warehouse_delivery` P@3 с 1.00 до 0.00, сводка с 0.50 до
+        0.33, MRR@3 с 0.58 до 0.25. Точный счётчик размера и есть тот признак,
+        который отличает содержательный процесс от пустого шаблона в датасете,
+        где 42 файла — заготовки упражнений.
+        """
         if root is None:
             return "invalid_xml"
         tasks = len(self._find_local(root, "task", "userTask", "serviceTask",
@@ -545,8 +601,11 @@ class BPMNKnowledgeBase:
         subprocesses = len(self._find_local(root, "subProcess"))
         total = tasks + gateways + events + subprocesses
         level = ("high" if total > 30 else "medium" if total > 15 else "low")
-        return (f"tasks_{tasks} gateways_{gateways} events_{events} "
-                f"flows_{flows} subprocesses_{subprocesses} {level}_complexity")
+        present = [key for tag, key, _ in self._PRACTICE_SIGNALS
+                   if self._find_local(root, tag)]
+        counts = (f"tasks_{tasks} gateways_{gateways} events_{events} "
+                  f"flows_{flows} subprocesses_{subprocesses}")
+        return " ".join([counts] + present + [f"{level}_complexity"])
 
 
 # ---------------------------------------------------------------------------
@@ -601,9 +660,12 @@ _SYSTEM_PROMPT = """Ты — эксперт по BPMN 2.0 и бизнес-ана
    и поведи в него по одному потоку из каждой ветки, а из него — дальше по
    маршруту («шлюз на входе, шлюз на выходе»), иначе ветка обрывается.
    На КАЖДОЙ ветке исключающего шлюза обязателен `condition`, кроме одной —
-   её помечай `"default": true` в `connect`, а уже существующий поток помечай
-   `set_default`. Необусловленную ветку без default аплайер отвергает: скоринг
-   считает такую ветку ошибкой.
+   новой ветке дай `"default": true` в `connect`, условие уже существующего
+   потока поправь операцией `add_condition` (по id потока из ИНВЕНТАРЯ), а уже
+   существующую ногу без условия сделай запасной операцией `set_default`.
+   `connect` на пару, которая есть в схеме, отвечает «такой поток уже
+   существует» — условие им не добавить. Необусловленную ветку без default
+   аплайер отвергает: скоринг считает такую ветку ошибкой.
 7. Новый шаг обязан встать в маршрут с двух сторон, и для этого у одной
    операции есть оба конца: `after` ставит шаг в поток (вход), `to` ведёт его
    дальше (исход). Отдельный `connect` нужен только там, где из узла реально
@@ -668,13 +730,68 @@ _RETRY_TEMPLATE = """Улучшение применено не полность
 {inventory}
 
 НЕПРИМЕНЁННЫЕ ОПЕРАЦИИ И ПРИЧИНЫ:
-{skipped}{applied}{routing}{pools}{docs}{limits_block}
+{skipped}{applied}{routing}{pools}{docs}{regressions}{limits_block}
 ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:
 {user_prompt}
 
 Верни только корректирующие операции, которые добиваются той же цели.
-Не используй id, которые уже есть в инвентаре. Ответ — только JSON с полями
-"analysis" и "operations"."""
+Не используй id, которые уже есть в инвентаре. Это единственный корректирующий
+раунд: начни с пропусков, названных выше, и не трать операции на то, что уже
+применилось. Ответ — только JSON с полями "analysis" и "operations"."""
+
+
+def _refusal_text(skipped: List[Dict[str, Any]]) -> str:
+    """Текст отказа, из которого читается, что делать.
+
+    Откат пакета даёт несколько записей с одной и той же причиной (операция,
+    перенесённая из `applied`, плюс строка `batch`), и дословный повтор в
+    сообщении только шумит. Подсказка уходит пользователю вместе с причиной:
+    «пакет создал цикл без защищённого выхода» без «верните ветку через
+    исключающий шлюз» — это диагноз без лечения, а следующий шаг известен.
+    """
+    parts: List[str] = []
+    seen = set()
+    for entry in skipped:
+        reason = str(entry.get("reason") or "").strip()
+        hint = str(entry.get("hint") or "").strip()
+        if not reason or (reason, hint) in seen:
+            continue
+        seen.add((reason, hint))
+        parts.append(f"{reason} ({hint})" if hint else reason)
+        if len(parts) == 3:
+            break
+    return ("Предложенные изменения не удалось применить: "
+            + "; ".join(parts or ["модель не вернула применимых операций"])
+            + ". Уточните запрос.")
+
+
+def _cycle_reject(base_xml: str):
+    """Гарант по циклу для одного раунда применения.
+
+    Цикл без защищённого выхода — ухудшение, а не стиль: процесс из него не
+    выходит. Пакет, который его замкнул, откатывается к схеме этого раунда, а
+    модель получает шанс перестроить ветку корректирующим повтором.
+    """
+    def _reject(candidate: str) -> Optional[bpmn_edits.Rejection]:
+        if (candidate == base_xml or not has_unguarded_cycle(candidate)
+                or has_unguarded_cycle(base_xml)):
+            return None
+        return bpmn_edits.Rejection(
+            "пакет создал цикл без защищённого выхода — изменение откачено",
+            "верните ветку через исключающий шлюз, у которого есть выход из "
+            "цикла (condition либо default)")
+    return _reject
+
+
+def _prune_stranded(candidate: str, created: Dict[str, str]):
+    """Снять узлы пакета, которые починка оставила вне маршрута.
+
+    Починка идёт после аплайера и вправе снять дугу: в прогоне #40 так приняли
+    улучшение, и принятие потеряло 15 баллов на `boundary_handled`. Гарантия
+    «принятое изменение не делает схему хуже» обязана действовать и после
+    починки, а пропуск — попасть в корректирующий повтор, если он ещё впереди.
+    """
+    return bpmn_edits.rollback_stranded(candidate, created)
 
 
 def _unrouted(notes: List[str]) -> List[str]:
@@ -691,11 +808,38 @@ def _empty_pools(notes: List[str]) -> List[str]:
             if any(m in n for m in bpmn_edits.POOL_EMPTY_NOTE_MARKERS)]
 
 
-def _op_key(entry: Dict[str, Any]) -> Tuple[str, str]:
-    """Пара «операция — элемент»: по ней повтор узнаёт правку, которую модель
-    провела во втором раунде в исправленном виде."""
-    return (str(entry.get("op") or ""),
-            str(entry.get("id") or entry.get("source") or entry.get("target") or ""))
+def _repair_own_notes(notes: List[str]) -> List[str]:
+    """Что починка изменила в схеме сама, а не попросила доделать у модели.
+
+    Тип элемента подменён, дуга снята или переведена в поток-сообщение, событие
+    достроено — всё это уходит в итоговый XML без единой операции модели.
+    Пользователь читает это в анализе до принятия: иначе «принятое улучшение»
+    для него оборачивается схемой, которую он не выбирал."""
+    covered = bpmn_edits.UNROUTED_NOTE_MARKERS + bpmn_edits.POOL_EMPTY_NOTE_MARKERS
+    return [n for n in notes
+            if any(m in n for m in bpmn_edits.REPAIR_OWN_NOTE_MARKERS)
+            and not any(m in n for m in covered)]
+
+
+def _op_key(entry: Dict[str, Any]) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
+    """«Операция и элемент, который она правит»: по ним повтор узнаёт правку,
+    которую модель провела во втором раунде в исправленном виде.
+
+    Поля берутся из `bpmn_edits.OP_ELEMENT_FIELDS`. Нагрузку правки (`name`,
+    `text`, `condition`, `after`, `to`) в ключ брать нельзя: корректирующий
+    вызов как раз и приносит её исправленной — с `after` у откатанного шага,
+    с условием у ветки. Старая версия читала только `id`/`source`/`target`,
+    поэтому у операции, названной одним `participant` (`remove_participant`),
+    ключ выходил пустым, зачёт не ставился никогда, и пользователь читал «не
+    применено» об уже удалённом пуле. `name` остаётся запасным ключом для
+    операций без id (`add_lane`) — иначе две разные дорожки слились бы в один
+    зачёт.
+    """
+    key = tuple((field, str(entry[field]))
+                for field in bpmn_edits.OP_ELEMENT_FIELDS if entry.get(field))
+    if not key and entry.get("name"):
+        key = (("name", str(entry["name"])),)
+    return (str(entry.get("op") or ""), key)
 
 
 def _routing_block(unrouted: List[str]) -> str:
@@ -723,6 +867,53 @@ def _docs_block(ids: List[str]) -> str:
             "схемы: добавь add_documentation для каждого id выше, текстом из "
             "описания процесса (не выдумывая данных):\n"
             + "\n".join(f"- {i}" for i in ids[:10]) + "\n")
+
+
+# Оформление — не узкое место: правила про описание, имя и разнообразие типов
+# задач процесс не меняют. В промпте они последней секцией, чтобы срез по
+# лимиту сначала съедал их, а не развилку без схода.
+COSMETIC_RULES = frozenset({"documentation", "naming", "task_types"})
+
+
+def _rules_regressed(base_xml: str, new_xml: str) -> Dict[str, str]:
+    """Правила скоринга, которые проходили на базе и провалены после пакета.
+
+    Гарантия «принятое улучшение не делает схему хуже» не могла опираться на
+    балл: два сдвинутых правила дают ноль дельты при сломанном третьем, и в
+    живом замере пакет с корректной операцией `add_event` ронял
+    `event_types` (95 → 90) без единой пометки — ни отказа, ни пометки починки,
+    ни повода для переспроса. Возвращает {правило: "passed->failed"}.
+
+    `not_applicable` ухудшением не считается: правило снято с проверки, потому
+    что пакет убрал саму ситуацию. Так легальное слияние роли в дорожку
+    выключило бы `participant_interacts` и `role_pools`, и любой гарант,
+    построенный на «статус изменился», отказывал бы улучшению, за которое его
+    и просят.
+    """
+    if base_xml == new_xml:
+        return {}
+    try:
+        delta = diff_scores(_scorer.evaluate(base_xml), _scorer.evaluate(new_xml))
+    except Exception:  # noqa: BLE001 — скоринг не имеет права ронять улучшение
+        return {}
+    return {name: f"{entry.get('before')}->{entry.get('after')}"
+            for name, entry in (delta.get("rules") or {}).items()
+            if entry.get("before") == PASSED
+            and entry.get("after") == FAILED}
+
+
+def _regressions_block(regressed: Dict[str, str]) -> str:
+    """Что пакет сломал в уже проходивших правилах — с подсказкой, чем чинить."""
+    if not regressed:
+        return ""
+    rules = _scorer.rules
+    lines = []
+    for name, change in sorted(regressed.items()):
+        action = ", ".join(rules.get(name, {}).get("action") or []) or "?"
+        lines.append(f"— {name} ({change}): {action}")
+    return ("\nПРАВИЛА, КОТОРЫЕ ПАКЕТ СЛОМАЛ (до правки проходили, после — "
+            "провалены; верни операции, которые их возвращают):\n"
+            + "\n".join(lines) + "\n")
 
 
 def _rule_passes(xml: str, rule: str) -> Optional[bool]:
@@ -792,7 +983,15 @@ def _limits_block(inventory: Dict[str, Any]) -> str:
             + ". Правки предлагай только по показанным id.\n\n")
 
 
-MAX_SCORING_FINDINGS = 8
+MAX_SCORING_FINDINGS = 10
+_FINDING_SECTIONS = ("ТОЧКИ УЛУЧШЕНИЯ ПРОЦЕССА", "НАРУШЕНИЯ НОТАЦИИ BPMN",
+                     "ОФОРМЛЕНИЕ (процесс не меняет)")
+
+
+def _finding_section(name: str) -> int:
+    if name in BUSINESS_RULES:
+        return 0
+    return 2 if name in COSMETIC_RULES else 1
 
 
 def _findings_block(bpmn_xml: str) -> str:
@@ -802,15 +1001,38 @@ def _findings_block(bpmn_xml: str) -> str:
     модели ради него не нужен. Без него пакет уходил в документацию и новые
     шаги, пока рядом висело правило на −8 за роль, раздутую в участника: модель
     не знала, что именно считается дефектом.
+
+    Порядок — секциями (сначала то, что меняет процесс) и по весу правила, а не
+    по порядку объявления словаря: на срезе по позиции в списке показанных
+    оставались `naming` (−10) и `no_isolated` (−8), а за линией исчезали
+    `role_pools` с готовой парой «Кладовщик → ВкусВилл», `guarded_cycles` (−10)
+    и `documentation` (−7). Скрытые правила называются по именам: «и ещё N» не
+    говорит модели, чего она не видит, а молчаливый срез означает, что мы мерим
+    отредактированный план, а не модель.
     """
-    recommendations = _scorer.evaluate(bpmn_xml)["recommendations"]
-    if not recommendations:
+    evaluation = _scorer.evaluate(bpmn_xml)
+    meta = evaluation.get("details_meta") or {}
+    by_rule = evaluation.get("recommendations_by_rule") or {}
+    if not by_rule:
         return ""
-    lines = "".join(f"— {r}\n" for r in recommendations[:MAX_SCORING_FINDINGS])
-    if len(recommendations) > MAX_SCORING_FINDINGS:
-        lines += f"— и ещё {len(recommendations) - MAX_SCORING_FINDINGS}\n"
-    return ("УЗКИЕ МЕСТА ПО СКОРИНГУ (поднять балл важнее, чем украшать):\n"
-            + lines + "\n")
+    ranked = sorted(by_rule,
+                    key=lambda name: (_finding_section(name),
+                                      -(meta.get(name, {}).get("weight") or 0),
+                                      name))
+    shown, hidden = ranked[:MAX_SCORING_FINDINGS], ranked[MAX_SCORING_FINDINGS:]
+    lines: List[str] = []
+    current = -1
+    for name in shown:
+        section = _finding_section(name)
+        if section != current:
+            lines.append(("" if lines else "") + _FINDING_SECTIONS[section] + ":")
+            current = section
+        lines.append(f"— {by_rule[name]}")
+    tail = ("— скрыто лимитом (важнее показанных не меньше): "
+            + ", ".join(hidden) + "\n") if hidden else ""
+    return ("УЗКИЕ МЕСТА ПО СКОРИНГУ. Порядок — по важности для процесса; "
+            "поднять балл нужнее, чем украшать:\n"
+            + "\n".join(lines) + "\n" + tail)
 
 
 def _format_practices(schemas: List[Dict[str, Any]]) -> str:
@@ -824,9 +1046,8 @@ def _format_practices(schemas: List[Dict[str, Any]]) -> str:
     grouped: Dict[str, Dict[str, Any]] = {}
     for schema in schemas[:TOP_SCHEMAS]:
         name = str(schema.get("name") or "без названия")
-        domain = str(schema.get("domain") or "general")
         for practice in list(schema.get("missing_practices") or [])[:PRACTICES_PER_SCHEMA]:
-            entry = grouped.setdefault(practice, {"domain": domain, "sources": []})
+            entry = grouped.setdefault(practice, {"sources": []})
             if name not in entry["sources"]:
                 entry["sources"].append(name)
     if not grouped:
@@ -836,7 +1057,10 @@ def _format_practices(schemas: List[Dict[str, Any]]) -> str:
         shown = ", ".join(entry["sources"][:2])
         if len(entry["sources"]) > 2:
             shown += f" и ещё {len(entry['sources']) - 2}"
-        lines.append(f"- [{entry['domain']}] {practice} (в эталонах: {shown})")
+        # Домен эталона сюда не печатается: тег `[hr]` читается моделью как
+        # готовое имя участника, и провенанс eval ловил его как утечку — по
+        # сценарию «HR» оракул требовал пул с тем же названием.
+        lines.append(f"- {practice} (в эталонах: {shown})")
     header = "ЛУЧШИЕ ПРАКТИКИ ИЗ ПОХОЖИХ ЭТАЛОННЫХ СХЕМ (чего нет в текущей схеме):"
     return header + "\n" + "\n".join(lines) + "\n\n"
 
@@ -933,104 +1157,81 @@ class BPMNImprovementOrchestrator:
                                     "skipped": [],
                                     "truncated_operations": truncated_operations}
 
-        xml_after, report = await asyncio.to_thread(bpmn_edits.apply_operations,
-                                                    xml_content, operations)
+        xml_after, report = await asyncio.to_thread(
+            bpmn_edits.apply_and_guarantee, xml_content, operations,
+            _cycle_reject(xml_content), _prune_stranded)
         report["truncated_operations"] = truncated_operations
         # Раунд помечается сразу: если корректирующий вызов не состоится (LLM
         # лег), иначе его причины пользователь прочитает как «повтор».
         for skip in report["skipped"]:
             skip.setdefault("stage", "plan")
             skip.setdefault("reapplied", False)
+        repair_notes = list(report.get("notes") or [])
+        first_reverted = str(report.get("reverted") or "")
 
-        # Один целевой повтор: по неприменённым операциям и по узлам, которые
-        # применились, но остались вне маршрута. Без второго пункта принятие
-        # улучшения роняет балл схемы — модель обязана добить связность сама,
-        # а не доверять это эвристике аплайера.
-        # Цикл без защищённого выхода — ухудшение, а не стиль: процесс из него
-        # не выходит. Пакет, который его замкнул, откатывается к базе (тот же
-        # порядок, что с нерассорченными шагами), и модель получает шанс
-        # перестроить ветку корректирующим повтором.
-        def _reject_cycle(candidate: str) -> str:
-            if (candidate == xml_content or not has_unguarded_cycle(candidate)
-                    or has_unguarded_cycle(xml_content)):
-                return candidate
-            report["skipped"].append({
-                "op": "batch", "stage": "plan", "reapplied": False,
-                "reason": "пакет создал цикл без защищённого выхода — изменение "
-                          "откачено",
-                "hint": "верните ветку через исключающий шлюз, у которого есть "
-                        "выход из цикла (condition либо default)",
-            })
-            return xml_content
-
-        async def _drop_stranded(candidate: str, notes: List[str]) -> Tuple[str, List[str]]:
-            """Откатить узлы пакета, которые починка оставила вне маршрута.
-
-            Починка идёт после аплайера и вправе снять дугу: в прогоне #40 так
-            приняли улучшение, и принятие потеряло 15 баллов на
-            `boundary_handled`. Гарантия «принятое изменение не делает схему
-            хуже» должна действовать после починки, а пропуск — попасть в
-            корректирующий повтор, если он ещё впереди.
-            """
-            created = {str(entry.get("id")): str(entry.get("op") or "")
-                       for entry in (report.get("applied") or [])
-                       if entry.get("id") and str(entry.get("op") or "")
-                       in bpmn_edits.ADD_NODE_OPS}
-            if not created:
-                return candidate, notes
-            candidate, stranded = await asyncio.to_thread(
-                bpmn_edits.rollback_stranded, candidate, created)
-            for drop in stranded:
-                gone = drop["id"]
-                report["applied"] = [
-                    e for e in report["applied"]
-                    if gone not in (str(e.get("id") or ""),
-                                    str(e.get("source") or ""),
-                                    str(e.get("target") or ""))]
-                report["skipped"].append({
-                    "op": drop["op"], "id": gone, "stage": "repair",
-                    "reapplied": False,
-                    "reason": f"новый шаг ({gone}) {drop['gap']} — изменение "
-                              "откачено после починки",
-                    "hint": drop["hint"]})
-                # Замечание починки про уже удалённый узел читать нельзя: чинить
-                # там нечего, правка откатана.
-                notes = [n for n in notes if gone not in n]
-            if stranded and report.get("status") == "success":
-                report["status"] = "partial"
-            return candidate, notes
-
-        xml_after, repair_notes = await asyncio.to_thread(bpmn_edits.validate_and_repair,
-                                                          xml_after)
-        rolled_back = _reject_cycle(xml_after)
-        if rolled_back != xml_after:
-            xml_after, repair_notes = rolled_back, []
-        xml_after, repair_notes = await _drop_stranded(xml_after, repair_notes)
+        # Один целевой повтор: по неприменённым операциям, по узлам вне
+        # маршрута, по пулам без шагов, по разбавленной документации и по
+        # правилам скоринга, которые пакет сломал. Без последнего принятие
+        # улучшения роняет балл схемы — модель обязана добить связность сама, а
+        # не доверять это эвристике аплайера.
         unrouted = _unrouted(repair_notes)
         empty_pools = _empty_pools(repair_notes)
         # Разбавление documentation — то же ухудшение, только меряется долей:
         # пакет добавляет шаг, а описание к нему пишет только модель.
         undocumented = _documentation_diluted(xml_content, xml_after,
                                               _added_ids(report))
-        if report["skipped"] or unrouted or empty_pools or undocumented:
+        regressed = _rules_regressed(xml_content, xml_after)
+        retried = False
+        if ([s for s in report["skipped"] if not s.get("reapplied")] or unrouted
+                or empty_pools or undocumented or regressed):
+            # Факт «повтор вызывали» ставится ДО вызова: отказ транспорта или
+            # пустой ответ — это тоже состоявшийся повтор, а не его отсутствие.
+            # Иначе `retry_attempted` читался бы как «контур не пытался
+            # починиться» ровно в тех прогонах, где попытка и была.
+            retried = True
             try:
-                xml_after, report = await self._retry_skipped(
+                # Третий элемент — «повтор принёс второй пакет правок», а не
+                # «повтор был»: попыткой он остаётся и при пустом ответе.
+                xml_after, report, _reapplied = await self._retry_skipped(
                     xml_after, user_prompt, report, unrouted, empty_pools,
-                    undocumented)
+                    undocumented, regressed)
+                # Пометки второго раунда не заменяют первые: понижение шлюза до
+                # задачи неидемпотентно, и второй `validate_and_repair` его уже
+                # не вернёт — терять факт подмены типа элемента нельзя.
+                repair_notes = bpmn_edits.merge_notes(
+                    repair_notes, list(report.get("notes") or []))
+                first_reverted = first_reverted or str(report.get("reverted") or "")
             except LLMTruncatedError as e:
                 logger.warning("Корректирующий повтор обрезан по лимиту "
                                "токенов: %s", e)
             except (LLMError, ValueError) as e:
                 logger.warning("Корректирующий повтор не выполнен: %s", e)
-            xml_after, repair_notes = await asyncio.to_thread(
-                bpmn_edits.validate_and_repair, xml_after)
-            rolled_back = _reject_cycle(xml_after)
-            if rolled_back != xml_after:
-                xml_after, repair_notes = rolled_back, []
-            xml_after, repair_notes = await _drop_stranded(xml_after,
-                                                           repair_notes)
+            unrouted = _unrouted(repair_notes)
+            empty_pools = _empty_pools(repair_notes)
             undocumented = _documentation_diluted(xml_content, xml_after,
                                                   _added_ids(report))
+
+        # Что пакет сломал из уже проходивших правил — факт, а не вывод. Он
+        # идёт и в переспрос (топливо для корректировки), и в отчёт (метрика
+        # `improve/rules_regressed_share`), и пользователю в анализ. Целиком
+        # пакету из-за него не отказывают: регресс по `start_event` после
+        # легального слияния пулов или по `documentation` после добавленного
+        # шага — это арифметика правила, а не сломанная схема, и отказ
+        # выбрасывал бы правку, которую пользователь как раз и просил.
+        # Гарантия «не делать хуже» там, где она исполнима механически: откат
+        # пакета с незащищённым циклом и поузловой откат того, что починка
+        # оставила вне маршрута (`bpmn_edits.apply_and_guarantee`).
+        regressed = _rules_regressed(xml_content, xml_after)
+        report["retry_attempted"] = retried
+        report["retry_closed"] = sum(1 for s in report["skipped"]
+                                     if s.get("reapplied"))
+        report["package_reverted"] = first_reverted or str(
+            report.get("reverted") or "")
+        # Пусто при откате: сломанная база — не заслуга и не вина пакета.
+        report["rules_regressed"] = {} if report["package_reverted"] else dict(
+            regressed)
+        report["noop_rows"] = int(report.get("noop_rows") or 0)
+        report["notes"] = repair_notes
         report["repair_notes"] = repair_notes
 
         # Висячий шаг — не улучшение: модель не указала, между какими шагами
@@ -1053,13 +1254,20 @@ class BPMNImprovementOrchestrator:
                          "долю элементов с документацией, поэтому без него "
                          "улучшение снимает балл схеме:\n"
                          + "\n".join(f"- {i}" for i in undocumented[:5]))
+        if (own_notes := _repair_own_notes(repair_notes)):
+            analysis += ("\n\nПочинка поправила схему сама — в итоговом XML эти "
+                         "узлы выглядят иначе, чем их предложила модель:\n"
+                         + "\n".join(f"- {n.strip()}" for n in own_notes[:5]))
+        if regressed:
+            rules = _scorer.rules
+            analysis += ("\n\nУлучшение применилось, но задело правила, которые "
+                         "раньше проходили — при принятии балл схемы упадёт:\n"
+                         + "\n".join(
+                             f"- {name}: {(rules.get(name) or {}).get('message', '')}"
+                             for name in sorted(regressed)[:5]))
 
         if not report["applied"]:
-            reasons = "; ".join(s.get("reason", "") for s in report["skipped"][:3])
-            raise ImprovementError(
-                f"Предложенные изменения не удалось применить: {reasons}. "
-                "Уточните запрос."
-            )
+            raise ImprovementError(_refusal_text(report["skipped"]))
 
         open_skips = [s for s in report["skipped"] if not s.get("reapplied")]
         # Дословный повтор отказа — тот же дефект: в списке для пользователя
@@ -1097,7 +1305,8 @@ class BPMNImprovementOrchestrator:
                              report: Dict[str, Any], unrouted: List[str],
                              empty_pools: List[str],
                              undocumented: Optional[List[str]] = None,
-                             ) -> Tuple[str, Dict[str, Any]]:
+                             regressed: Optional[Dict[str, str]] = None,
+                             ) -> Tuple[str, Dict[str, Any], bool]:
         """Корректирующий раунд: по не применённым операциям и по узлам,
         оставшимся вне маршрута.
 
@@ -1122,6 +1331,7 @@ class BPMNImprovementOrchestrator:
                 routing=_routing_block(unrouted),
                 pools=_pools_block(empty_pools),
                 docs=_docs_block(undocumented or []),
+                regressions=_regressions_block(regressed or {}),
                 limits_block=_limits_block(inventory),
                 user_prompt=user_prompt,
             )
@@ -1136,10 +1346,14 @@ class BPMNImprovementOrchestrator:
         retry_ops = [op for op in retry_planned if isinstance(op, dict)][:MAX_OPERATIONS]
         retry_truncated = max(0, len(retry_planned) - len(retry_ops))
         if not retry_ops:
-            return intermediate_xml, report
+            return intermediate_xml, report, False
 
+        # Тот же гарант, что и в первом раунде: повтор не вправе оставить
+        # схему хуже того, что уже сошлось, — циклический отказ здесь
+        # откатывает только второй пакет, а правки первого остаются.
         xml_after, retry_report = await asyncio.to_thread(
-            bpmn_edits.apply_operations, intermediate_xml, retry_ops)
+            bpmn_edits.apply_and_guarantee, intermediate_xml, retry_ops,
+            _cycle_reject(intermediate_xml), _prune_stranded)
         # Повтор вправе провести ту же правку в исправленном виде (откатанный
         # шаг вставлен через after). Такую правку нельзя показывать пользователю
         # как невыполненную.
@@ -1184,5 +1398,13 @@ class BPMNImprovementOrchestrator:
             "repeat_rejections": repeats,
             "truncated_operations": (report.get("truncated_operations", 0)
                                     + retry_truncated),
+            # Пометки и «применилось зря» складываются по раундам: оркестратор
+            # читает их из финального отчёта, а второй раунд не отменяет
+            # первого.
+            "notes": bpmn_edits.merge_notes(report.get("notes") or [],
+                                           retry_report.get("notes") or []),
+            "noop_rows": (int(report.get("noop_rows") or 0)
+                          + int(retry_report.get("noop_rows") or 0)),
+            "reverted": str(retry_report.get("reverted") or ""),
         }
-        return xml_after, merged
+        return xml_after, merged, True

@@ -584,13 +584,15 @@ def test_package_that_closes_an_unguarded_cycle_is_rolled_back(orchestrator,
     plan = '{"analysis": "замкнул маршрут", "operations": [' \
            '{"op":"connect","source":"B","target":"A"}]}'
     FakeLLM(monkeypatch, _wrap(plan), _wrap(plan))
-    analysis, xml_after, report = _improve(orchestrator, linear,
-                                           prompt="Свяжи шаги по кругу")
-    assert 'sourceRef="B" targetRef="A"' not in xml_after
-    cycles = [s for s in report["skipped"]
-              if "цикл без защищённого выхода" in s["reason"]]
-    assert cycles, report["skipped"]
-    assert "исключающий шлюз" in cycles[0]["hint"]
+    with pytest.raises(ImprovementError) as exc:
+        _improve(orchestrator, linear, prompt="Свяжи шаги по кругу")
+    message = str(exc.value)
+    assert "цикл без защищённого выхода" in message
+    # Причина без подсказки — диагноз без лечения: как разорвать круг,
+    # пользователь читает в том же тексте.
+    assert "исключающий шлюз" in message
+    # дословно та же причина в отказе не повторяется (операция + строка batch)
+    assert message.count("цикл без защищённого выхода") == 1
 
 
 def test_retry_closes_the_handler_branch_the_rollback_asked_for(orchestrator,
@@ -708,6 +710,40 @@ def test_reapplied_in_the_retry_is_not_reported_as_missed(orchestrator, monkeypa
     assert "Не применено" not in analysis
     assert "Повтор добил 1 правку" in analysis
     assert "Проверить склад" in xml_after
+
+
+def test_repair_substitution_is_named_in_the_analysis(orchestrator, monkeypatch,
+                                                      single_pool_xml):
+    """Шлюз с единственной веткой починка понижает до задачи. Модель этого не
+    просила, и в итоговом XML элемент выглядит иначе, чем в плане: читатель
+    обязан увидеть подмену до принятия, а не разбирать схему глазами."""
+    plan = '{"analysis": "развилка", "operations": [' \
+           '{"op":"add_gateway","id":"new_G1","name":"Согласовано за 3 дня?",' \
+           '"gateway_type":"exclusive","after":"T_collect"}]}'
+    FakeLLM(monkeypatch, _wrap(plan))
+    analysis, xml_after, report = _improve(orchestrator, single_pool_xml)
+
+    assert any("понижен до задачи" in n for n in report["repair_notes"])
+    assert "понижен до задачи" in analysis
+    # в анализе та же формулировка, что и в отчёте, а не своя пересказка
+    assert "new_G1" in analysis
+
+
+def test_report_carries_the_facts_of_the_round(orchestrator, monkeypatch,
+                                               single_pool_xml):
+    """Отчёт говорит фактами, а не позволяет их догадываться: харнесс и HTTP
+    слой считают по ним метрики, и вывод «повтор был» вместо факта о том, что
+    его не удалось выполнить, приписывал контуру чужие провалы."""
+    plan = '{"analysis": "план", "operations": [' \
+           '{"op":"add_documentation","id":"T_collect","text":"Сборка"}]}'
+    FakeLLM(monkeypatch, _wrap(plan))
+    _, _, report = _improve(orchestrator, single_pool_xml)
+
+    assert report["retry_attempted"] is False
+    assert report["retry_closed"] == 0
+    assert report["package_reverted"] == ""
+    assert report["rules_regressed"] == {}
+    assert report["noop_rows"] == 0
 
 
 # --- промпт как обязательство перед аплайером -------------------------------
@@ -864,6 +900,75 @@ class TestPromptContract:
         _improve(orchestrator, single_pool_xml)
         assert "Часть схемы не показана" in fake.prompts[0]
         assert "elements_omitted" in fake.prompts[0]
+
+    def test_every_rule_names_an_operation_the_applier_has(self):
+        """Правило скоринга обязано называть операцию, которая существует:
+        блок «чинится: …» уходит в промпт как обещание, и правка, которой нет в
+        `OP_SPEC`, возвращается отказом «неизвестная операция» — модель тратит
+        на неё пакет и не может его исправить."""
+        for name, meta in BPMNScorer().rules.items():
+            actions = meta.get("action")
+            assert actions, f"правило {name} не говорит, чем чинится"
+            for op in actions:
+                assert op in bpmn_edits.OP_SPEC, f"{name} → {op}"
+
+    def test_findings_are_sectioned_and_the_cut_names_what_it_hid(self, monkeypatch):
+        """Секции идут по порядку `_FINDING_SECTIONS` и пустых заголовков в блоке
+        нет, а срез по лимиту обязан назвать скрытые правила: «и ещё N» не
+        говорит модели, чего она не видит, а молчаливый срез мерит отредактированный
+        план, а не модель."""
+        by_rule = BPMNScorer().evaluate(ROLE_POOL_XML)["recommendations_by_rule"]
+        assert by_rule, "на схеме без единого проваленного правила тест слепнет"
+
+        block = llm_improve._findings_block(ROLE_POOL_XML)
+        # Заголовок печатается только тогда, когда в блоке есть хотя бы одно
+        # нарушение секции, поэтому порядок сверяется по фактически показанным
+        # заголовкам: `ROLE_POOL_XML` проваливает правила нотации и оформления,
+        # а «ТОЧКИ УЛУЧШЕНИЯ ПРОЦЕССА» у неё нет — требовать его значило бы
+        # проверять фикстуру, а не контракт. Имена берутся из `_FINDING_SECTIONS`,
+        # чтобы правка промпта не разъехалась с тестом.
+        headers = [line[:-1] for line in block.splitlines()
+                   if line.endswith(":") and not line.startswith("УЗКИЕ")]
+        assert len(headers) >= 2, "по одной секции — порядок нечем проверить"
+        # Левая часть — заголовки в порядке появления в тексте, правая — они же,
+        # отсортированные константой. Равенство значит и порядок, и то, что
+        # заголовков нет ни выдуманных (их не будет справа), ни повторённых.
+        assert headers == [name for name in llm_improve._FINDING_SECTIONS
+                           if name in headers], headers
+
+        # Ни одна показанная секция не пуста, и каждая строка `— ` принадлежит
+        # той секции, под которой напечатана: «секция-призрак» (заголовок без
+        # своего нарушения) иначе прятала бы пустой раздел промпта.
+        section_of = {}
+        for name, recommendation in by_rule.items():
+            section_of.setdefault(recommendation, set()).add(
+                llm_improve._finding_section(name))
+        filled = set()
+        current = None
+        for line in block.splitlines():
+            if line.endswith(":") and not line.startswith("УЗКИЕ"):
+                current = line[:-1]
+            elif line.startswith("— ") and "скрыто лимитом" not in line:
+                section = llm_improve._FINDING_SECTIONS.index(current)
+                assert section in section_of.get(line[len("— "):], set()), \
+                    f"под «{current}» напечатано чужое нарушение: {line}"
+                filled.add(current)
+        assert filled == set(headers), "есть заголовок без своего нарушения"
+
+        monkeypatch.setattr(llm_improve, "MAX_SCORING_FINDINGS", 1)
+        cut = llm_improve._findings_block(ROLE_POOL_XML)
+        # Тире хвоста отсекается вместе с ним: иначе «скрыто лимитом» оставляет в
+        # голове висячее «— », и счётчик показанных нарушений врал бы.
+        head, marker, tail = cut.partition("— скрыто лимитом")
+        assert marker, "срез молча спрятал правила"
+        assert head.count("\n— ") == 1, "лимит 1 показал не одно нарушение"
+        quoted = {name for name, recommendation in by_rule.items()
+                  if recommendation in head}
+        named = {item.strip() for item in tail.partition(":")[2].split(",")
+                 if item.strip()}
+        assert quoted | named == set(by_rule), \
+            f"не показано и не названо: {set(by_rule) - quoted - named}"
+        assert not quoted & named, "правило показано и названо скрытым сразу"
 
     def test_scoring_findings_reach_the_planner_and_stop_at_the_retry(
             self, orchestrator, monkeypatch):

@@ -7,6 +7,7 @@
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List
 
@@ -311,7 +312,13 @@ class TestPracticesBlock:
         block = _format_practices([item])
         assert TIMER_PRACTICE in block
         assert reference in block
-        assert "[general]" in block or "[logistics]" in block
+        # Тег домена из блока выбросили: `[hr]` читается моделью как готовое имя
+        # участника, а оракул `employee_onboarding` требует пул «HR» — тег
+        # выдавал ответ прямо в промпт (это и мерил eval/provenance.py).
+        # Поэтому закрепляем не «именно этого домена нет», а «никаких `[...]` в
+        # блоке нет»: иначе следующий домен из `_DOMAIN_KEYWORDS` протёк бы
+        # незаметно — тест зелёный, а подсказка ответа в промпте.
+        assert not re.search(r"\[[^\]]*\]", block), block
 
     def test_identical_schema_leaves_the_block_empty(self, make_kb):
         kb = make_kb(BASE_CORPUS, table={"согласования": [1.0, 0.0],
@@ -335,6 +342,83 @@ class TestPracticesBlock:
         assert block.startswith("ЛУЧШИЕ ПРАКТИКИ")
 
 
+class TestStructuralSignature:
+    """Сигнатура формы: количества остались точными, признаки практик добавились.
+
+    Исходная гипотеза была такой: `tasks_11` и `tasks_12` — разные слова словаря
+    TF-IDF, редкое значение получает высокий IDF, и косинус начинает награждать
+    совпадение счётчиков. На кредитной заявке top-3 действительно состоял из
+    шаблонов упражнений (`New_Process`, `Ex_3`, `exercise3`) — та же форма,
+    пустое содержимое. Полосы вместо чисел эффект убирали и роняли сводку, поэтому
+    гипотеза закрыта замером, а не мнением: числа остаются, к ним добавлены ключи
+    практик — по ним подбор «процесс с такой же конструкцией» сходится с
+    `missing_practices`, которые читает модель.
+    """
+
+    def test_counts_stay_exact(self, make_kb):
+        """Числа точные, и это не недосмотр: полосы `few_tasks`/`many_tasks`
+        вместо них просадили единственный работавший кейс (`warehouse_delivery`
+        P@3 1.00 → 0.00, сводка 0.50 → 0.33). Размер процесса — тот признак,
+        который в датасете на 42 заготовки упражнений отличает содержательную
+        схему от пустой. Отдельное утверждение про числа держит эту память:
+        «улучшить» их полосами снова придётся через снятие этого теста."""
+        kb = make_kb(BASE_CORPUS)
+        sig = kb._extract_xml_features(kb._parse(diagram(flow())))
+        assert "tasks_1" in sig and "events_2" in sig
+
+    def test_signature_names_the_practices_the_contour_reasons_about(self, make_kb):
+        """Признаки формы совпадают с ключами практик: подбор «на такую же
+        конструкцию» и `missing_practices`, которые читает модель, перестают
+        быть двумя разными описаниями одной схемы."""
+        kb = make_kb(BASE_CORPUS)
+        with_timer = kb._extract_xml_features(
+            kb._parse(diagram(flow(SLA_BOUNDARY))))
+        nested = kb._extract_xml_features(kb._parse(diagram(flow(NESTED))))
+        assert "boundary" in with_timer and "timer" in with_timer
+        assert "subprocess" in nested and "timer" not in nested
+
+
+INCIDENT_XML = diagram(
+    '<startEvent id="S" name="Инцидент зарегистрирован"/>'
+    '<userTask id="T1" name="Разобрать инцидент на сервере мониторинга"/>'
+    '<endEvent id="E" name="Инцидент закрыт"/>', "P9")
+
+
+class TestDomainIsCorpusAware:
+    """Классификатор не вправе утверждать тему, под которую в датасете нет ни
+    одного эталона.
+
+    `_DOMAIN_KEYWORDS` знает `it` и `manufacturing`, а в корпусе под них ноль
+    файлов (замер: general 167, finance 70, logistics 61, hr 48, approval 16,
+    customer_service 5). Строка классификатора попадает в тексты запроса обеих
+    веток, и ранжирование уходило словом, которого не несёт ни один документ.
+    """
+
+    def test_a_topic_the_corpus_cannot_serve_degrades_to_general(self, make_kb):
+        kb = make_kb(BASE_CORPUS, broken_semantics=True)
+        kb.ensure_ready()
+        assert kb._detect_domain(INCIDENT_XML) == "it"
+        assert "it" not in kb._corpus_domains()
+        assert kb._detect_domain(INCIDENT_XML, kb._corpus_domains()) == "general"
+
+    def test_the_query_text_carries_the_degraded_topic(self, make_kb):
+        """Сам по себе `_detect_domain` нужен и корпусу, где пустой раздел —
+        норма; в текст запроса обязан уходить ограниченный ответ."""
+        kb = make_kb(BASE_CORPUS, broken_semantics=True)
+        kb.ensure_ready()
+        _, lexical = kb._query_texts("найди узкие места", INCIDENT_XML)
+        assert " it" not in f" {lexical}" and "general" in lexical
+
+    def test_a_topic_the_corpus_actually_has_is_kept(self, make_kb):
+        """Ограничение — не глушение: под тему, для которой в корпусе есть
+        эталон, классификатор отвечает как отвечал."""
+        files = dict(BASE_CORPUS)
+        files["Эталон_инцидента"] = INCIDENT_XML
+        kb = make_kb(files, broken_semantics=True)
+        kb.ensure_ready()
+        assert kb._detect_domain(INCIDENT_XML, kb._corpus_domains()) == "it"
+
+
 def test_identical_gap_from_several_references_becomes_one_line():
     """Одна и та же недостающая практика в трёх эталонах — одна строка
     промпта: три дубля читаются как навязчивая идея, а не как подтверждение."""
@@ -348,3 +432,6 @@ def test_identical_gap_from_several_references_becomes_one_line():
     assert block.count("Таймеры SLA") == 1
     assert "Эталон А, Эталон Б" in block
     assert "Подпроцессы" in block
+    # Домен в схемы передан (`approval`) и всё равно не печатается: дедупликация
+    # — не место, куда тег может вернуться под другим именем теста.
+    assert "[approval]" not in block

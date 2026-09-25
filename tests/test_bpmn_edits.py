@@ -4,6 +4,9 @@
 Это та часть контура улучшения, которая раньше отдавала 500: LLM возвращал
 произвольный XML, а валидатор требовал полную DI-раскладку. Теперь модель
 возвращает операции, и применяем их мы."""
+import inspect
+import re
+import sys
 import time
 import xml.etree.ElementTree as ET
 
@@ -14,12 +17,17 @@ from core.bpmn_edits import (
     DEFAULT_TIMER_DURATION,
     FLOW_NODE_TAGS,
     INVENTORY_MAX_ELEMENTS,
+    NOOP_NOTE_MARKERS,
+    OP_ALIASES,
     OP_SPEC,
     POOL_EMPTY_NOTE_MARKERS,
+    REJECT_HINT,
     UNROUTED_NOTE_MARKERS,
     XML_DECLARATION,
+    apply_and_guarantee,
     apply_operations,
     build_inventory,
+    merge_notes,
     rollback_stranded,
     validate_and_repair,
     _HANDLERS,
@@ -549,6 +557,286 @@ class TestPackageOrder:
         assert report["status"] == "failed"
 
 
+
+class TestMessageFlowEndsAreNotGateways:
+    """Аплайер не ставит развилку концом потока-сообщения.
+
+    Запрет живёт и в линейке (`message_flow_ends`), и здесь, потому что совет
+    самой линейки такие обмены и рисовал: `cross_pool_flow` переводил межпуловую
+    дугу из развилки в `connect(source='<шлюз>', …, flow_type='message')` — то
+    есть пакет заводил дефект, которого нет ни в одном из 625 обменов корпуса.
+    Отказ здесь не «тихая обрезка валидного ответа»: обмен с развилкой на конце
+    невалиден по BPMN, и причина обязана называть законную форму.
+    """
+
+    TWO_POOLS = '''<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D"
+             targetNamespace="t">
+  <collaboration id="C1">
+    <participant id="P1" name="Заказчик" processRef="Proc_1"/>
+    <participant id="P2" name="Исполнитель" processRef="Proc_2"/>
+  </collaboration>
+  <process id="Proc_1" name="Заказчик">
+    <startEvent id="S1" name="Начало"/>
+    <sequenceFlow id="f1" sourceRef="S1" targetRef="A1"/>
+    <userTask id="A1" name="Собрать"/>
+    <sequenceFlow id="f2" sourceRef="A1" targetRef="G1"/>
+    <exclusiveGateway id="G1" name="Куда дальше"/>
+    <sequenceFlow id="f3" sourceRef="G1" targetRef="E1"/>
+    <endEvent id="E1" name="Конец"/>
+  </process>
+  <process id="Proc_2" name="Исполнитель">
+    <startEvent id="S2" name="Заявка принята"/>
+    <sequenceFlow id="g1" sourceRef="S2" targetRef="A2"/>
+    <userTask id="A2" name="Выполнить"/>
+    <sequenceFlow id="g2" sourceRef="A2" targetRef="E2"/>
+    <endEvent id="E2" name="Готово"/>
+  </process>
+</definitions>'''
+
+    def _connect(self, source, target):
+        _, report = apply_operations(self.TWO_POOLS, [
+            {"op": "connect", "source": source, "target": target,
+             "flow_type": "message"}])
+        return report
+
+    def test_message_from_a_gateway_is_refused_with_the_legal_form(self):
+        report = self._connect("G1", "A2")
+        assert report["status"] == "failed"
+        skipped = report["skipped"][0]
+        assert "развилка" in skipped["reason"] and "G1" in skipped["reason"]
+        assert "шаг, ведущий в развилку" in skipped["hint"]
+
+    def test_message_into_a_gateway_is_refused(self):
+        report = self._connect("A2", "G1")
+        assert report["status"] == "failed"
+        assert "развилка" in report["skipped"][0]["reason"]
+
+    def test_message_between_steps_is_applied(self):
+        out, report = apply_operations(self.TWO_POOLS, [
+            {"op": "connect", "source": "A1", "target": "A2",
+             "flow_type": "message"}])
+        assert report["status"] == "success"
+        assert _root(out).find(".//bpmn:messageFlow[@sourceRef='A1']", NS) is not None
+
+    def test_the_ban_does_not_reach_sequence_flows(self):
+        """Ветку развилки запрет трогать не должен: у `sequenceFlow` шлюз —
+        законный источник, и перепутать их значило бы обрезать валидный ответ."""
+        _, report = apply_operations(self.TWO_POOLS, [
+            {"op": "connect", "source": "G1", "target": "A2"}])
+        assert report["skipped"][0]["reason"] == "sequenceFlow между разными пулами недопустим"
+
+
+class TestEventDefinitionOnExistingEvent:
+    """Определение события можно добавить узлу, который уже в схеме.
+
+    `add_event` создаёт событие с определением, но событие без определения в
+    ответе модели — другой дефект, и правки ему не было: `event_types` у
+    скоринга и инвариант `event_definitions` ругались на пустой кружок, а
+    подсказать было нечего — приходилось удалять узел и рисовать заново, цепляя
+    обратно потоки. Опасность не в балле, а в молчании: нарушение выглядело
+    непочиняемым, хотя нот требует ровно одного дочернего элемента.
+    """
+
+    UNTYPED = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_wait">
+  <process id="Process_wait" name="Ожидание" isExecutable="true">
+    <startEvent id="Start_1" name="Запрос ушёл"/>
+    <sequenceFlow id="F1" sourceRef="Start_1" targetRef="W_answer"/>
+    <intermediateCatchEvent id="W_answer" name="Ожидание ответа"/>
+    <sequenceFlow id="F2" sourceRef="W_answer" targetRef="T_next"/>
+    <userTask id="T_next" name="Обработать ответ"/>
+    <sequenceFlow id="F3" sourceRef="T_next" targetRef="End_ok"/>
+    <endEvent id="End_ok" name="Готово"/>
+  </process>
+</definitions>"""
+
+    OPS = [{"op": "add_event_definition", "id": "W_answer",
+            "event_definition": "timer", "duration": "PT2H"}]
+
+    def test_definition_becomes_a_child_of_the_existing_event(self):
+        out, report = apply_operations(self.UNTYPED, self.OPS)
+        assert report["status"] == "success"
+        event = _by_id(out, "W_answer")
+        assert "timerEventDefinition" in _child_tags(event)
+        duration = event.find("bpmn:timerEventDefinition/bpmn:timeDuration", NS)
+        assert duration.text == "PT2H"
+
+    def test_route_is_untouched_by_the_definition(self):
+        out, _ = apply_operations(self.UNTYPED, self.OPS)
+        assert build_inventory(out)["flows"] == build_inventory(self.UNTYPED)["flows"]
+
+    def test_timer_without_a_requested_duration_gets_the_default(self):
+        out, _ = apply_operations(self.UNTYPED, [{"op": "add_event_definition",
+                                                  "id": "W_answer",
+                                                  "event_definition": "timer"}])
+        duration = _by_id(out, "W_answer").find(
+            "bpmn:timerEventDefinition/bpmn:timeDuration", NS)
+        assert duration.text == DEFAULT_TIMER_DURATION
+
+    def test_second_definition_is_skipped_with_a_reason(self):
+        _, report = apply_operations(self.UNTYPED, self.OPS + [
+            {"op": "add_event_definition", "id": "W_answer",
+             "event_definition": "message"}])
+        skip = report["skipped"][0]
+        assert skip["op"] == "add_event_definition"
+        assert "уже есть" in skip["reason"]
+
+    def test_a_task_is_not_an_event(self):
+        _, report = apply_operations(self.UNTYPED, [
+            {"op": "add_event_definition", "id": "T_next",
+             "event_definition": "timer"}])
+        assert "не событие" in report["skipped"][0]["reason"]
+
+    def test_unknown_definition_names_the_enum(self):
+        _, report = apply_operations(self.UNTYPED, [
+            {"op": "add_event_definition", "id": "W_answer",
+             "event_definition": "pulse"}])
+        skip = report["skipped"][0]
+        assert "timer" in skip["hint"] and "message" in skip["hint"]
+
+    def test_missing_event_is_reported_as_not_found(self):
+        _, report = apply_operations(self.UNTYPED, [
+            {"op": "add_event_definition", "id": "W_missing",
+             "event_definition": "timer"}])
+        assert "не найден" in report["skipped"][0]["reason"]
+
+    def test_creating_an_event_that_exists_points_at_the_definition_op(self):
+        """`add_event` с id готового события — это правка, а не создание.
+
+        Отказывавший текст «новые элементы обязаны иметь id с new_» модель читала
+        как «придумать id» и заводила второй пустой кружок: маршрут оставался
+        нарушен по `event_types`, а пакет становился больше. Подсказка теперь
+        называет операцию, исполнимую именно по этому id."""
+        _, report = apply_operations(self.UNTYPED, [
+            {"op": "add_event", "id": "W_answer", "name": "Ожидание ответа",
+             "event_type": "intermediateCatch", "participant": "Process_wait"}])
+        skip = report["skipped"][0]
+        assert "без префикса new_" in skip["reason"]
+        assert "add_event_definition(id='W_answer'" in skip["hint"]
+
+    def test_a_task_or_a_typed_event_keeps_the_plain_new_id_hint(self):
+        """Адрес подсказки — только пустой кружок между маршрутами: задачей он не
+        правится, и совет «перейдите на add_event_definition» на задаче был бы
+        вторым отказом вместо ответа."""
+        _, report = apply_operations(self.UNTYPED, [
+            {"op": "add_event", "id": "T_next", "name": "Обработка",
+             "event_type": "intermediateCatch", "participant": "Process_wait"}])
+        assert report["skipped"][0]["hint"] == \
+            "новые элементы обязаны иметь id, начинающийся с new_"
+
+    # --- таймер без хронометража -------------------------------------------
+    # `<timerEventDefinition/>` исполнитель не заведёт никогда: ветка «срок
+    # вышел» на такой схеме не наступает, хотя выглядит готовой. Подставить
+    # срок этому узлу было нечем — `add_event_definition` отказывал по
+    # «определение уже есть», а нарушения (`timer_without_schedule` у скоринга,
+    # `timer_schedule` у оракула) выглядели непочиняемыми.
+
+    INERT_TIMER = UNTYPED.replace(
+        '<intermediateCatchEvent id="W_answer" name="Ожидание ответа"/>',
+        '<intermediateCatchEvent id="W_answer" name="Ожидание ответа">'
+        '<timerEventDefinition/></intermediateCatchEvent>')
+
+    INERT_BLANK = UNTYPED.replace(
+        '<intermediateCatchEvent id="W_answer" name="Ожидание ответа"/>',
+        '<intermediateCatchEvent id="W_answer" name="Ожидание ответа">'
+        '<timerEventDefinition><timeDuration> </timeDuration>'
+        '</timerEventDefinition></intermediateCatchEvent>')
+
+    LIVE_TIMER = UNTYPED.replace(
+        '<intermediateCatchEvent id="W_answer" name="Ожидание ответа"/>',
+        '<intermediateCatchEvent id="W_answer" name="Ожидание ответа">'
+        '<timerEventDefinition><timeDuration>PT1H</timeDuration>'
+        '</timerEventDefinition></intermediateCatchEvent>')
+
+    def test_timing_fills_a_timer_that_has_none(self):
+        out, report = apply_operations(self.INERT_TIMER, [
+            {"op": "add_event_definition", "id": "W_answer",
+             "event_definition": "timer", "duration": "PT30M"}])
+        assert report["status"] == "success", report["skipped"]
+        event = _by_id(out, "W_answer")
+        definitions = [c for c in event
+                       if "timerEventDefinition" in str(c.tag)]
+        assert len(definitions) == 1
+        assert definitions[0].find("bpmn:timeDuration", NS).text == "PT30M"
+
+    def test_blank_timing_is_treated_as_absent(self):
+        out, report = apply_operations(self.INERT_BLANK, [
+            {"op": "add_event_definition", "id": "W_answer",
+             "event_definition": "timer", "duration": "PT30M"}])
+        assert report["status"] == "success", report["skipped"]
+        assert _by_id(out, "W_answer").find(
+            "bpmn:timerEventDefinition/bpmn:timeDuration", NS).text == "PT30M"
+
+    def test_a_schedule_that_exists_is_not_overwritten(self):
+        """Заменить срок — это не «починить узел», а изменить процесс без
+        просьбы: хронометраж мог поставить автор, и молча переписывать его
+        нельзя."""
+        out, report = apply_operations(self.LIVE_TIMER, [
+            {"op": "add_event_definition", "id": "W_answer",
+             "event_definition": "timer", "duration": "PT30M"}])
+        assert "хронометраж" in report["skipped"][0]["reason"]
+        assert _by_id(out, "W_answer").find(
+            "bpmn:timerEventDefinition/bpmn:timeDuration", NS).text == "PT1H"
+
+    def test_changing_the_definition_type_of_a_live_timer_is_still_refused(self):
+        _, report = apply_operations(self.LIVE_TIMER, [
+            {"op": "add_event_definition", "id": "W_answer",
+             "event_definition": "message"}])
+        assert "уже есть" in report["skipped"][0]["reason"]
+
+    def test_filling_a_schedule_does_not_touch_the_route(self):
+        out, _ = apply_operations(self.INERT_TIMER, [
+            {"op": "add_event_definition", "id": "W_answer",
+             "event_definition": "timer", "duration": "PT30M"}])
+        assert build_inventory(out)["flows"] == build_inventory(self.INERT_TIMER)["flows"]
+
+
+class TestOpNameAlias:
+    """Синоним имени операции стоит дешевле, чем отказ с правильными операндами.
+
+    В записанном improvement-пакете две правки из одиннадцати умерли формулировкой
+    «неизвестная операция»: модель звала соединение `add_flow` — это слово из
+    словаря BPMN (`sequenceFlow`) и из подсказок починки, где «добавь поток»
+    встречается чаще, чем «connect». Операнды у её операции были верные, и
+    `improve/op_acceptance` записывала отказ как качество модели, хотя виновато
+    расхождение словарей.
+
+   Подстановка не расширяет возможности аплайера: принимается ровно то, что
+    приняла бы операция `connect` с теми же полями, и она показывает подстановку
+    в заметке, чтобы «принято» не выглядело так, будто модель написала
+    каноническое имя.
+    """
+
+    def test_add_flow_is_applied_as_connect(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_flow", "source": "T_ship", "target": "T_cancel"}])
+        assert report["status"] == "success"
+        applied = report["applied"][0]
+        assert applied["op"] == "connect"
+        assert "add_flow" in applied["note"]
+        added = _root(out).findall(
+            ".//bpmn:sequenceFlow[@sourceRef='T_ship'][@targetRef='T_cancel']", NS)
+        assert len(added) == 1
+
+    def test_alias_names_only_operations_the_applier_understands(self):
+        assert set(OP_ALIASES.values()) <= set(OP_SPEC)
+        assert not set(OP_ALIASES) & set(OP_SPEC)
+
+    def test_a_name_outside_the_table_is_still_rejected(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_wire", "source": "T_ship", "target": "T_cancel"}])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "неизвестная операция"
+        assert "connect" in skip["hint"]
+
+    def test_alias_inherits_the_operand_errors_of_canonical_op(self, single_pool_xml):
+        """Подстановка не отменяет проверку: поток в никуда остаётся отказом."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_flow", "source": "T_ship", "target": "Nope_1"}])
+        assert report["skipped"][0]["op"] == "connect"
+        assert "не найден" in report["skipped"][0]["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Граничные события и определения событий
 # ---------------------------------------------------------------------------
@@ -666,12 +954,20 @@ class TestBoundaryEvent:
         assert report["skipped"][0]["reason"] == "неизвестный тип граничного события 'signal'"
         assert report["skipped"][0]["hint"] == "допустимы: timer, error"
 
-    def test_missing_name_is_skipped(self, single_pool_xml):
-        _, report = apply_operations(single_pool_xml, [
+    def test_missing_name_is_applied_to_a_boundary_event(self, single_pool_xml):
+        """Безымянное граничное событие — не дефект: `naming` требует имени у
+        шага, а тип события читается из дочернего `*EventDefinition`, не из
+        подписи кружка. Ветка обработки здесь обязательна по другой причине —
+        её требует скоринг (`TestUnroutedRollback`), и отказ по ней не про имя.
+        См. `TestNameIsNotATransportConstraint`."""
+        out, report = apply_operations(single_pool_xml, [
             {"op": "add_boundary_event", "id": "new_BE", "attached_to": "T_collect",
-             "event_type": "timer"},
+             "event_type": "timer", "to": "T_ship"},
         ])
-        assert report["skipped"][0]["reason"] == "не задано имя элемента"
+        assert report["status"] == "success", report["skipped"]
+        event = _by_id(out, "new_BE")
+        assert event.get("attachedToRef") == "T_collect"
+        assert "name" not in event.attrib
 
     def test_reused_id_is_skipped(self, single_pool_xml):
         _, report = apply_operations(single_pool_xml, self.OPS + self.OPS)
@@ -704,6 +1000,28 @@ class TestBoundaryEvent:
         }])
         assert report["skipped"][0]["reason"] == "неизвестное определение события 'pulse'"
 
+    @pytest.mark.parametrize("bare_type", ["intermediateCatch", "intermediateThrow"])
+    def test_intermediate_event_without_a_definition_is_refused(self, single_pool_xml,
+                                                              bare_type):
+        """Промежуточное событие без определения — пустой кружок: bpmn-js его
+        рисует, а скоринг тип события не засчитывает (`event_definitions`,
+        `event_types`). Опаснее всего молчание контура: операция применялась,
+        пропуска и пометки починки не было, поэтому корректирующий повтор не
+        звал модель даже тогда, когда пакет ронял балл живой схеме
+        (production_incident: 95 → 90). Порядок задаёт
+        `add_boundary_event` — он тип требует тоже."""
+        out, report = apply_operations(single_pool_xml, [{
+            "op": "add_event", "id": "new_IC_bare", "name": "Ожидание",
+            "event_type": bare_type, "participant": "Заказ", "after": "T_collect",
+        }])
+        assert report["applied"] == []
+        skip = report["skipped"][0]
+        assert skip["reason"] == "событию нужно определение"
+        assert "event_definition=timer|message|error|signal" in skip["hint"]
+        assert _by_id(out, "new_IC_bare") is None
+        # Отказ до вставки: маршрут хозяина `after` не тронут.
+        assert _refs(_by_id(out, "T_collect"), "outgoing") == ["F2"]
+
     def test_definition_on_start_event_is_refused(self, single_pool_xml):
         _, report = apply_operations(single_pool_xml, [{
             "op": "add_event", "id": "new_E", "name": "Старт", "event_type": "start",
@@ -718,6 +1036,69 @@ class TestBoundaryEvent:
             "event_definition": "timer",
         }])
         assert report["skipped"][0]["reason"] == "определение события задают только событию"
+
+
+# ---------------------------------------------------------------------------
+# Имя: обязательность шагу, а не каждому узлу (транспорт не решает за ноту)
+# ---------------------------------------------------------------------------
+
+class TestNameIsNotATransportConstraint:
+    """`naming` в линейке объявляет: имя обязательно шагу, а «шлюзу и событию имя
+    в BPMN не требуется — ветку подписывает условие». Этот же текст модель читает
+    в промпте улучшения, значит безымянный шлюз — легальный ответ, и обрезать
+    его транспортом нельзя.
+
+    Найдено не фикстурами, а записанным живым пакетом
+    (`warehouse_delivery.live.improve`): модель вернула шлюз ветвления с
+    `name: ""` и получила «не задано имя элемента» — одна из четырёх отсеянных
+    правок первого раунда. Тип события скоринг читает из дочернего
+    `*EventDefinition` (`event_types`), а не из подписи, поэтому безымянные
+    узлы не добавляют схеме ни одного нарушения.
+    """
+
+    def test_activity_without_a_name_is_still_refused(self, single_pool_xml):
+        """Здесь отказ законен: безымянный шаг — нарушение того же `naming`, и
+        подсказка зовёт корректирующий повтор, а не молча принимает дефект."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_T_noname", "name": "",
+             "participant": "Заказ", "after": "T_collect"},
+        ])
+        assert report["skipped"][0]["reason"] == "не задано имя элемента"
+
+    def test_gateway_without_a_name_is_applied(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [{
+            "op": "add_gateway", "id": "new_G_unnamed", "name": "",
+            "gateway_type": "exclusive", "participant": "Заказ",
+            "after": "T_collect",
+        }])
+        assert report["status"] == "success", report["skipped"]
+        gateway = _by_id(out, "new_G_unnamed")
+        assert gateway is not None and "name" not in gateway.attrib
+        assert "имя не задано" in report["applied"][0]["note"]
+
+    def test_event_without_a_name_is_applied(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [{
+            "op": "add_event", "id": "new_IC_unnamed", "name": "",
+            "event_type": "intermediateCatch", "event_definition": "message",
+            "participant": "Заказ", "after": "T_collect",
+        }])
+        assert report["status"] == "success", report["skipped"]
+        event = _by_id(out, "new_IC_unnamed")
+        assert event.find("bpmn:messageEventDefinition", NS) is not None
+        assert "name" not in event.attrib
+
+    def test_nameless_gateway_survives_the_guarantee(self, single_pool_xml):
+        """Гарант — тот же путь, что у харнесса и продукта: если починка или
+        снятие осиротевших узлов не оставляет шлюз, метрика приняла бы правку,
+        которой в принятой схеме нет."""
+        out, report = apply_and_guarantee(single_pool_xml, [{
+            "op": "add_gateway", "id": "new_G_unnamed", "name": "",
+            "gateway_type": "exclusive", "participant": "Заказ",
+            "after": "T_collect",
+        }])
+        assert report["status"] == "success", report["skipped"]
+        assert report["reverted"] == "", report
+        assert _by_id(out, "new_G_unnamed") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1179,7 +1560,7 @@ class TestPerformance:
         xml = _wide_xml()
         inventory = build_inventory(xml)
         # Ширина схемы — по самому XML: инвентарь ограничен потолком контекста
-        # модели и для теста линейности показывает, что срез по лimit работает.
+        # модели и для теста линейности показывает, что срез по лимиту работает.
         assert xml.count("<userTask") >= 250
         assert xml.count("<sequenceFlow") >= 500
         assert inventory["limits"]["elements_omitted"] > 0
@@ -2082,9 +2463,11 @@ class TestTimerSchedule:
         _, report = apply_operations(single_pool_xml, [
             {"op": "add_boundary_event", "id": "new_BE", "attached_to": "T_collect",
              "event_type": "error", "name": "Ошибка", "duration": "PT10M"},
+            # Определение названо: иначе первым сработал бы отказ «событию нужно
+            # определение», а здесь проверяется хронометраж не-таймера.
             {"op": "add_event", "id": "new_IC", "name": "Сообщение",
              "event_type": "intermediateCatch", "participant": "Заказ",
-             "duration": "PT10M"},
+             "event_definition": "message", "duration": "PT10M"},
         ])
         assert [s["reason"] for s in report["skipped"]] == [
             "хронометраж задают только таймеру",
@@ -2560,6 +2943,31 @@ class TestFlowEndsAndAttachments:
         '<sequenceFlow id="XF_bad" sourceRef="A_ship" targetRef="A_start"/>\n'
         '    <messageFlow id="MF_hand"')
 
+    # По BPMN 2.0 конец потока-сообщения — это и узел, и участник целиком; так
+    # рисует обмен Signavio, когда получатель внутри пула не размечен.
+    POOL_END_XML = XML.replace(
+        '<messageFlow id="MF_hand" sourceRef="A_ship" targetRef="B_start"/>',
+        '<messageFlow id="MF_hand" sourceRef="Pool_a" targetRef="B_start"/>\n'
+        '    <messageFlow id="MF_back" sourceRef="B_take" targetRef="Pool_a"/>')
+
+    BROKEN_POOL_END_XML = POOL_END_XML.replace(
+        '<messageFlow id="MF_back" sourceRef="B_take" targetRef="Pool_a"/>',
+        '<messageFlow id="MF_back" sourceRef="B_take" targetRef="Pool_zzz"/>')
+
+    def test_message_flow_may_end_on_the_participant_itself(self):
+        """До фикса починка звала такой конец «висящим» и резала обмен: по
+        корпусу это 52 схемы из 88 с messageFlow, и у каждой исчезавшая дуга
+        роняла `participant_interacts` с passed на failed."""
+        repaired, notes = validate_and_repair(self.POOL_END_XML)
+        assert notes == []
+        ids = {e.get("id") for e in _root(repaired).iter() if e.get("id")}
+        assert {"MF_hand", "MF_back"} <= ids
+
+    def test_message_flow_to_an_absent_pool_is_still_removed(self):
+        """Разрешить пул — не значит перестать замечать несуществующий id."""
+        _, notes = validate_and_repair(self.BROKEN_POOL_END_XML)
+        assert any("MF_back" in note for note in notes)
+
     def test_legal_scheme_is_not_touched(self):
         repaired, notes = validate_and_repair(self.XML)
         assert notes == []
@@ -2879,3 +3287,375 @@ class TestRoleLaneIsAnAddress:
              "lane": "Lane_wh"}])
         assert any(s["reason"] == "пул не определён" for s in report["skipped"])
         assert _by_id(out, "new_A") is None
+
+
+# ---------------------------------------------------------------------------
+# Единая точка входа: «применено и не хуже исходной»
+#
+# Последовательность «аплайер → починка → откат по ухудшению» писалась руками
+# трижды (оркестратор — два раза подряд, харнесс — короче), и каждый раз
+# по-своему неполно: откат пакета, замкнувшего цикл, возвращал базовый XML,
+# оставляя в `applied` строки правок, которых в схеме уже нет, — корректирующий
+# повтор затем запрещает модели делать то, чего она уже «сделала». Второй прогон
+# починки, в свою очередь, перезаписывает пометки: неидемпотентный факт о
+# подмене типа элемента исчезает из отчёта ровно тогда, когда он важнее всего.
+# ---------------------------------------------------------------------------
+
+LINEAR_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_lin">
+  <process id="P_lin" name="Маршрут" isExecutable="true">
+    <startEvent id="L_s" name="Запрос"><outgoing>LF1</outgoing></startEvent>
+    <sequenceFlow id="LF1" sourceRef="L_s" targetRef="L_a"/>
+    <userTask id="L_a" name="Собрать заказ">
+      <incoming>LF1</incoming><outgoing>LF2</outgoing></userTask>
+    <sequenceFlow id="LF2" sourceRef="L_a" targetRef="L_b"/>
+    <userTask id="L_b" name="Отгрузить">
+      <incoming>LF2</incoming><outgoing>LF3</outgoing></userTask>
+    <sequenceFlow id="LF3" sourceRef="L_b" targetRef="L_e"/>
+    <endEvent id="L_e" name="Готово"><incoming>LF3</incoming></endEvent>
+  </process>
+</definitions>"""
+
+
+class TestApplyAndGuarantee:
+    """Откат имеет право вернуть базу только с пустым `applied`: отчёт не вправе
+    утверждать, что правка в схеме, когда схема вернулась к базе."""
+
+    # Оба шага легальны поодиночке и вместе замыкают L_a → new_X → L_b → L_a —
+    # цикл без шлюза на выходе. Решение «отказывать пакету» принимает вызывающий
+    # код, аплайер обязан честно отразить отказ в отчёте.
+    CYCLING = [
+        {"op": "add_task", "id": "new_X", "name": "Проверить пломбы",
+         "task_type": "userTask", "after": "L_a", "to": "L_b"},
+        {"op": "connect", "source": "L_b", "target": "L_a"},
+    ]
+
+    def test_reverted_package_leaves_no_applied_row(self):
+        out, report = apply_and_guarantee(
+            LINEAR_XML, self.CYCLING, reject=lambda _xml: "цикл без выхода")
+        assert out == LINEAR_XML
+        assert report["applied"] == []
+        assert report["reverted"] == "цикл без выхода"
+        assert report["status"] == "failed"
+        by_op = {s["op"]: s for s in report["skipped"]}
+        assert {"add_task", "connect"} <= set(by_op), report["skipped"]
+        for row in by_op.values():
+            assert row["reason"] == "цикл без выхода"
+            assert row["hint"] == REJECT_HINT
+        # Идентичность правки сохранена: повтор понимает, о каком элементе речь,
+        # и не считает откатанную вставку уже сделанной.
+        assert by_op["add_task"]["id"] == "new_X"
+        assert by_op["connect"]["source"] == "L_b"
+        assert by_op["connect"]["target"] == "L_a"
+        assert _by_id(out, "new_X") is None
+
+    def test_revert_of_an_empty_package_still_says_why(self):
+        """Ни одной применённой строки — отказ всё равно обязан дойти до
+        корректирующего повтора, который собран по `skipped`."""
+        _, report = apply_and_guarantee(
+            LINEAR_XML, [{"op": "rename", "id": "нет-такого", "name": "X"}],
+            reject=lambda _xml: "схема хуже исходной")
+        assert report["applied"] == []
+        assert report["reverted"] == "схема хуже исходной"
+        assert report["status"] == "failed"
+        batch = [s for s in report["skipped"] if s["op"] == "batch"]
+        assert batch[0]["reason"] == "схема хуже исходной"
+
+    def test_without_a_reject_the_package_survives(self):
+        out, report = apply_and_guarantee(LINEAR_XML, self.CYCLING[:1])
+        assert report["reverted"] == ""
+        assert report["status"] == "success"
+        assert [a["op"] for a in report["applied"]] == ["add_task"]
+        assert _by_id(out, "new_X") is not None
+        assert out != LINEAR_XML
+
+    def test_merge_notes_keeps_order_and_drops_duplicates(self):
+        assert merge_notes(["a", "b"], ["b", "c"]) == ["a", "b", "c"]
+        assert merge_notes([], ["x"]) == ["x"]
+        assert merge_notes() == []
+
+    def test_repair_notes_of_every_round_are_kept(self):
+        """«Понижен до задачи» второй прогон уже не вернёт: чинить нечего, а
+        факт подмены типа элемента читателю терять нельзя — без `merge_notes`
+        отчёт замолкал о нём сразу, как начинался корректирующий повтор."""
+        demoted = BARE_GATEWAY_XML.replace(
+            '<sequenceFlow id="F3" sourceRef="G1" targetRef="T2"/>\n', "").replace(
+            '<exclusiveGateway id="G1" name="Оплата?">',
+            '<exclusiveGateway id="G1" name="Оплата?" default="F2">')
+        out, report = apply_and_guarantee(demoted, [])
+        assert report["repair_rounds"] == 2, "второй прогон обязана быть: он проверяет покой"
+        assert any("понижен до задачи" in n for n in report["notes"]), report["notes"]
+        assert _tag(_by_id(out, "G1")) == "task"
+
+    def test_reject_is_asked_about_the_repaired_tree(self):
+        """Предикат смотрит на то, что ушло бы пользователю: ссылок, которые
+        починка всё равно пересобрала бы, в кандидат-XML быть не должно."""
+        stale = LINEAR_XML.replace('<incoming>LF2</incoming>',
+                                   '<incoming>LF_ghost</incoming>')
+        seen = []
+
+        def _reject(candidate):
+            seen.append(candidate)
+            return None
+
+        out, report = apply_and_guarantee(stale, [], reject=_reject)
+        assert seen and seen[0] != stale
+        assert "LF_ghost" not in seen[0]
+        assert "LF1" in _refs(_by_id(out, "L_a"), "incoming")
+        assert report["reverted"] == ""
+        assert report["repair_rounds"] >= 1
+
+    def test_noop_rows_count_applied_rows_that_changed_nothing(self):
+        """Строка «применено» там, где схема не изменилась, — не правка: без
+        счётчика оркестратор считает её успехом и не зовёт переспрос."""
+        text = "Собираем по описи"
+        _, report = apply_and_guarantee(LINEAR_XML, [
+            {"op": "add_documentation", "id": "L_a", "text": text},
+            {"op": "add_documentation", "id": "L_a", "text": text},
+        ])
+        assert len(report["applied"]) == 2
+        note = report["applied"][1]["note"]
+        assert any(marker in note for marker in NOOP_NOTE_MARKERS), note
+        assert report["noop_rows"] == 1
+
+    def test_partial_status_survives_the_repair(self):
+        """Отказанная правка — не успех и не отказ пакета: переспрос обязан
+        видеть, что работа осталась открытой."""
+        out, report = apply_and_guarantee(LINEAR_XML, [
+            {"op": "add_task", "id": "new_X", "name": "Проверить пломбы",
+             "task_type": "userTask", "after": "L_a", "to": "L_b"},
+            {"op": "rename", "id": "нет-такого", "name": "X"},
+        ])
+        assert report["status"] == "partial"
+        assert report["reverted"] == ""
+        assert len(report["applied"]) == 1
+        assert _by_id(out, "new_X") is not None
+
+
+# ---------------------------------------------------------------------------
+# Условие на существующей ветке шлюза
+# ---------------------------------------------------------------------------
+
+class TestAddCondition:
+    """`connect` поток создаёт и на готовую пару отвечает «такой поток уже
+    существует» с подсказкой про `set_default` — а тот условие снимает. Ветка
+    шлюза без условия и без default оказывалась неисправимой: правило
+    `gateway_conditions` стоит 15 баллов, и на живой схеме vehicle_reservation
+    пакет, применившийся целиком, не сдвинул скор (80 → 80)."""
+
+    def test_condition_lands_on_the_existing_branch(self):
+        out, report = apply_operations(BARE_GATEWAY_XML, [
+            {"op": "add_condition", "flow": "F2", "condition": "остаток > 0"}])
+        assert report["status"] == "success", report["skipped"]
+        flow = _flow(_root(out), "F2")
+        assert flow is not None, "id потока сохраняется, а не заменяется новым"
+        assert flow.get("sourceRef") == "G1" and flow.get("targetRef") == "T1"
+        assert flow.find("bpmn:conditionExpression", NS).text == "остаток > 0"
+        # планировщик правку увидит — иначе повтор принесёт её снова
+        flows = {f["id"]: f for f in build_inventory(out)["flows"]}
+        assert flows["F2"]["condition"] == "остаток > 0"
+
+    def test_connect_cannot_do_this_job(self):
+        """Само существование операции из этого теста: `connect` по существующей
+        паре отказывает, а `add_condition` ту же ветку условной делает."""
+        _, by_connect = apply_operations(BARE_GATEWAY_XML, [
+            {"op": "connect", "source": "G1", "target": "T1",
+             "condition": "остаток > 0"}])
+        assert by_connect["skipped"][0]["reason"] == "такой поток уже существует"
+        out, report = apply_operations(BARE_GATEWAY_XML, [
+            {"op": "add_condition", "flow": "F2", "condition": "остаток > 0"}])
+        assert report["applied"][0]["op"] == "add_condition"
+        assert _flow(_root(out), "F2").find("bpmn:conditionExpression", NS) is not None
+
+    def test_the_operation_is_offered_to_the_planner(self):
+        assert "add_condition" in OP_SPEC and "add_condition" in _HANDLERS
+        assert '"op":"add_condition"' in OP_SPEC["add_condition"]
+        assert '"flow":' in OP_SPEC["add_condition"]
+        assert '"condition":' in OP_SPEC["add_condition"]
+
+    def test_empty_condition_is_refused(self):
+        out, report = apply_operations(BARE_GATEWAY_XML, [
+            {"op": "add_condition", "flow": "F2", "condition": "   "}])
+        assert report["skipped"][0]["reason"] == "не задано условие"
+        assert "condition" in report["skipped"][0]["hint"]
+        assert _flow(_root(out), "F2").find("bpmn:conditionExpression", NS) is None
+
+    def test_unknown_flow_points_at_the_inventory_flows(self):
+        _, report = apply_operations(BARE_GATEWAY_XML, [
+            {"op": "add_condition", "flow": "F9", "condition": "да"}])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "поток 'F9' не найден"
+        assert "flows" in skip["hint"]
+
+    def test_flow_of_a_non_gateway_is_refused(self):
+        """F1 выходит из старта, F4 — из задачи: условия на таких ветках движок
+        не читает, а скоринг их не требует."""
+        for flow_id in ("F1", "F4"):
+            _, report = apply_operations(BARE_GATEWAY_XML, [
+                {"op": "add_condition", "flow": flow_id, "condition": "да"}])
+            assert report["skipped"][0]["reason"].endswith(
+                "не является веткой шлюза"), report["skipped"]
+
+    def test_message_flow_is_refused(self, two_pool_xml):
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_condition", "flow": "MF1", "condition": "да"}])
+        assert report["skipped"][0]["reason"] == "'MF1' не sequence-поток"
+
+    def test_parallel_gateway_branch_is_refused(self):
+        xml = BARE_GATEWAY_XML.replace(
+            '<exclusiveGateway id="G1" name="Оплата?">',
+            '<parallelGateway id="G1" name="И туда, и туда">').replace(
+            "</exclusiveGateway>", "</parallelGateway>")
+        _, report = apply_operations(xml, [
+            {"op": "add_condition", "flow": "F2", "condition": "да"}])
+        assert "не является исключающим шлюзом" in report["skipped"][0]["reason"]
+
+    def test_default_of_this_flow_is_lifted(self):
+        """Ветка не может быть одновременно «иначе» и условной: снятие default
+        — часть правки, а не побочный эффект, и читатель обязан её видеть."""
+        xml = BARE_GATEWAY_XML.replace(
+            '<exclusiveGateway id="G1" name="Оплата?">',
+            '<exclusiveGateway id="G1" name="Оплата?" default="F2">')
+        out, report = apply_operations(xml, [
+            {"op": "add_condition", "flow": "F2", "condition": "оплачен"}])
+        assert report["status"] == "success", report["skipped"]
+        assert _gateway_default_id(out, "G1") is None
+        assert ("выход по умолчанию со 'F2' снят: теперь он условный"
+                in report["applied"][0]["note"])
+
+    def test_previous_condition_is_replaced_not_doubled(self):
+        out, report = apply_operations(BARE_GATEWAY_XML, [
+            {"op": "add_condition", "flow": "F2", "condition": "первое"},
+            {"op": "add_condition", "flow": "F2", "condition": "второе"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        conditions = _flow(_root(out), "F2").findall("bpmn:conditionExpression", NS)
+        assert len(conditions) == 1 and conditions[0].text == "второе"
+        assert "прежнее условие заменено" in report["applied"][1]["note"]
+
+
+_OP_LIKE = re.compile(r"\b(?:add|remove|set|move|merge)_[a-z_]+\b"
+                      r"|\b(?:disconnect|delete|rename|connect)\b")
+
+
+def test_no_hint_or_spec_invents_an_operation():
+    """Отказ, в котором названа несуществующая операция, модель читает буквально:
+    `add_condition` жил в подсказке `_require_element` ровно так, и в живом
+    отчёте «правку по id принимает только add_condition» повторилось 4 раза
+    (eval/reports/20260923-210453.json) — на операцию, которой у аплайера нет.
+
+    Имя, которое сам модуль определяет как функцию (`merge_notes`), операцией
+    не прикидывается: читателю отчёта оно не показывается, поэтому оно
+    разрешается через hasattr, а внутренним переменным такие имена писать
+    нельзя — отсюда `touched_by_merge` и `merged_ops` вместо `merge_*`."""
+    module = sys.modules["core.bpmn_edits"]
+    source = inspect.getsource(module)
+    for name in _OP_LIKE.findall(source):
+        # Синоним из `OP_ALIASES` — имя, которое аплайер принимает (с подстановкой
+        # канонической операции), поэтому упоминать его в тексте можно.
+        assert name in OP_SPEC or name in OP_ALIASES or hasattr(module, name), \
+            f"упомянуто {name!r}, которого нет в OP_SPEC"
+
+
+DEMOTION_XML = '''<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <process id="Proc_1" name="Процесс">
+    <startEvent id="S" name="Начало"/>
+    <sequenceFlow id="f1" sourceRef="S" targetRef="G1"/>
+    <exclusiveGateway id="G1" name="Проверка документов"/>
+    <sequenceFlow id="f2" sourceRef="G1" targetRef="T1">
+      <conditionExpression>count > 0</conditionExpression>
+    </sequenceFlow>
+    <userTask id="T1" name="Собрать документы"/>
+    <sequenceFlow id="f3" sourceRef="T1" targetRef="G2"/>
+    <exclusiveGateway id="G2" name=""/>
+    <sequenceFlow id="f4" sourceRef="G2" targetRef="E"/>
+    <endEvent id="E" name="Готово"/>
+  </process>
+</definitions>
+'''
+
+
+def test_unnamed_single_branch_gateway_is_not_demoted_into_an_unnamed_task():
+    """Понижение шлюза с единственной веткой до задачи — починка, которая обязана
+    думать о том, что она оставляет после себя.
+
+    У шлюза имени по нотации не бывает, а `naming` спрашивает имя с шагов:
+    безымянный шлюз, пониженный до задачи, превращался в нарушение, которого до
+    ремонта не было. Находка переписи `eval/advice` (witness
+    `Warenversand_9d83f8d992b647feb794f8441e98cb56.bpmn`): один `connect` из
+    подсказки ронял `naming` не из-за текста совета, а из-за этой починки.
+    Именованный шлюз понижается по-прежнему — вместе с условием единственной
+    ветки."""
+    out, notes = validate_and_repair(DEMOTION_XML)
+    assert _tag(_by_id(out, "G1")) == "task", out
+    assert _tag(_by_id(out, "G2")) == "exclusiveGateway", out
+    assert any("требует имени" in n for n in notes), notes
+    assert any("понижен до задачи" in n for n in notes), notes
+    root = _root(out)
+    nameless_steps = [e.get("id") for e in root.iter()
+                      if _tag(e) in ("task", "userTask", "manualTask",
+                                     "serviceTask", "sendTask", "receiveTask")
+                      and len((e.get("name") or "").strip()) < 3]
+    assert nameless_steps == []
+    # Условие снято только там, где шлюз стал задачей: у оставшегося шлюза оно
+    # не мешало (ветка одна, а `gateway_conditions` наказывает расщепление).
+    assert _flow(root, "f2").find("bpmn:conditionExpression", NS) is None
+    assert _flow(root, "f4").find("bpmn:conditionExpression", NS) is None
+
+
+class TestSetTaskType:
+    """`set_task_type` меняет тег задачи, сохраняя узел: id, имя, дорожку, обе
+    дуги и ссылку диаграммы.
+
+    Операция нужна потому, что самый массовый дефект корпуса (200 схем из 367 с
+    одними родовыми `task`) нечем было починить: `delete` + `add_task` даёт другой
+    id и рвёт маршрут. Отдельно следим за формой имени: `service` и `serviceTask`
+    — одна правка, и отказ по короткому слову был бы обрезкой валидного ответа
+    транспортом.
+    """
+
+    ONE_POOL = TestMessageFlowEndsAreNotGateways.TWO_POOLS
+
+    def _apply(self, op):
+        return apply_operations(self.ONE_POOL, [op])
+
+    def test_generic_task_becomes_a_service_task(self):
+        out, report = self._apply({"op": "set_task_type", "id": "A1",
+                                   "task_type": "serviceTask"})
+        assert report["status"] == "success"
+        root = _root(out)
+        # тронут только названный узел: сосед по коллаборации остаётся как был
+        assert root.find(".//bpmn:userTask[@id='A1']", NS) is None
+        assert root.find(".//bpmn:userTask[@id='A2']", NS) is not None
+        service = root.find(".//bpmn:serviceTask[@id='A1']", NS)
+        assert service is not None and service.get("name") == "Собрать"
+        # маршрут и дорожка не тронуты
+        assert root.find(".//bpmn:sequenceFlow[@sourceRef='A1']", NS) is not None
+        assert root.find(".//bpmn:sequenceFlow[@targetRef='A1']", NS) is not None
+
+    def test_short_type_name_is_the_same_repair(self):
+        _, report = self._apply({"op": "set_task_type", "id": "A1",
+                                 "task_type": "service"})
+        assert report["status"] == "success", report["skipped"]
+
+    def test_unknown_type_is_refused_with_the_allowed_list(self):
+        _, report = self._apply({"op": "set_task_type", "id": "A1",
+                                 "task_type": "printerTask"})
+        assert report["status"] == "failed"
+        assert "printerTask" in report["skipped"][0]["reason"]
+        assert "businessRuleTask" in report["skipped"][0]["hint"]
+
+    def test_gateway_is_not_a_step(self):
+        _, report = self._apply({"op": "set_task_type", "id": "G1",
+                                 "task_type": "serviceTask"})
+        assert report["status"] == "failed"
+        assert "не шаг" in report["skipped"][0]["reason"]
+
+    def test_reapplying_the_same_type_is_reported_as_noop(self):
+        """Одно и то же правило, применённое второй раз, не «изменило схему»:
+        без такой строки отчёта модель зацикливается на правке, которой нет."""
+        out, report = self._apply({"op": "set_task_type", "id": "A1",
+                                   "task_type": "userTask"})
+        notes = str(report["applied"]) + str(report.get("noop_rows"))
+        assert "уже тип" in notes, report
+        assert _root(out).find(".//bpmn:userTask[@id='A1']", NS) is not None

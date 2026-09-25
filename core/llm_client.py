@@ -15,13 +15,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from gigachat import GigaChat
 from gigachat.exceptions import (AuthenticationError, BadRequestError,
-                                 ForbiddenError, RateLimitError,
+                                 ForbiddenError, NotFoundError, RateLimitError,
                                  RequestEntityTooLargeError, ResponseError,
                                  ServerError, UnprocessableEntityError)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "GigaChat"
+# Пул моделей по убыванию предпочтения. Имя «GigaChat» принадлежало старому API
+# (gigachat.devices.sberbank.ru); шлюз api.giga.chat, на который переводит SDK
+# 0.2.3, его не знает и отвечает 404 «No such model» — повтор такого не лечит,
+# поэтому спрашиваем следующую модель. `GigaChat-2` — наследник той линии, на
+# которой обкатаны промпты, `GigaChat-3-Lightning` — актуальное поколение.
+# Порядок задаёт GIGACHAT_MODEL: одно имя или список через запятую.
+DEFAULT_MODEL_POOL = ("GigaChat-2", "GigaChat-3-Lightning")
 DEFAULT_SCOPE = "GIGACHAT_API_PERS"
 MAX_ATTEMPTS = 2
 RETRY_PAUSE_SECONDS = 3
@@ -64,6 +70,20 @@ class LLMRequestTooLargeError(LLMError):
     никогда, и совет переформулировать то, с чем всё в порядке.
     """
 
+
+class _LLMModelRejectedError(LLMError):
+    """Эту модель провайдер не знает: имя не из его списка.
+
+    Служебный сигнал для пула — наружу не выходит, пока в пуле есть следующая
+    модель. От транспортного сбоя отличается ровно тем, что повторять бессмысленно:
+    имя в запросе то же.
+    """
+
+
+# Формулировки отказа «модели нет» тоже разбросаны: часть шлюзов отвечает 400
+# вместо 404. Подстроки нижним регистром — по телу ответа.
+_UNKNOWN_MODEL_HINTS = ("no such model", "unknown model", "model not found",
+                        "нет модели", "несуществующ")
 
 # Формулировки отказов из-за длины разбросаны (GigaChat и OpenAI-совместимые
 # шлюзы пишут по-разному), поэтому ищем по подстроке в теле ответа.
@@ -149,6 +169,15 @@ def _is_auth_failure(error: ResponseError) -> bool:
     return "/oauth" in str(getattr(error, "url", "")).lower()
 
 
+def _error_text(error: ResponseError) -> str:
+    """Тело ответа нижним регистром: битые байты заменяем на читаемый текст —
+    нам нужны только подстроки, а не дословный дамп."""
+    content = error.content
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", "replace")
+    return content.casefold() if isinstance(content, str) else ""
+
+
 def _is_too_large(error: ResponseError) -> bool:
     """Отказ «запрос не влезает»: 413 по размеру тела, 400/422 по тексту ответа.
 
@@ -161,19 +190,32 @@ def _is_too_large(error: ResponseError) -> bool:
         return True
     if not isinstance(error, (BadRequestError, UnprocessableEntityError)):
         return False
-    content = error.content
-    if isinstance(content, bytes):
-        # Битые байты из ответа не должны ронять разбор: заменяем на читаемый
-        # текст — нам нужны только подстроки.
-        content = content.decode("utf-8", "replace")
-    if not isinstance(content, str):
-        return False
-    text = content.casefold()
+    text = _error_text(error)
     return any(hint in text for hint in _CONTEXT_LIMIT_HINTS)
 
 
-def get_model_name() -> str:
-    return os.getenv("GIGACHAT_MODEL", DEFAULT_MODEL)
+def _is_unknown_model(error: ResponseError) -> bool:
+    """Отказ «модели нет»: 404 по классу ответа, 400/422 — по тексту.
+
+    Отличаем его от транспортного сбоя затем, чтобы не жечь попытку на имени,
+    которого у провайдера никогда не было: 404 из лога живого прогона выглядит
+    как «503, попробуйте позже» на запрос, который не пройдёт никогда.
+    """
+    if isinstance(error, NotFoundError):
+        return True
+    if not isinstance(error, (BadRequestError, UnprocessableEntityError)):
+        return False
+    text = _error_text(error)
+    return any(hint in text for hint in _UNKNOWN_MODEL_HINTS)
+
+
+def get_model_pool() -> List[str]:
+    """Модели по убыванию предпочтения: GIGACHAT_MODEL — имя или список через
+    запятую. Пустое значение = пул по умолчанию, чтобы порядок жил в одном месте.
+    """
+    raw = os.getenv("GIGACHAT_MODEL", "")
+    pool = [name.strip() for name in raw.split(",") if name.strip()]
+    return pool or list(DEFAULT_MODEL_POOL)
 
 
 def ensure_llm_ready() -> None:
@@ -210,12 +252,37 @@ def _log_usage(model: str, attempt: int, elapsed_ms: int,
 
 def _complete(messages: List[Dict[str, str]], temperature: float,
               max_tokens: Optional[int]) -> str:
+    """Обход пула моделей: спрашиваем следующую, только когда провайдер не знает
+    текущую.
+
+    Транспортный сбой (5xx, 429, сеть) пул не перебирает: та же ошибка на
+    каждой модели означала бы прогон всех попыток впустую — наружу идёт
+    отказ от первой.
+    """
+    pool = get_model_pool()
+    for index, model in enumerate(pool):
+        try:
+            return _complete_with_model(model, messages, temperature, max_tokens)
+        except _LLMModelRejectedError as e:
+            if index + 1 == len(pool):
+                raise LLMError(
+                    f"Ни одна из моделей пула ({', '.join(pool)}) провайдеру "
+                    f"неизвестна: {e}. Проверьте GIGACHAT_MODEL — список "
+                    "доступных имён отдаёт GET /v1/models."
+                ) from e
+            logger.warning("Модель %s провайдер не знает — перехожу на %s",
+                           model, pool[index + 1])
+    raise LLMError("Пул моделей пуст")  # get_model_pool гарантирует непустоту
+
+
+def _complete_with_model(model: str, messages: List[Dict[str, str]],
+                         temperature: float,
+                         max_tokens: Optional[int]) -> str:
     """Один раунд с ограниченными повторами. Только транспортные повторы
     (429/5xx/сеть); смысловые ошибки ответа повторяет вызывающий код, а отказ
     «не влезло в контекст» поднимается сразу — повтор его не лечит."""
     from gigachat.models import Chat, Messages
 
-    model = get_model_name()
     request = Chat(
         model=model,
         messages=[Messages(role=m["role"], content=m["content"]) for m in messages],
@@ -244,6 +311,10 @@ def _complete(messages: List[Dict[str, str]], temperature: float,
                 raise LLMError(
                     "GigaChat отклонил авторизацию — проверьте "
                     f"GIGACHAT_CREDENTIALS и GIGACHAT_SCOPE: {e}"
+                ) from e
+            if _is_unknown_model(e):
+                raise _LLMModelRejectedError(
+                    f"провайдер не знает модель {model!r}: {e}"
                 ) from e
             if isinstance(e, RateLimitError):
                 last_error = str(e)

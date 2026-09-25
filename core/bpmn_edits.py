@@ -8,7 +8,8 @@ import difflib
 import logging
 import re
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Set,
+                    Tuple)
 
 try:
     from defusedxml import ElementTree as _SafeET
@@ -62,6 +63,13 @@ TASK_TAGS = {
     "task", "userTask", "serviceTask", "scriptTask", "manualTask",
     "businessRuleTask", "sendTask", "receiveTask", "callActivity", "subProcess",
 }
+# Типы, которые операция ставит у существующего шага: «task» и его
+# специализации. `subProcess` и `callActivity` исключены намеренно — это не
+# переименованный шаг, а другой элемент со своим содержимым (`calledElement`,
+# вложенный процесс), и его появление требует маршрута, а не правки тега.
+TASK_TYPE_TAGS = ("task", "userTask", "serviceTask", "scriptTask", "manualTask",
+                  "businessRuleTask", "sendTask", "receiveTask")
+
 GATEWAY_TAGS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway", "eventBasedGateway"}
 EVENT_TAGS = {
     "startEvent", "endEvent", "intermediateCatchEvent", "intermediateThrowEvent",
@@ -177,6 +185,27 @@ def _timer_timing(op: Dict[str, Any],
     return TIMER_TIME_TAGS[field], value.upper()
 
 
+# Что исполнитель читает как расписание таймера. `timeDate` здесь есть, хотя
+# аплайер его не создаёт: «таймер на 2025-01-01» — рабочий таймер, а не пустой.
+TIMER_SCHEDULE_TAGS = ("timeDate", "timeDuration", "timeCycle")
+
+
+def timer_schedule(definition: ET.Element) -> str:
+    """Хронометраж таймера; "" — если его нет или он пустой.
+
+    `<timerEventDefinition/>` без значения исполнитель не заведёт никогда:
+    ветка «срок вышел» выглядит готовой и не наступает. Это читают скоринг
+    (`timer_without_schedule`), оракул харнесса и сам аплайер — этим же
+    различается «подставить срок пустому таймеру» и «переписать срок».
+    """
+    for child in definition:
+        if isinstance(child.tag, str) and _local(child.tag) in TIMER_SCHEDULE_TAGS:
+            text = (child.text or "").strip()
+            if text:
+                return text
+    return ""
+
+
 # Словарь операций в одном месте: дословные формулировки полей, с которыми
 # аплайер их понимает. Планирующий промпт (core/llm_improve.py) обязан
 # перечислять операции так же, а тест сверяет состав OP_SPEC и _HANDLERS:
@@ -204,6 +233,10 @@ OP_SPEC: Dict[str, str] = {
                  '"duration":"PT15M (опц., таймеру)","cycle":"R3/PT10M (опц., таймеру)"}',
     "add_participant": '{"op":"add_participant","id":"new_...","name":"..."}',
     "add_documentation": '{"op":"add_documentation","id":"id элемента","text":"..."}',
+    "add_event_definition": '{"op":"add_event_definition","id":"id события",'
+                            '"event_definition":"'
+                            + "|".join(sorted(EVENT_DEFINITIONS))
+                            + '","duration":"PT2H (только таймеру, опц.)"}',
     "add_lane": '{"op":"add_lane","id":"new_...","name":"...","participant":"пул"}',
     "move_to_lane": '{"op":"move_to_lane","id":"id элемента","lane":"id|имя дорожки"}',
     "add_boundary_event": '{"op":"add_boundary_event","id":"new_...","attached_to":"id задачи",'
@@ -211,10 +244,16 @@ OP_SPEC: Dict[str, str] = {
                           '"to":"id шага обработки (опц.)",'
                           '"duration":"PT15M (опц.)","cycle":"R3/PT10M (опц.)"}',
     "rename": '{"op":"rename","id":"...","name":"..."}',
+    "set_task_type": '{"op":"set_task_type","id":"id шага из схемы",'
+                                     '"task_type":"' + "|".join(TASK_TYPE_TAGS) + '"}', 
     "delete": '{"op":"delete","id":"..."}',
     "connect": '{"op":"connect","source":"...","target":"...",'
                '"flow_type":"sequence|message","condition":"опц.",'
                '"default":true (опц. — сделать эту ветку шлюза выходом по умолчанию)}',
+    # Ветка, которая на схеме уже есть, через `connect` условия не получит: он
+    # создаёт поток и на готовую пару отвечает «такой поток уже существует».
+    "add_condition": '{"op":"add_condition","flow":"id потока шлюза",'
+                     '"condition":"текст условия"}',
     "set_default": '{"op":"set_default","gateway":"id шлюза","flow":"id его ветки"}',
     "disconnect": '{"op":"disconnect","flow":"id потока"}',
     "move_to_participant": '{"op":"move_to_participant","id":"...","participant":"пул"}',
@@ -278,7 +317,7 @@ class _Index:
         self.parents: Dict[ET.Element, ET.Element] = {}
         # Id элементов, затронутых merge_participants: по ним пакет слияния
         # откатывается, если починка нашла поломку именно в перенесённом.
-        self.merge_touched: Set[str] = set()
+        self.touched_by_merge: Set[str] = set()
         self._build()
 
     def _build(self) -> None:
@@ -769,14 +808,38 @@ def _require_element(index: _Index, elem_id: Any) -> ET.Element:
     raise _Skip("элемент не найден", "используйте id из инвентаря")
 
 
+def _new_id_hint(op_id: str, index: _Index) -> str:
+    """Подсказка к отказу «id без new_» для события, которое в схеме уже есть.
+
+    Модель, назвавшая id готового события в `add_event`, хотела поправить его, а
+    не рисовать второй кружок: об этом говорит сам факт, что id взят из схемы и
+    префикса не имеет. Прежняя подсказка предлагала только «придумать id с new_»,
+    и модель в ответ заводила новый пустой кружок, а нарушение `event_types`
+    оставалось. Теперь у отказа есть исполнимый адрес: `add_event_definition`
+    правит тем же id то, чего в схеме не хватало.
+
+    Область подсказки — промежуточные события: `event_types` ругается только на
+    них, поэтому стартовому и конечному событию тип не спрашивают и адрес им не
+    нужен.
+    """
+    elem = index.elements.get(op_id)
+    if elem is not None and _local(elem.tag) in ("intermediateCatchEvent",
+                                                 "intermediateThrowEvent"):
+        typed = any(isinstance(c.tag, str) and _local(c.tag).endswith("EventDefinition")
+                    for c in elem)
+        if not typed:
+            return (f"событие '{op_id}' уже есть в схеме и у него нет определения: "
+                    f"поправьте его операцией add_event_definition(id='{op_id}', "
+                    "event_definition=timer|message|error|signal), а id с new_ "
+                    "нужен только для нового элемента")
+    return "новые элементы обязаны иметь id, начинающийся с new_"
+
+
 def _require_new_id(op_id: Optional[str], index: _Index) -> str:
     if not op_id or not isinstance(op_id, str):
         raise _Skip("не задан id нового элемента", "укажите id с префиксом new_")
     if not op_id.startswith("new_"):
-        raise _Skip(
-            f"id '{op_id}' без префикса new_",
-            "новые элементы обязаны иметь id, начинающийся с new_",
-        )
+        raise _Skip(f"id '{op_id}' без префикса new_", _new_id_hint(op_id, index))
     if index.is_taken(op_id):
         raise _Skip(f"id '{op_id}' уже занят", "используйте уникальный id")
     return op_id
@@ -1119,8 +1182,17 @@ def _pool_skip(index: "_Index", key: Any) -> "_Skip":
 def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     op_id = _require_new_id(op.get("id"), index)
     name = (op.get("name") or "").strip()
-    if not name:
+    # Имя требует нота, а не аплайер: `naming` в скоринге объявляет имя
+    # обязательным шагу, а «шлюзу и событию имя в BPMN не требуется — ветку
+    # подписывает условие». Тот же текст читает модель в промпте улучшения,
+    # поэтому отказать безымянному шлюзу — значит обрезать валидный ответ
+    # транспортом. Записанный живой пакет (`warehouse_delivery.live.improve`)
+    # терял так ветку эскалации: `add_gateway` с `name: ""` шёл в пропуск,
+    # а тип события скоринг читает из дочернего `*EventDefinition`, так что ни
+    # одного нарушения безымянные узлы схеме не добавляют.
+    if kind == "task" and not name:
         raise _Skip("не задано имя элемента", "укажите name")
+    name_attr = {"name": name} if name else {}
     process = index.resolve_process(op.get("participant"))
     lane_key = str(op.get("lane") or "").strip()
     lane = None
@@ -1187,7 +1259,7 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                 "допустимы: " + ", ".join(sorted(ADD_TASK_TAGS))
                 + " (subProcess и callActivity создать нечем наполнить)",
             )
-        elem = ET.Element(_q(task_type), {"id": op_id, "name": name})
+        elem = ET.Element(_q(task_type), {"id": op_id, **name_attr})
         tag = task_type
     elif kind == "gateway":
         if definition:
@@ -1201,7 +1273,7 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                 f"неизвестный тип шлюза '{gateway_type}'",
                 "допустимы: exclusive, parallel, inclusive",
             )
-        elem = ET.Element(_q(tag), {"id": op_id, "name": name})
+        elem = ET.Element(_q(tag), {"id": op_id, **name_attr})
     else:  # event
         event_type = (op.get("event_type") or "").strip()
         tag = EVENT_TYPE_TO_TAG.get(event_type) or EVENT_TYPE_TO_TAG.get(event_type.lower())
@@ -1224,8 +1296,23 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                 "стартовому и конечному событию определение не добавляется",
                 "операцией add_boundary_event можно добавить таймер или ошибку",
             )
+        if definition is None and tag in ("intermediateCatchEvent",
+                                          "intermediateThrowEvent"):
+            # Пустой кружок событием не считается: bpmn-js его рисует, а
+            # скоринг тип события не засчитывает (`event_definitions`,
+            # `event_types`). Опаснее всего здесь молчание контура: правка
+            # применялась, пропуска и пометки починки не было, поэтому
+            # принятый пакет ронял балл живой схеме (production_incident:
+            # 95 → 90), а корректирующий повтор даже не звался.
+            # `add_boundary_event` определение требует давно — тот же порядок.
+            raise _Skip(
+                "событию нужно определение",
+                "укажите event_definition=timer|message|error|signal (таймеру — "
+                "duration или cycle): без определения bpmn-js рисует пустой "
+                "кружок и скоринг не засчитывает тип события",
+            )
         timing = _timer_timing(op, definition)
-        elem = ET.Element(_q(tag), {"id": op_id, "name": name})
+        elem = ET.Element(_q(tag), {"id": op_id, **name_attr})
         if definition:
             _adopt_event_definition(index, elem, definition, op_id, timing)
 
@@ -1233,6 +1320,9 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     outlet_id = _check_outlet(op, index, process, tag,
                               str(after_id or "").strip())
     notes: List[str] = [x for x in (alias_note, lane_alias_note) if x]
+    if not name:
+        notes.append("имя не задано — шлюзу и событию в BPMN оно не требуется; "
+                     "подписать узел можно операцией rename")
     if tag in ("startEvent", "endEvent"):
         # Событие без рёбер — висячий узел, который скоринг считает дефектом
         # связей, поэтому пробуем сразу привязать его к потоку. Явный `to`
@@ -1288,6 +1378,46 @@ def _op_rename(op: Dict[str, Any], index: _Index) -> List[str]:
     return []
 
 
+def _op_set_task_type(op: Dict[str, Any], index: _Index) -> List[str]:
+    """Сменить тип существующего шага, сохранив маршрут, имя и дорожку.
+
+    До этой операции линейка умела только ругать родовые `task` (200 схем из
+    367), а контур — лишь удалить шаг и завести новый с другим id: маршрут,
+    дорожка и ссылка в диаграмме при этом терялись, поэтому правильный ответ
+    модели был для неё дорогим. Тип — то, что в BPMN читается из тега, а не из
+    имени, и менять его надо у того же узла.
+    """
+    elem = _require_element(index, op.get("id"))
+    elem_id = elem.get("id") or ""
+    kind = (op.get("task_type") or op.get("type") or "").strip()
+    # Короткое слово из словаря BPMN — та же правка, что и полное имя тега:
+    # отказывать по форме имени значило бы обрезать валидный ответ транспортом.
+    short = {"task": "task", "user": "userTask", "service": "serviceTask",
+             "script": "scriptTask", "manual": "manualTask",
+             "businessrule": "businessRuleTask", "send": "sendTask",
+             "receive": "receiveTask"}
+    kind = short.get(kind.lower().removesuffix("task"), kind)
+    if kind not in TASK_TYPE_TAGS:
+        raise _Skip(f"неизвестный тип шага '{kind}'",
+                    "задайте один из: " + ", ".join(TASK_TYPE_TAGS))
+    current = _local(elem.tag)
+    if current not in TASK_TYPE_TAGS:
+        raise _Skip(
+            f"'{elem_id}' ({current}) — не шаг: тип меняют у задачи",
+            "у шлюза, события и подпроцесса свой смысл: их правят другими "
+            "операциями",
+        )
+    if current == kind:
+        return [f"у '{elem_id}' уже тип '{kind}' — изменено не было"]
+    elem.tag = _q(kind)
+    notes = [f"шаг '{elem_id}' стал '{kind}' (был '{current}'): имя, дорожка и "
+             "оба конца маршрута сохранены"]
+    if current == "userTask":
+        notes.append(f"'{elem_id}' больше не ручная работа: проверьте дорожку и "
+                     "нагрузку по `lane_overload`")
+    return notes
+
+
 def _op_add_documentation(op: Dict[str, Any], index: _Index) -> List[str]:
     elem = _require_element(index, op.get("id"))
     text = (op.get("text") or "").strip()
@@ -1306,6 +1436,76 @@ def _op_add_documentation(op: Dict[str, Any], index: _Index) -> List[str]:
     # outgoing; несколько документации складываются рядом.
     elem.insert(_position_after(elem, {"documentation"}), doc)
     return [f"дополнено к {len(existing)} существующей(им)"] if existing else []
+
+
+def _op_add_event_definition(op: Dict[str, Any], index: _Index) -> List[str]:
+    """Определение события узлу, который уже стоит в схеме.
+
+    `add_event` создаёт событие с определением, а пустой кружок в ответе модели
+    — другой дефект: узел на месте, потоки к нему на месте, дочернего
+    `*EventDefinition` нет. Правки такому узлу не было вовсе, и нарушение
+    (`event_types` у скоринга, `event_definitions` у оракула) выглядело
+    непочиняемым, хотя нот требует один дочерний элемент.
+
+    Второе определение — отказ, а не «применено»: схема допускает у события
+    несколько определений, и молча добавленный рядом с таймером message читался
+    бы как событие, ждущее и сообщение, и срок, — схема меняет семантику там,
+    где модель просила только подписать тип.
+
+    Этим же текстом ограничена и область применения: операцией подписывают тип
+    пустому кружку (`event_types`), а не назначают срок ожиданию. Таймерное
+    определение внутри `intermediateCatchEvent` перестаёт ждать сообщения, и
+    нарушение `wait_without_sla` формально снимается ценой удалённого бизнес-
+    ожидания; срок для ожидания — граничный таймер на активности либо нога
+    развилки (рецепт называет их в подсказке скоринга).
+    """
+    elem_id = str(op.get("id") or "")
+    elem = _require_element(index, elem_id)
+    tag = _local(elem.tag)
+    if tag not in EVENT_TAGS:
+        raise _Skip(f"'{elem_id}' — {tag}, а не событие",
+                    "определение добавляют стартовому, конечному, промежуточному "
+                    "или граничному событию")
+    existing = [child for child in elem if isinstance(child.tag, str)
+                and _local(child.tag).endswith("EventDefinition")]
+    definition = _event_definition_key(op)
+    if existing:
+        timing = _timer_timing(op, definition)
+        bare_timer = (len(existing) == 1
+                      and _local(existing[0].tag) == "timerEventDefinition"
+                      and definition == "timer")
+        if bare_timer and timer_schedule(existing[0]):
+            raise _Skip(
+                f"у '{elem_id}' хронометраж уже задан "
+                f"({timer_schedule(existing[0])})",
+                "заменить срок нельзя — это меняет процесс, а не чинит узел; "
+                "если срок другой, удалите событие и заведите его заново")
+        if bare_timer:
+            # Единственный случай, где «определение уже есть» — не препятствие:
+            # `<timerEventDefinition/>` без значения исполнитель не заведёт
+            # никогда, а другой правки у этого узла нет (нарушение
+            # `timer_without_schedule` выглядело непочиняемым). Тип события при
+            # этом не подменяется.
+            time_tag, time_text = timing or (TIMER_TIME_TAGS["duration"],
+                                             DEFAULT_TIMER_DURATION)
+            node = existing[0].find(_q(time_tag))
+            if node is None:
+                node = ET.SubElement(existing[0], _q(time_tag))
+            node.text = time_text
+            note = f"таймеру задан хронометраж {time_text}"
+            if not timing:
+                note += " (взят по умолчанию: в операции нет duration/cycle)"
+            return [note]
+        raise _Skip(f"у '{elem_id}' определение уже есть",
+                    "поменять определение нельзя — удалите событие и добавьте "
+                    "новое с нужным event_definition")
+    if definition is None:
+        raise _Skip("не задан event_definition",
+                    "допустимы: " + ", ".join(sorted(EVENT_DEFINITIONS))
+                    + " (таймеру — duration или cycle)")
+    _adopt_event_definition(index, elem, definition, elem_id,
+                            _timer_timing(op, definition))
+    return [f"добавлено определение '{definition}'"]
 
 
 def _op_add_lane(op: Dict[str, Any], index: _Index) -> List[str]:
@@ -1486,6 +1686,20 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
             "messageFlow внутри одного пула не имеет смысла",
             "используйте flow_type=sequence",
         )
+    # Развилка не бывает концом потока-сообщения: у обмена конец — участник или
+    # узел, но не шлюз (в 625 обменах корпуса шлюзовых концов ноль). Заряжать
+    # этот класс пришлось здесь же, потому что совет линейки такие обмены и
+    # рисовал: `cross_pool_flow` переводил межпуловую дугу из развилки в
+    # `connect(source='<шлюз>', …, flow_type='message')`.
+    if flow_type == "message":
+        on_gateway = [ref for ref, elem in ((source_id, source), (target_id, target))
+                      if _local(elem.tag) in GATEWAY_TAGS]
+        if on_gateway:
+            raise _Skip(
+                f"развилка ({', '.join(on_gateway)}) концом messageFlow не бывает",
+                "сообщением обмениваются шаг и шаг либо пул целиком: источником "
+                "поставьте шаг, ведущий в развилку, а не саму развилку",
+            )
     # Поток не должен пересекать границу subProcess: узел внутри подпроцесса
     # принадлежит ему, и bpmn-js такую конструкцию не отрисует.
     if index.has_subprocess_ancestor(source) is not index.has_subprocess_ancestor(target):
@@ -1625,6 +1839,60 @@ def _op_set_default(op: Dict[str, Any], index: _Index) -> List[str]:
     return notes or [f"поток '{flow_id}' — выход по умолчанию шлюза '{gateway_id}'"]
 
 
+def _op_add_condition(op: Dict[str, Any], index: _Index) -> List[str]:
+    """Условие на уже существующей ветке шлюза.
+
+    Отдельная операция нужна потому, что `connect` поток создаёт: на готовую
+    пару «шлюз → шаг» он отвечает «такой поток уже существует» и отправляет к
+    `set_default`, который условие снимает, а не добавляет. Ветка, пришедшая в
+    схему без условия и без пометки default, оставалась физически
+    неисправимой — при том, что `gateway_conditions` стоит 15 баллов и пакет из
+    косметических правок не сдвигал скор вообще (живая схема
+    vehicle_reservation: 80 → 80 при полностью применённом пакете). Правка
+    поэтому идёт по id потока и сохраняет и сам id, и его концы: переизобретать
+    ветку новым id незачем, а маршруту это только вредит.
+    """
+    flow_id = str(op.get("flow") or "").strip()
+    condition = str(op.get("condition") or "").strip()
+    if not condition:
+        raise _Skip("не задано условие",
+                    'укажите condition — текст вида «остаток на складе > 0»')
+    flow = index.find_flow(flow_id)
+    if flow is None:
+        raise _Skip(f"поток '{flow_id}' не найден",
+                    "используйте id потока из раздела flows инвентаря")
+    if _local(flow.tag) != "sequenceFlow":
+        raise _Skip(f"'{flow_id}' не sequence-поток",
+                    "условие бывает у ветки шлюза: messageFlow расходится "
+                    "самим событием, а не проверкой")
+    gateway_id = flow.get("sourceRef") or ""
+    gateway = index.elements.get(gateway_id)
+    if gateway is None or _local(gateway.tag) not in GATEWAY_TAGS:
+        raise _Skip(f"поток '{flow_id}' не является веткой шлюза",
+                    f"источник '{gateway_id}' — не шлюз: condition ставят "
+                    "исходящему потоку развилки, у задачи ветка одна")
+    if _local(gateway.tag) != "exclusiveGateway":
+        raise _Skip(f"шлюз '{gateway_id}' не является исключающим шлюзом",
+                    "условие нужно развилке «или-или»: параллельный и "
+                    "инклюзивный шлюзы ветку по условию не выбирают")
+    notes: List[str] = []
+    if gateway.get("default") == flow_id:
+        # «Иначе» и «при условии» — две записи об одном выборе: скоринг
+        # засчитывает ветку по любому из признаков, а bpmn-js показывает
+        # сомнительную развилку.
+        del gateway.attrib["default"]
+        notes.append(f"выход по умолчанию со '{flow_id}' снят: теперь он условный")
+    previous = flow.find(_q("conditionExpression"))
+    if previous is not None:
+        flow.remove(previous)
+        notes.append("прежнее условие заменено")
+    # conditionExpression — лист без id, в индексы не попадает. По схеме BPMN
+    # он идёт после extensionElements, поэтому append корректен и для потока,
+    # у которого уже есть дети.
+    ET.SubElement(flow, _q("conditionExpression")).text = condition
+    return notes or [f"ветка '{flow_id}' получила условие"]
+
+
 def _op_disconnect(op: Dict[str, Any], index: _Index) -> List[str]:
     flow_id = op.get("flow") or ""
     flow = index.find_flow(flow_id)
@@ -1691,8 +1959,8 @@ def _op_move(op: Dict[str, Any], index: _Index) -> List[str]:
 def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     op_id = _require_new_id(op.get("id"), index)
     name = (op.get("name") or "").strip()
-    if not name:
-        raise _Skip("не задано имя элемента", "укажите name")
+    # Событию имя в BPMN не требуется (то же, что в `_op_add_node`): тип
+    # читается из дочернего `*EventDefinition`, а не из подписи кружка.
     event_type = str(op.get("event_type") or "").strip().lower()
     if event_type not in ("timer", "error"):
         raise _Skip(
@@ -1731,11 +1999,14 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     # кружком без ветки и откатывалось, унося с собой весь маршрут эскалации.
     outlet_id = _check_outlet(op, index, process, "boundaryEvent", host_id)
     elem = ET.Element(_q("boundaryEvent"), {
-        "id": op_id, "name": name, "attachedToRef": host_id,
+        "id": op_id, "attachedToRef": host_id, **({"name": name} if name else {}),
     })
     _adopt_event_definition(index, elem, event_type, op_id, timing)
     index.adopt(process, elem)
-    note = f"граничное событие '{name}' прицеплено к '{host_id}'"
+    note = f"граничное событие '{name or op_id}' прицеплено к '{host_id}'"
+    if not name:
+        note += "; имя не задано — событию в BPMN оно не требуется, тип читается " \
+                "из определения"
     if timing:
         note += f", {'цикл' if timing[0] == 'timeCycle' else 'длительность'} {timing[1]}"
     if outlet_id:
@@ -1871,7 +2142,7 @@ def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
 
     index.detach(source_process)
     index.detach(source_participant)
-    index.merge_touched |= {item for item in touched if item}
+    index.touched_by_merge |= {item for item in touched if item}
 
     notes = [f"пул «{source_name}» слит в «{target_name}» дорожкой «{lane_name}», "
              f"перенесено узлов: {moved_nodes}, потоков: {len(moved_flows)}"]
@@ -1933,18 +2204,31 @@ _HANDLERS = {
     "add_event": lambda op, i: _op_add_node(op, i, "event"),
     "add_participant": _op_add_participant,
     "add_documentation": _op_add_documentation,
+    "add_event_definition": _op_add_event_definition,
     "add_lane": _op_add_lane,
     "move_to_lane": _op_move_to_lane,
     "add_boundary_event": _op_add_boundary_event,
     "rename": _op_rename,
+    "set_task_type": _op_set_task_type,
     "delete": _op_delete,
     "connect": _op_connect,
+    "add_condition": _op_add_condition,
     "set_default": _op_set_default,
     "disconnect": _op_disconnect,
     "move_to_participant": _op_move,
     "merge_participants": _op_merge_participants,
     "remove_participant": _op_remove_participant,
 }
+
+
+# Синонимы имён операции: то, что модель зовёт по-своему при тех же операндах.
+# `add_flow` — слово из словаря BPMN (`sequenceFlow`) и из подсказок починки, где
+# «добавь поток» встречается чаще, чем «connect»; в записанном improvement-пакете
+# две правки из одиннадцати умерли отказом «неизвестная операция» с верными
+# source/target, и `improve/op_acceptance` записала это как качество модели.
+# Синоним не даёт аплайеру новых возможностей — он перенаправляет в существующую
+# операцию, а подстановка попадает в заметку к применённой правке.
+OP_ALIASES: Dict[str, str] = {"add_flow": "connect"}
 
 
 def _lane_move_pools(operations: List[Dict[str, Any]],
@@ -1999,6 +2283,18 @@ def _pool_words(text: Any) -> Set[str]:
 # «пропуск первого раунда закрыт повтором» в оркестраторе: без них нельзя
 # понять, что исправленная версия той же операции прошла.
 _OP_IDENTITY_KEYS = ("id", "element_id", "flow", "source", "target", "name",
+                     "participant", "gateway")
+# Те же поля — публичный словарь идентичности: по ним сверку «отказ первого
+# раунда закрыт повтором» ведёт оркестратор. Держать два списка было нельзя:
+# пока он читал только `id`/`source`/`target`, `remove_participant` не получал
+# зачёта никогда, и пользователь читал «не применено» об уже удалённом пуле.
+OP_IDENTITY_FIELDS = _OP_IDENTITY_KEYS
+# Подмножество — поля, называющие ЭЛЕМЕНТ схемы (в отличие от `name`, `text`,
+# `condition`, `after`, `to` — это содержательная нагрузка правки). Оркестратор
+# сверяет ими «отказ первого раунда закрыт повтором»: повтор как раз и обязан
+# принести исправленную нагрузку той же операции над тем же элементом, и
+# считать её частью идентичности означало бы никогда не ставить зачёт.
+OP_ELEMENT_FIELDS = ("id", "element_id", "flow", "source", "target",
                      "participant", "gateway")
 
 
@@ -2137,7 +2433,7 @@ def apply_operations(xml_text: str,
     skipped: List[Dict[str, Any]] = []
     added: List[str] = []
     added_ops: Dict[str, str] = {}
-    merge_identities: List[Dict[str, Any]] = []
+    merged_ops: List[Dict[str, Any]] = []
     # id и имена, которые пакет создаёт: операция, ждущая один из них,
     # откладывается до прохода, где зависимость уже есть. Порядок, который
     # модель выбрала для своих операций, не имеет права стоить ветки правок.
@@ -2156,13 +2452,22 @@ def apply_operations(xml_text: str,
                 skipped.append({"op": str(op), "reason": "операция не объект",
                                 "hint": "каждая операция — JSON-объект с полем op"})
                 continue
-            op_name = op.get("op")
-            handler = _HANDLERS.get(op_name or "")
+            op_name = str(op.get("op") or "")
+            # `mapped` — каноническое имя для синонима, `alias` — то, что написала
+            # модель; заметка держит пару, чтобы «принято» не приписывало модели
+            # каноническое имя, которого она не давала.
+            mapped = ("" if op_name in _HANDLERS
+                      else OP_ALIASES.get(op_name, ""))
+            alias = op_name if mapped else ""
+            op_name = mapped or op_name
+            handler = _HANDLERS.get(op_name)
             if handler is None:
                 skipped.append({"op": op_name or "?",
                                 "reason": "неизвестная операция",
                                 "hint": "допустимы: " + ", ".join(sorted(_HANDLERS))})
                 continue
+            if alias:
+                op = {**op, "op": op_name}
             derived = ""
             if op_name == "add_lane" and index.resolve_process(op.get("participant")) is None:
                 lane_key = str(op.get("id") or "").strip()
@@ -2173,11 +2478,14 @@ def apply_operations(xml_text: str,
                     derived = f"пул '{hint[0]}' взят из элемента '{hint[1]}'"
             try:
                 notes = handler(op, index)
+                if alias:
+                    notes = [f"имя операции '{alias}' заменено каноническим "
+                             f"'{op_name}'"] + list(notes)
                 if op_name in ADD_NODE_OPS and op.get("id"):
                     added.append(str(op["id"]))
                     added_ops[str(op["id"])] = op_name
                 if op_name == "merge_participants":
-                    merge_identities.append(_op_identity(op))
+                    merged_ops.append(_op_identity(op))
                 if derived:
                     notes = notes + [derived]
                 if waited:
@@ -2236,13 +2544,13 @@ def apply_operations(xml_text: str,
     # в другой процесс. Если из-за переноса починка чистит висящий поток или
     # находит узел вне маршрута, полуслитая схема хуже целой: откатываем весь
     # пакет к XML до применения и честно сообщаем причину.
-    if index.merge_touched:
-        problems = _merge_breakage(_serialize(root), index.merge_touched)
+    if index.touched_by_merge:
+        problems = _merge_breakage(_serialize(root), index.touched_by_merge)
         if problems:
             # Откатывается весь пакет, поэтому пропуск оформляется по последней
             # слиявшей операции: по её полям оркестратор поймёт, какая правка
             # не закрыта, и не покажет её как успешное изменение.
-            for identity in reversed(merge_identities):
+            for identity in reversed(merged_ops):
                 skipped.insert(0, {
                     "op": "merge_participants", **identity,
                     "reason": "слияние пулов сделало схему невалидной: "
@@ -2265,6 +2573,179 @@ def apply_operations(xml_text: str,
 
     status = "success" if not skipped else ("partial" if applied else "failed")
     return _serialize(root), {"status": status, "applied": applied, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Единая точка входа: пакет + починка + гарант «не хуже исходной»
+# ---------------------------------------------------------------------------
+
+# Подсказка к откатанному пакету: без неё корректирующий повтор получает
+# причину, но не получает направления — модель снова строит пакет, который
+# схему ухудшает.
+REJECT_HINT = ("перестройте пакет так, чтобы он не ухудшал схему: сохраните "
+               "маршрут и защищённый выход из цикла")
+
+# Пометки операций, которые «применились», ничего не изменив. Строка applied по
+# такой правке — не улучшение: оркестратор иначе засчитывает её как сделанную
+# работу и не зовёт переспрос.
+NOOP_NOTE_MARKERS = ("добавлено не было", "схема не изменилась")
+
+# Второй прогон починки нужен, чтобы увидеть состояние покоя: первый меняет
+# дерево и тем самым обнажает то, что чинится следующим шагом. Больше — уже
+# стоимость, а не точность.
+MAX_REPAIR_ROUNDS = 2
+
+
+class Rejection(NamedTuple):
+    """Отказ гаранта: причина и то, чем он лечится."""
+
+    reason: str
+    hint: str = REJECT_HINT
+
+
+def merge_notes(*groups: List[str]) -> List[str]:
+    """Пометки починки по раундам с сохранением порядка и дедупликацией.
+
+    Неидемпотентные пометки (понижение шлюза до задачи, снятие default)
+    второй прогон `validate_and_repair` уже не вернёт — чинить нечего, а
+    факт подмены типа элемента читателю терять нельзя.
+    """
+    merged: List[str] = []
+    seen: Set[str] = set()
+    for group in groups:
+        for note in group or ():
+            if note in seen:
+                continue
+            seen.add(note)
+            merged.append(note)
+    return merged
+
+
+def revert_package(base_xml: str, report: Dict[str, Any], reason: str,
+                   hint: str = REJECT_HINT) -> str:
+    """Откатить пакет и привести отчёт в соответствие: `applied` пуст, каждая
+    снятая строка уехала в `skipped` с причиной отката. Возвращает базовую схему.
+
+    Без этой сверки отчёт утверждает правки, которых в вернувшемся XML нет
+    (промерено: applied_share 0.67 на схеме, байт в байт равной базе), а
+    корректирующий повтор запрещает модели пересоздавать элемент, которого в
+    показанном ей инвентаре уже нет. Тот же порядок, что с откатом слияния пулов
+    внутри `apply_operations`.
+
+    `hint` — чем конкретный отказ лечится. Guarantor-предикат знает, почему он
+    отказал (цикл без выхода, несвязанный узел), и общая подсказка про «не
+    ухудшать схему» моделью читается как «пробуй то же ещё раз».
+    """
+    rows = report.get("applied") or []
+    report["applied"] = []
+    skipped = report.setdefault("skipped", [])
+    for entry in rows:
+        rolled = {k: v for k, v in entry.items() if k != "note"}
+        rolled["reason"] = reason
+        rolled["hint"] = hint
+        skipped.append(rolled)
+    if not rows:
+        # Причина обязана дойти до переспроса: он собран по skipped, и без этой
+        # строки модель увидела бы пустой отказ.
+        skipped.append({"op": "batch", "reason": reason, "hint": hint})
+    report["reverted"] = reason
+    report["status"] = "failed"
+    return base_xml
+
+
+def apply_and_guarantee(xml_text: str,
+                        operations: List[Dict[str, Any]],
+                        reject: Optional[Callable[[str], Optional[str]]] = None,
+                        prune: Optional[Callable[
+                            [str, Dict[str, str]],
+                            Tuple[str, List[Dict[str, Any]]]]] = None
+                        ) -> Tuple[str, Dict[str, Any]]:
+    """Пакет операций + починка до состояния покоя + гарант «не хуже исходной».
+
+    `reject(candidate_xml) -> str | None` — причина откатить ВЕСЬ пакет.
+    Вызывается на уже отпочиненной схеме, поэтому предикат видит дерево в том
+    виде, в каком оно ушло бы пользователю.
+
+    Отчёт = отчёт `apply_operations` плюс "notes" (пометки всех прогонов
+    починки), "reverted" ("" | причина отката), "noop_rows" (сколько
+    «применённых» строк ничего не изменили), "repair_rounds".
+
+    При откате каждая applied-строка переезжает в skipped с причиной отката, а
+    `applied` очищается: отчёт не вправе утверждать, что правка в схеме, когда
+    схема вернулась к базе. Тот же порядок, что с откатом слияния пулов в
+    `apply_operations` и с `_drop_stranded` оркестратора; раньше он писался
+    руками дважды в `llm_improve.py` и один раз короче — в харнессе, и откат
+    по циклу без выхода возвращал базу с полным `applied`. Корректирующий
+    повтор после этого запрещал модели пересоздавать элемент, которого в
+    показанном ей инвентаре уже не было.
+
+    Частичный откат узлов вне маршрута задаёт `prune`: `prune(candidate_xml,
+    created) -> (candidate_xml, [dropped])`, где `created` — «id → операция» для
+    узлов, которые этот пакет добавил, а `dropped` — строки
+    `{"id", "op", "gap", "hint"}`. Он звонится ДО `reject`, потому что снятый
+    односторонний шаг перестаёт быть ухудшением, и иначе гарант отвергал бы
+    пакет из-за узла, который сам же и уберёт. Отчёт по снятию ведётся здесь, а
+    не у вызывающего кода: `applied` теряет строки, ссылающиеся на снятый узел,
+    в `skipped` уходит отказ со стадией «починка», а пометка починки про уже
+    удалённый элемент не остаётся.
+    """
+    xml_after, report = apply_operations(xml_text, operations)
+    rows = report["applied"]
+    groups: List[List[str]] = []
+    seen_notes: Set[str] = set()
+    rounds = 0
+    while rounds < MAX_REPAIR_ROUNDS:
+        xml_after, round_notes = validate_and_repair(xml_after)
+        rounds += 1
+        groups.append(round_notes)
+        if not [note for note in round_notes if note not in seen_notes]:
+            # Раунд ничего нового не нашёл: схема в состоянии покоя.
+            break
+        seen_notes.update(round_notes)
+    notes = merge_notes(*groups)
+    created_ids = {str(row.get("id")): str(row.get("op") or "") for row in rows
+                   if row.get("id") and str(row.get("op") or "") in ADD_NODE_OPS}
+    # Считается до отката: «применилось зря» — свойство пакета, а не схемы, и
+    # откатанному пакету оно тем более касается.
+    noop_rows = sum(1 for row in rows
+                    if any(marker in str(row.get("note") or "")
+                           for marker in NOOP_NOTE_MARKERS))
+    if prune is not None and created_ids:
+        xml_after, dropped = prune(xml_after, created_ids)
+        # Идентичность исходной операции — в строку отказа: без неё пропуск
+        # называет только id, и сверка «повтор добил ту же правку» и список
+        # для пользователя теряют имя элемента.
+        origin = {str(op.get("id") or ""): _op_identity(op)
+                  for op in (operations or []) if isinstance(op, dict)}
+        for drop in dropped:
+            gone = str(drop.get("id") or "")
+            report["applied"] = [e for e in report["applied"]
+                                 if gone not in (str(e.get("id") or ""),
+                                                 str(e.get("source") or ""),
+                                                 str(e.get("target") or ""))]
+            report["skipped"].append({
+                "op": str(drop.get("op") or created_ids.get(gone) or "add_task"),
+                "id": gone, "stage": "repair", "reapplied": False,
+                "reason": f"новый шаг ({gone}) {drop.get('gap')} — изменение "
+                          "откачено после починки",
+                "hint": str(drop.get("hint") or ""),
+                **origin.get(gone, {})})
+            # Замечание починки про уже удалённый узел: чинить там нечего,
+            # правка откатана, и показывать её нельзя.
+            notes = [n for n in notes if gone not in n]
+    rejection = reject(xml_after) if reject is not None else None
+    hint = getattr(rejection, "hint", "") or REJECT_HINT
+    reverted = str(getattr(rejection, "reason", rejection) or "").strip()
+    if reverted:
+        xml_after = revert_package(xml_text, report, reverted, hint)
+    open_skips = [s for s in report["skipped"] if not s.get("reapplied")]
+    report["status"] = ("failed" if reverted else
+                        ("success" if not open_skips else "partial"))
+    report["notes"] = notes
+    report["reverted"] = reverted
+    report["noop_rows"] = noop_rows
+    report["repair_rounds"] = rounds
+    return xml_after, report
 
 
 # ---------------------------------------------------------------------------
@@ -2316,6 +2797,16 @@ MERGE_FATAL_NOTE_MARKERS = (UNROUTED_NOTE_MARKERS + POOL_EMPTY_NOTE_MARKERS + (
     "удалён висящий поток", "ссылалась на удалённый элемент",
     "перенесён в другой пул"))
 
+# Починка поправила схему САМА: подменила тип элемента, сняла или переквалифици
+# дугу, достроила событие. Это не «улучшение не доделан» (те пометки в
+# UNROUTED/POOL_EMPTY) и не болезнь входа — это расхождение между тем, что
+# предложила модель, и тем, что уедет пользователю: в прогоне #40 шлюз с одной
+# веткой тихо стал задачей, и по отчёту этого видно не было.
+REPAIR_OWN_NOTE_MARKERS = ("понижен до", "переведено в", "удалён ",
+                           "стал потоком-сообщением", "перенесён в другой пул",
+                           "добавлено стартовое", "добавлено конечное",
+                           "ссылалась на удалённый элемент")
+
 
 def _merge_breakage(applied_xml: str, touched: Set[str]) -> List[str]:
     """Заметки починки, относящиеся к элементам, перенесённым слиянием пулов.
@@ -2335,10 +2826,22 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
     notes: List[str] = []
 
     known_ids = set(index.elements.keys())
+    # Пул — легальный конец потока-сообщения: по BPMN 2.0 `sourceRef`/`targetRef`
+    # у messageFlow указывают на Participant или на узел, и так рисуют обмен
+    # Signavio и bpmn-js, когда деталь получателя не размечена. Participants не
+    # входят в `elements` (они не узлы маршрута), поэтому без этого конца пула
+    # починка считала «висящим» и удаляла сам межпуловой обмен: замер по корпусу
+    # — 52 схемы из 88 с messageFlow теряли дугу при одной только починке, без
+    # каких-либо правок, а `participant_interacts` после этого падал
+    # passed→failed.
+    # Для sequenceFlow пул концом быть не может — тот случай разбирает шаг 1b.
+    pool_ids = {p.get("id") for p in index.participants if p.get("id")}
 
     # 1. Потоки с несуществующими концами удаляются.
     for flow in list(index.sequence_flows) + list(index.message_flows):
-        if flow.get("sourceRef") not in known_ids or flow.get("targetRef") not in known_ids:
+        ends = pool_ids | known_ids if _local(flow.tag) == "messageFlow" else known_ids
+        if (flow.get("sourceRef") not in ends
+                or flow.get("targetRef") not in ends):
             index.detach(flow)
             notes.append(f"удалён висящий поток {flow.get('id')}")
 
@@ -2475,6 +2978,17 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
         if len(branches) >= 2 or incoming_count.get(elem_id, 0) >= 2:
             # Сходящийся шлюз легален с одним исходящим: понижение съело бы
             # слияния веток, которые генератор вставляет осознанно.
+            continue
+        if len((elem.get("name") or "").strip()) < 3:
+            # Понижение до задачи требует имени: `naming` спрашивает имя с
+            # шагов, а у шлюза по нотации имени не бывает. Молча превратить
+            # безымянный шлюз в безымянную задачу — создать нарушение, которого
+            # до починки не было (замер корпуса: Warenversand_…, `naming`
+            # passed→failed после одного `connect`). Шлюз с единственной веткой
+            # нотации не противоречит: расщепления и схождения у него нет, но и
+            # маршрута он не ломает.
+            notes.append(f"шлюз {elem_id} с единственной веткой оставлен шлюзом: "
+                         "имени нет, а понижение до задачи требует имени")
             continue
         elem.tag = _q("task")
         condition = branches[0].find(_q("conditionExpression")) if branches else None

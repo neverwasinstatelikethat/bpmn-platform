@@ -32,9 +32,13 @@ class FakeProvider:
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes)
         self.calls = 0
+        # Какие имена моделей реально ушли в запросе: без этого переход по пулу
+        # неотличим от повтора того же запроса.
+        self.models: list = []
 
     def chat(self, request):
         self.calls += 1
+        self.models.append(getattr(request, "model", None))
         outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
         if isinstance(outcome, Exception):
             raise outcome
@@ -330,3 +334,82 @@ class TestProviderRefusals:
         with pytest.raises(LLMRequestTooLargeError):
             llm_client.call_json("система", "запрос")
         assert provider.calls == 2
+
+
+class TestModelPool:
+    """Пул имён моделей: следующего просят только когда провайдер не знает текущего.
+
+    Живой случай 2026-09-23: образ поднял `gigachat` 0.2.3, у которого дефолтный
+    шлюз — api.giga.chat, а имени «GigaChat» там нет. Запрос падал в 404
+    «No such model», роутер отвечал 503 с Retry-After, и ИИ-контур выглядел
+    лежащим, хотя имя модели было попросту устаревшим.
+    """
+
+    POOL = "GigaChat,GigaChat-2"
+
+    def test_empty_env_falls_back_to_the_default_pool(self, monkeypatch):
+        """Пустая переменная — не «модель с пустым именем», а пул из кода:
+        порядок имён живёт в одном месте, а не в трёх конфигах."""
+        monkeypatch.setenv("GIGACHAT_MODEL", "")
+        assert llm_client.get_model_pool() == list(llm_client.DEFAULT_MODEL_POOL)
+        assert all(llm_client.DEFAULT_MODEL_POOL), "в пуле не может быть пустых имён"
+
+    def test_env_pool_is_comma_separated_and_trimmed(self, monkeypatch):
+        monkeypatch.setenv("GIGACHAT_MODEL", " GigaChat-2 , GigaChat-3-Lightning,")
+        assert llm_client.get_model_pool() == ["GigaChat-2", "GigaChat-3-Lightning"]
+
+    def test_unknown_model_name_asks_the_next_one(self, monkeypatch):
+        monkeypatch.setenv("GIGACHAT_MODEL", self.POOL)
+        provider = _provider(
+            monkeypatch,
+            _response_error(llm_client.NotFoundError, 404,
+                            b'{"status":404,"message":"No such model"}'),
+            _response('{"ok": true}'))
+        assert llm_client.call_json("система", "запрос") == {"ok": True}
+        assert provider.models == ["GigaChat", "GigaChat-2"]
+
+    def test_400_about_a_missing_model_walks_the_pool_too(self, monkeypatch):
+        """Часть шлюзов зовёт отсутствие модели не 404, а 400 — читаем тело."""
+        monkeypatch.setenv("GIGACHAT_MODEL", self.POOL)
+        provider = _provider(
+            monkeypatch,
+            _response_error(BadRequestError, 400, '{"message": "Unknown model"}'),
+            _response('{"ok": true}'))
+        assert llm_client.call_json("система", "запрос") == {"ok": True}
+        assert provider.models == ["GigaChat", "GigaChat-2"]
+
+    def test_exhausted_pool_blames_the_config_not_an_outage(self, monkeypatch):
+        """Сообщение обязано называть и пул, и переменную: «LLM недоступна» на
+        опечатку в имени модели — это ещё один ложный 503."""
+        monkeypatch.setenv("GIGACHAT_MODEL", self.POOL)
+        provider = _provider(
+            monkeypatch,
+            _response_error(llm_client.NotFoundError, 404, b'{"message":"No such model"}'))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        text = str(caught.value)
+        assert "GigaChat" in text and "GigaChat-2" in text
+        assert "GIGACHAT_MODEL" in text
+        # Ни одной лишней попытки: 404 не транспортный сбой, повторять нечего.
+        assert provider.calls == 2
+
+    def test_transport_failure_does_not_walk_the_pool(self, monkeypatch):
+        """5xx на первой модели — не повод спрашивать вторую: та же ошибка на
+        каждой из них умножила бы ожидание пользователя на размер пула."""
+        monkeypatch.setenv("GIGACHAT_MODEL", self.POOL)
+        provider = _provider(monkeypatch, _response_error(ServerError, 503,
+                                                          b"upstream unavailable"))
+        with pytest.raises(LLMError):
+            _complete()
+        assert provider.models == ["GigaChat"] * llm_client.MAX_ATTEMPTS
+
+    def test_auth_failure_does_not_walk_the_pool(self, monkeypatch):
+        """Отказ авторизации проверяется раньше пула: иначе протухший токен
+        выглядел бы как «нет такой модели»."""
+        monkeypatch.setenv("GIGACHAT_MODEL", self.POOL)
+        provider = _provider(monkeypatch, _response_error(
+            llm_client.AuthenticationError, 401, "token expired", url=CHAT_URL))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert "авторизаци" in str(caught.value).lower()
+        assert provider.models == ["GigaChat"]

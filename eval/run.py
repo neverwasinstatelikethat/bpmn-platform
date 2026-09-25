@@ -7,18 +7,32 @@
 `--mode live` читает GIGACHAT_CREDENTIALS из окружения и без него честно падает
 (код 2): тихая подмена live'а на replay иначе выглядела бы как «зелёный» прогон.
 Код 1 — по `--fail-on-regression`, если относительно baseline что-то упало: CI
-так и должен differить «правку промпта, которая ухудшила контур».
+так и должен отличать «правку промпта, которая ухудшила контур».
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
 from . import harness, metrics
 from .harness import DEFAULT_BASELINE, HarnessError
+
+
+def _force_utf8_output() -> None:
+    """Отчёт печатается символами (✗, ⊘), которых нет в windows-кодировке cp1251.
+
+    Иначе на родной для проекта консоли прогон падал с UnicodeEncodeError уже
+    после того, как всё было посчитано и записано в JSON: код возврата оставался
+    осмысленным, но таблицу метрик человек не видел. Замена символа здесь
+    честнее падения.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
+    _force_utf8_output()
     try:
         report = harness.run(
             mode=args.mode, scenarios_spec=args.scenarios, repeat=args.repeat,

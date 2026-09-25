@@ -21,6 +21,7 @@
    {"id": "G1", "kind": "exclusiveGateway", "name": "Товар надлежащего качества?", "participant": "ВкусВилл", "lane": "L_qc"},
    {"id": "A3", "kind": "userTask", "name": "Возвратить деньги тем же способом", "participant": "ВкусВилл", "lane": "L_cash"},
    {"id": "A5", "kind": "userTask", "name": "Отправить товар на независимую экспертизу", "participant": "ВкусВилл", "lane": "L_qc"},
+   {"id": "A9", "kind": "userTask", "name": "Принять заключение экспертизы", "participant": "ВкусВилл", "lane": "L_qc"},
    {"id": "G3", "kind": "exclusiveGateway", "name": "Экспертиза подтвердила брак?", "participant": "ВкусВилл", "lane": "L_qc"},
    {"id": "A6", "kind": "userTask", "name": "Провести возврат и уведомить покупателя", "participant": "ВкусВилл", "lane": "L_cash"},
    {"id": "A7", "kind": "userTask", "name": "Направить мотивированный отказ", "participant": "ВкусВилл", "lane": "L_cash"},
@@ -43,7 +44,8 @@
    {"id": "F6", "source": "A2", "target": "G1", "kind": "sequence", "condition": ""},
    {"id": "F7", "source": "G1", "target": "A3", "kind": "sequence", "condition": "качество в норме, 14 дней не истекло"},
    {"id": "F8", "source": "G1", "target": "A5", "kind": "sequence", "condition": "есть признаки брака"},
-   {"id": "F9", "source": "A5", "target": "G3", "kind": "sequence", "condition": ""},
+   {"id": "F9", "source": "A5", "target": "A9", "kind": "sequence", "condition": ""},
+   {"id": "F9b", "source": "A9", "target": "G3", "kind": "sequence", "condition": ""},
    {"id": "F10", "source": "G3", "target": "A6", "kind": "sequence", "condition": "брак подтверждён"},
    {"id": "F11", "source": "G3", "target": "A7", "kind": "sequence", "condition": "брак не подтверждён"},
    {"id": "F12", "source": "A7", "target": "E2", "kind": "sequence", "condition": ""},
@@ -56,7 +58,7 @@
    {"id": "F19", "source": "C1", "target": "C2", "kind": "sequence", "condition": ""},
    {"id": "M1", "source": "P1", "target": "A1", "kind": "message", "condition": "заявление с чеком"},
    {"id": "M2", "source": "A5", "target": "C1", "kind": "message", "condition": "запрос экспертизы"},
-   {"id": "M3", "source": "C1", "target": "G3", "kind": "message", "condition": "заключение экспертизы"},
+   {"id": "M3", "source": "C1", "target": "A9", "kind": "message", "condition": "заключение экспертизы"},
    {"id": "M4", "source": "A7", "target": "P2", "kind": "message", "condition": "мотивированный отказ"}
   ]
  }

@@ -19,20 +19,31 @@ from pathlib import Path
 
 import pytest
 
-from eval import harness, metrics, scenarios
-from eval.invariants import (ALL_CHECKS, CORE_INVARIANTS, check_structure,
-                             check_xml, summarize)
+from eval import harness, invariants, metrics, scenarios
+from eval.invariants import (ALL_CHECKS, BUSINESS_INVARIANTS, CORE_INVARIANTS,
+                             NOTATION_INVARIANTS, check_structure, check_xml,
+                             summarize)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVED_WAREHOUSE_XML = REPO_ROOT / "reports" / "warehouse-delivery" / "process.bpmn"
 
 # Что обязан провалить каждый «плохой» план на уровне сырого ответа модели.
-# С сверяется ровно это множество: лишние провалы означают, что оракул путает
-# дефекты, а отсутствие нужного — что перестал их видеть.
+# Сверяется ровно это множество: лишние провалы означают, что оракул путает
+# дефекты, а отсутствие нужного — что перестал их видеть. Таблица держит
+# корректностный слой (`NOTATION_INVARIANTS` + ожидания сценария): бизнес-слой
+# проваливается и на исправных схемах, поэтому он заперт отдельной таблицей
+# ниже, а не подмешан в эту.
 EXPECTED_RAW_FAILS = {
+    # Дословный ответ модели из живого прогона: 12 потоков, из них 5 ведут из
+    # одного пула в другой, и `kind="message"` не назван ни разу. Это нашёл
+    # новый инвариант, а не переписанный разбор: до него и скоринг, и оракул
+    # видели межпуловую дугу законной (скоринг проверял существование конца, а
+    # не его процесс), и то, что генератор потом переделает её в сообщение,
+    # — транспорт, а не знание модели о границе процесса.
     "warehouse_delivery.live.plan": {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
-        "event_definitions", "has_branching", "no_unrouted"},
+        "event_definitions", "has_branching", "no_unrouted",
+        "flows_within_pool"},
     "purchase_approval.bad.plan": {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
         "gateway_conditions_or_default", "no_unrouted"},
@@ -47,6 +58,25 @@ EXPECTED_RAW_FAILS = {
         "no_unrouted", "has_timer"},
 }
 
+# Бизнес-дебит ЭТАЛОНА: узкие места процесса, которые есть у правильного ответа.
+# Находка, а не брак гейта: из-за неё бизнес-слой и вынесен из `scenario_pass`
+# (см. `invariants.deciding_checks`) — конъюнкция по нему невыполнима ни для
+# какой схемы, и `pass@1` мерил бы стиль эталона вместо контура.
+#
+# * `loan_application.good.plan` — ответ Бюро возвращается в тот же шаг `A3`,
+#   который его запросил: у принятого решения нет хозяина, доводящего историю до
+#   конца (`pools_not_pingpong`).
+# * `warehouse_delivery.good.plan` — `receiveTask` `A8` «зафиксировать подпись
+#   получателя» ждёт без единого таймера в модели (`waits_have_sla`); сценарий
+#   срока не требует, поэтому `has_timer` по нему молчит.
+#
+## Новое имя здесь = оракул нашёл в эталоне ещё одно узкое место. Убирать его
+# молча нельзя: `business/not_worse_than_etalon` теряет опору.
+EXPECTED_ETALON_BUSINESS_DEBT = {
+    "loan_application.good.plan": {"pools_not_pingpong"},
+    "warehouse_delivery.good.plan": {"waits_have_sla"},
+}
+
 
 def _fixtures(kind: str, quality: str = ""):
     out = [f for f in harness.load_fixtures(kinds=(kind,))
@@ -55,10 +85,18 @@ def _fixtures(kind: str, quality: str = ""):
     return out
 
 
-def _raw_failures(fixture) -> set:
+def _raw_failures(fixture, layer: str = "notation") -> set:
+    """Проваленные инварианты сырого плана, по слою.
+
+    `layer="business"` нужен отдельной таблицей: смешивать «схема бракованная» и
+    «в процессе есть узкое место» в одном множестве нельзя — первая таблица
+    обязана совпадать ровно, а вторая держит эталонный дебит.
+    """
     scenario = scenarios.get(fixture["scenario"])
     results = check_structure(fixture["plan"], scenario.expectations())
-    return {check["name"] for check in summarize(results)["failed"]}
+    names = {check["name"] for check in summarize(results)["failed"]}
+    business = set(BUSINESS_INVARIANTS)
+    return names & business if layer == "business" else names - business
 
 
 # ---------------------------------------------------------------------------
@@ -69,9 +107,23 @@ def _raw_failures(fixture) -> set:
 @pytest.mark.parametrize("fixture", _fixtures("plan", "good"),
                          ids=lambda f: f["id"])
 def test_good_plans_satisfy_all_declared_invariants(fixture):
-    """Эталонный план не проваливает ни одного заявленного инварианта."""
+    """Эталонный план не проваливает ни одного корректностного инварианта."""
     assert _raw_failures(fixture) == set(), (
         f"{fixture['id']} проваливает инварианты, которых в эталоне быть не должно")
+
+
+@pytest.mark.parametrize("fixture", _fixtures("plan", "good"),
+                         ids=lambda f: f["id"])
+def test_etalon_business_debt_is_exactly_the_documented_one(fixture):
+    """Бизнес-узкие места эталона заперты таблицей, а не спрятаны под ковёр.
+
+    Вынесение бизнес-слоя из гейта — решение, которое обязано оставаться
+    видимым: без этого теста `pass@1/scenario` мог бы тихо перестать замечать,
+    что оракул нашёл в эталоне новое узкое место, и
+    `business/not_worse_than_etalon` стал бы мерить плотность по устаревшей опоре.
+    """
+    assert _raw_failures(fixture, "business") == EXPECTED_ETALON_BUSINESS_DEBT.get(
+        fixture["id"], set())
 
 
 @pytest.mark.parametrize("fixture", _fixtures("plan", "bad")
@@ -79,7 +131,12 @@ def test_good_plans_satisfy_all_declared_invariants(fixture):
                          ids=lambda f: f["id"])
 def test_bad_plans_fail_exactly_the_broken_invariants(fixture):
     """Плохой план падает ровно на сломанных свойствах — метрика полезна только
-    когда она различает классы дефектов."""
+    когда она различает классы дефектов.
+
+    Сверяется корректностный слой: бизнес-узкие места плохой план может добавить
+    сверх намеренного слома (в `production_incident.bad.plan` работа легла на
+    одну дорожку), и это другой вопрос — он заперт в `test_eval_invariants.py`.
+    """
     assert _raw_failures(fixture) == EXPECTED_RAW_FAILS[fixture["id"]]
 
 
@@ -139,8 +196,17 @@ def test_unattached_boundary_and_open_split_are_detected():
     failed = {f["name"] for f in summarize(results)["failed"]}
     assert {"gateway_split_join", "boundary_handled", "no_unrouted",
             "event_definitions", "participant_interacts"} <= failed
-    # неприменимые проверки в метрику не входят: проверять нечего
-    assert summarize(results)["not_applicable"] == ["roles_as_lanes"]
+    # Неприменимые проверки в метрику не входят: проверять нечего. Кроме
+    # `roles_as_lanes` сюда попали все пять бизнес-инвариантов: в синтетической
+    # однопуловой сцене без сообщений, без второй дорожки и без ожидания нечего
+    # сравнивать — это «не применимо», а не «пройдено». Два правых имени — те же
+    # причины: узлы лежат в одном пуле, а потоков сообщения в плане нет.
+    # `signoffs_need_a_gate` — потому что ручных шагов три, а цепочка
+    # согласований начинается с четырёх.
+    assert summarize(results)["not_applicable"] == [
+        "flows_within_pool", "message_flow_ends", "no_blind_rework",
+        "no_overloaded_lane", "pools_not_pingpong", "roles_as_lanes",
+        "signoffs_need_a_gate", "timer_schedule", "waits_have_sla"]
 
 
 def test_default_flow_counts_as_condition():
@@ -198,12 +264,53 @@ def test_structure_and_xml_of_generated_schema_agree():
     assert case.ok, case.error
     assert case.disagreements == []
     assert case.scenario_pass is True
+    # Гейт стал уже (бизнес-слой из него вынесен), и это проверяемый след:
+    # узкое место эталона обязано остаться в отчёте, а не исчезнуть вместе с
+    # ассертом выше.
+    assert case.business_smells == ["waits_have_sla"]
+
+
+def test_drift_table_reads_the_scorer_status_not_its_presence():
+    """Сверка слоёв получает ВЕСЬ ответ скоринга, а не вырезку статусов.
+
+    Проводка с `details_meta` вместо ответа превращает каждое правило, о котором
+    скоринг просто молчит, в «оракул строже»: `_scorer_view` в плоской ветке
+    читает `{правило: словарь}` как истину. Таблица расхождений заполняется на
+    битой схеме, `business/scorer_oracle_agreement` падает, и человек идёт править
+    правило вместо харнесса. Здесь оба слоя проваливают одно и то же ожидание —
+    значит расхождений не должно быть вовсе."""
+    fixture = next(f for f in _fixtures("plan", "good")
+                   if f["id"] == "warehouse_delivery.good.plan")
+    scenario = scenarios.get(fixture["scenario"])
+    case = harness.run_generation_case(scenario, fixture)
+    meta = case.scorer_evaluation["details_meta"]["wait_without_sla"]
+    assert meta["status"] == "failed" and meta["elements"] == ["A8"]
+    row = case.drift["wait_without_sla"]
+    assert row["scorer"] == "failed" and row["oracle"] == "failed"
+    assert row["verdict"] == invariants.AGREE, row
+    assert case.drift_lines == []
+    assert harness.agreement_share(case.drift) == 1.0
+
+
+def test_agreement_share_ignores_rules_one_layer_does_not_have():
+    """`no_data` не входит в знаменатель, а пустая таблица — это None, а не 1.0:
+    доля согласия не должна раздуваться там, где сверять было нечего."""
+    assert harness.agreement_share({}) is None
+    rows = {"rework_loop": {"verdict": invariants.NO_DATA},
+            "lane_overload": {"verdict": invariants.NOT_COMPARABLE},
+            "handoff_pingpong": {"verdict": invariants.ORACLE_STRICTER}}
+    assert harness.agreement_share(rows) == 0.5
 
 
 # Каркас двухпуловой схемы — ровно та же схема, что собирает
 # `_flow_ends_plan`: messageFlow Клиента приходит в startEvent ВкусВилла,
 # это штатный способ запустить пул. Поток обязан лежать внутри `process`,
 # иначе оракул его не увидит.
+#
+# Граничный таймер здесь с хронометражем: `timer_schedule` сняла бы каркас как
+# битый по другому классу (пустой `timerEventDefinition` — мёртвый срок), а этот
+# файл проверяет концы потоков. Для мёртвого таймера есть своя пара тестов в
+# `tests/test_eval_invariants.py`.
 FLOW_ENDS_XML = """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
              id="Definitions_flow_ends">
   <collaboration id="Collaboration_1">
@@ -215,7 +322,7 @@ FLOW_ENDS_XML = """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MOD
     <startEvent id="S1" name="Поступил заказ"/>
     <userTask id="A1" name="Собрать заказ"/>
     <boundaryEvent id="B1" name="Просрочка" attachedToRef="A1">
-      <timerEventDefinition/>
+      <timerEventDefinition><timeDuration>PT1H</timeDuration></timerEventDefinition>
     </boundaryEvent>
     <endEvent id="E1" name="Заказ выдан"/>
     <sequenceFlow id="F1" sourceRef="S1" targetRef="A1"/>
@@ -344,6 +451,46 @@ def test_flow_ends_legal_is_declared_for_both_entry_points():
         assert failed["flow_ends_legal"]["ids"] == ["FBAD"]
 
 
+def test_dump_schemes_pairs_the_improvement_with_its_base(tmp_path):
+    """Пара before/after плюс отчёт: «пакет применился и стало лучше» офлайн не
+    проверяется, а diff двух схем читается без повторного прогона."""
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery")
+    out = tmp_path / "улучшение"
+    written = harness.dump_schemes(report, out)
+    improve = [p for p in written if p.name.startswith("improve_")]
+    assert improve, "у сценария есть improve-фикстура — значит есть и пара файлов"
+    stems = {p.name.rsplit("_", 1)[0] for p in improve if p.suffix == ".bpmn"}
+    assert len(stems) == 1, stems
+    stem = stems.pop()
+    before = out / f"{stem}_before.bpmn"
+    after = out / f"{stem}_after.bpmn"
+    verdict = stem.rsplit("_", 1)[1]
+    assert verdict in ("pass", "fail", "revert", "regress"), stem
+    assert before.exists() and after.exists()
+    assert before.read_text(encoding="utf-8") != after.read_text(encoding="utf-8")
+    dump = json.loads((out / f"{stem}_report.json").read_text(encoding="utf-8"))
+    case = report.improve_cases[0]
+    assert dump["fixture"] == case.fixture
+    for key in ("applied", "skipped", "package_reverted", "rules_regressed",
+                "retry_attempted", "retry_closed", "noop_rows", "unmeasured",
+                "checks_before", "checks_after", "score_before", "score_after"):
+        assert key in dump, key
+
+
+def test_dump_schemes_names_the_worst_improvement_outcome():
+    """Вердикт в имени файла — не украшение: откатанный пакет и пакет,
+    задевший проходившее правило, разбирают первым."""
+    case = harness.ImproveCase(scenario="s", fixture="f", label="", quality="live",
+                               mode="replay")
+    assert harness.improve_verdict(case) == "fail"      # схема не померена
+    case.checks_after = check_xml(_xml_with(), {})
+    assert harness.improve_verdict(case) == "pass"
+    case.rules_regressed = {"event_types": "passed->failed"}
+    assert harness.improve_verdict(case) == "regress"
+    case.package_reverted = "пакет создал цикл без защищённого выхода"
+    assert harness.improve_verdict(case) == "revert"
+
+
 # ---------------------------------------------------------------------------
 # метрики и детектор регрессий
 # ---------------------------------------------------------------------------
@@ -400,8 +547,50 @@ def test_regression_detector_respects_direction_and_threshold():
     assert not detector.compare({"repairs_per_scheme": 5.0}, {"repairs_per_scheme": 4.0})
     strict = metrics.RegressionDetector(threshold=0.5)
     assert not strict.compare({"score": 100.0}, {"score": 60.0})
-    # нулевой baseline: относительная доля невозможна, но ухудшение видно
-    assert [r.name for r in detector.compare({"x": 0.0}, {"x": 1.0})] == ["x"]
+    # Нулевой baseline у метрики «меньше = лучше»: относительная доля
+    # невозможна, но отлёт от нуля — ухудшение, и именно его гейт обязан
+    # увидеть. Метрика без объявленного направления тут не показательна: без
+    # направления у неё «выше нуля = лучше», и проверка закрепляла обратное.
+    off_zero = detector.compare({"repairs_per_scheme": 0.0},
+                                {"repairs_per_scheme": 3.0})
+    assert [r.name for r in off_zero] == ["repairs_per_scheme"]
+    assert detector.compare({"repairs_per_scheme": 0.0},
+                            {"repairs_per_scheme": 0.0}) == []
+
+
+def test_zero_baseline_respects_direction_not_its_inverse():
+    lower = metrics.RegressionDetector(directions={"err": metrics.LOWER})
+    assert [r.name for r in lower.compare({"err": 0.0}, {"err": 0.5})] == ["err"]
+    higher = metrics.RegressionDetector(directions={"fixed": metrics.HIGHER})
+    assert higher.compare({"fixed": 0.0}, {"fixed": 0.5}) == []
+    assert [r.name for r in higher.compare({"fixed": 0.0}, {"fixed": -0.5})] == ["fixed"]
+
+
+def test_unverified_lists_metrics_the_baseline_never_saw():
+    """`compare` идёт по ключам baseline — всё, что завелось позже слепка (или
+    что слепок не померил), выпадает из сверки. `unverified` называет это явно,
+    а не молчит: иначе «регрессий нет» читается как «сверили всё»."""
+    detector = metrics.RegressionDetector()
+    assert detector.compare({"score": 90.0},
+                            {"score": 90.0, "improve/new": 0.0}) == []
+    assert detector.unverified({"score": 90.0},
+                               {"score": 90.0, "improve/new": 0.0}) == ["improve/new"]
+    # null в baseline против померенного сейчас — тоже «сверки не было»
+    assert detector.unverified({"a": 1.0, "old": None},
+                               {"a": 1.0, "old": 0.2, "b/новая": 0.5}) == \
+        ["b/новая", "old"]
+    # Обратное направление: метрику из прогона сняли, ключ остался в слепке,
+    # `compare` её не находит — и без этой строки удаление четырёх метрик
+    # улучшения выглядело бы как «всё сверили, регрессий нет».
+    assert detector.unverified({"a": 1.0, "improve/applied_share": 0.75},
+                               {"a": 1.0, "improve/op_acceptance": 0.5}) == \
+        ["improve/applied_share", "improve/op_acceptance"]
+    # не померена в этом прогоне — «нет данных», а не «baseline старее»
+    assert detector.unverified({"a": 1.0, "cv": None},
+                               {"a": 1.0, "cv": None}) == []
+    assert detector.unverified({}, {"a": 1.0}) == []
+    assert detector.unverified(None, {"a": 1.0}) == []
+    assert detector.unverified({"a": 1.0}, None) == []
 
 
 def test_regression_detector_skips_unmeasured_metrics():
@@ -504,13 +693,31 @@ def test_repeat_produces_spread_stats():
 def test_improvement_replay_metrics():
     report = harness.run(mode="replay", scenarios_spec="all", repeat=1)
     cases = {c.key: c for c in report.improve_cases}
+    flat = report.metrics_flat()
+    # Снятые метрики не вернутся «для совместимости»: они считали строки отчёта
+    # вместо работы и выводили потребность в повторе из стадий отказов.
+    assert not {"improve/applied_share", "improve/skipped_share",
+                "improve/retry_needed_share",
+                "improve/no_regression"} & set(flat)
     live = cases["warehouse_delivery/warehouse_delivery.live.improve"]
-    assert live.ok and live.retried
-    assert 0 < live.applied_share < 1
+    assert live.ok and live.retry_attempted is True
+    # Повтор был и не закрыл ни одного отказа: это 0, а не «повтора не было»
+    # (старая метрика на этом же кейсе врала в обе стороны сразу).
+    assert live.retry_closed == 0
+    assert harness._retry_gain(live) == 0.0
+    assert live.package_reverted == "" and live.rules_regressed == {}
+    assert live.noop_rows == 0 and live.truncated_operations == 0
+    assert 0 < harness._op_acceptance(live) < 1
     assert live.score_after is not None
-    # «хороший» пакет применяется целиком и не портит схему
+    # «Хороший» пакет применяется целиком и не портит схему
     clean = cases["production_incident/production_incident.good.improve"]
-    assert clean.applied_share == 1.0 and not clean.retried
+    assert harness._op_acceptance(clean) == 1.0
+    assert clean.retry_attempted is False
+    # Повтора не было — метрики повтора не имеют значения, и ноль в выборку
+    # не идёт (иначе «контур не звал повтор» выглядел бы как «повтор бессилен»).
+    assert harness._retry_gain(clean) is None
+    assert harness._repeat_rejection_share(clean) is None
+    assert harness._defects_introduced(clean) == 0.0
     assert clean.score_delta >= 0
     # Разбор отказа улучшения читается из отчёта: без базовой схемы прогон не
     # отличает унаследованный от генерации провал от того, что принёс пакет,
@@ -518,6 +725,286 @@ def test_improvement_replay_metrics():
     dump = clean.as_dict()
     assert dump["checks_before"] and dump["applied_details"]
     assert dump["summary_before"]["applicable"] >= 1
+    assert clean.base_xml and "base_xml" not in dump   # XML живёт в файле, не в JSON
+    for key in ("retry_attempted", "retry_closed", "package_reverted",
+                "rules_regressed", "noop_rows", "truncated_operations",
+                "op_acceptance", "defects_introduced", "unmeasured"):
+        assert key in dump, key
+
+
+# ---------------------------------------------------------------------------
+# контур применения в replay: тот же гарант, что в продукте
+# ---------------------------------------------------------------------------
+
+# Линейный маршрут — ровно та схема, что в `tests/test_bpmn_edits.py`: два
+# шага легальны поодиночке и вместе замыкают L_a → new_X → L_b → L_a в цикл без
+# защищённого выхода.
+GUARANTEE_XML = """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_lin">
+  <process id="P_lin" name="Маршрут" isExecutable="true">
+    <startEvent id="L_s" name="Запрос"><outgoing>LF1</outgoing></startEvent>
+    <sequenceFlow id="LF1" sourceRef="L_s" targetRef="L_a"/>
+    <userTask id="L_a" name="Собрать заказ">
+      <incoming>LF1</incoming><outgoing>LF2</outgoing></userTask>
+    <sequenceFlow id="LF2" sourceRef="L_a" targetRef="L_b"/>
+    <userTask id="L_b" name="Отгрузить">
+      <incoming>LF2</incoming><outgoing>LF3</outgoing></userTask>
+    <sequenceFlow id="LF3" sourceRef="L_b" targetRef="L_e"/>
+    <endEvent id="L_e" name="Готово"><incoming>LF3</incoming></endEvent>
+  </process>
+</definitions>"""
+
+CYCLING_OPS = [
+    {"op": "add_task", "id": "new_X", "name": "Проверить пломбы",
+     "task_type": "userTask", "after": "L_a", "to": "L_b"},
+    {"op": "connect", "source": "L_b", "target": "L_a"},
+]
+
+TWICE_THE_SAME_DOC = [
+    {"op": "add_documentation", "id": "L_a",
+     "text": "Собрать заказ по накладной, сверив сроки"},
+    {"op": "add_documentation", "id": "L_a",
+     "text": "Собрать заказ по накладной, сверив сроки"},
+]
+
+
+def _base_gencase(xml: str) -> harness.GenCase:
+    return harness.GenCase(scenario="purchase_approval", fixture="base",
+                           label="", quality="live", mode="replay", ok=True,
+                           xml=xml)
+
+
+def _improve(operations, retry=None, xml=GUARANTEE_XML, **overrides):
+    """Кейс улучшения на готовой схеме: фикстура тут — только план операций."""
+    fixture = {"id": "fx", "scenario": "purchase_approval", "label": "план",
+               "quality": "live", "operations": operations}
+    if retry:
+        fixture["retry_operations"] = retry
+    fixture.update(overrides)
+    return harness.run_improvement_case(scenarios.get("purchase_approval"),
+                                        fixture, _base_gencase(xml))
+
+
+def test_replay_applies_operations_through_the_production_guarantor(monkeypatch):
+    """Replay обязан играть тот же гарант, что и продукт.
+
+    Своя короткая копия «применить → починить» стоила харнессу целого класса
+    слепых зон: откат пакета по циклу без выхода возвращал базовую схему с
+    полным `applied`, и метрика рапортовала успех на схеме, байт в байт равной
+    базе. Здесь проверяется, что харнесс зовёт `apply_and_guarantee` с
+    продуктовскими предикатами, а не своими.
+    """
+    from core import bpmn_edits, llm_improve
+
+    seen: dict = {}
+    real = bpmn_edits.apply_and_guarantee
+
+    def spy(xml_text, operations, reject=None, prune=None):
+        seen["reject"], seen["prune"] = reject, prune
+        return real(xml_text, operations, reject=reject, prune=prune)
+
+    monkeypatch.setattr(bpmn_edits, "apply_and_guarantee", spy)
+    unmeasured: list = []
+    out, report = harness._apply_package(GUARANTEE_XML, [dict(o) for o in
+                                                         TWICE_THE_SAME_DOC],
+                                         "plan", unmeasured)
+    assert unmeasured == []
+    assert seen["prune"] is llm_improve._prune_stranded
+    # Гарант по циклу — фабричный `_cycle_reject` на СХЕМЕ ЭТОГО РАУНДА: база
+    # легальна, а замкнутый маршрут обязан дать отказ с причиной.
+    assert seen["reject"](GUARANTEE_XML) is None
+    cycled, _ = bpmn_edits.apply_operations(GUARANTEE_XML, [dict(o) for o in
+                                                            CYCLING_OPS])
+    rejection = seen["reject"](cycled)
+    assert rejection is not None and "цикл без защищённого выхода" in \
+        rejection.reason
+    assert out != GUARANTEE_XML and report["noop_rows"] == 1
+    # Стадию получает каждая строка (продукт размечает только отказы — строка
+    # `applied` и так из того раунда, откуда её взяли), `reapplied` — только
+    # отказ: по нему повтор узнаёт закрытую правку.
+    assert all(row["stage"] == "plan" for row in report["skipped"] + report["applied"])
+    assert all(not row["reapplied"] for row in report["skipped"])
+    assert all("reapplied" not in row for row in report["applied"])
+
+
+def test_reverted_package_leaves_no_applied_rows():
+    """Откат обязан быть сверен с отчётом: `applied` пуст, каждая снятая правка
+    уехала в `skipped`, и `improve/op_acceptance` читает 0.0, а не 0.67."""
+    case = _improve(CYCLING_OPS)
+    assert case.package_reverted and "цикл" in case.package_reverted
+    assert case.applied == [] and case.xml_after == GUARANTEE_XML
+    assert {s["op"] for s in case.skipped} == {"add_task", "connect"}
+    assert all(s["stage"] == "plan" for s in case.skipped)
+    assert harness._op_acceptance(case) == 0.0
+    assert harness._package_revert_share(case) == 1.0
+    # Регресс правил при откате не приписывается пакету: сравнивать не с чем.
+    assert case.rules_regressed == {}
+    # Продукт на пустом `applied` поднимает ImprovementError — и харнесс зовёт
+    # такой кейс несобранным, а не «улучшение применилось».
+    assert case.ok is False
+    # `noop_rows` считается до отката: в сверенном отчёте строк нет, и числитель
+    # acceptance не имеет права уехать в минус.
+    mixed = _improve(TWICE_THE_SAME_DOC + CYCLING_OPS)
+    assert mixed.noop_rows == 1 and mixed.applied == []
+    assert harness._op_acceptance(mixed) == 0.0
+    assert harness._noop_share(mixed) is None
+
+
+def test_noop_applied_rows_do_not_count_as_work():
+    """Строка «добавлено не было» — не улучшение: вторая копия той же
+    документации применяется в ноль, и старая `applied_share` считала её
+    успехом (1.0), новая acceptance — 0.5."""
+    case = _improve(TWICE_THE_SAME_DOC)
+    assert len(case.applied) == 2 and not case.skipped
+    assert case.noop_rows == 1
+    assert harness._op_acceptance(case) == 0.5
+    assert harness._noop_share(case) == 0.5
+
+
+def test_live_case_reads_facts_instead_of_guessing_the_retry(monkeypatch):
+    """Старый вывод `retried = any(stage == "retry")` давал ложный ноль ровно
+    там, где повтор отработал без новых отказов: оркестратор закрывает пропуск
+    флагом `reapplied`, и стадия у строки остаётся «план». Теперь live читает
+    факты отчёта."""
+    report = {
+        "status": "partial",
+        "applied": [{"op": "add_task", "id": "new_A"}],
+        "skipped": [{"op": "connect", "source": "A", "target": "B",
+                     "stage": "plan", "reapplied": True, "reason": "нет цели"},
+                    {"op": "add_lane", "name": "Кладовщик", "stage": "plan",
+                     "reapplied": False, "reason": "дорожка уже есть",
+                     "duplicate": True}],
+        "repair_notes": ["узел new_A остался без потоков"],
+        "retry_attempted": True, "retry_closed": 1,
+        "package_reverted": "", "rules_regressed": {"documentation": "passed->failed"},
+        "noop_rows": 0, "truncated_operations": 3,
+    }
+    monkeypatch.setattr(
+        harness, "_live_improve",
+        lambda xml, prompt: (xml, report, 2))
+    case = harness.run_improvement_case(scenarios.get("purchase_approval"),
+                                        {"id": "fx", "label": "", "quality": "live"},
+                                        _base_gencase(GUARANTEE_XML), mode="live")
+    assert case.retry_attempted is True and case.retry_closed == 1
+    assert harness._retry_gain(case) == 1.0
+    assert harness._repeat_rejection_share(case) == 0.5
+    assert harness._plan_truncated_share(case) == 1.0
+    assert harness._rules_regressed_share(case) == 1.0
+    assert harness._package_revert_share(case) == 0.0
+    assert case.repair_notes == ["узел new_A остался без потоков"]
+    assert case.truncated_operations == 3 and case.noop_rows == 0
+    # live-отчёт не знает, чего харнесс не доиграл: список пуст, а не «всё хорошо»
+    assert case.unmeasured == []
+
+
+def test_missing_guarantor_is_recorded_not_raised(monkeypatch):
+    """Имя живого кода может уехать: харнесс обязан записать кейс несобранным,
+    а не падать и не подменять себе контур локальной копией."""
+    from core import bpmn_edits
+
+    monkeypatch.setattr(bpmn_edits, "apply_and_guarantee", None)
+    case = _improve(TWICE_THE_SAME_DOC)
+    assert "apply_and_guarantee" in case.error
+    assert not case.ok and not case.applied
+    suite = harness.build_improvement_suite().run(
+        [{"name": case.key, "payload": case}])
+    for name, result in suite.metrics.items():
+        if name == "improve/error_share":
+            continue
+        assert result.n == 0, f"{name} посчитана по кейсу без данных"
+
+
+def test_missing_reject_predicate_leaves_the_revert_fact_unknown(monkeypatch):
+    """«Гарант не игрался» и «гарант не отказал» — разные состояния: первое не
+    имеет права читаться как второе."""
+    from core import llm_improve
+
+    monkeypatch.setattr(llm_improve, "_cycle_reject", None)
+    case = _improve(CYCLING_OPS)
+    assert case.package_reverted is None
+    assert harness._package_revert_share(case) is None
+    assert any("_cycle_reject" in note for note in case.unmeasured)
+    # без гаранта пакет доживает до отчёта с applied — ровно та ошибка,
+    # из-за которой харнесс и переехал на продуктовский гарант
+    assert case.applied and case.xml_after != GUARANTEE_XML
+
+
+def test_retry_closes_a_refusal_only_on_the_same_element():
+    """`retry_closed` — сверка идентичностей, а не подсчёт строк повтора:
+    первый раунд отказал в вставке без `after`, повтор вставил тот же узел
+    правильно."""
+    insert_bad = [{"op": "add_task", "id": "new_doc", "name": "Оформить",
+                   "task_type": "userTask"}]
+    insert_good = [{"op": "add_task", "id": "new_doc", "name": "Оформить",
+                    "task_type": "userTask", "after": "L_a", "to": "L_b"}]
+    case = _improve(insert_bad, retry=insert_good)
+    assert case.retry_attempted is True and case.retry_closed == 1
+    assert harness._retry_gain(case) == 1.0
+    assert all(s["stage"] == "retry" for s in case.skipped
+               if s["op"] != "add_task")
+    # Другой элемент за «ту же правку» не засчитывается: повтор приносит
+    # connect, которого первый раунд не просил.
+    other = _improve(insert_bad, retry=[{"op": "connect", "source": "L_b",
+                                         "target": "L_e"}])
+    assert other.retry_attempted is True
+    assert other.retry_closed == 0
+
+
+def test_repeat_rejection_share_only_counts_verbatim_refusals():
+    case = harness.ImproveCase(scenario="s", fixture="f", label="",
+                               quality="live", mode="live",
+                               retry_attempted=True,
+                               skipped=[{"op": "add_task", "id": "X",
+                                         "stage": "plan"},
+                                        {"op": "add_task", "id": "X",
+                                         "stage": "retry", "duplicate": True},
+                                        {"op": "connect", "source": "A",
+                                         "stage": "retry"}])
+    assert harness._repeat_rejection_share(case) == pytest.approx(1 / 3)
+    case.retry_attempted = False
+    assert harness._repeat_rejection_share(case) is None
+    assert case.repeat_rejections is None
+
+
+def test_defects_introduced_sees_what_no_regression_hid():
+    """Один инвариант починен, другой сломан, дельта балла 0 — `no_regression`
+    на этом молчал, счётчик упавших видит обе половины."""
+    broken = _xml_with('<sequenceFlow id="FX" sourceRef="E1" targetRef="S1"/>')
+    case = harness.ImproveCase(scenario="s", fixture="f", label="",
+                               quality="live", mode="replay")
+    case.checks_before = check_xml(broken, {})
+    case.checks_after = check_xml(broken, {})
+    # Ничего не изменилось — и нечего приписывать пакету.
+    assert harness._defects_introduced(case) == 0.0
+    case.checks_before = check_xml(_xml_with(), {})
+    assert harness._defects_introduced(case) >= 1.0
+    case.checks_before = {}
+    assert harness._defects_introduced(case) is None
+
+
+def test_improve_metrics_do_not_invent_zero_for_broken_cases():
+    """Сломанный кейс не участвует в долях: ноль в `op_acceptance` — это
+    вердикт контуру, а у кейса без данных вердикта нет."""
+    case = harness.ImproveCase(scenario="s", fixture="f", label="", quality="",
+                               mode="live", error="нет схемы")
+    suite = harness.build_improvement_suite()
+    result = suite.run([{"name": case.key, "payload": case}])
+    for name, metric in result.metrics.items():
+        if name == "improve/error_share":
+            continue
+        assert metric.n == 0, f"{name} посчитана по кейсу без данных (n={metric.n})"
+        assert metric.mean is None
+    assert result.metrics["improve/error_share"].mean == 1.0
+
+
+def test_improve_case_phrase_says_whether_the_retry_ran():
+    case = harness.ImproveCase(scenario="s", fixture="f", label="", quality="",
+                               mode="live")
+    assert case.retry_phrase() == "повтор не померен"
+    case.retry_attempted = False
+    assert case.retry_phrase() == "повтор не был вызван"
+    case.retry_attempted, case.retry_closed = True, 2
+    case.skipped = [{"op": "connect", "stage": "retry", "duplicate": True}]
+    assert case.retry_phrase() == "повтор закрыл 2 отказов, 1 вернул дословно"
 
 
 def test_generation_error_is_a_result_not_a_crash():
@@ -608,6 +1095,49 @@ def test_baseline_of_another_mode_is_not_compared(tmp_path):
     assert "несопоставимы" in harness.render_table(report)
 
 
+def test_baseline_from_another_ruler_is_not_compared(tmp_path):
+    """Балл считается линейкой, поэтому слепок, собранный другими правилами, —
+    не та мерка: добавление правила, которое заряжает то, что раньше
+    прощалось, выглядит как падение `improve/score_delta` на незапятнанном
+    контуре. Харнесс обязан назвать причину и не давать код выхода по такой
+    «регрессии» — и не вправе молчать: ослаблять правило, чтобы цифра
+    вернулась, было бы обманом вместо замера."""
+    baseline_path = tmp_path / "current.json"
+    harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                repeat=1).write_baseline(baseline_path)
+    stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert stored["ruler"]["rules"], "baseline обязан нести отпечаток линейки"
+    stored["ruler"]["rules"].pop("cross_pool_flow", None)
+    stored["ruler"]["weights_total"] -= 10
+    baseline_path.write_text(json.dumps(stored, ensure_ascii=False),
+                             encoding="utf-8")
+
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                         repeat=1, baseline_path=baseline_path)
+    assert report.regressions == []
+    assert "линейка изменилась" in report.baseline_note
+    assert "cross_pool_flow" in report.baseline_note
+    assert "--write-baseline" in report.baseline_note
+
+
+def test_baseline_without_ruler_is_compared_but_says_so(tmp_path):
+    """Слепки, записанные до отпечатка, сверять нечем — но и освобождать их от
+    гейта нельзя: иначе «забыли ключ в JSON» стало бы способом выключить
+    регрессии."""
+    baseline_path = tmp_path / "current.json"
+    harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                repeat=1).write_baseline(baseline_path)
+    stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+    del stored["ruler"]
+    baseline_path.write_text(json.dumps(stored, ensure_ascii=False),
+                             encoding="utf-8")
+
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                         repeat=1, baseline_path=baseline_path)
+    assert "отпечатка линейки" in report.baseline_note
+    assert "нет отпечатка" in report.baseline_note
+
+
 def test_same_mode_baseline_still_reports_a_real_drop(tmp_path):
     """Пропуск сверки по режиму не должен превратиться в «сверки нет вообще»:
     то же падение метрики в своём режиме обязано быть замечено."""
@@ -624,6 +1154,66 @@ def test_same_mode_baseline_still_reports_a_real_drop(tmp_path):
                         repeat=1, baseline_path=baseline_path)
     assert rerun.baseline_note == ""
     assert [r.name for r in rerun.regressions] == ["pass@1/scenario"]
+
+
+def test_metric_newer_than_baseline_is_reported_and_not_failed(tmp_path):
+    """Слепок старше метрик (сегодня — `improve/defects_repaired`): такая
+    метрика не сверяется никогда, и «регрессий нет» без этой строки читается
+    как «сверили всё». Заметка, а не регрессия: код выхода она не меняет."""
+    baseline_path = tmp_path / "current.json"
+    harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                repeat=1).write_baseline(baseline_path)
+    stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+    stored["metrics"].pop("improve/defects_repaired", None)
+    stored["directions"].pop("improve/defects_repaired", None)
+    baseline_path.write_text(json.dumps(stored, ensure_ascii=False),
+                             encoding="utf-8")
+
+    rerun = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                        repeat=1, baseline_path=baseline_path)
+    assert "improve/defects_repaired" in rerun.metrics_flat()
+    assert rerun.regressions == []
+    assert "не сверялись с baseline" in rerun.baseline_note
+    assert ("не сверялись с baseline (наборы метрик разошлись): "
+            "improve/defects_repaired" in harness.render_table(rerun))
+    # И в CI-маршруте: заметка не даёт ни кода 1, ни секции РЕГРЕССИИ.
+    assert cli(["--mode", "replay", "--scenarios", "warehouse_delivery",
+                "--baseline", str(baseline_path), "--fail-on-regression",
+                "--no-report"]) == 0
+
+
+def test_metric_removed_from_the_run_is_reported_not_failed(tmp_path):
+    """Снятая метрика не имеет права выглядеть «всё сверили»: `compare` идёт по
+    ключам baseline и такой ключ просто не находит, поэтому удаление
+    `improve/no_regression` дало бы зелёный CI без единой строки об этом."""
+    baseline_path = tmp_path / "current.json"
+    harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                repeat=1).write_baseline(baseline_path)
+    stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+    stored["metrics"]["improve/no_regression"] = 1.0
+    stored["directions"]["improve/no_regression"] = "higher"
+    baseline_path.write_text(json.dumps(stored, ensure_ascii=False),
+                             encoding="utf-8")
+
+    rerun = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                        repeat=1, baseline_path=baseline_path)
+    assert "improve/no_regression" not in rerun.metrics_flat()
+    assert rerun.regressions == []
+    assert "improve/no_regression" in rerun.baseline_note
+
+
+def test_baseline_that_knows_every_metric_prints_no_note(tmp_path):
+    """Обратная сторона: слепок, записанный этим же прогоном, свежее всех
+    метрик — и пустой `baseline_note` обязан оставаться пустым, иначе заметка
+    обесценится до шума."""
+    baseline_path = tmp_path / "current.json"
+    harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                repeat=1).write_baseline(baseline_path)
+    rerun = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
+                        repeat=1, baseline_path=baseline_path)
+    assert rerun.regressions == []
+    assert rerun.baseline_note == ""
+    assert "не сверялись" not in harness.render_table(rerun)
 
 
 def test_baseline_survives_change_of_repeat(tmp_path):

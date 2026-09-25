@@ -266,10 +266,17 @@ class RegressionDetector:
                 # improve-кейсов). Это «нет данных», а не «лучше» и не «хуже».
                 continue
             if base == 0.0:
-                # ноль в baseline: относительная доля бессмысленна,
-                # сравниваем только явное ухудшение с абсолютным порогом
+                # Ноль в baseline: относительная доля бессмысленна, зато знак
+                # изменения читается и без неё — метрика ушла от «идеально»
+                # туда, куда по своему направлению «лучше» ей уходить нельзя.
+                # Долей тут правит направление, а не «больше = лучше»: в
+                # baseline нулями лежат `generation_error_share` и
+                # `improve/error_share` (LOWER), и их отлёт от нуля — ровно тот
+                # сигнал, ради которого гейт и заведён. Любая доля ошибок,
+                # ставшая ненулевой, — уже регрессия, какой бы ни была база.
                 if now != 0.0:
-                    worse = (now > 0) if self.direction_of(name) == HIGHER else (now < 0)
+                    worse = ((now > 0.0) if self.direction_of(name) == LOWER
+                             else (now < 0.0))
                     if worse:
                         out.append(Regression(name=name, baseline=base, current=now,
                                               rel_change=1.0, threshold=self.threshold,
@@ -285,6 +292,39 @@ class RegressionDetector:
                                       rel_change=rel, threshold=self.threshold,
                                       direction=direction))
         return out
+
+    def unverified(self, baseline: Optional[Mapping[str, Any]],
+                   current: Optional[Mapping[str, Any]]) -> List[str]:
+        """Метрики, которых сверка не касалась, — в обе стороны расхождения.
+
+        `compare` идёт по ключам baseline, поэтому метрика, заведённая после
+        того как baseline записали (например `improve/defects_repaired`), не
+        сравнивается ни разу — и ни одна строка об этом не говорит. Сюда же
+        попадает метрика, которую слепок не померил (null в baseline), а прогон
+        померил: это тот же «сверки не было».
+
+        Обратное направление нужно не меньше: метрику сняли или переименовали,
+        её ключ остался в слепке, `compare` про него молчит, и «регрессий нет»
+        читается как «сверили всё», хотя четыре метрики улучшения просто исчезли
+        из прогона. Входят только имена, которых в прогоне нет вовсе; померенное
+        и равное None остаётся «нет данных», иначе `spread/score_cv_per_case`
+        при `--repeat 1` превратил бы заметку в постоянный шум.
+
+        Это заметка, а не регрессия (сравнивать не с чем), и на код выхода она
+        влиять не вправе.
+        """
+        if not baseline or not current:
+            return []
+        out: List[str] = []
+        for name in current:
+            if _as_number(current[name]) is None:
+                continue
+            if name not in baseline or _as_number(baseline[name]) is None:
+                out.append(str(name))
+        for name in baseline:
+            if name not in current and _as_number(baseline[name]) is not None:
+                out.append(str(name))
+        return sorted(set(out))
 
     def regressions(self, baseline: Mapping[str, Any],
                     current: Mapping[str, Any]) -> List[str]:

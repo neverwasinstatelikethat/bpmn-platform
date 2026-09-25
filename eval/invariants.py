@@ -12,13 +12,22 @@
 (то, что чинит `repair_structure`) и `check_xml(xml)` для сгенерированного
 XML. Обе возвращают по каждому инварианту не только bool, но и причину со
 списком id — без причин метрика бесполезна при разборе прогона.
+
+Отдельная секция — бизнес-слой (`no_blind_rework`, `pools_not_pingpong`,
+`no_overloaded_lane`, `waits_have_sla`): те же свойства, за которые отвечает
+`BUSINESS_RULES` скоринга, но выведенные из семантики графа. Их формулировки
+намеренно расходятся с эвристикой продукта (расхождения подписаны в docstrings
+проверок), а `business_agreement` показывает, где два слоя не сошлись: «узел
+процесса» — это утверждение о бизнесе, а не о нотации, и проверять его тем же
+модулем, который его выдаёт, — значит никогда не узнать, что оба ошиблись.
 """
 
 from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set,
+                    Tuple)
 
 from core.bpmn_edits import parse_xml
 
@@ -50,20 +59,36 @@ ILLEGAL_SEQUENCE_TARGETS = {"startEvent", "boundaryEvent"}
 EVENT_DEFINITION_NAMES = {"timer", "message", "error", "signal", "escalation",
                           "conditional", "compensation", "terminate", "link"}
 
-# Основные инварианты: проверяются всегда. Сценарные ожидания включаются,
-# только если заявлены в сценарии, — иначе pass@1 накручивался бы «пустыми»
-# проверками.
-CORE_INVARIANTS: Tuple[str, ...] = (
+# Инварианты нотации и замысла: нарушение значит «схему нельзя принять», и
+# эталонный ответ удовлетворяет им по построению (проверено на всех фикстурах
+# quality=good). Именно они входят в гейт `scenario_pass`.
+NOTATION_INVARIANTS: Tuple[str, ...] = (
     "pool_has_steps",
     "participant_interacts",
     "roles_as_lanes",
     "gateway_split_join",
     "gateway_conditions_or_default",
     "event_definitions",
+    "timer_schedule",
     "boundary_handled",
     "flow_ends_legal",
+    "flows_within_pool",
+    "message_flow_ends",
     "no_unrouted",
 )
+# Бизнес-слой: узкие места процесса, а не нотации. Пересказывают `BUSINESS_RULES`
+# скоринга средствами графа и ничего у него не берут.
+BUSINESS_INVARIANTS: Tuple[str, ...] = (
+    "no_blind_rework",
+    "pools_not_pingpong",
+    "no_overloaded_lane",
+    "waits_have_sla",
+    "signoffs_need_a_gate",
+)
+# Основные инварианты: проверяются всегда. Сценарные ожидания включаются,
+# только если заявлены в сценарии, — иначе pass@1 накручивался бы «пустыми»
+# проверками.
+CORE_INVARIANTS: Tuple[str, ...] = NOTATION_INVARIANTS + BUSINESS_INVARIANTS
 SCENARIO_EXPECTATIONS: Tuple[str, ...] = (
     "has_timer",
     "has_branching",
@@ -77,6 +102,20 @@ INVARIANTS = ALL_CHECKS
 # Ключи ожидаемого определения события в структуре генератора: план модели
 # меняется (поле могли назвать по-разному), поэтому читаем все варианты.
 _DEFINITION_KEYS = ("event_definition", "event_type", "definition")
+
+# Статусы бизнес-правил — строки из ответа `BPMNScorer.evaluate`, переписанные
+# здесь намеренно (`business_agreement` получает результат скоринга как вход,
+# но не имеет права его импортировать).
+_SCORER_PASSED = "passed"
+_SCORER_FAILED = "failed"
+_SCORER_NA = "not_applicable"
+_SCORER_UNKNOWN = "unknown"
+# Состояния сверки двух слоёв: расхождение — это данные человеку, а не гейт.
+AGREE = "agree"
+ORACLE_STRICTER = "oracle_stricter"
+SCORER_STRICTER = "scorer_stricter"
+NOT_COMPARABLE = "not_comparable"
+NO_DATA = "no_data"
 
 
 @dataclass(frozen=True)
@@ -107,6 +146,10 @@ class _Node:
     pool: str
     lane: str = ""
     definition: str = ""
+    # Хронометраж таймера (`timeDate` / `timeDuration` / `timeCycle`): тип
+    # события и его срок — разные вещи, и `<timerEventDefinition/>` без значения
+    # исполнитель не заведёт.
+    schedule: str = ""
     attached_to: str = ""
     documented: bool = False
 
@@ -119,6 +162,10 @@ class _Edge:
     target: str
     condition: str = ""
     is_default: bool = False
+    # Подпись потока (`name`): в bpmn-js так выглядит «вернули»/«согласовано»,
+    # когда формального conditionExpression нет. Бизнес-инварианты читают её,
+    # `gateway_conditions_or_default` — по-прежнему нет (там требование нотации).
+    label: str = ""
 
 
 @dataclass
@@ -135,18 +182,29 @@ class _Graph:
     pools: List[str] = field(default_factory=list)
     lanes: List[Dict[str, str]] = field(default_factory=list)
     defaults: Dict[str, str] = field(default_factory=dict)  # шлюз -> поток
+    # Любой id, которым назван пул: участник XML, его процесс, имя плана. Нужно
+    # потому, что конец messageFlow по BPMN 2.0 имеет право быть участником
+    # целиком, и «кто затронут» тогда не читается из узлов.
+    pool_aliases: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.by_id: Dict[str, _Node] = {n.id: n for n in self.nodes}
         self.seq_out: Dict[str, List[_Edge]] = {}
         self.seq_in: Dict[str, List[_Edge]] = {}
         self.message_edges: List[_Edge] = []
+        # Дуги, у которых конца в схеме нет: они не дают узлу ни входа, ни
+        # выхода, иначе «несуществующий поток» засчитывался бы как маршрут и
+        # нога выглядела соединённой (оракул прощал это на 2 схемах корпуса).
+        self.unresolved: List[_Edge] = []
         for e in self.edges:
             if e.kind == "message":
                 self.message_edges.append(e)
                 continue
-            self.seq_out.setdefault(e.source, []).append(e)
-            self.seq_in.setdefault(e.target, []).append(e)
+            if e.source in self.by_id and e.target in self.by_id:
+                self.seq_out.setdefault(e.source, []).append(e)
+                self.seq_in.setdefault(e.target, []).append(e)
+            else:
+                self.unresolved.append(e)
         # Дорожка в XML — не атрибут узла, а flowNodeRef в laneSet: размечаем
         # её здесь, чтобы обе точки входа давали одинаковый граф.
         for lane in self.lanes:
@@ -220,6 +278,16 @@ def _graph_from_structure(structure: Mapping[str, Any]) -> _Graph:
             pool=_text(elem.get("participant")),
             lane=_text(elem.get("lane")),
             definition=_definition_of(elem),
+            # План без поля срока — это НЕ мёртвый таймер: генератор пишет
+            # хронометраж по умолчанию (`core/bpmn_generator.py`), и требовать
+            # срок на стадии плана значило бы снимать инвариант за то, чего в
+            # продукте не бывает. Значение-SENTINEL переписано здесь намеренно:
+            # оракул не импортирует константы генератора (тот же порядок, что со
+            # статусами скоринга выше), а проверка на пустоту видит результат.
+            schedule=(_text(elem.get("duration")) or _text(elem.get("timer"))
+                      or _text(elem.get("cycle")) or _text(elem.get("timeDate"))
+                      or ("plan-default" if _definition_of(elem) == "timer"
+                          else "")),
             attached_to=_text(elem.get("attached_to") or elem.get("attachedToRef")),
             documented=bool(_text(elem.get("documentation"))),
         ))
@@ -239,6 +307,7 @@ def _graph_from_structure(structure: Mapping[str, Any]) -> _Graph:
         edges.append(_Edge(
             id=_text(flow.get("id")), kind=kind, source=source, target=target,
             condition=_text(flow.get("condition") or flow.get("name")),
+            label=_text(flow.get("name")),
             is_default=is_default,
         ))
 
@@ -246,8 +315,17 @@ def _graph_from_structure(structure: Mapping[str, Any]) -> _Graph:
               "pool": _text(lane.get("participant"))}
              for lane in raw_lanes if isinstance(lane, Mapping)]
     pools = [_pool_name(p) for p in (structure.get("participants") or [])]
+    aliases: Dict[str, str] = {}
+    for p in (structure.get("participants") or []):
+        name = _pool_name(p)
+        if not name:
+            continue
+        aliases[name] = name
+        if isinstance(p, Mapping) and _text(p.get("id")):
+            aliases[_text(p.get("id"))] = name
     return _Graph(nodes=nodes, edges=edges,
                   pools=[p for p in pools if p], lanes=lanes,
+                  pool_aliases=aliases,
                   defaults={k: v for k, v in defaults.items() if v})
 
 
@@ -265,6 +343,7 @@ def _is_bpmn(tag: Any) -> bool:
 def _graph_from_xml(xml: str) -> _Graph:
     root = parse_xml(xml)
     pools: List[str] = []
+    aliases: Dict[str, str] = {}
     pool_by_process: Dict[str, str] = {}
     edges: List[_Edge] = []
     defaults: Dict[str, str] = {}
@@ -277,6 +356,8 @@ def _graph_from_xml(xml: str) -> _Graph:
             if tag == "participant":
                 name = _text(child.get("name")) or _text(child.get("id"))
                 pools.append(name)
+                if child.get("id"):
+                    aliases[child.get("id")] = name
                 if child.get("processRef"):
                     pool_by_process[child.get("processRef")] = name
             elif tag == "messageFlow":
@@ -287,6 +368,7 @@ def _graph_from_xml(xml: str) -> _Graph:
                     source=_text(child.get("sourceRef")),
                     target=_text(child.get("targetRef")),
                     condition=_text(child.get("name")),
+                    label=_text(child.get("name")),
                 ))
 
     nodes: List[_Node] = []
@@ -318,20 +400,31 @@ def _graph_from_xml(xml: str) -> _Graph:
                     id=_text(child.get("id")), kind="sequence",
                     source=_text(child.get("sourceRef")),
                     target=_text(child.get("targetRef")),
+                    label=_text(child.get("name")),
                     condition=_text(next((_text(c.text) for c in child
                                           if _local(c.tag) == "conditionExpression"),
                                          "")),
                 ))
             elif tag in TASK_KINDS | GATEWAY_KINDS | EVENT_KINDS:
                 definition = ""
+                schedule = ""
                 for sub in child:
                     sub_tag = _local(sub.tag)
                     if sub_tag.endswith("EventDefinition"):
                         definition = sub_tag[:-len("EventDefinition")]
+                        # Хронометраж — ВНУТРИ определения (`timerEventDefinition
+                        # / timeDuration`), а не дочерний узел события: читать его
+                        # на уровне события значило бы не найти срок там, где он
+                        # есть. Пустое значение = «срока нет».
+                        schedule = schedule or next(
+                            (_text(t.text) for t in sub
+                             if _local(t.tag) in ("timeDate", "timeDuration",
+                                                  "timeCycle")),
+                            "")
                 nodes.append(_Node(
                     id=_text(child.get("id")), kind=tag,
                     name=_text(child.get("name")), pool=pool,
-                    definition=definition,
+                    definition=definition, schedule=schedule,
                     attached_to=_text(child.get("attachedToRef")),
                     documented=any(_local(c.tag) == "documentation" and _text(c.text)
                                    for c in child),
@@ -347,6 +440,7 @@ def _graph_from_xml(xml: str) -> _Graph:
         if edge.id and edge.id in default_flow_ids:
             edge.is_default = True
     return _Graph(nodes=nodes, edges=edges, pools=pools, lanes=lanes,
+                  pool_aliases={**aliases, **pool_by_process},
                   defaults=defaults)
 
 
@@ -388,6 +482,13 @@ def _check_participant_interacts(g: _Graph, _exp: Mapping[str, Any]) -> Check:
             node = g.by_id.get(node_id)
             if node is not None:
                 touched.add(node.pool)
+            elif node_id in g.pool_aliases:
+                # Конец потока — участник целиком. BPMN 2.0 это разрешает, и
+                # Signavio рисует так «фронт» банка: пул затронут, хотя ни один
+                # его шаг в обмене не назван. До этой правки оракул объявлял
+                # такой пул немым на 35 схемах корпуса из 367, а инвариант
+                # стоит в гейте `pass@1/scenario`.
+                touched.add(g.pool_aliases[node_id])
     silent = [p for p in g.pools if p not in touched]
     if not silent:
         return _pass("participant_interacts",
@@ -444,8 +545,17 @@ def _branch_closes(g: _Graph, start_id: str) -> bool:
 
 
 def _splits(g: _Graph) -> List[Tuple[_Node, List[_Edge]]]:
+    """Развилки, обязанные иметь сход: по ним идёт больше одного токена.
+
+    `eventBasedGateway` исключён: его ноги ждут разных событий, срабатывает
+    одна, и схождения потоков у такой развилки по семантике нотации нет. Пока её
+    не исключали, оракул выдавал 7 ложных «развилка без схождения» на 98 схемах
+    корпуса с разветвлённым event-шлюзом, а `gateway_split_join` входит в гейт
+    `pass@1/scenario`. Скоринг трактует требование так же (`SPLIT_GATEWAY_TAGS`)."""
     result = []
     for node in g.of_kind(GATEWAY_KINDS):
+        if node.kind == "eventBasedGateway":
+            continue
         outgoing = g.seq_out.get(node.id, [])
         if len(outgoing) >= 2:
             result.append((node, outgoing))
@@ -566,6 +676,95 @@ def _check_flow_ends_legal(g: _Graph, _exp: Mapping[str, Any]) -> Check:
                  "исходящего потока не бывает", bad)
 
 
+def _check_flows_within_pool(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """`sequenceFlow` живёт внутри одного процесса: токен не переезжает из пула
+    в пул, для этого есть `messageFlow`.
+
+    Принадлежность узла оракул читает по **имени** пула, а скоринг — по id
+    процесса, и это намеренно разные читательские пути: два пула с одним именем
+    дали бы расхождение по этому инварианту, а не молчаливый пропуск (именно так
+    и был найден класс висячих дуг — сверкой двух слоёв, а не фикстурами).
+    """
+    seq = [e for e in g.edges if e.kind != "message"]
+    if len({n.pool for n in g.nodes if n.pool}) < 2:
+        return _na("flows_within_pool", "пул в схеме один — пересекать нечего")
+    bad: List[str] = []
+    details: List[str] = []
+    for edge in seq:
+        source, target = g.by_id.get(edge.source), g.by_id.get(edge.target)
+        if source is None or target is None:
+            continue  # висячая ссылка — забота `no_unrouted`
+        if not source.pool or not target.pool or source.pool == target.pool:
+            continue
+        ident = edge.id or f"{edge.source}->{edge.target}"
+        bad.append(ident)
+        details.append(f"{ident}: '{source.id}' в пуле '{source.pool}', а "
+                       f"'{target.id}' — в '{target.pool}'")
+    if not bad:
+        return _pass("flows_within_pool", f"проверено sequence-потоков: {len(seq)}")
+    return _fail("flows_within_pool",
+                 "дуги между пулами: " + "; ".join(details)
+                 + " — связь двух участников выражается потоком сообщения, "
+                 "а не потоком управления", bad)
+
+
+def _check_message_flow_ends(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Концы сообщения обязаны быть названы в схеме и способны обмен принять:
+    участником или узлом, но не развилкой.
+
+    `participant_interacts` про неё молчит правильно: он считает, кого обмен
+    затронул, а сломанный конец ни кого не затрагивает — и схема выглядит
+    «мало участников», а не «битый обмен».
+    """
+    if not g.message_edges:
+        return _na("message_flow_ends", "потоков сообщения нет")
+    bad: List[str] = []
+    details: List[str] = []
+    for edge in g.message_edges:
+        problems = []
+        for side, ref in (("источника", edge.source), ("цели", edge.target)):
+            if not ref:
+                problems.append(f"нет {side}")
+            elif ref not in g.by_id and ref not in g.pool_aliases:
+                problems.append(f"{side} названа id '{ref}', которого в схеме нет")
+            elif ref in g.by_id and g.by_id[ref].kind in GATEWAY_KINDS:
+                # Развилка не бывает концом обмена: у `messageFlow` конец —
+                # участник или узел, а решение развилки наружу уходит ногой
+                # того же пула. Класс зарядила не корпус (из 625 обменов
+                # шлюзовых концов ноль), а собственный совет линейки.
+                problems.append(f"{side} — развилка '{g.by_id[ref].kind}', "
+                                "концом обмена она не бывает")
+        if not problems:
+            continue
+        ident = edge.id or f"{edge.source}->{edge.target}"
+        bad.append(ident)
+        details.append(f"{ident}: " + ", ".join(problems))
+    if not bad:
+        return _pass("message_flow_ends",
+                     f"проверено потоков сообщения: {len(g.message_edges)}")
+    return _fail("message_flow_ends",
+                 "битые обмены: " + "; ".join(details), bad)
+
+
+def _check_timer_schedule(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Таймер обязан иметь хронометраж, иначе он не наступит.
+
+    `event_definitions` про неё молчит правильно: определение у узла есть,
+    пустое значение — другой дефект. Для бизнеса он хуже обычного битого XML:
+    схема с «просрочкой» нарисована, ветка эскалации подписана, а исполнитель
+    её не заведёт, и процесс просто ждёт.
+    """
+    timers = [n for n in g.nodes if n.definition == "timer"]
+    if not timers:
+        return _na("timer_schedule", "таймеров в схеме нет")
+    inert = [n.id for n in timers if not n.schedule]
+    if not inert:
+        return _pass("timer_schedule", f"таймеров: {len(timers)}, срок у всех")
+    return _fail("timer_schedule",
+                 "таймер без timeDate/timeDuration/timeCycle — он не наступит: "
+                 + ", ".join(inert), inert)
+
+
 def _check_no_unrouted(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     if not g.nodes:
         return _na("no_unrouted", "узлов нет")
@@ -588,6 +787,492 @@ def _check_no_unrouted(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     if not bad:
         return _pass("no_unrouted")
     return _fail("no_unrouted", "узлы вне маршрута: " + "; ".join(notes), bad)
+
+
+# ---------------------------------------------------------------------------
+# бизнес-слой: узкие места процесса, а не нотации
+# ---------------------------------------------------------------------------
+#
+# Четыре проверки ниже пересказывают бизнес-правила скоринга (`BUSINESS_RULES`)
+# средствами одного лишь графа. Делать это «в лоб» было бы бессмысленно:
+# сверка двух копий одной формулировки не ловит общее заблуждение, из-за которого
+# правило и промпт улучшения разъезжаются вместе, а метрика остаётся зелёной.
+# Поэтому каждая проверка формулирует то же бизнес-требование независимо, а
+# каждый осознанный разрыв подписан в её docstring; `business_agreement`
+# превращает эти разрывы в таблицу для человека.
+
+# Монополия дорожки: >3/4 всех работ пула на одном исполнителе при двух и более
+# дорожках. Порог свой и он сознательно ВЫШЕ скоринговых 60%: у оракула нет
+# калитки «дорожек хотя бы три», и с двумя дорожками 60% ловили бы честное
+# разделение «оператор делает 7 шагов из 12». 0.75 — это «второй роли досталась
+# дорожка-фишка».
+LANE_MONOPOLY_SHARE = 0.75
+
+# Ожидание, блокирующее маршрут: `intermediateCatchEvent` не-таймера (сообщение,
+# сигнал, условие — токен стоит до наступления) и `receiveTask`, который по BPMN
+# и есть «жду сообщение». Граничные события в список не входят: они не держат
+# токен, а throw-событие завершается сразу.
+BLOCKING_CATCH_KINDS = {"intermediateCatchEvent", "receiveTask"}
+
+# Определения catch-событий, которые ничьего прихода не ждут. `link` — метка
+# перехода: токен доходит до неё и идёт дальше по сопоставленной мишени, а не
+# встаёт. `compensate` — триггер отработки: событие будит уже выполненный
+# участок, а не внешний мир. Требовать у них срок — значит ставить нарушение
+# там, где его нечем исполнить: таймер на метку перехода ничего не значит.
+# Те же два имени знает скоринг (`wait_without_sla`): на корпусе из 367 файлов
+# только `link` приносил 675 «нарушений» из 2731.
+NOT_A_WAIT_DEFINITIONS = frozenset({"link", "compensate"})
+
+
+def _reachable(g: _Graph, start: str, skip: Optional[_Edge] = None) -> set:
+    """Узлы, куда токен доходит из `start` по sequence-потокам (включая сам
+    start; `skip` — дуга, которую считать нельзя, чтобы не замкнуть путь её же
+    собственным концом)."""
+    seen = {start}
+    stack = [start]
+    while stack:
+        node_id = stack.pop()
+        for edge in g.seq_out.get(node_id, []):
+            if edge is skip or not edge.target or edge.target in seen:
+                continue
+            seen.add(edge.target)
+            stack.append(edge.target)
+    return seen
+
+
+def _ancestors(g: _Graph, target: str) -> set:
+    """Узлы, из которых в `target` можно войти по sequence-потокам (без самого
+    target): маршруты, проложенные до него."""
+    seen: set = set()
+    stack = [target]
+    while stack:
+        node_id = stack.pop()
+        for edge in g.seq_in.get(node_id, []):
+            if not edge.source or edge.source in seen:
+                continue
+            seen.add(edge.source)
+            stack.append(edge.source)
+    return seen
+
+
+def _leg_named(g: _Graph, edge: _Edge) -> bool:
+    """Нога развилки названа: conditionExpression, подпись потока либо выход по
+    умолчанию. Скоринг на этом месте расходится с нами осознанно — см.
+    docstring `no_blind_rework`."""
+    if edge.is_default or g.defaults.get(edge.source) == edge.id:
+        return True
+    return bool(edge.condition or edge.label)
+
+
+def _back_arcs(g: _Graph) -> List[Tuple[_Edge, _Node]]:
+    """Дуги возврата: поток, конец которого — активность, откуда маршрут снова
+    приходит к началу этого потока. Точно «повторно сделать работу», а не
+    «вернуться в шлюз схождения»: события и шлюзы работу не выполняют."""
+    result: List[Tuple[_Edge, _Node]] = []
+    for edge in g.edges:
+        if edge.kind == "message" or not edge.source or not edge.target:
+            continue
+        target = g.by_id.get(edge.target)
+        if target is None or target.kind not in TASK_KINDS:
+            continue
+        if edge.source == edge.target or edge.source in _reachable(g, edge.target,
+                                                                  skip=edge):
+            result.append((edge, target))
+    return result
+
+
+def _loop_nodes(g: _Graph, start: str, finish: str) -> set:
+    """Тело петли: узлы хотя бы одного пути `start → finish` вместе с концами."""
+    return (_reachable(g, start) & _ancestors(g, finish)) | {start, finish}
+
+
+def _distinguishes(g: _Graph, node_id: str, loop: set) -> bool:
+    """Развилка различает «вернули» и «согласовано»: у неё есть нога в петлю и
+    нога из петли, и каждая нога названа. Одной названной ноги мало — тогда
+    безымянной остаётся та ветка, по которой работа возвращается."""
+    legs = g.seq_out.get(node_id, [])
+    if len(legs) < 2:
+        return False
+    into = [e for e in legs if e.target in loop]
+    out = [e for e in legs if e.target not in loop]
+    return bool(into) and bool(out) and all(_leg_named(g, e) for e in legs)
+
+
+def _check_no_blind_rework(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Повтор обязан называть, чем «вернули» отличается от «согласовано».
+
+    Петля берётся из семантики токена: дуга, возвращающая работу в уже
+    сделанную активность (её конец сам доходит до её начала). Такая петля
+    осмысленна, если решение о повторе различимо — названа либо сама
+    возвращающая дуга, либо обе ноги развилки, одна из которых ведёт в петлю, а
+    другая выводит из неё. Иначе процесс идёт по кругу без записанной причины.
+
+    Два осознанных расхождения со скорингом (`rework_loop`). Первое: скоринг
+    смотрит только на дуги *выхода* из цикла и требует защиты хотя бы у одной из
+    них, поэтому безымянный возврат ему не нарушение, а цикл без дуг выхода
+    вовсе молча проходит (`no_isolated` в это время ругается на недостижимый
+    конец). Оракул спрашивает про пару ног «в петлю / из петли» и такой цикл
+    тоже называет слепым повтором. Второе: оракул признаёт подписью ноги и
+    `name` потока — в нарисованной схеме «Вернули на доработку» на дуге
+    различает ветки не хуже conditionExpression, а требование нотационного
+    условия сторожит отдельный инвариант `gateway_conditions_or_default`.
+    """
+    backs = _back_arcs(g)
+    if not backs:
+        return _na("no_blind_rework", "дуг, возвращающих работу в уже сделанный "
+                                     "шаг, нет — повторных проходов нечего проверять")
+    blind: List[str] = []
+    ids: List[str] = []
+    for edge, target in backs:
+        if _leg_named(g, edge):
+            continue
+        loop = _loop_nodes(g, target.id, edge.source)
+        if any(_distinguishes(g, node.id, loop) for node in g.nodes):
+            continue
+        blind.append(
+            f"{edge.id or f'{edge.source}->{edge.target}'} возвращает работу в "
+            f"{target.id} («{target.name}»), а «вернули» ничем не отличается от "
+            f"«согласовано»: ни на дуге возврата, ни на ногах её развилки нет ни "
+            f"условия, ни подписи, ни выхода по умолчанию")
+        ids.extend(i for i in (edge.id, edge.source, target.id) if i)
+    if not blind:
+        return _pass("no_blind_rework", f"дуг возврата: {len(backs)}")
+    return _fail("no_blind_rework",
+                 "слепой повтор: " + "; ".join(blind)
+                 + " — процесс идёт по кругу без записанной причины возврата",
+                 list(dict.fromkeys(ids)))
+
+
+def _pool_of_endpoint(g: _Graph, ref: str) -> str:
+    """Пулы на конце messageFlow: узел отвечает через свой процесс, а ссылка на
+    участник (или на имя пула, как её кладёт в план аплайер) — сама за себя."""
+    node = g.by_id.get(ref)
+    if node is not None:
+        return node.pool
+    return next((p for p in g.pools if _norm(p) == _norm(ref)), ref)
+
+
+def _check_pools_not_pingpong(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Одна и та же работа не должна ходить между двумя пулами туда-сюда.
+
+    Пинг-понг — это *возврат той же работы*: два потока-сообщения, соединяющие
+    одну и ту же пару концов в обе стороны (концы могут быть и шагами, и пулами
+    целиком). Ответственность при этом не разведена, а перекладывается: у шага
+    нет хозяина, который доводит её до конца.
+
+    Совпадение критерия с `handoff_pingpong` (тот тоже ждёт возврата той же пары
+    концов) — не дублирование, а то, ради чего оракул и живёт отдельно: формулировки
+    независимы, и любое расхождение между ними видно по строке
+    `business_agreement`, а не молча переезжает из правила в метрику. Механически
+    слои расходятся там, где скорингу надо *разрешить* концы в участников с
+    именем: неразрешённый конец для него — повод молчать, а для оракула — сторона
+    обмена (битая ссылка на пул тоже перекидывание, и её чинят, а не прощают).
+    """
+    if len(g.pools) < 2:
+        return _na("pools_not_pingpong", "пул один — перекидывать работу некому")
+    arcs = [e for e in g.message_edges if e.source and e.target]
+    if not arcs:
+        return _na("pools_not_pingpong", "потоков-сообщений нет")
+    by_pair: Dict[Tuple[str, str], List[_Edge]] = {}
+    for edge in arcs:
+        by_pair.setdefault((edge.source, edge.target), []).append(edge)
+    names = {n.id: n.name for n in g.nodes}
+    hits: List[str] = []
+    ids: List[str] = []
+    for (src, dst), there in sorted(by_pair.items()):
+        back = by_pair.get((dst, src))
+        if not back or src >= dst:
+            continue
+        pool_src, pool_dst = _pool_of_endpoint(g, src), _pool_of_endpoint(g, dst)
+        if not pool_src or pool_src == pool_dst:
+            # Оба конца в одном пуле — это внутренний маршрут, а не обмен
+            continue
+        work = (f" — та же работа в руках у двух пулов («{names[src]}» / "
+                f"«{names[dst]}»)" if src in names and dst in names else "")
+        hits.append(
+            f"«{pool_src}» ↔ «{pool_dst}»: "
+            + ", ".join(f"{e.id} ({src} → {dst})" for e in there)
+            + " и обратно "
+            + ", ".join(f"{e.id} ({dst} → {src})" for e in back)
+            + f" — взаимных обменов этой пары: {max(len(there), len(back))}"
+            + work)
+        ids.extend(e.id for e in there + back)
+        ids.extend([i for i in (src, dst) if i not in names])
+    if not hits:
+        return _pass("pools_not_pingpong",
+                     "двусторонних обменов одной работой нет (потоков-сообщений: "
+                     f"{len(arcs)})")
+    return _fail("pools_not_pingpong",
+                 "пулы гоняют одну и ту же работу друг другу в обе стороны: "
+                 + "; ".join(hits) + " — у процесса должен быть один хозяин, "
+                 "остальным рольам — дорожки", list(dict.fromkeys(ids)))
+
+
+def _lane_groups(g: _Graph) -> List[Tuple[str, List[Dict[str, str]]]]:
+    """Дорожки, сгруппированные по пулу.
+
+    Пул берётся из объявления дорожки (`participant` плана, процесс XML), а если
+    его нет — из узлов, которые в дорожку разложены. По `g.pools` не ходим: у
+    схемы без `<collaboration>` пулов в этом списке нет вовсе, и проверка
+    объявляла бы не применимой ровно ту однопольную раскладку, ради которой её
+    и завели."""
+    groups: Dict[str, List[Dict[str, str]]] = {}
+    for lane in g.lanes:
+        pool = _text(lane.get("pool"))
+        if not pool:
+            owners = [n.pool for n in g.nodes
+                      if n.lane == lane.get("id", "") and n.pool]
+            pool = owners[0] if owners else ""
+        groups.setdefault(pool, []).append(lane)
+    return list(groups.items())
+
+
+def _work_of(g: _Graph, pool: str) -> List[_Node]:
+    """Работы пула: активности (события и шлюзы работу не делают), включая
+    неразложенные по дорожкам — знаменатель обязан считаться от шагов пула."""
+    return [n for n in g.nodes if n.pool == pool and n.kind in TASK_KINDS]
+
+
+def _check_no_overloaded_lane(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Одна дорожка не должна держать почти все работы пула.
+
+    Роли нарисованы, а работа лежит на одном исполнителе — это узкое место
+    процесса: он и очередь, и единственный носитель знания. Доля считается так:
+    работы дорожки / все работы пула (`TASK_KINDS` пула, включая те, что вообще
+    не разложены по дорожкам), порог — `LANE_MONOPOLY_SHARE`.
+
+    Два отличия от скоринга (`lane_overload`) остались и после того, как
+    двухдорожечные пулы перестали быть для него «не применимы» (калитка в три
+    дорожки стоила контуру подсказки на дежурной смене production_incident, где
+    4 работы из 5 лежат на одном исполнителе — теперь этот случай ловят оба).
+    Знаменатель: скоринг делит на работы размеченных дорожек, оракул — на все
+    шаги пула, поэтому не размеченная по ролям работа разбавляет долю дорожки,
+    зато схема без laneSet не получает права молчать. Порог: 75% здесь против 60%
+    у скоринга при трёх и более дорожках, поэтому `laned_doc([4, 1, 1])` —
+    `scorer_stricter`. Оба расхождения видит `business_agreement`.
+    """
+    split = [(pool, lanes) for pool, lanes in _lane_groups(g) if len(lanes) >= 2]
+    if not split:
+        return _na("no_overloaded_lane",
+                   "пулов с двумя и более дорожками нет — делить работу не между кем")
+    checked = 0
+    bad: List[str] = []
+    ids: List[str] = []
+    for pool, lanes in split:
+        work = _work_of(g, pool)
+        if not work:
+            continue
+        checked += 1
+        by_lane: Dict[str, int] = {}
+        for node in work:
+            if node.lane:
+                by_lane[node.lane] = by_lane.get(node.lane, 0) + 1
+        for lane in lanes:
+            count = by_lane.get(lane.get("id", ""), 0)
+            share = count / len(work)
+            if share <= LANE_MONOPOLY_SHARE:
+                continue
+            name = lane.get("name") or lane.get("id", "")
+            bad.append(f"дорожка «{name}» держит {count} из {len(work)} работ пула "
+                       f"«{pool or 'без имени'}» ({round(share * 100)}%)")
+            ids.append(lane.get("id", ""))
+    if not checked:
+        return _na("no_overloaded_lane",
+                   "в пулах с дорожками нет ни одной работы — сравнивать нечего")
+    if not bad:
+        return _pass("no_overloaded_lane",
+                     f"пулов с ≥2 дорожками: {checked}, ни одна дорожка не держит "
+                     f"больше {round(LANE_MONOPOLY_SHARE * 100)}% работ пула")
+    return _fail("no_overloaded_lane",
+                 "работа сосредоточена на одном исполнителе: " + "; ".join(bad)
+                 + " — роли есть, а процесса у них нет",
+                 [i for i in dict.fromkeys(ids) if i])
+
+
+# Ручная работа в цепочке согласований. `task` — шаг без типа: так человека
+# рисует bpmn-js, и если считать только `userTask`, проверка слепнет к половине
+# рукописного корпуса. Список совпадает с `HUMAN_TASK_TAGS` скоринга намеренно:
+# оракул не импортирует `core`, поэтому врознь у них только способ прочесть
+# схему, а не признак.
+HUMAN_SIGNOFF_KINDS = frozenset({"userTask", "manualTask", "task"})
+# Сколько ручных шагов подряд — уже «согласования без решения». Число взято из
+# `APPROVAL_CHAIN_MIN`: по одному бизнес-вопросу слои обязаны сходиться, иначе
+# `business_agreement` показывал бы расхождение там, где просто разные пороги.
+SIGNOFF_CHAIN_MIN = 4
+
+
+def _signoff_chain(g: _Graph, ids: Set[str],
+                   minimum: int = SIGNOFF_CHAIN_MIN) -> List[str]:
+    """Первая найденная линия ручных шагов длиной не меньше `minimum`.
+
+    Линию разрывает всё, что не ручная работа из `ids`: шлюз — это решение,
+    автоматический шаг — не «ещё один согласующий». Возврат в уже посещённый узел
+    не продлевает линию (цикл считает `no_blind_rework`), поэтому обход конечен.
+    Ищем существование линии нужной длины, а не самую длинную: свидетелю
+    достаточно четырёх id, а полный перебор путей на разветвлённой схеме стоил бы
+    времени прогона.
+    """
+    def walk(node_id: str, path: List[str]) -> List[str]:
+        if len(path) >= minimum:
+            return list(path)
+        for edge in g.seq_out.get(node_id, []):
+            nxt = edge.target
+            if not nxt or nxt not in ids or nxt in path:
+                continue
+            found = walk(nxt, path + [nxt])
+            if found:
+                return found
+        return []
+
+    for node_id in sorted(ids):
+        found = walk(node_id, [node_id])
+        if found:
+            return found
+    return []
+
+
+def _check_signoffs_need_a_gate(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Четыре ручных шага подряд у одного исполнителя — узкое место, а не норма.
+
+    Пятый бизнес-инвариант и зеркало правила `approval_chain`: до него скоринг
+    находил цепочки согласований на 37 схемах корпуса из 367, а метрики харнесса
+    (`business/smells`, `improve/business_repaired_share`) про этот класс молчали —
+    улучшение согласования не превращалось ни в какое число.
+
+    Дорожка обязана быть названа там, где она есть: без `laneSet` четыре подписи
+    идут одной линией в одном пуле, и это худший случай (исполнители неразличимы
+    вовсе), а не «свойство неприменимо». Процесс, где в группе меньше четырёх
+    ручных шагов, остаётся `not_applicable` — проверять нечего.
+    """
+    groups: List[Tuple[str, Set[str]]] = []
+    if g.lanes:
+        for lane in g.lanes:
+            lane_id = str(lane.get("id") or "")
+            users = {n.id for n in g.nodes
+                     if n.kind in HUMAN_SIGNOFF_KINDS and n.lane == lane_id}
+            if len(users) >= SIGNOFF_CHAIN_MIN:
+                groups.append((str(lane.get("name") or lane_id), users))
+    else:
+        users = {n.id for n in g.nodes if n.kind in HUMAN_SIGNOFF_KINDS}
+        if len(users) >= SIGNOFF_CHAIN_MIN:
+            groups.append(("", users))
+    if not groups:
+        return _na("signoffs_need_a_gate",
+                   f"нет группы с {SIGNOFF_CHAIN_MIN} ручными шагами — цепочка "
+                   "согласований не складывается")
+    notes: List[str] = []
+    offenders: List[str] = []
+    for name, users in groups:
+        line = _signoff_chain(g, users)
+        if not line:
+            continue
+        offenders.extend(line)
+        notes.append(f"«{name or 'дорожка не названа'}»: "
+                     + ", ".join(f"'{i}'" for i in line)
+                     + " идут подряд по ручным шагам, решения между ними нет")
+    if not notes:
+        return _pass("signoffs_need_a_gate",
+                     f"групп с {SIGNOFF_CHAIN_MIN}+ ручными шагами: {len(groups)}, "
+                     "сплошных линий между подписями нет")
+    return _fail("signoffs_need_a_gate",
+                 "; ".join(notes) + " — цепочка согласований без развилки: ни "
+                                    "один шаг не решает, идти ли дальше",
+                 list(dict.fromkeys(offenders)))
+
+
+def _sla_bounds(g: _Graph, wait: _Node, timers: List[_Node]) -> bool:
+    """Ограничивает ли какой-нибудь таймер именно это ожидание — по маршруту
+    токена, а не по факту «таймер в схеме водится».
+
+    Три легальные формы: таймер-определение в самом ожидании, граничный таймер на
+    него (`attachedToRef`) и развилка «ответ или срок» над ожиданием. Третью форму
+    оракул выводит из семантики токена сам: развилка обязана быть предком
+    ожидания, таймер — её прямой ногой, а сам таймер не должен вести в это
+    ожидание (иначе он стоит ниже по маршруту и срабатывает уже после ответа).
+    `exclusiveGateway` отбраковывается: его ветки выбираются в момент развилки, и
+    срок из такой схемы не следует.
+
+    Совпадение со скорингом (`wait_without_sla`) намеренное: расхождение по
+    признаку, за который отвечает один и тот же бизнес-вопрос, означало бы, что
+    продукт меряет себя сам. Разводят их только знаменатель `no_overloaded_lane`
+    и слова в текстах.
+    """
+    if not timers:
+        return False
+    if wait.definition == "timer":
+        return True
+    for timer in timers:
+        if timer.kind == "boundaryEvent":
+            if timer.attached_to == wait.id:
+                return True
+    raced = [t for t in timers if t.kind != "boundaryEvent"
+             and wait.id not in _reachable(g, t.id)]
+    if not raced:
+        return False
+    for fork_id in _ancestors(g, wait.id):
+        fork = g.by_id.get(fork_id)
+        if fork is None or fork.kind == "exclusiveGateway":
+            continue
+        legs = {e.target for e in g.seq_out.get(fork_id, []) if e.target}
+        if len(legs) < 2:
+            continue
+        if any(timer.id in legs for timer in raced):
+            return True
+    return False
+
+
+def _blocking_waits(g: _Graph) -> List[_Node]:
+    return [n for n in g.nodes
+            if (n.kind == "receiveTask"
+                or (n.kind in BLOCKING_CATCH_KINDS
+                    and n.definition != "timer"
+                    and n.definition not in NOT_A_WAIT_DEFINITIONS))]
+
+
+def _check_waits_have_sla(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """У ожидания, которое блокирует маршрут, должен быть срок в модели.
+
+    Ждущий шаг — это `intermediateCatchEvent` не-таймера и `receiveTask`: токен
+    стоит, пока не придёт сообщение/сигнал/условие. Срок по BPMN назначается
+    структурно: граничным таймером на самом ожидании либо параллельной веткой
+    «срок вышел», уходящей с маршрута до ожидания.
+
+    Метка перехода (`link`) и триггер отработки (`compensate`) ожиданиями не
+    считаются: первая не ждала бы ничего — токен проходит её к сопоставленной
+    мишени, второй будит не внешний мир, а уже отработанный участок. Требовать у
+    них срок — просить таймер на узле, где он ничего не означает, и это не
+    бизнес-узкое место, а шум: на корпусе одна метка перехода давала четверть
+    всех «нарушений» правила.
+
+    Расхождение со скорингом (`wait_without_sla`) по этому признаку закрыто:
+    раньше оракул принимал параллельную ветку «срок вышел», а скоринг требовал
+    таймер на самом ожидании и советовал `add_boundary_event`, который на
+    catch-событие аплайер не принимает. Теперь обе линейки знают три формы и
+    обе требуют, чтобы развилкой были `eventBasedGateway` или `parallelGateway`.
+    Совпадение намеренное: расхождение по признаку, за который отвечает один и
+    тот же бизнес-вопрос, означало бы, что продукт меряет себя сам.
+
+    Текста оракул не читает: ни `documentation` со «сроком 2 дня», ни имя
+    «Просрочка SLA» нарушением не покрываются и нарушением не считаются — срок
+    обязан быть узлом, иначе его не исполнить.
+    """
+    waits = _blocking_waits(g)
+    if not waits:
+        return _na("waits_have_sla",
+                   "блокирующих ожиданий (catch-событие не-таймера и не метка "
+                   "перехода/триггер отработки, либо receiveTask) в схеме нет")
+    timers = [n for n in g.of_kind(TYPED_EVENT_KINDS) if n.definition == "timer"]
+    unmeasured = [w for w in waits if not _sla_bounds(g, w, timers)]
+    if not unmeasured:
+        return _pass("waits_have_sla",
+                     f"ожиданий: {len(waits)}, у каждого срок смоделирован таймером")
+    notes = [f"{w.id} («{w.name}», {w.kind}) ждёт без срока: ни таймера на самом "
+             f"ожидании, ни параллельной ветки «срок вышел» от его развилки"
+             for w in unmeasured]
+    return _fail("waits_have_sla",
+                 "ожидание без срока — висящий маршрут: " + "; ".join(notes)
+                 + f" (таймеров в схеме: {len(timers)})",
+                 [w.id for w in unmeasured])
 
 
 def _has_timer(g: _Graph) -> bool:
@@ -680,9 +1365,17 @@ def _run_checks(g: _Graph, expectations: Mapping[str, Any]) -> Dict[str, Check]:
         "gateway_split_join": _check_gateway_split_join(g, expectations),
         "gateway_conditions_or_default": _check_gateway_conditions(g, expectations),
         "event_definitions": _check_event_definitions(g, expectations),
+        "timer_schedule": _check_timer_schedule(g, expectations),
         "boundary_handled": _check_boundary_handled(g, expectations),
         "flow_ends_legal": _check_flow_ends_legal(g, expectations),
+        "flows_within_pool": _check_flows_within_pool(g, expectations),
+        "message_flow_ends": _check_message_flow_ends(g, expectations),
         "no_unrouted": _check_no_unrouted(g, expectations),
+        "no_blind_rework": _check_no_blind_rework(g, expectations),
+        "pools_not_pingpong": _check_pools_not_pingpong(g, expectations),
+        "no_overloaded_lane": _check_no_overloaded_lane(g, expectations),
+        "waits_have_sla": _check_waits_have_sla(g, expectations),
+        "signoffs_need_a_gate": _check_signoffs_need_a_gate(g, expectations),
     }
     for name, fn in _SCENARIO_CHECKS.items():
         check = fn(g, expectations)
@@ -715,6 +1408,41 @@ def failed_checks(results: Mapping[str, Check]) -> List[Check]:
 
 def applicable_checks(results: Mapping[str, Check]) -> List[Check]:
     return [c for c in results.values() if c.applicable]
+
+
+def deciding_checks(results: Mapping[str, Check]) -> List[Check]:
+    """Инварианты, по которым схема считается принятой (`scenario_pass`, ядро `pass@1`).
+
+    Это корректностный слой: нотация плюс заявленные сценарием ожидания.
+    Бизнес-слой (`BUSINESS_INVARIANTS`) из гейта исключён — и это не смягчение
+    оракула, а следствие того, как устроена линейка:
+
+    * Провал корректности значит «схему нельзя принять»: эталонный ответ не
+      проваливает ни одного такого инварианта, иначе сам эталон стал бы браком.
+    * Провал бизнес-слоя значит «в процессе есть узкое место»: конечная схема
+      всегда держит хотя бы одно, и эталон — не исключение. Замер на текущем
+      наборе: `loan_application.good.plan` — возврат той же работы в `A3`
+      (`pools_not_pingpong`), `warehouse_delivery.good.plan` — `receiveTask`
+      `A8` без единого таймера в модели (`waits_have_sla`).
+    * Значит конъюнкция по обоим слоям не выполнима ни для какой схемы: `pass@1`
+      навсегда упирался бы в потолок ниже единицы и мерил не контур, а стиль
+      эталона — модель, скопировавшая эталон точь-в-точь, получила бы ноль.
+
+    Ничего не перестаёт считаться: каждый бизнес-инвариант по-прежнему
+    вычисляется, печатается с id и причиной и попадает в три измеримых места —
+    `business/smells` (плотность узких мест против эталона того же сценария),
+    `business_agreement` (где оракул и скоринг разошлись) и `defects_repaired` /
+    `defects_introduced` у контура улучшения. Гейт перестаёт быть единственной
+    точкой, где о них узнают.
+    """
+    return [c for c in results.values()
+            if c.applicable and c.name not in BUSINESS_INVARIANTS]
+
+
+def business_smells(results: Mapping[str, Check]) -> List[Check]:
+    """Проваленные бизнес-инварианты схемы: узкие места, а не брак нотации."""
+    return [c for c in results.values()
+            if c.applicable and c.name in BUSINESS_INVARIANTS and not c.ok]
 
 
 def failed(results: Mapping[str, Check]) -> List[str]:
@@ -751,3 +1479,145 @@ def disagreements(structure_results: Mapping[str, Check],
         if a.applicable != b.applicable or a.ok != b.ok:
             out.append(name)
     return out
+
+
+# ---------------------------------------------------------------------------
+# сверка двух слоёв: эвристика продукта против независимого оракула
+# ---------------------------------------------------------------------------
+
+# Правило скоринга -> инвариант оракула, который формулирует то же
+# бизнес-требование по одному лишь графу. Нужен этот словарь затем, чтобы
+# расхождение двух слоёв стало данными: правило и промпт улучшения живут в одном
+# модуле и могут разъезжаться вместе, а оракул — снаружи.
+#
+# `approval_chain` здесь отсутствует намеренно: «четыре ручные задачи подряд —
+# уже цепочка согласований» есть суждение о норме времени на решение, и из
+# BPMN-семантики оно не выводится — четыре последовательные `userTask` формально
+# ничем не хуже трёх. Независимая проверка потребовала бы данных о
+# длительностях, а их в схеме нет, поэтому проверять это нечем.
+SCORING_TO_ORACLE: Dict[str, str] = {
+    "rework_loop": "no_blind_rework",
+    "handoff_pingpong": "pools_not_pingpong",
+    "lane_overload": "no_overloaded_lane",
+    "wait_without_sla": "waits_have_sla",
+    "approval_chain": "signoffs_need_a_gate",
+}
+# Обратный взгляд — для отчёта, который идёт по строкам инвариантов.
+ORACLE_TO_SCORING: Dict[str, str] = {v: k for k, v in SCORING_TO_ORACLE.items()}
+
+
+def _scorer_view(evaluation_details: Optional[Mapping[str, Any]]
+                 ) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    """(статус, элементы) по правилам из ответа `BPMNScorer.evaluate`.
+
+    Переваривается и весь ответ, и `details_meta`, и плоский `details`
+    {правило: bool}: слои сравниваются в разных местах (прогон держит
+    `details_meta`, API — `details`), а отказ от одного из форматов обвалил бы
+    сверку молча. Плоский `details` не различает «пройдено» и «не применимо» —
+    там возвращается `passed`, поэтому сверка по нему грубее: неприменимое
+    свойство выглядит пройденным, и в отчёте это надо читать как «слои не
+    спорили», а не как «оба нашли норму»."""
+    data = evaluation_details or {}
+    meta = data.get("details_meta") if isinstance(data, Mapping) else None
+    statuses: Dict[str, str] = {}
+    elements: Dict[str, List[str]] = {}
+    if isinstance(meta, Mapping) and meta:
+        for name, entry in meta.items():
+            if isinstance(entry, Mapping):
+                statuses[name] = str(entry.get("status") or _SCORER_UNKNOWN)
+                elements[name] = [str(e) for e in (entry.get("elements") or [])]
+            else:
+                statuses[name] = _SCORER_PASSED if entry else _SCORER_FAILED
+        return statuses, elements
+    details = data.get("details") if isinstance(data, Mapping) else None
+    if not isinstance(details, Mapping):
+        details = data if isinstance(data, Mapping) else {}
+    for name, passed in details.items():
+        statuses[name] = (_SCORER_PASSED if passed else _SCORER_FAILED)
+    return statuses, elements
+
+
+def business_agreement(checks_xml: Mapping[str, Check],
+                       evaluation_details: Optional[Mapping[str, Any]],
+                       pairs: Optional[Mapping[str, str]] = None
+                       ) -> Dict[str, Dict[str, Any]]:
+    """Сходятся ли два слоя в оценках бизнес-свойств одной схемы.
+
+    Вход — инварианты оракула по итоговому XML и ответ скоринга (см.
+    `_scorer_view` о форматах). Выход — по строке на каждое бизнес-правило:
+    что сказал каждый слой и сошлись ли они. Ничья в этой таблице не считается
+    регрессией и не влияет на код прогона: расхождение — это запись человеку о
+    том, что одно из двух прочтений процесса неверно, а какое — надо разобрать.
+
+    `verdict`: `agree` — слои сказали одно и то же; `oracle_stricter` — дефект
+    видит оракул (скоринг его прощает или не смотрел туда вовсе);
+    `scorer_stricter` — наоборот; `not_comparable` — оба молчат и хотя бы один
+    объявил свойство неприменимым; `no_data` — ответа одного из слоёв нет.
+
+    `pairs` — другая таблица соответствия. Продуктовый гейт сверяет бизнес-слой
+    (`SCORING_TO_ORACLE`), а `eval/coverage` прогоняет этим же механизмом и
+    нотационный слой: слои расходились на 35 схемах корпуса именно там, куда
+    сводка не смотрела."""
+    statuses, elements = _scorer_view(evaluation_details)
+    rows: Dict[str, Dict[str, Any]] = {}
+    for rule, invariant in (pairs or SCORING_TO_ORACLE).items():
+        scorer_status = statuses.get(rule, _SCORER_UNKNOWN)
+        check = (checks_xml or {}).get(invariant)
+        row: Dict[str, Any] = {
+            "rule": rule,
+            "invariant": invariant,
+            "scorer": scorer_status,
+            "scorer_elements": elements.get(rule, []),
+            "oracle": _SCORER_UNKNOWN,
+            "oracle_ok": None,
+            "oracle_applicable": None,
+            "oracle_ids": [],
+            "oracle_reason": "",
+            "verdict": NO_DATA,
+        }
+        if check is None:
+            rows[rule] = row
+            continue
+        row["oracle"] = ((_SCORER_NA if not check.applicable
+                          else _SCORER_PASSED) if check.ok else _SCORER_FAILED)
+        row["oracle_ok"] = check.ok
+        row["oracle_applicable"] = check.applicable
+        row["oracle_ids"] = list(check.ids)
+        row["oracle_reason"] = check.reason
+        row["verdict"] = _agreement_verdict(row["oracle"], scorer_status)
+        rows[rule] = row
+    return rows
+
+
+def _agreement_verdict(oracle: str, scorer: str) -> str:
+    if _SCORER_UNKNOWN in (oracle, scorer):
+        return NO_DATA
+    if oracle == scorer:
+        # «Оба не применили» — не согласие: сравнивать было нечего.
+        return NOT_COMPARABLE if oracle == _SCORER_NA else AGREE
+    if _SCORER_FAILED in (oracle, scorer):
+        # Дефект назвал один слой, а второй промолчал или сказал «мне не
+        # применимо»: согласием это быть не может, иначе односторонний взгляд на
+        # узкое место прятался бы за калиткой чужого порога.
+        return ORACLE_STRICTER if oracle == _SCORER_FAILED else SCORER_STRICTER
+    # Неприменимость у одного из слоёв при пройденном другом: сравнивать нечего.
+    return NOT_COMPARABLE
+
+
+def business_disagreements(agreement: Mapping[str, Dict[str, Any]]) -> List[str]:
+    """Правила, где два слоя не согласны (в обе стороны) — для сводки прогона."""
+    return [rule for rule, row in agreement.items()
+            if row.get("verdict") in (ORACLE_STRICTER, SCORER_STRICTER)]
+
+
+def format_business_agreement(agreement: Mapping[str, Dict[str, Any]]) -> List[str]:
+    """Строки таблицы для отчёта: слой скоринга, слой оракула и вердикт."""
+    lines: List[str] = []
+    for rule, row in agreement.items():
+        line = (f"{rule} ↔ {row['invariant']}: скоринг={row['scorer']}, "
+                f"оракул={row['oracle']} → {row['verdict']}")
+        if row["verdict"] in (ORACLE_STRICTER, SCORER_STRICTER, NOT_COMPARABLE) \
+                and row.get("oracle_reason"):
+            line += f"\n    оракул: {row['oracle_reason']}"
+        lines.append(line)
+    return lines

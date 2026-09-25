@@ -177,7 +177,31 @@ class TestImprovement:
         after = {"no_unrouted": _check("no_unrouted", ids=["new_A9"])}
         owner = attribution.attribute_improvement(
             {}, after, [], [{"op": "add_task", "id": "new_A9", "stage": "retry"}])
-        assert owner["no_unrouted"] == "аплайер:retry"
+        assert owner["no_unrouted"] == f"{attribution.OWNER_REFUSED}:повтор"
+
+    def test_a_refusal_is_not_an_applier_breakage(self):
+        """Отказ в плане и в повторе — корректное решение по пакету модели,
+        снятие узла после починки — работа гаранта связности. Одна строка
+        «аплайер:<stage>» на все три случая звала чинить не тот узел, а
+        английское «plan» из fallback не совпадало ни с одним stage, который
+        оркестратор действительно пишет."""
+        after = {"no_unrouted": _check("no_unrouted", ids=["new_A9"])}
+        owners = {stage: attribution.attribute_improvement(
+            {}, after, [], [{"op": "add_task", "id": "new_A9", "stage": stage}])[
+            "no_unrouted"] for stage in ("plan", "retry", "repair", None)}
+        assert owners["plan"] == f"{attribution.OWNER_REFUSED}:план"
+        assert owners["retry"] == f"{attribution.OWNER_REFUSED}:повтор"
+        assert owners["repair"] == f"{attribution.OWNER_GUARD}:починка"
+        # Раунд без пометки stage — это план: оркестратор сам проставляет
+        # «plan» (`llm_improve`), и фолбэк обязан совпасть с ним, а не выдумать
+        # четвёртого владельца.
+        assert owners[None] == f"{attribution.OWNER_REFUSED}:план"
+        assert len(set(owners.values())) == 3, owners
+        assert owners["repair"] != owners["plan"], (owners["repair"],
+                                                    owners["plan"])
+        # Суффикс раунда — по-русски: «аплайер:plan» был гибридом двух языков.
+        assert not any(latin in o for o in owners.values()
+                       for latin in ("plan", "retry", "repair")), owners
 
     def test_applied_operation_owns_the_shape_it_produced(self):
         after = {"gateway_conditions_or_default": _check(
@@ -191,6 +215,154 @@ class TestImprovement:
         owner = attribution.attribute_improvement(
             {}, {"min_steps": _check("min_steps", ids=["A1"])}, [], [])
         assert owner["min_steps"] == attribution.OWNER_BASE
+
+    def test_refusal_closed_by_the_retry_does_not_steal_the_blame(self):
+        """Строка отказа первого раунда живёт в отчёте как история: повтор провёл
+        ту же правку, и перехватывать ею владельца нельзя — иначе крупнейшим
+        «породителем дефектов» прогона становится бухгалтерия отказов (тот же
+        артефакт разметки, что в сводке генерации с «отвергнутым переспросом»).
+        Флаг `reapplied` ставит оркестратор, и только на нём ехать нельзя:
+        закрытие сверяется ещё и по идентичности операции над тем же
+        элементом."""
+        before = {"no_unrouted": _check("no_unrouted", ok=True)}
+        after = {"no_unrouted": _check("no_unrouted", ids=["A", "B"])}
+        applied = [{"op": "disconnect", "flow": "f2", "source": "A", "target": "B",
+                    "stage": "retry"}]
+        refusal = {"op": "disconnect", "flow": "f2", "source": "A", "target": "B",
+                   "stage": "plan", "reason": "нет такого потока"}
+        expected = {"no_unrouted": "пакет модели:disconnect"}
+        assert attribution.attribute_improvement(
+            before, after, applied, [dict(refusal, reapplied=True)]) == expected
+        assert attribution.attribute_improvement(
+            before, after, applied, [refusal]) == expected
+        # Незакрытый отказ остаётся владельцем: правки в схеме нет, и назвать
+        # нечего, кроме раунда, который её отверг.
+        assert attribution.attribute_improvement(
+            before, after, [], [dict(refusal, reapplied=False)]) == {
+            "no_unrouted": f"{attribution.OWNER_REFUSED}:план"}
+        # Другая правка — не закрытие этого отказа: зачёт только по той же
+        # операции над тем же элементом (поля — `bpmn_edits.OP_ELEMENT_FIELDS`).
+        assert attribution.attribute_improvement(
+            before, after, [{"op": "connect", "source": "C", "target": "D",
+                             "stage": "retry"}], [refusal])["no_unrouted"] == \
+            f"{attribution.OWNER_REFUSED}:план"
+
+    def test_base_defect_stays_with_the_base_even_when_rows_match(self):
+        """Пакет, который не починил, — не тот, кто сломал: провал значил и до
+        правок. Строки применения/отказа на те же id не имеют права перетягивать
+        вину на `improve`-контур, иначе доля провалов пакета мерялась бы
+        качеством генерации."""
+        broken = {"event_definitions": _check("event_definitions", ids=["A11"])}
+        owner = attribution.attribute_improvement(
+            broken, broken,
+            [{"op": "edit_element", "id": "A11", "stage": "retry"}],
+            [{"op": "add_event", "id": "A11", "stage": "plan", "reapplied": False}])
+        assert owner == {"event_definitions": attribution.OWNER_BASE}
+        # Тот же порядок и при откаченном пакете: на выходе базовый XML.
+        assert attribution.attribute_improvement(
+            broken, broken, [], [{"op": "add_event", "id": "A11", "stage": "plan"}],
+            report={"package_reverted": "цикл без выхода"}) == \
+            {"event_definitions": attribution.OWNER_BASE}
+
+    def test_introduced_damage_names_the_node_that_changed_the_scheme(self):
+        """«Сломал то, что работало» обязан называть физическое изменение:
+        снятие гаранта, применившуюся операцию или самовольную правку починки.
+        Прежний порядок («skipped раньше applied») отдавал такой провал отказу,
+        который ничего в схеме не менял, — и две разные поломки читались одной
+        строкой."""
+        before = {"no_unrouted": _check("no_unrouted", ok=True)}
+        after = {"no_unrouted": _check("no_unrouted", ids=["new_C"])}
+        refusal = {"op": "add_task", "id": "new_C", "participant": "Склад",
+                   "stage": "plan", "reapplied": False}
+        # Гарант связности снял узел после починки.
+        assert attribution.attribute_improvement(
+            before, after, [],
+            [refusal, {"op": "add_task", "id": "new_C", "stage": "repair"}])[
+            "no_unrouted"] == f"{attribution.OWNER_GUARD}:починка"
+        # Операция применилась и оставила шаг вне маршрута — при том что отказ
+        # называет этот же id.
+        assert attribution.attribute_improvement(
+            before, after, [{"op": "add_task", "id": "new_C", "stage": "retry"}],
+            [refusal])["no_unrouted"] == "пакет модели:add_task"
+        # Починка подменила тип сама: ни applied-строки, ни отказа по ней нет,
+        # есть только пометка `validate_and_repair`.
+        assert attribution.attribute_improvement(
+            before, after, [], [refusal],
+            report={"notes": ["шлюз «Проверка» (new_C) понижен до задачи "]})[
+            "no_unrouted"] == attribution.OWNER_REPAIR_SOLO
+
+    def test_repair_note_that_only_asks_the_model_is_not_an_owner(self):
+        """«Узел вне маршрута» — требование к пакету, а не правка починки:
+        назвать её владельцем значит переложить урон операции на того, кто его
+        не наносил."""
+        after = {"no_unrouted": _check("no_unrouted", ids=["new_C"])}
+        owner = attribution.attribute_improvement(
+            {}, after, [{"op": "add_task", "id": "new_C", "stage": "plan"}], [],
+            report={"notes": ["узел (new_C) недостижим: выход есть, входа нет"]})
+        assert owner["no_unrouted"] == "пакет модели:add_task"
+
+    def test_noop_application_says_so_instead_of_quietly_owning_the_breakage(
+            self):
+        """Аплайер отчитался строкой, а дерево не тронул: `пакет модели:add_task`
+        без приписки читался бы как «правка сломала схему», хотя сломать она
+        ничего не могла. Агрегат `noop_rows` покрывает строки, которым пометку
+        не сохранили (склейка раундов)."""
+        before = {"no_unrouted": _check("no_unrouted", ok=True)}
+        after = {"no_unrouted": _check("no_unrouted", ids=["new_X"])}
+        row = {"op": "add_task", "id": "new_X", "stage": "plan",
+               "note": "изменение добавлено не было: схема не изменилась"}
+        assert attribution.attribute_improvement(before, after, [row], []) == {
+            "no_unrouted": "пакет модели:add_task (применилось без изменения схемы)"}
+        assert attribution.attribute_improvement(
+            before, after, [{"op": "add_task", "id": "new_X", "stage": "plan"}], [],
+            report={"noop_rows": 1})["no_unrouted"].endswith(
+            "(применилось без изменения схемы)")
+
+    def test_reverted_package_is_a_base_defect_named_by_the_guard(self):
+        """Откат пакета — решение гаранта, а не «отказ аплайером по операции»:
+        в схеме лежит базовый XML, и провал в нём принадлежит генерации. Без
+        приписки «дефект базовой схемы» был неотличим от «пакет даже не
+        пытались применить». Применившиеся правки второго раунда при этом
+        остаются владельцами своего урона."""
+        before = {"no_unrouted": _check("no_unrouted", ok=True)}
+        after = {"no_unrouted": _check("no_unrouted", ids=["new_C"])}
+        owner = attribution.attribute_improvement(
+            before, after, [], [{"op": "add_task", "id": "new_C",
+                                 "reason": "изменение откачено вместе с пакетом"}],
+            report={"package_reverted": "цикл без выхода"})
+        assert owner == {
+            "no_unrouted": attribution.OWNER_BASE + attribution.OWNER_ROLLED_BACK}
+        # Сырой отчёт `apply_and_guarantee` называет откат просто `reverted`:
+        # атрибуция обязана принять и его, и весь отчёт целиком.
+        assert attribution.attribute_improvement(
+            before, after, [], [{"op": "add_task", "id": "new_C"}],
+            report={"reverted": "цикл без выхода", "applied": [], "notes": []}) == owner
+        assert attribution.attribute_improvement(
+            before, after, [{"op": "connect", "id": "new_C", "stage": "retry"}],
+            [{"op": "add_task", "id": "new_C"}],
+            report={"package_reverted": "цикл без выхода"})["no_unrouted"] == \
+            "пакет модели:connect"
+
+    def test_refusal_names_whether_the_corrective_round_ran(self):
+        """Два отказа, которые раньше читались одной строкой: контур не дал
+        модели шанса (чинится триггер повтора) и повтор всё видел и не перебил
+        (чинится промпт повтора). Без фактов повтора приписки нет: атрибуция не
+        выдумывает решение контура по отсутствию записи."""
+        after = {"no_unrouted": _check("no_unrouted", ids=["new_C"])}
+        skipped = [{"op": "add_task", "id": "new_C", "stage": "plan"}]
+        base = f"{attribution.OWNER_REFUSED}:план"
+        owner = attribution.attribute_improvement({}, after, [], skipped)
+        assert owner["no_unrouted"] == base
+        for facts, tail in (({"retry_attempted": False, "retry_closed": 0},
+                             " (корректирующий раунд не вызывался)"),
+                            ({"retry_attempted": True, "retry_closed": 0},
+                             " (повтор не закрыл ни одного отказа)"),
+                            ({"retry_attempted": True, "retry_closed": 2}, ""),
+                            # отсутствующий факт харнесс хранит как None — это
+                            # не «повтор не вызывался»
+                            ({"retry_attempted": None, "retry_closed": None}, "")):
+            assert attribution.attribute_improvement(
+                {}, after, [], skipped, report=facts)["no_unrouted"] == base + tail
 
 
 class TestTally:
@@ -232,10 +404,70 @@ class TestHarnessIntegration:
 
         report = harness.run(mode="replay", scenarios_spec="vehicle_reservation")
         table = harness.render_table(report)
-        assert "КТО ПОРОДИЛ ДЕФЕКТЫ" in table
+        assert "ГЕНЕРАЦИЯ: КТО ПОРОДИЛ ДЕФЕКТЫ" in table
+        assert "УЛУЧШЕНИЕ: КТО ПОРОДИЛ ДЕФЕКТЫ" in table
         assert "из " in table.split("КТО ПОРОДИЛ ДЕФЕКТЫ", 1)[1].split(
             "ПРОВЕНАНС")[0]
         assert "виноват" in table
+
+    def test_the_two_contours_are_blamed_in_their_own_sections(self):
+        """Одна сводка на генерацию и улучшение складывала «содержание
+        фикстуры» и «дефект базовой схемы» в лидера с общим знаменателем — то
+        есть в утверждение, которое не относится ни к одному из контуров.
+        Сверяем секции с владельцами, посчитанными по данным прогона, а не по
+        имени контура в тексте: иначе тест зависит от того, что там сейчас
+        чинят в `core/*`."""
+        from eval import harness
+
+        report = harness.run(mode="replay", scenarios_spec="all", repeat=1)
+        table = harness.render_table(report)
+        _, rest = table.split("ГЕНЕРАЦИЯ: КТО ПОРОДИЛ ДЕФЕКТЫ", 1)
+        generation, rest = rest.split("УЛУЧШЕНИЕ: КТО ПОРОДИЛ ДЕФЕКТЫ", 1)
+        improvement = rest.split("ПРОВЕНАНС", 1)[0]
+
+        def expected(cases):
+            counts: Dict[str, int] = {}
+            for case in cases:
+                for owner in case.attribution.values():
+                    counts[owner] = counts.get(owner, 0) + 1
+            return counts
+
+        def parsed(section):
+            rows: Dict[str, int] = {}
+            total = None
+            for line in section.splitlines():
+                left, sep, tail = line.strip().partition(" — ")
+                if not sep or " из " not in tail:
+                    continue
+                count, _, count_total = tail.partition(" из ")
+                rows[left] = int(count)
+                total = int(count_total)
+            return rows, total
+
+        gen_rows, gen_total = parsed(generation)
+        imp_rows, imp_total = parsed(improvement)
+        assert gen_rows == expected(report.cases), generation
+        assert imp_rows == expected(report.improve_cases), improvement
+        assert gen_rows, "битые фикстуры обязаны оставить провалы генерации"
+        assert gen_total == sum(gen_rows.values()) > 0
+        assert (imp_total or 0) == sum(imp_rows.values())
+        # Разные контуры — разные знаменатели и разные владельцы: в слитой
+        # сводке «из 8» стояло бы на 7 провалов генерации и 1 провал улучшения.
+        if imp_rows:
+            assert gen_total != imp_total, (gen_total, imp_total)
+            assert not set(gen_rows) & set(imp_rows)
+
+    def test_improve_section_says_there_is_nothing_to_blame(self):
+        """Пустой контур улучшения не обязан выдавать владельцев — но обязан
+        сказать, что атрибутировать нечего, а не напечатать пустой блок."""
+        from eval import harness
+
+        report = harness.run(mode="replay", scenarios_spec="support_ticket")
+        table = harness.render_table(report)
+        assert "УЛУЧШЕНИЕ: КТО ПОРОДИЛ ДЕФЕКТЫ" in table
+        section = table.split("УЛУЧШЕНИЕ: КТО ПОРОДИЛ ДЕФЕКТЫ", 1)[1].split(
+            "ПРОВЕНАНС")[0]
+        assert "атрибутировать нечего" in section
 
 
 class TestTouchedScope:

@@ -1412,6 +1412,28 @@ def _noop_share(case: ImproveCase) -> Optional[float]:
     return _share(case.noop_rows, len(case.applied))
 
 
+# Отказ «то, что ты просишь, уже сделано». В живом прогоне #61 это крупнейший
+# класс: 33 строки из 121 отказа — `connect` дугой, которая на схеме стоит.
+_REDUNDANT_REFUSALS = ("уже существует", "уже есть", "уже стоит", "уже присоединён")
+
+
+def _redundant_refusals_share(case: ImproveCase) -> Optional[float]:
+    """Доля отказов, которые отвергли повтор, а не ошибку.
+
+    Нужна отдельным числом, потому что `improve/op_acceptance` смешивает два
+    разных брака: правку, которую аплайер не мог выполнить (выдуманный id,
+    неверный род узла), и правку, которая схеме не нужна (она уже сделана). Для
+    пользователя это разные очереди: первую чинят подсказкой об операнде,
+    вторую — советом, который перестанет предлагать существующее.
+    """
+    if not case.skipped:
+        return None
+    redundant = sum(1 for s in case.skipped
+                    if any(m in str(s.get("reason") or "")
+                           for m in _REDUNDANT_REFUSALS))
+    return _share(redundant, len(case.skipped))
+
+
 def _retry_gain(case: ImproveCase) -> Optional[float]:
     """Доля отказов первого раунда, закрытых корректирующим повтором.
 
@@ -1550,6 +1572,10 @@ def build_improvement_suite() -> metrics.EvaluationSuite:
                              "(applied без no-op строк над всеми решениями)")
     suite.metric("improve/noop_share", _noop_share, direction=metrics.LOWER,
                  description="доля «применённых» строк, не изменивших схему")
+    suite.metric("improve/redundant_refusals_share", _redundant_refusals_share,
+                 direction=metrics.LOWER,
+                 description="доля отказов, отвергших уже сделанное (просьба "
+                             "повторить дугу), а не невыполнимую правку")
     suite.metric("improve/retry_gain", _retry_gain,
                  description="доля отказов первого раунда, закрытых повтором "
                              "(только кейсы с состоявшимся повтором)")

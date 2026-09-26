@@ -910,6 +910,31 @@ def test_live_case_reads_facts_instead_of_guessing_the_retry(monkeypatch):
     assert case.unmeasured == []
 
 
+def test_redundant_refusals_are_separated_from_impossible_ones():
+    """«Такой поток уже существует» и «выдуманного id нет» — разный брак.
+
+    Первый чинится советом, который не предлагает сделанное, второй — подсказкой
+    об операнде. В `improve/op_acceptance` они весят одинаково, и по одному
+    числу нельзя сказать, какую очередь чинить (перепись #61: 33 redundant строки
+    из 121 отказа).
+    """
+    case = harness.ImproveCase(
+        scenario="s", fixture="f", label="l", quality="advice", mode="live",
+        skipped=[{"op": "connect", "stage": "plan",
+                  "reason": "такой поток уже существует"},
+                 {"op": "connect", "stage": "plan",
+                  "reason": "источник или цель не найдены"},
+                 {"op": "move_to_lane", "stage": "plan",
+                  "reason": "элемент уже стоит в этой дорожке"},
+                 {"op": "add_task", "stage": "plan",
+                  "reason": "указанный пул не найден"}])
+    assert harness._redundant_refusals_share(case) == 0.5
+    # Пакет без отказов — не 0.0 «идеала», а «не измерено»
+    assert harness._redundant_refusals_share(
+        harness.ImproveCase(scenario="s", fixture="f", label="l",
+                            quality="advice", mode="live")) is None
+
+
 def test_retry_gain_is_a_share_not_a_count():
     """Закрытый отказ из десяти и закрытый отказ из одного — разная работа
     повтора, и среднее по абсолютным числам это стирало (#58 давал 0.18 «правок»

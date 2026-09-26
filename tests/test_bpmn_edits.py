@@ -908,6 +908,20 @@ class TestOpNameAlias:
             ".//bpmn:sequenceFlow[@sourceRef='T_ship'][@targetRef='T_cancel']", NS)
         assert len(added) == 1
 
+    def test_add_timer_is_accepted_as_boundary_event(self, single_pool_xml):
+        """Живой прогон #58: `add_timer` — имя из рецепта «граничный таймер», и
+        аплайер отвергал его как неизвестную операцию. Отказ не называл ни
+        недостающий операнд, ни направление, поэтому `improve/op_acceptance`
+        записала расхождение словарей качеством модели."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_timer", "after": "T_ship", "event_definition": "timer",
+             "duration": "PT15M"}])
+        skip = report["skipped"][0]
+        assert skip["op"] == "add_boundary_event"
+        assert skip["reason"] != "неизвестная операция"
+        assert skip["reason"] == "не задан id нового элемента"
+        assert "new_" in skip["hint"]
+
     def test_alias_names_only_operations_the_applier_understands(self):
         assert set(OP_ALIASES.values()) <= set(OP_SPEC)
         assert not set(OP_ALIASES) & set(OP_SPEC)
@@ -2707,6 +2721,31 @@ class TestCrossPoolLegEnds:
 
 
 class TestMergeParticipants:
+    def test_lane_as_operand_names_the_pool_it_belongs_to(self):
+        """Модель живого прогона #58 четырежды звала дорожку пулом
+        (`source="L4"`, `source="Lane_2"`), а отказ говорил «используйте имена
+        участников из инвентаря», не назвав ни одного имени. Повтор приносил те же
+        id, и `improve/repeat_rejection_share` записывал это качеством модели."""
+        _, report = apply_operations(MERGE_XML, [
+            {"op": "merge_participants", "source": "Lane_wh", "target": "Склад",
+             "as_lane": True},
+        ])
+        assert report["skipped"], report
+        hint = report["skipped"][0]["hint"]
+        assert "дорожка" in hint and "Кладовщик" in hint, hint
+        assert 'source="Кладовщик"' in hint, hint
+
+    def test_unrelated_operand_lists_pool_names(self):
+        """Если операнд не дорожка и не пул, отказ обязан перечислить пулы: пустой
+        список кандидатов — это та же подсказка «угадай», только длиннее."""
+        _, report = apply_operations(MERGE_XML, [
+            {"op": "merge_participants", "source": "Кладащик", "target": "Склад",
+             "as_lane": True},
+        ])
+        assert report["skipped"], report
+        hint = report["skipped"][0]["hint"]
+        assert "Склад" in hint or "Кладовщик" in hint, hint
+
     def test_pool_becomes_a_lane_of_the_target_process(self):
         out, report = apply_operations(MERGE_XML, [MERGE_OP])
         assert report["status"] == "success", report["skipped"]

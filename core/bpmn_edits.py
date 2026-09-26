@@ -2045,6 +2045,33 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     return [note]
 
 
+def _merge_operand_hint(index: _Index, key: str, role: str) -> str:
+    """Отказ «пул не найден» обязан назвать то, что модель имела в виду.
+
+    Живой прогон #58: `merge_participants(source="L4", target="L5")` — модель
+    назвала дорожками то, что сливается пулами, а подсказка звала «используйте
+    имена участников из инвентаря», не назвав ни одного имени. Повтор приносил те
+    же id, и `improve/repeat_rejection_share` записывал это качеством модели.
+    """
+    wanted = str(key or "").strip()
+    lane = index.find_lane(wanted)
+    if lane is not None:
+        process = index.enclosing_process(lane)
+        owner = (index.participant_name(process) if process is not None else "")
+        field = "source" if role == "источник" else "target"
+        lane_name = lane.get("name") or lane.get("id") or ""
+        if owner:
+            return (f"'{wanted}' — дорожка «{lane_name}» пула «{owner}»: сливать "
+                    f"можно пулы, возьмите {field}=\"{owner}\"")
+        return (f"'{wanted}' — дорожка «{lane_name}», а не пул: укажите в {field} "
+                "имя пула, который сливаете")
+    candidates = index.pool_candidates(wanted)
+    if candidates:
+        return ("похожие пулы: "
+                + ", ".join(f'"{name}"' for name in candidates[:4]))
+    return "используйте имена участников из инвентаря"
+
+
 def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
     """Слить пул в дорожку: роли одной организации — дорожки одного процесса.
 
@@ -2066,7 +2093,7 @@ def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
                         "укажите source и target именами или id пулов из инвентаря")
         if process is None:
             raise _Skip(f"пул '{key}' не найден ({role})",
-                        "используйте имена участников из инвентаря")
+                        _merge_operand_hint(index, key, role))
         if participant is None:
             raise _Skip(f"'{key}' не является пулом ({role}): процесс не заявлен "
                         "участником в коллаборации",
@@ -2259,7 +2286,14 @@ _HANDLERS = {
 # source/target, и `improve/op_acceptance` записала это как качество модели.
 # Синоним не даёт аплайеру новых возможностей — он перенаправляет в существующую
 # операцию, а подстановка попадает в заметку к применённой правке.
-OP_ALIASES: Dict[str, str] = {"add_flow": "connect"}
+OP_ALIASES: Dict[str, str] = {"add_flow": "connect",
+                              # Модель зовёт правку срока `add_timer` — по слову
+                              # из рецепта «граничный таймер». Без алиаса она
+                              # получала «неизвестная операция», где нет ни
+                              # недостающего операнда, ни направления, а
+                              # `improve/op_acceptance` считала это расхождение
+                              # словарей качеством модели.
+                              "add_timer": "add_boundary_event"}
 
 
 def _lane_move_pools(operations: List[Dict[str, Any]],

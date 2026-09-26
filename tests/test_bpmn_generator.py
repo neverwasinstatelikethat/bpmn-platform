@@ -2123,6 +2123,65 @@ class TestDeclaredRoles:
                     if "дорожку с таким же именем" in g]
 
 
+class TestBranchSurvivesTheContour:
+    """Ветвление не имеет права исчезать из-за починки.
+
+    По живому прогону #57 8 схем из 16 остались без шлюза, и у всех 8 в трейсе
+    стояло «понижен до задачи»: нога развилки уходила в чужой пул, починка
+    превращала её в поток-сообщение, у шлюза оставалась одна легальная нога, и
+    следующий шаг снимал шлюз. Причина либо в переносе шага по имени пула (его
+    делал сам контур), либо в плане модели — и то и другое лечится без выдумки
+    содержания.
+    """
+
+    @staticmethod
+    def _plan(leg_target_pool: str):
+        return {"participants": ["ВкусВилл", "компания-перевозчик"],
+                "elements": [
+                    {"id": "G1", "kind": "exclusiveGateway",
+                     "name": "Транспорт найден?", "participant": "ВкусВилл"},
+                    {"id": "A4", "kind": "userTask", "name": "Оформить путевой лист",
+                     "participant": "ВкусВилл"},
+                    {"id": "A3", "kind": "userTask",
+                     "name": "Запросить транспорт у компании-перевозчика",
+                     "participant": leg_target_pool},
+                ],
+                "flows": [{"id": "F1", "source": "G1", "target": "A4"},
+                          {"id": "F2", "source": "G1", "target": "A3"}]}
+
+    def test_step_is_not_moved_into_a_pool_whose_branch_it_serves(self):
+        """Перенос «Запросить транспорт у компании-перевозчика» в пул перевозчика
+        превращает ногу шлюза в обмен — шлюз остаётся с одной легальной ногой и
+        починка его снимает. Пустой пул контрагента ждёт узкого вопроса, а не
+        этого переноса."""
+        structure = self._plan("ВкусВилл")
+        notes: list = []
+        bpmn_generator._claim_steps_by_name(
+            structure,
+            "Диспетчер проверяет парк; если свободной машины нет, диспетчер "
+            "запрашивает машину у компании-перевозчика и ждёт подтверждения.",
+            notes)
+        moved = next(e for e in structure["elements"] if e["id"] == "A3")
+        assert moved["participant"] == "ВкусВилл", notes
+        assert any("нога развилки" in n for n in notes), notes
+
+    def test_gateway_leg_into_another_pool_is_a_plan_gap(self):
+        """Если ногу развилки в чужой пул нарисовала сама модель, нарушение
+        уходит в переспрос с названным операндом: правка — шаг своего пула, а не
+        удаление развилки."""
+        gaps = bpmn_generator.plan_gaps(self._plan("компания-перевозчик"), "")
+        hit = [g for g in gaps if "ведёт в чужой пул" in g]
+        assert hit, gaps
+        assert "G1" in hit[0] and "`F2`" in hit[0], hit[0]
+        assert "компания-перевозчик" in hit[0] and "ВкусВилл" in hit[0], hit[0]
+
+    def test_intra_pool_branch_gets_no_such_gap(self):
+        """Ветка внутри своего пула — законная развилка: выдумывать ей опору
+        контур не вправе."""
+        gaps = bpmn_generator.plan_gaps(self._plan("ВкусВилл"), "")
+        assert not [g for g in gaps if "ведёт в чужой пул" in g], gaps
+
+
 class TestOwnershipClarification:
     """Кому принадлежит шаг и кому — роль, знает только модель: шаг «получить
     подтверждение отгрузки от поставщика» она записала чужим пулом, а «HR» и

@@ -150,6 +150,30 @@ def _step_owner(step: Mapping[str, Any]) -> str:
     return f"{OWNER_REPAIR}:{step.get('step') or '?'}"
 
 
+# Шаг починки, который снимает шлюз со схемы, и инварианты ветвления, за которые
+# этот шаг тогда отвечает. Из живого прогона #57: все 9 провалов `has_branching`
+# шли через «понижен до задачи», а владельцу-модели нарушение записывалось
+# потому, что у шлюза осталась одна легальная нога — вторую починка перевела в
+# поток-сообщение. Вина контура, а не модели, и называть её надо контуром.
+_BRANCH_REMOVAL_STEP = "понижение одновыходных шлюзов"
+_BRANCH_NOTE = "понижен до задачи"
+_BRANCH_CHECKS = ("has_branching", "gateway_conditions_or_default",
+                  "gateway_split_join")
+# Фразы нарушений плана про ветвление (из `core.bpmn_generator.plan_gaps`): если
+# план-гейт уже жаловался на отсутствие шлюза, ветвления в плане не было, и
+# понижение другого шлюза винить в провале нельзя.
+_BRANCH_GAP_NEEDLES = ("ни одного шлюза", "без шлюза", "развилка спрятана")
+
+
+def _branch_removed_by_repair(steps: Sequence[Mapping[str, Any]]) -> str:
+    for step in steps:
+        if str(step.get("step") or "") != _BRANCH_REMOVAL_STEP:
+            continue
+        if any(_BRANCH_NOTE in str(note) for note in (step.get("notes") or ())):
+            return _step_owner(step)
+    return ""
+
+
 def attribute_generation(
         checks_xml: Mapping[str, Any],
         checks_structure: Mapping[str, Any],
@@ -200,6 +224,15 @@ def attribute_generation(
         if structure_check is not None and structure_check.ok:
             out[name] = OWNER_XML
             continue
+        if name in _BRANCH_CHECKS:
+            demoted = _branch_removed_by_repair(steps)
+            if demoted and not any(needle in gap for gap in gaps
+                                   for needle in _BRANCH_GAP_NEEDLES):
+                # Ветвление в плане было (план-гейт про него не жаловался), а на
+                # схеме его нет: починка понизила шлюз до задачи. Модель за это
+                # ответственности не несёт.
+                out[name] = demoted
+                continue
         if _was_in_the_plan(ids, gaps):
             out[name] = _plan_owner(name) + OWNER_SEEN
             continue

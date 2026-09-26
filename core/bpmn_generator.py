@@ -2150,6 +2150,29 @@ def _role_candidate_pools(raw: Dict[str, Any], text: str = "") -> List[str]:
     return out
 
 
+def _gateway_branch_targets(raw: Dict[str, Any]) -> Set[str]:
+    """Шаги, в которые ведут ноги шлюза, действительно раздваивающего маршрут.
+
+    Для признака берётся тот же разбор дуг, что и у нарушения «развилка спрятана
+    в подписях потоков»: поток-сообщение веткой не считается, шлюзом считается
+    только узел шлюзового вида.
+    """
+    elements = _raw_dicts(raw.get("elements"))
+    kinds = {_raw_text(e.get("id")): _raw_text(e.get("kind") or e.get("type"))
+             for e in elements}
+    legs: Dict[str, List[str]] = {}
+    for flow in _raw_dicts(raw.get("flows")):
+        if _raw_text(flow.get("kind")).lower() == "message":
+            continue
+        source = _raw_text(flow.get("source"))
+        target = _raw_text(flow.get("target"))
+        if source and target:
+            legs.setdefault(source, []).append(target)
+    return {target for gid, outs in legs.items()
+            if len(outs) >= 2 and kinds.get(gid) in GATEWAY_KINDS
+            for target in outs}
+
+
 def _vacant_named_pools(raw: Dict[str, Any], text: str) -> List[Dict[str, Any]]:
     """Пустые пулы, названные в описании, с шагами-кандидатами из чужих пулов.
 
@@ -2206,9 +2229,22 @@ def _claim_steps_by_name(structure: Dict[str, Any], text: str,
                 and _raw_text(e.get("kind") or e.get("type"))
                 not in ("startEvent", "endEvent")]
 
+    # Цель ноги развилки — не кандидат на перенос. Перенесённый в чужой пул шаг
+    # превращает дугу шлюза в поток-сообщение, после чего починка «понижение
+    # одновыходных шлюзов» снимает шлюз: ветвление из описания исчезает со схемы
+    # руками контура. По живому прогону #57 8 планов из 16 остались без развилки,
+    # и у всех 8 в трейсе стояло понижение шлюза, а у 6 до него был перенос шага
+    # по имени пула.
+    branch_targets = _gateway_branch_targets(structure)
+
     for entry in _vacant_named_pools(structure, text):
         pool, candidates = entry["pool"], entry["candidates"]
         if _norm_name(pool) in declared_roles or len(candidates) != 1:
+            continue
+        if candidates[0]["id"] in branch_targets:
+            notes.append(f"шаг {candidates[0]['id']} в пул «{pool}» не перенесён: "
+                         "в него ведёт нога развилки — перенос убрал бы шлюз "
+                         "со схемы")
             continue
         elem = next((e for e in elements
                      if _raw_text(e.get("id")) == candidates[0]["id"]), None)
@@ -2468,6 +2504,31 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
                         "parallel) и веди ветки от него"
                         + (f", а не удаляй ни одну из них: fixes c "
                            f"`condition` у потоков {named}" if named else ""))
+    # Нога развилки, уходящая в чужой пул, — то же ветвление, потерянное на
+    # выходе контура, только с другой стороны: починка превратит такую дугу в
+    # поток-сообщение, у шлюза останется одна легальная нога, и шаг понижения
+    # снимет шлюз со схемы. Шлюз концом обмена не бывает (в 625 обменах корпуса
+    # таких концов ноль), поэтому правка называется конкретным шагом: в пуле
+    # развилки обязан появиться шаг, который отправляет сообщение.
+    for gid in sorted(explicit_split):
+        own = pool_by_id.get(gid, "")
+        if not own:
+            continue
+        for flow in flows:
+            if _raw_text(flow.get("kind")).lower() == "message":
+                continue
+            if _raw_text(flow.get("source")) != gid:
+                continue
+            other = pool_by_id.get(_raw_text(flow.get("target")), "")
+            if not other or other == own:
+                continue
+            gaps.append(
+                f"нога развилки {gid} (поток "
+                f"`{_raw_text(flow.get('id')) or '?'}`) ведёт в чужой пул "
+                f"«{other}»: у обмена между пулами на конце не шлюз, а шаг — "
+                f"заведи в пуле «{own}» шаг, который отправляет сообщение, и "
+                "веди эту ногу в него, не убирая развилку")
+            break
     # Порядок = важность: переспрос один, и на плане с десятком нарушений модель
     # доходила до подписей имён, оставляя на схеме меньше участников, чем в
     # описании. Потерянный участник — первое, что надо исправить.
@@ -2544,7 +2605,11 @@ _GAP_PRIORITY = (("действующим лицом", 0),
                  ("задаёт ожидание", 1),
                  # Ветвление из описания — тоже содержание процесса, а не
                  # косметика маршрута.
-                 ("ни одного шлюза", 1))
+                 ("ни одного шлюза", 1),
+                 # Нога развилки в чужом пуле — то же потерянное ветвление, но
+                 # заметившееся только на выходе: ниже рангом она проиграла бы
+                 # подписям имён, и повтор ушёл бы косметикой.
+                 ("ведёт в чужой пул", 1))
 # Последний класс — «остальное»: он никогда не выбирается иглой, а служит
 # приданым для сравнения профилей.
 _GAP_RANK_DEFAULT = 2
@@ -2563,6 +2628,7 @@ _GAP_CLASS_OF = (("действующим лицом", "лицо без пула
                  ("задаёт ожидание", "таймер"),
                  ("ни одного шлюза", "развилка"),
                  ("развилка спрятана", "развилка"),
+                 ("ведёт в чужой пул", "развилка"),
                  ("объявил дорожку с таким же именем", "роль-пул"))
 _GAP_CLASS_OTHER = "маршрут"
 

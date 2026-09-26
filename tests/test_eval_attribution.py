@@ -140,6 +140,41 @@ class TestGeneration:
         owner = attribution.attribute_generation(checks, {}, trace)
         assert owner["has_branching"] == attribution.OWNER_MODEL_FIRST
 
+    def test_demoted_gateway_belongs_to_the_repair_not_the_model(self):
+        """Прогон #57: все 9 провалов `has_branching` шли через «понижен до
+        задачи». Ветвление в плане было (план-гейт о нём молчал), а на схеме его
+        нет — значит шлюз снял контур, и писать владельцем модель нельзя."""
+        trace = _trace(**{"починка структуры": {"steps": _steps(
+            {"step": "понижение одновыходных шлюзов",
+             "notes": ["Шлюз G1 («Транспорт найден?») с одним потоком с каждой "
+                       "стороны понижен до задачи"]})}})
+        checks = {"has_branching": _check("has_branching")}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["has_branching"].startswith(attribution.OWNER_REPAIR)
+        assert "понижение одновыходных шлюзов" in owner["has_branching"]
+
+    def test_plan_without_a_branch_still_belongs_to_the_model(self):
+        """Если план-гейт сам жаловался на отсутствие шлюза, понижение другого
+        узла ничего не сломало: ветвления в плане не было."""
+        trace = _trace(**{"починка структуры": {"steps": _steps(
+            {"step": "понижение одновыходных шлюзов",
+             "notes": ["Шлюз G2 понижен до задачи"]})}})
+        checks = {"has_branching": _check("has_branching")}
+        gaps = ["описание задаёт условие («если…»),"
+                " а в плане ни одного шлюза, который раздваивает маршрут"]
+        owner = attribution.attribute_generation(checks, {}, trace, gaps)
+        assert owner["has_branching"].startswith(attribution.OWNER_MODEL_FIRST)
+
+    def test_repair_without_demotion_does_not_claim_the_branch(self):
+        """Понижения не было — права приписывать себе провал ветвления у починки
+        нет: иначе любое отсутствие шлюза стало бы «виной контура»."""
+        trace = _trace(**{"починка структуры": {"steps": _steps(
+            {"step": "закрытие маршрутов", "notes": ["Шаг A2 был без исходящего "
+                                                     "потока — присоединён"]})}})
+        checks = {"has_branching": _check("has_branching")}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert attribution.OWNER_REPAIR not in owner["has_branching"]
+
     def test_the_repair_classes_are_the_ones_the_generator_emits(self):
         """Словарь атрибуции и классы плана расходятся молча и без падений:
         несуществующий класс просто никогда не совпадёт, и харнесс вернётся к

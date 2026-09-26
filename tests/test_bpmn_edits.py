@@ -592,6 +592,47 @@ class TestPackageOrder:
         assert [s["op"] for s in report["skipped"]] == ["connect"]
         assert report["skipped"][0]["reason"] == "источник или цель не найдены"
 
+    def test_connect_refusal_names_the_creation_that_failed(self, two_pool_xml):
+        """Отказ дуги обязан называть несостоявшееся создание опоры.
+
+        Измерено на живом прогоне #57: из 26 отказов «источник или цель не
+        найдены» 13 ссылались на узел, который этот же пакет пытался создать и не
+        создал (`new_report_manager` — «пул не определён», `new_sla_timer_1` —
+        откат без ветки обработки). Текст «используйте существующие id из
+        инвентаря» описывал не тот дефект: повтор латал дугу, узел так и не
+        появлялся, а `improve/op_acceptance` записывала это качеством модели.
+        """
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A9", "name": "Проверить срок"},
+            {"op": "connect", "source": "S_accept", "target": "new_A9"},
+        ])
+        rows = [s for s in report["skipped"] if s["op"] == "connect"]
+        assert rows, report
+        hint = rows[0]["hint"]
+        assert "не создана этим же пакетом" in hint, hint
+        assert "new_A9" in hint and "пул не определён" in hint, hint
+
+    def test_upstream_note_keeps_the_inventory_advice(self, two_pool_xml):
+        """Причина выше по пакету не отменяет того, что второй операнд модель
+        может и правда брать из инвентаря: прежняя подсказка остаётся в тексте."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A9", "name": "Проверить срок"},
+            {"op": "connect", "source": "S_accept", "target": "new_A9"},
+        ])
+        hint = [s for s in report["skipped"] if s["op"] == "connect"][0]["hint"]
+        assert "инвентаря" in hint, hint
+
+    def test_created_node_gets_no_upstream_note(self, two_pool_xml):
+        """Пакет, который свою опору создал, не должен читать про несозданный
+        узел: иначе подсказка ведёт модель чинить то, что уже починено."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A9", "name": "Проверить срок",
+             "participant": "Магазин", "after": "S_accept", "to": "S_end"},
+        ])
+        assert report["applied"], report["skipped"]
+        assert not [s for s in report["skipped"]
+                   if "не создана этим же пакетом" in (s.get("hint") or "")]
+
     def test_mutual_dependency_does_not_loop(self, two_pool_xml):
         """Шаг А ждёт Б, Б ждёт А: второй проход обязан остановиться, а не
         крутиться до конца жизни процесса."""

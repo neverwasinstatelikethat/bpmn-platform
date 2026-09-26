@@ -2314,8 +2314,7 @@ def _pool_words(text: Any) -> Set[str]:
 # «пропуск первого раунда закрыт повтором» в оркестраторе: без них нельзя
 # понять, что исправленная версия той же операции прошла.
 _OP_IDENTITY_KEYS = ("id", "element_id", "flow", "source", "target", "name",
-                     "participant", "gateway")
-# Те же поля — публичный словарь идентичности: по ним сверку «отказ первого
+                     "participant", "gateway")# Те же поля — публичный словарь идентичности: по ним сверку «отказ первого
 # раунда закрыт повтором» ведёт оркестратор. Держать два списка было нельзя:
 # пока он читал только `id`/`source`/`target`, `remove_participant` не получал
 # зачёта никогда, и пользователь читал «не применено» об уже удалённом пуле.
@@ -2331,6 +2330,35 @@ OP_ELEMENT_FIELDS = ("id", "element_id", "flow", "source", "target",
 
 def _op_identity(op: Dict[str, Any]) -> Dict[str, Any]:
     return {key: op[key] for key in _OP_IDENTITY_KEYS if op.get(key)}
+
+
+def _explain_failed_dependencies(skipped: List[Dict[str, Any]],
+                                 failed: Dict[str, str]) -> None:
+    """Подсказка к отказу обязана называть неработающую опору, а не приказывать
+    угадывать id.
+
+    Измерено на живом прогоне #57: из 26 отказов «источник или цель не найдены»
+    13 ссылались на узел, который этот же пакет пытался создать и не создал
+    (`new_sla_timer_1` откатан без ветки обработки, `new_report_manager` — «пул
+    не определён»). Текст «используйте существующие id из инвентаря» описывал не
+    тот дефект: повтор латал дугу, узел так и не появлялся, а
+    `improve/op_acceptance` записывала это как качество модели. Правило то же,
+    что у советов скоринга: подсказка без операндов читается как «придумай id».
+    """
+    if not failed:
+        return
+    for entry in skipped:
+        if entry.get("op") in CREATES_ID_OPS:
+            continue  # это сам отказ создания — его причину пишет создатель
+        stuck = sorted({str(value) for key, value in entry.items()
+                        if key in OP_ELEMENT_FIELDS and str(value) in failed})
+        if not stuck:
+            continue
+        why = "; ".join(f"'{i}' — {failed[i]}" for i in stuck)
+        note = (f"опора не создана этим же пакетом: {why} — почините сначала "
+                f"создание, дуга применится после")
+        previous = str(entry.get("hint") or "").strip()
+        entry["hint"] = f"{note}. {previous}" if previous else note
 
 
 def _routing_gap(index: _Index, elem_id: str) -> Optional[str]:
@@ -2472,6 +2500,11 @@ def apply_operations(xml_text: str,
                if str(op.get("op") or "") in CREATES_ID_OPS
                for s in (str(op.get("id") or "").strip(),
                          str(op.get("name") or "").strip()) if s}
+    # Узлы, которые пакет пытался создать и не создал: правка, ссылающаяся на
+    # такой id, отказывает не потому, что модель выдумала адрес, а потому, что
+    # не создана опора. Без этого отказа подсказка к дуге звала бы «взять id из
+    # инвентаря», и корректирующий повтор чинил не то.
+    failed_creations: Dict[str, str] = {}
     queue: List[Tuple[Any, ...]] = [(op, (), None) for op in (operations or [])]
     passes = 0
     while queue and passes < MAX_PACKAGE_PASSES:
@@ -2532,10 +2565,15 @@ def apply_operations(xml_text: str,
                     pending.append((op, skip.needs,
                                     {"reason": str(skip), "hint": skip.hint}))
                     continue
+                if op_name in CREATES_ID_OPS and str(op.get("id") or "").strip():
+                    failed_creations.setdefault(str(op["id"]).strip(), str(skip))
                 skipped.append({"op": op_name, **_op_identity(op),
                                 "reason": str(skip), "hint": skip.hint})
             except Exception as e:  # noqa: BLE001 — одна операция не роняет пакет
                 logger.exception("Операция %s упала", op_name)
+                if op_name in CREATES_ID_OPS and str(op.get("id") or "").strip():
+                    failed_creations.setdefault(str(op["id"]).strip(),
+                                                f"внутренняя ошибка: {e}")
                 skipped.append({"op": op_name, **_op_identity(op),
                                 "reason": f"внутренняя ошибка: {e}",
                                 "hint": "упростите операцию"})
@@ -2554,6 +2592,9 @@ def apply_operations(xml_text: str,
         entry.update(last or {"reason": "зависимость пакета не создана",
                               "hint": "создайте элемент раньше, чем сошлётесь "
                                       "на него"})
+        if (str(entry["op"]) in CREATES_ID_OPS
+                and str(op.get("id") or "").strip()):
+            failed_creations.setdefault(str(op["id"]).strip(), entry["reason"])
         skipped.append(entry)
     # Узлы, добавленные пакетом и оставшиеся без маршрута, откатываем:
     # принятое улучшение не имеет права делать схему хуже исходной.
@@ -2566,10 +2607,13 @@ def apply_operations(xml_text: str,
         for elem_id, gap in dropped.items():
             op_name = added_ops.get(elem_id, "add_task")
             hint = _rollback_hint(elem_id, gap, op_name)
+            reason = (f"новый шаг ({elem_id}) {gap} — изменение "
+                      f"откачено")
+            failed_creations.setdefault(elem_id, reason)
             skipped.append({"op": op_name, "id": elem_id,
-                            "reason": f"новый шаг ({elem_id}) {gap} — изменение "
-                                      f"откачено",
+                            "reason": reason,
                             "hint": hint})
+    _explain_failed_dependencies(skipped, failed_creations)
 
     # Слияние пулов — единственная правка, которая переносит чужие узлы и потоки
     # в другой процесс. Если из-за переноса починка чистит висящий поток или

@@ -1626,6 +1626,12 @@ def _remove_node(index: _Index, elem: ET.Element) -> Tuple[List[str], List[str]]
 
 def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
     elem_id = op.get("id") or ""
+    elem = index.elements.get(elem_id)
+    if elem is None:
+        lane = index.find_lane(elem_id)
+        if lane is not None:
+            return _drop_lane(index, lane)
+    # Ни узел, ни дорожка: тот же отказ «элемент не найден» с инвентарём.
     elem = _require_element(index, elem_id)
     if _local(elem.tag) in ("startEvent", "endEvent"):
         raise _Skip(
@@ -1640,6 +1646,32 @@ def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
     if removed_flows:
         notes.append(f"удалены связанные потоки: {', '.join(removed_flows)}")
     return notes
+
+
+def _drop_lane(index: _Index, lane: ET.Element) -> List[str]:
+    """Снять дорожку с процесса: только пустую.
+
+    Модель зовёт правку `remove_lane` (прогон #61: 2 отказа «неизвестная
+    операция», которые `improve/op_acceptance` записал качеством модели), а
+    аплайер умел снимать только узлы. Дорожка — не узел: её удаление не чинит
+    маршрут, оно забирает подписание шагов, поэтому шаги внутри дорожки — отказ
+    с названием переносимых id, а не тихая правка.
+    """
+    refs = [_text_of(ref) for ref in lane.findall(_q("flowNodeRef"))]
+    occupied = [ref for ref in refs if ref in index.elements]
+    if occupied:
+        name = lane.get("name") or lane.get("id") or ""
+        raise _Skip(
+            f"в дорожке '{name}' ещё есть шаги",
+            "сначала перенесите их: "
+            + ", ".join(f'move_to_lane(id="{ref}", lane="<другая>")'
+                        for ref in occupied[:3])
+            + ", либо удалите сами шаги операцией delete",
+            needs=tuple(occupied),
+        )
+    index.detach(lane)
+    name = lane.get("name") or lane.get("id") or ""
+    return [f"дорожка «{name}» удалена: в ней не было ни одного шага"]
 
 
 def _flag(value: Any, field: str) -> bool:
@@ -2319,7 +2351,13 @@ OP_ALIASES: Dict[str, str] = {"add_flow": "connect",
                               # недостающего операнда, ни направления, а
                               # `improve/op_acceptance` считала это расхождение
                               # словарей качеством модели.
-                              "add_timer": "add_boundary_event"}
+                              "add_timer": "add_boundary_event",
+                              # `remove_lane` — так модель называет снятие пустой
+                              # дорожки (прогон #61: 2 отказа «неизвестная
+                              # операция»). `delete` понимает и id узла, и id
+                              # дорожки, а наполненную дорожку отвергает со
+                              # списком переносимых шагов.
+                              "remove_lane": "delete"}
 
 
 def _lane_move_pools(operations: List[Dict[str, Any]],

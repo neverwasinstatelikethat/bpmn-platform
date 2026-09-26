@@ -881,6 +881,57 @@ class TestEventDefinitionOnExistingEvent:
         assert build_inventory(out)["flows"] == build_inventory(self.INERT_TIMER)["flows"]
 
 
+class TestRemoveLane:
+    """Снятие дорожки — операция аплайера, а не «неизвестная операция».
+
+    Прогон #61: модель дважды звала `remove_lane` и получала отказ, в котором
+    нет ни операнда, ни направления, — `improve/op_acceptance` записала это
+    качеством модели, хотя расходились словари.
+    """
+
+    LANES = XML_DECLARATION + '''<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <process id="Process_1" name="Процесс" isExecutable="true">
+    <laneSet>
+      <lane id="L1" name="Кладовщик"><flowNodeRef>T1</flowNodeRef></lane>
+      <lane id="L2" name="Разработчик"/>
+    </laneSet>
+    <startEvent id="S1" name="Начало"/>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="T1"/>
+    <userTask id="T1" name="Взять со склада"/>
+    <sequenceFlow id="F2" sourceRef="T1" targetRef="E1"/>
+    <endEvent id="E1" name="Готово"/>
+  </process>
+</definitions>
+'''
+
+    def test_empty_lane_leaves_the_process(self):
+        out, report = apply_operations(self.LANES, [
+            {"op": "remove_lane", "id": "L2"}])
+        assert report["status"] == "success"
+        applied = report["applied"][0]
+        assert applied["op"] == "delete"
+        assert "remove_lane" in applied["note"]
+        assert "дорожка «Разработчик» удалена" in applied["note"]
+        root = _root(out)
+        assert [l.get("id") for l in root.findall(".//bpmn:lane", NS)] == ["L1"]
+        assert _lane_refs(root.find(".//bpmn:lane[@id='L1']", NS)) == ["T1"]
+
+    def test_occupied_lane_refuses_with_the_steps_to_move(self):
+        """Дорожка с шагами не снимается молча: refusal обязан назвать, что
+        переносить, — иначе пакет теряет подписание шагов."""
+        _, report = apply_operations(self.LANES, [
+            {"op": "remove_lane", "id": "L1"}])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "в дорожке 'Кладовщик' ещё есть шаги"
+        assert 'move_to_lane(id="T1"' in skip["hint"]
+        assert "delete" in skip["hint"]
+
+    def test_unknown_id_is_still_not_a_lane(self):
+        _, report = apply_operations(self.LANES, [
+            {"op": "remove_lane", "id": "L40"}])
+        assert report["skipped"][0]["reason"] == "элемент не найден"
+
+
 class TestOpNameAlias:
     """Синоним имени операции стоит дешевле, чем отказ с правильными операндами.
 

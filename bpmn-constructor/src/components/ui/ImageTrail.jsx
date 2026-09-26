@@ -5,7 +5,7 @@ import './ui.css';
 
 // След из изображений за курсором. На тач-устройствах и при
 // prefers-reduced-motion превращается в обычный слайдер.
-const ImageTrail = ({ images = [], className = '', hint }) => {
+const ImageTrail = ({ images = [], className = '', hint, ariaLabel = 'Галерея' }) => {
     const areaRef = useRef(null);
     const lastRef = useRef({ x: 0, y: 0, t: 0, index: 0 });
     const timersRef = useRef([]);
@@ -64,7 +64,7 @@ const ImageTrail = ({ images = [], className = '', hint }) => {
                 slides={images.map((image) => ({ src: image.src, alt: image.alt || '', caption: image.label }))}
                 autoPlay={3800}
                 className={className}
-                ariaLabel="Скриншоты продукта"
+                ariaLabel={ariaLabel}
             />
         );
     }

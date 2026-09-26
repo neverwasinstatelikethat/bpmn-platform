@@ -1,3 +1,9 @@
+/* ============================================================
+   Мастерская BPMN (маршрут /guideline)
+   Карточки тем рисует системный Accordion, поэтому правил под
+   самописный триггер, палитру bpmn-js и иконки-ягоды здесь нет.
+   ============================================================ */
+
 /* Корень страницы: WorkPage подмешивает этот класс к <main class="work-page guideline">.
    Здесь задаём локальные меры раздела, чтобы не дублировать их в media-запросах. */
 .guideline {
@@ -9,6 +15,8 @@
     grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
     gap: var(--space-xl);
 }
+
+/* --- Левая колонка: темы --- */
 
 .guideline-sidebar {
     align-self: start;
@@ -34,16 +42,26 @@
     cursor: pointer;
 }
 
-.sidebar-item:hover,
-.sidebar-item.active { color: var(--color-primary-active); }
-.sidebar-item.active { background: var(--color-primary-soft); }
+/* Наведение — одно, из CSS (framer-ховер с тем же фоном убран из разметки).
+   Правило `.active` стоит ниже, поэтому выбранный пункт не перекрашивается ховером. */
+.sidebar-item:hover {
+    background: var(--color-surface-mist);
+    color: var(--color-primary-active);
+}
+
+.sidebar-item.active {
+    background: var(--color-primary-soft);
+    color: var(--color-primary-active);
+}
+
 .sidebar-item:focus-visible,
-.guideline-section__trigger:focus-visible,
-.test input:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.test input:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
 
-.guideline-sections { display: grid; gap: var(--space-md); }
+/* --- Правая колонка: темы выбранной группы или пустое состояние --- */
 
-/* Правая колонка: столбец карточек выбранной группы, по виду — как .guideline-section */
 .guideline-main {
     min-width: 0;
     display: grid;
@@ -51,68 +69,251 @@
     gap: var(--space-md);
 }
 
-.guideline-section {
-    overflow: clip;
-    background: var(--color-surface);
-    border: 1px solid var(--color-hairline-soft);
-    border-radius: var(--radius-card);
-    box-shadow: var(--shadow-soft);
-}
-
-.guideline-section__trigger {
+/* Заголовок карточки (живёт внутри триггера Accordion): название элемента
+   и честная метка проверки после ответа. */
+.guideline-heading {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: var(--space-md);
-    width: 100%;
-    min-height: 62px;
-    padding: var(--space-md) var(--space-lg);
-    border: 0;
-    background: var(--color-surface);
+    min-width: 0;
+}
+
+.guideline-heading__title {
     color: var(--color-ink);
-    font: 600 var(--text-body) var(--font-sans);
-    text-align: left;
+    font-weight: 600;
+}
+
+/* --- Содержимое карточки: теория слева, проверка справа --- */
+
+.guideline-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(16rem, .9fr);
+    gap: var(--space-lg);
+}
+
+.theory,
+.test {
+    min-width: 0;
+    padding-top: var(--space-sm);
+}
+
+.theory h3,
+.test h3 {
+    margin: 0 0 var(--space-sm);
+    font-size: var(--text-h3);
+}
+
+.theory h4 {
+    margin: var(--space-xl) 0 var(--space-xs);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+}
+
+.theory p {
+    margin: 0;
+    color: var(--color-ink-soft);
+    line-height: 1.65;
+}
+
+/* Акцент в тексте — нейтральный: ягода здесь не про ошибку, а про ритм чтения. */
+.theory strong.guideline-em {
+    color: var(--color-ink);
+    font-weight: 600;
+}
+
+/* --- Учебные схемы (только просмотр) --- */
+
+.diagram-container {
+    position: relative;
+    height: var(--guideline-diagram-height, 280px);
+    margin-top: var(--space-md);
+    overflow: hidden;
+    border: 1px solid var(--color-hairline);
+    border-radius: var(--radius-md);
+    background: var(--color-surface-mist);
+}
+
+.diagram {
+    width: 100%;
+    height: 100%;
+}
+
+/* Пока bpmn-js импортирует XML, поверх пустого холста — загрузочный индикатор. */
+.diagram-container__overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    display: grid;
+    place-items: center;
+    background: var(--color-surface-mist);
+}
+
+.diagram-container__overlay .page-loader {
+    min-height: 0;
+    font-size: var(--text-sm);
+}
+
+/* Текст ошибки — читаемым тоном поверх мягкой подложки (--color-danger даёт ≈3.2:1).
+   Селектор с `.theory` сильнее правила `.theory p { margin: 0 }`, иначе отступ пропадёт. */
+.theory .guideline-error {
+    margin-top: var(--space-xs);
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--color-hairline);
+    border-radius: var(--radius-md);
+    background: var(--color-danger-soft);
+    color: var(--color-danger-text);
+    font-size: var(--text-sm);
+}
+
+/* --- Проверка по элементу --- */
+
+.test {
+    align-self: start;
+    padding: var(--space-lg);
+    background: var(--color-surface-mist);
+    border-radius: var(--radius-md);
+}
+
+.test form {
+    display: grid;
+    gap: var(--space-sm);
+}
+
+.test__hint {
+    margin: 0;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+}
+
+.test__option {
+    display: flex;
+    gap: var(--space-xs);
+    align-items: flex-start;
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    line-height: 1.4;
     cursor: pointer;
 }
 
-.guideline-section__trigger svg { flex: 0 0 auto; }
-.guideline-section .content { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(16rem, .9fr); gap: var(--space-lg); padding: 0 var(--space-lg) var(--space-lg); }
-.theory, .test { min-width: 0; padding-top: var(--space-sm); }
-.theory h3, .test h3 { margin: 0 0 var(--space-sm); font-size: var(--text-h3); }
-.theory h4 { margin: var(--space-xl) 0 var(--space-xs); color: var(--color-ink); font-family: var(--font-sans); font-size: var(--text-body); }
-.theory p { margin: 0; color: var(--color-ink-soft); line-height: 1.65; }
-.theory strong.guideline-em { color: var(--color-berry); font-weight: 600; }
-.diagram-container { position: relative; height: var(--guideline-diagram-height, 280px); margin-top: var(--space-md); overflow: hidden; border: 1px solid var(--color-hairline); border-radius: var(--radius-md); background: var(--color-surface-mist); }
-.diagram { width: 100%; height: 100%; }
-/* Пока bpmn-js импортирует XML, поверх пустого холста — загрузочный индикатор. */
-.diagram-container__overlay { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; background: var(--color-surface-mist); }
-.diagram-container__overlay .page-loader { min-height: 0; font-size: var(--text-sm); }
-.theory p.guideline-error { margin-top: var(--space-xs); padding: var(--space-sm) var(--space-md); border: 1px solid var(--color-berry-soft); border-radius: var(--radius-md); background: var(--color-danger-soft); color: var(--color-danger); font-size: var(--text-sm); }
-.guideline-icon--good { fill: var(--color-primary); }
-.guideline-icon--bad { fill: var(--color-berry); }
+.test__option input[type='checkbox'] {
+    width: 16px;
+    height: 16px;
+    margin: 2px 0 0;
+    flex: none;
+    accent-color: var(--color-primary);
+}
 
-.test { align-self: start; padding: var(--space-lg); background: var(--color-surface-mist); border-radius: var(--radius-md); }
-.test form { display: grid; gap: var(--space-sm); }
-.test form > div { display: block; }
-.test label { display: flex; gap: var(--space-xs); align-items: flex-start; color: var(--color-ink-soft); font-size: var(--text-sm); line-height: 1.4; }
-.test input[type='checkbox'] { width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--color-primary); }
-.test input[type='number'] { width: 72px; min-height: 36px; margin-left: var(--space-xs); padding: 0 var(--space-xs); border: 1px solid var(--color-hairline); border-radius: var(--radius-sm); font: inherit; }
-.test button { min-height: var(--control-min-height); margin-top: var(--space-sm); border: 0; border-radius: var(--radius-pill); background: var(--color-primary); color: var(--color-on-primary); font: 600 var(--text-body) var(--font-sans); cursor: pointer; }
-.result { margin-top: var(--space-md); padding: var(--space-sm) var(--space-md); border-radius: var(--radius-md); font-size: var(--text-sm); }
-.result.pass { background: var(--color-success-soft); color: var(--color-primary-active); }
-.result.fail { background: var(--color-danger-soft); color: var(--color-danger); }
+.test__field {
+    display: grid;
+    gap: var(--space-xs);
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    line-height: 1.4;
+}
+
+.test__field-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+}
+
+.test__field input[type='number'] {
+    width: 72px;
+    min-height: 36px;
+    padding: 0 var(--space-xs);
+    border: 1px solid var(--color-hairline);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface);
+    color: var(--color-ink);
+    font: inherit;
+}
+
+.test__bounds {
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+}
+
+.test__submit {
+    justify-self: start;
+    margin-top: var(--space-sm);
+}
+
+/* --- Вердикт: зачтено / не зачтено, без синтетического процента --- */
+
+.verdict-chip {
+    padding: 4px 10px;
+    border-radius: var(--radius-pill);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    line-height: 1.2;
+}
+
+.verdict-chip--pass {
+    background: var(--color-success-soft);
+    color: var(--color-primary-active);
+}
+
+.verdict-chip--fail {
+    background: var(--color-danger-soft);
+    color: var(--color-danger-text);
+}
+
+.result {
+    display: grid;
+    gap: var(--space-xs);
+    margin-top: var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+    font-size: var(--text-sm);
+}
+
+.result .verdict-chip {
+    justify-self: start;
+}
+
+.result__note {
+    margin: 0;
+    color: var(--color-ink-soft);
+    line-height: 1.5;
+}
+
+.result__list {
+    margin: 0;
+    padding-left: var(--space-md);
+    display: grid;
+    gap: var(--space-xxs);
+    color: var(--color-ink-soft);
+    line-height: 1.5;
+}
+
+/* --- Адаптив и движение --- */
 
 @media (max-width: 860px) {
-    .guideline-content, .guideline-section .content { grid-template-columns: 1fr; }
-    .guideline-sidebar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .guideline-content,
+    .guideline-body {
+        grid-template-columns: 1fr;
+    }
+
+    .guideline-sidebar {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 
 @media (max-width: 560px) {
-    .guideline { --guideline-diagram-height: 220px; }
-    .guideline-sidebar { grid-template-columns: 1fr; }
-    .guideline-section__trigger, .guideline-section .content { padding-left: var(--space-md); padding-right: var(--space-md); }
+    .guideline {
+        --guideline-diagram-height: 220px;
+    }
+
+    .guideline-sidebar {
+        grid-template-columns: 1fr;
+    }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .guideline-section, .sidebar-item { transition: none; }
+    .sidebar-item {
+        transition: none;
+    }
 }

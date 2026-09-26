@@ -1,7 +1,11 @@
 import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
+import { Button, Input } from './components/ui';
 import { useAuth } from './context/AuthContext';
 import './Register.css';
+
+// Сообщение об ошибке уже разобрано в AuthContext через toUserMessage.
+const failureText = (error, fallback) => (error?.message?.trim() ? error.message : fallback);
 
 const Register = () => {
     const { register } = useAuth();
@@ -10,25 +14,21 @@ const Register = () => {
     const [email, setEmail] = useState(() => searchParams.get('email') || '');
     const [password, setPassword] = useState('');
     const [confirmation, setConfirmation] = useState('');
-    const [consent, setConsent] = useState(false);
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
 
     const submit = async (event) => {
         event.preventDefault();
         if (password !== confirmation) {
+            // Введённое сохраняем: человек правит одно поле, а не всю форму.
             setError('Пароли не совпадают.');
-            return;
-        }
-        if (!consent) {
-            setError('Подтвердите согласие с условиями использования.');
             return;
         }
         setBusy(true); setError('');
         try {
             await register(name.trim(), email.trim(), password);
         } catch (requestError) {
-            setError(requestError.message);
+            setError(failureText(requestError, 'Не удалось создать аккаунт.'));
         } finally {
             setBusy(false);
         }
@@ -42,23 +42,20 @@ const Register = () => {
                 <p className="auth-panel__lead">Создайте рабочее пространство — первая BPMN‑схема появится уже через несколько минут.</p>
                 {error && <p className="auth-alert auth-alert--error" role="alert">{error}</p>}
                 <form className="auth-form" onSubmit={submit}>
-                    <label htmlFor="register-name">Имя</label>
-                    <input id="register-name" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} required />
-                    <label htmlFor="register-email">Рабочая почта</label>
-                    <input id="register-email" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
-                    <label htmlFor="register-password">Пароль</label>
-                    <input id="register-password" type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} minLength="6" required />
-                    <label htmlFor="register-confirmation">Повторите пароль</label>
-                    <input id="register-confirmation" type="password" autoComplete="new-password" value={confirmation} onChange={(e) => setConfirmation(e.target.value)} minLength="6" required />
-                    <label className="auth-consent"><input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} />Я принимаю условия использования</label>
-                    <button className="auth-submit" type="submit" disabled={busy}>{busy ? 'Создаём…' : 'Создать аккаунт'}</button>
+                    <Input label="Имя" id="register-name" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} required />
+                    <Input label="Рабочая почта" id="register-email" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
+                    <Input label="Пароль" id="register-password" type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} minLength="6" required />
+                    <Input label="Повторите пароль" id="register-confirmation" type="password" autoComplete="new-password" value={confirmation} onChange={(e) => setConfirmation(e.target.value)} minLength="6" required />
+                    <Button type="submit" block disabled={busy}>{busy ? 'Создаём…' : 'Создать аккаунт'}</Button>
                 </form>
                 <p className="auth-panel__footer">Уже есть аккаунт? <Link to="/login">Войти</Link></p>
             </section>
             <aside className="auth-aside auth-aside--berry" aria-hidden="true">
-                <small>01 / пространство</small>
-                <p>Процесс<br /><span>становится</span><br />видимым.</p>
-                <em>Описывайте работу человеческим языком — остальное соберём в понятную схему.</em>
+                <div className="auth-scene">
+                    <small>01 / пространство</small>
+                    <p>Процесс <br /><span>становится</span> <br />видимым.</p>
+                    <em>Описывайте работу человеческим языком — остальное соберём в понятную схему.</em>
+                </div>
             </aside>
         </main>
     );

@@ -1,6 +1,13 @@
 @import './Login.css';
 
-.auth-form .auth-consent { display: flex; align-items: flex-start; gap: var(--space-xs); margin-top: var(--space-md); color: var(--color-ink-soft); font-weight: 400; cursor: pointer; }
-.auth-consent input { min-height: 18px; width: 18px; margin: 2px 0 0; accent-color: var(--color-primary); }
-.auth-aside--berry { background: var(--color-berry-blush); }
-.auth-aside--berry small { color: var(--color-berry); }
+/* Ягодная «сцена»: та же ограниченная карточка, другая марка. Текст —
+   --color-danger-text, то есть читаемая пара к ягодной мягкой подложке
+   (--color-berry-blush = --color-danger-soft), а не ягода по румянцу:
+   контраст 7:1 вместо 3,2:1. */
+.auth-aside--berry .auth-scene { background: var(--color-berry-blush); }
+.auth-aside--berry .auth-scene small,
+.auth-aside--berry .auth-scene p span { color: var(--color-danger-text); }
+
+/* Согласие с «условиями использования» убрано: маршрута с самими условиями в
+   приложении нет, а обязательное действие не может вести в никуда. Если юрикам
+   нужен блок согласия — сначала нужен маршрут и текст условий. */

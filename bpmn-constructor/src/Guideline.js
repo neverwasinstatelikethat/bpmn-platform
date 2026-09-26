@@ -1,27 +1,22 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import BpmnModeler from 'bpmn-js/lib/Modeler';
+import React, { useEffect, useRef, useState } from 'react';
+import { motion } from 'framer-motion';
+import BpmnViewer from 'bpmn-js/lib/NavigatedViewer';
 import 'bpmn-js/dist/assets/diagram-js.css';
-import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
 import './Guideline.css';
 import { guidelineExamples } from './guidelineExamples';
 import WorkPage from './components/layout/WorkPage';
 import PageLoader from './components/layout/PageLoader';
-
-// SVG иконки в стиле ВкусВилл: цвет задаётся классом в Guideline.css (токены), не хардкодом.
-const CheckIcon = () => (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path className="guideline-icon guideline-icon--good" d="M9 16.17L4.83 12L3.41 13.41L9 19L21 7L19.59 5.59L9 16.17Z" />
-    </svg>
-);
-
-const WarningIcon = () => (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path className="guideline-icon guideline-icon--bad" d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM13 17H11V15H13V17ZM13 13H11V7H13V13Z" />
-    </svg>
-);
+import EmptyState from './components/layout/EmptyState';
+// Компоненты берём напрямую из модулей, а не через barrel `components/ui`:
+// barrel тянет Button с react-router-dom, который не разбирается сбором jest.
+import Accordion from './components/ui/Accordion';
+import Button from './components/ui/Button';
 
 const DIAGRAM_ERROR_TEXT = 'Схему-пример не удалось отрисовать. Перезагрузите страницу или закройте и снова откройте этот раздел.';
+
+// Верхняя граница числового ответа: минимум переходов или внутренних элементов
+// в бизнес-схемах двузначным не бывает, а валидные границы полю нужны.
+const COUNT_MAX = 10;
 
 /**
  * Теория приходит из guidelineExamples с markdown-акцентом **…** и переносами строк.
@@ -39,273 +34,367 @@ const renderRichText = (text) => (text || '').split('\n').map((line, lineIndex) 
     </React.Fragment>
 ));
 
-const GuidelineSection = ({ elementKey, data }) => {
-    const [isOpen, setIsOpen] = useState(false);
-    const incorrectContainerRef = useRef(null);
-    const correctContainerRef = useRef(null);
-    const [diagramLoading, setDiagramLoading] = useState(false);
-    const [diagramErrors, setDiagramErrors] = useState({});
-    const [testCompleted, setTestCompleted] = useState(false);
-    const [testAnswers, setTestAnswers] = useState({});
-    const [testResult, setTestResult] = useState(null);
+/**
+ * Правила проверки строятся от человекочитаемого названия элемента (`data.title`),
+ * а не от внутреннего ключа BPMN: `subProcess` и `timerEvent` остаются в данных
+ * и в схеме, но подписи видит человек. Предикаты — в настоящем времени, чтобы
+ * согласование не зависело от рода названия.
+ */
+const buildRules = (data) => {
+    const criteria = data.evaluationCriteria || {};
+    const name = `«${data.title}»`;
+    const rules = [
+        {
+            id: 'required',
+            kind: 'boolean',
+            statement: `В процессе нужен элемент ${name}`,
+            expected: !!criteria.requiredElements?.length,
+        },
+        {
+            id: 'singleOccurrence',
+            kind: 'boolean',
+            statement: `${name} встречается в процессе только один раз`,
+            expected: criteria.maxOccurrences === 1,
+        },
+        {
+            id: 'outgoingFlows',
+            kind: 'boolean',
+            statement: `${name} требует исходящих переходов`,
+            expected: !!criteria.outgoingFlows,
+        },
+        {
+            id: 'incomingFlows',
+            kind: 'boolean',
+            statement: `${name} требует входящих переходов`,
+            expected: !!criteria.minIncomingFlows,
+        },
+        {
+            id: 'conditions',
+            kind: 'boolean',
+            statement: `${name} требует условий на переходах`,
+            expected: !!criteria.conditions,
+        },
+        {
+            id: 'attached',
+            kind: 'boolean',
+            statement: `${name} прикрепляется к задаче`,
+            expected: !!criteria.attachedToTask,
+        },
+        {
+            id: 'calledElement',
+            kind: 'boolean',
+            statement: `${name} ссылается на другой, отдельный процесс`,
+            expected: !!criteria.calledElement,
+        },
+    ];
 
-    // Модели диаграмм живут только на время открытого раздела: при закрытии
-    // контейнеры размонтируются, поэтому bpmn-js пересоздаётся при каждом открытии.
-    useEffect(() => {
-        if (!isOpen) return undefined;
-
-        const diagrams = [
-            { key: 'incorrect', ref: incorrectContainerRef, xml: data.incorrectExample.xml, label: 'неправильный пример' },
-            { key: 'correct', ref: correctContainerRef, xml: data.correctExample.xml, label: 'правильный пример' },
-        ];
-        const created = [];
-        let cancelled = false;
-        let settled = 0;
-
-        const settle = () => {
-            settled += 1;
-            if (settled === diagrams.length && !cancelled) setDiagramLoading(false);
-        };
-
-        const fail = (key, err, stage) => {
-            console.error(`Ошибка bpmn-js (${stage}):`, err);
-            if (!cancelled) setDiagramErrors((current) => ({ ...current, [key]: DIAGRAM_ERROR_TEXT }));
-        };
-
-        setDiagramLoading(true);
-        setDiagramErrors({});
-
-        diagrams.forEach(({ key, ref, xml, label }) => {
-            try {
-                if (!ref.current) throw new Error('Контейнер диаграммы недоступен');
-                const modeler = new BpmnModeler({ container: ref.current });
-                created.push(modeler);
-
-                modeler.importXML(xml).then((result) => {
-                    if (result && result.warnings && result.warnings.length) {
-                        console.warn(`Предупреждения bpmn-js (${label}):`, result.warnings);
-                    }
-                    modeler.get('canvas').zoom('fit-viewport', 'auto');
-                }).catch((err) => {
-                    fail(key, err, `загрузка диаграммы (${label})`);
-                }).finally(settle);
-            } catch (err) {
-                fail(key, err, `инициализация bpmn-js (${label})`);
-                settle();
-            }
+    if (criteria.minOutgoingFlows) {
+        rules.push({
+            id: 'minOutgoingFlows',
+            kind: 'count',
+            statement: `Минимальное количество исходящих переходов для ${name}`,
+            expected: criteria.minOutgoingFlows,
         });
+    }
+    if (criteria.minInternalElements) {
+        rules.push({
+            id: 'minInternalElements',
+            kind: 'count',
+            statement: `Минимальное количество элементов внутри ${name}`,
+            expected: criteria.minInternalElements,
+        });
+    }
+
+    return rules;
+};
+
+/** Пустое или неразобранное поле — «нет ответа», а не NaN и не молчаливый ноль. */
+const parseCount = (raw) => {
+    if (raw === '' || raw === null || raw === undefined) return null;
+    const value = Number(raw);
+    return Number.isInteger(value) && value >= 0 ? value : null;
+};
+
+/**
+ * Честный вердикт вместо процента: либо все правила совпали, либо перечислены
+ * те, где ответ неверный. Никаких синтетических «86 %» и штрафов за ошибку.
+ */
+const gradeTest = (rules, answers) => {
+    const failures = [];
+
+    rules.forEach((rule) => {
+        if (rule.kind === 'boolean') {
+            if (Boolean(answers[rule.id]) !== rule.expected) {
+                failures.push({ statement: rule.statement, answer: `правило ${rule.expected ? 'верно' : 'неверно'}` });
+            }
+            return;
+        }
+        const value = parseCount(answers[rule.id]);
+        if (value === null) {
+            failures.push({ statement: rule.statement, answer: `нужно число от 0 до ${COUNT_MAX}` });
+        } else if (value < rule.expected) {
+            failures.push({ statement: rule.statement, answer: `не меньше ${rule.expected}` });
+        }
+    });
+
+    return { passed: failures.length === 0, failures };
+};
+
+/**
+ * Учебная схема — только для чтения: NavigatedViewer даёт масштаб и
+ * перетаскивание, но не рисует палитру и не даёт стереть узел без отката,
+ * что делает BpmnModeler в обучающем блоке.
+ */
+const DiagramPreview = ({ xml, label }) => {
+    const containerRef = useRef(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+
+    useEffect(() => {
+        const container = containerRef.current;
+        if (!container) {
+            setLoading(false);
+            setError(DIAGRAM_ERROR_TEXT);
+            return undefined;
+        }
+
+        let cancelled = false;
+        let viewer = null;
+
+        setLoading(true);
+        setError('');
+
+        try {
+            viewer = new BpmnViewer({ container });
+        } catch (initError) {
+            console.error(`Ошибка инициализации bpmn-js (${label}):`, initError);
+            setLoading(false);
+            setError(DIAGRAM_ERROR_TEXT);
+            return undefined;
+        }
+
+        viewer.importXML(xml)
+            .then((result) => {
+                if (result && result.warnings && result.warnings.length) {
+                    console.warn(`Предупреждения bpmn-js (${label}):`, result.warnings);
+                }
+                viewer.get('canvas').zoom('fit-viewport', 'auto');
+            })
+            .catch((importError) => {
+                console.error(`Ошибка импорта схемы (${label}):`, importError);
+                if (!cancelled) setError(DIAGRAM_ERROR_TEXT);
+            })
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
 
         return () => {
             cancelled = true;
-            created.forEach((modeler) => {
-                try {
-                    modeler.destroy();
-                } catch (err) {
-                    console.error('Ошибка очистки bpmn-js:', err);
-                }
-            });
+            try {
+                viewer.destroy();
+            } catch (destroyError) {
+                console.error('Ошибка очистки bpmn-js:', destroyError);
+            }
         };
-    }, [isOpen, data.incorrectExample.xml, data.correctExample.xml]);
-
-    const testQuestions = [
-        { id: 'required', text: `Элемент ${elementKey} обязателен в процессе`, correct: !!data.evaluationCriteria.requiredElements?.length },
-        { id: 'singleOccurrence', text: `Элемент ${elementKey} должен быть только один`, correct: data.evaluationCriteria.maxOccurrences === 1 },
-        { id: 'outgoingFlows', text: `Элемент ${elementKey} требует исходящих потоков`, correct: !!data.evaluationCriteria.outgoingFlows },
-        { id: 'incomingFlows', text: `Элемент ${elementKey} требует входящих потоков`, correct: !!data.evaluationCriteria.minIncomingFlows },
-        { id: 'conditions', text: `Элемент ${elementKey} требует условий`, correct: !!data.evaluationCriteria.conditions },
-        { id: 'attached', text: `Элемент ${elementKey} должен быть привязан к задаче`, correct: !!data.evaluationCriteria.attachedToTask },
-        { id: 'calledElement', text: `Элемент ${elementKey} требует ссылки на процесс`, correct: !!data.evaluationCriteria.calledElement },
-    ];
-
-    const handleTestSubmit = (e) => {
-        e.preventDefault();
-        const criteria = data.evaluationCriteria;
-        let score = 0;
-        let total = testQuestions.length;
-        let penalty = 0;
-
-        testQuestions.forEach(({ id, correct }) => {
-            const userAnswer = testAnswers[id] || false;
-            if (userAnswer === correct) score += 1;
-            else penalty += 0.5;
-        });
-
-        if (criteria.minOutgoingFlows) {
-            const userValue = testAnswers.minOutgoingFlows || 0;
-            if (userValue >= criteria.minOutgoingFlows) score += 1;
-            else penalty += 0.5;
-            total += 1;
-        }
-        if (criteria.minInternalElements) {
-            const userValue = testAnswers.minInternalElements || 0;
-            if (userValue >= criteria.minInternalElements) score += 1;
-            else penalty += 0.5;
-            total += 1;
-        }
-
-        const finalScore = Math.max(0, (score / total) * 100 - penalty * 5);
-        setTestResult(finalScore);
-        setTestCompleted(true);
-    };
+    }, [xml, label]);
 
     return (
-        <motion.div
-            className="guideline-section"
-            initial={{ opacity: 0, y: 5 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.3 }}
-        >
-            <motion.button
-                type="button"
-                className="guideline-section__trigger"
-                onClick={() => setIsOpen(!isOpen)}
-                aria-expanded={isOpen}
-                whileHover={{ backgroundColor: 'var(--color-surface-mist)' }}
-                transition={{ duration: 0.2 }}
-            >
-                <span>{data.title}</span>
-                {testCompleted ? <CheckIcon /> : isOpen ? <WarningIcon /> : <WarningIcon />}
-            </motion.button>
-            <AnimatePresence>
-                {isOpen && (
-                    <motion.div
-                        className="content"
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: 'auto', opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.3 }}
-                    >
-                        <div className="theory">
-                            <motion.h3 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.1, duration: 0.2 }}>
-                                Теория
-                            </motion.h3>
-                            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2, duration: 0.2 }}>
-                                {renderRichText(data.description)}
-                            </motion.p>
-                            <motion.h4 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.3, duration: 0.2 }}>
-                                Неправильный пример
-                            </motion.h4>
-                            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4, duration: 0.2 }}>
-                                {renderRichText(data.incorrectExample.description)}
-                            </motion.p>
-                            <motion.div className="diagram-container" initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.5, duration: 0.2 }}>
-                                {diagramLoading && (
-                                    <div className="diagram-container__overlay">
-                                        <PageLoader label="Рисуем пример схемы…" />
-                                    </div>
-                                )}
-                                <div ref={incorrectContainerRef} className="diagram" />
-                            </motion.div>
-                            {diagramErrors.incorrect && (
-                                <p className="guideline-error" role="alert">{diagramErrors.incorrect}</p>
-                            )}
-                            <motion.h4 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.6, duration: 0.2 }}>
-                                Правильный пример
-                            </motion.h4>
-                            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.7, duration: 0.2 }}>
-                                {renderRichText(data.correctExample.description)}
-                            </motion.p>
-                            <motion.div className="diagram-container" initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.8, duration: 0.2 }}>
-                                {diagramLoading && (
-                                    <div className="diagram-container__overlay">
-                                        <PageLoader label="Рисуем пример схемы…" />
-                                    </div>
-                                )}
-                                <div ref={correctContainerRef} className="diagram" />
-                            </motion.div>
-                            {diagramErrors.correct && (
-                                <p className="guideline-error" role="alert">{diagramErrors.correct}</p>
-                            )}
-                        </div>
-                        <div className="test">
-                            <motion.h3 initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.9, duration: 0.2 }}>
-                                Тест
-                            </motion.h3>
-                            <form onSubmit={handleTestSubmit}>
-                                {testQuestions.map(({ id, text }, index) => (
-                                    <motion.div key={id} initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 1.0 + 0.1 * index, duration: 0.2 }}>
-                                        <label>
-                                            <input type="checkbox" checked={testAnswers[id] || false} onChange={(e) => setTestAnswers({ ...testAnswers, [id]: e.target.checked })} /> {text}
-                                        </label>
-                                    </motion.div>
-                                ))}
-                                {data.evaluationCriteria.minOutgoingFlows && (
-                                    <motion.div initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 1.0 + 0.1 * testQuestions.length, duration: 0.2 }}>
-                                        <label>
-                                            Минимальное количество исходящих потоков:
-                                            <input type="number" value={testAnswers.minOutgoingFlows || 0} onChange={(e) => setTestAnswers({ ...testAnswers, minOutgoingFlows: parseInt(e.target.value) })} />
-                                        </label>
-                                    </motion.div>
-                                )}
-                                {data.evaluationCriteria.minInternalElements && (
-                                    <motion.div initial={{ x: -10, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 1.0 + 0.1 * (testQuestions.length + 1), duration: 0.2 }}>
-                                        <label>
-                                            Минимальное количество внутренних элементов:
-                                            <input type="number" value={testAnswers.minInternalElements || 0} onChange={(e) => setTestAnswers({ ...testAnswers, minInternalElements: parseInt(e.target.value) })} />
-                                        </label>
-                                    </motion.div>
-                                )}
-                                <motion.button type="submit" whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} transition={{ duration: 0.2 }}>
-                                    Проверить
-                                </motion.button>
-                            </form>
-                            {testResult !== null && (
-                                <motion.div className={`result ${testResult >= 80 ? 'pass' : 'fail'}`} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>
-                                    Ваш результат: {Math.round(testResult)}% {testResult >= 80 ? 'Отлично!' : 'Попробуйте снова.'}
-                                </motion.div>
-                            )}
-                        </div>
-                    </motion.div>
+        <>
+            <div className="diagram-container">
+                {loading && (
+                    <div className="diagram-container__overlay">
+                        <PageLoader label="Рисуем пример схемы…" />
+                    </div>
                 )}
-            </AnimatePresence>
-        </motion.div>
+                <div ref={containerRef} className="diagram" />
+            </div>
+            {error && <p className="guideline-error" role="alert">{error}</p>}
+        </>
     );
 };
 
-const Guideline = () => {
-    const [activeGroup, setActiveGroup] = useState(null);
-    const groups = {
-        Подпроцесс: ['subProcess', 'callActivity'],
-        Сообщения: ['messageEvent'],
-        Таймер: ['timerEvent'],
-        Активность: ['task'],
-        Развилки: ['exclusiveGateway', 'parallelGateway'],
-        События: ['startEvent', 'boundaryEvent'],
+/**
+ * Содержимое темы: теория со схемами и проверка. Вердикт отдаём наверх —
+ * метку «зачтено/не зачтено» видно в заголовке аккордеона, не только внутри.
+ */
+const GuidelineTopic = ({ data, onVerdict }) => {
+    const [answers, setAnswers] = useState({});
+    const [result, setResult] = useState(null);
+    const rules = buildRules(data);
+    const booleanRules = rules.filter((rule) => rule.kind === 'boolean');
+    const countRules = rules.filter((rule) => rule.kind === 'count');
+
+    const setAnswer = (id, value) => {
+        setAnswers((current) => ({ ...current, [id]: value }));
+    };
+
+    const handleTestSubmit = (event) => {
+        event.preventDefault();
+        const verdict = gradeTest(rules, answers);
+        setResult(verdict);
+        onVerdict(verdict);
     };
 
     return (
-        <WorkPage title="Мастерская BPMN" eyebrow="обучение" description="Разбирайте элементы схемы на коротких примерах: что сработает, что запутает команду и как это исправить." className="guideline">
+        <div className="guideline-body">
+            <div className="theory">
+                <h3>Теория</h3>
+                <p>{renderRichText(data.description)}</p>
+
+                <h4>Неправильный пример</h4>
+                <p>{renderRichText(data.incorrectExample.description)}</p>
+                <DiagramPreview xml={data.incorrectExample.xml} label="неправильный пример" />
+
+                <h4>Правильный пример</h4>
+                <p>{renderRichText(data.correctExample.description)}</p>
+                <DiagramPreview xml={data.correctExample.xml} label="правильный пример" />
+            </div>
+
+            <div className="test">
+                <h3>Проверьте себя</h3>
+                <form onSubmit={handleTestSubmit}>
+                    <p className="test__hint">
+                        Отметьте утверждения, которые верны для этого элемента, и укажите нужные минимумы.
+                    </p>
+
+                    {booleanRules.map((rule) => (
+                        <label className="test__option" key={rule.id}>
+                            <input
+                                type="checkbox"
+                                checked={Boolean(answers[rule.id])}
+                                onChange={(event) => setAnswer(rule.id, event.target.checked)}
+                            />
+                            <span>{rule.statement}</span>
+                        </label>
+                    ))}
+
+                    {countRules.map((rule) => (
+                        <label className="test__field" key={rule.id}>
+                            <span>{rule.statement}</span>
+                            <span className="test__field-line">
+                                <input
+                                    type="number"
+                                    inputMode="numeric"
+                                    min={0}
+                                    max={COUNT_MAX}
+                                    step={1}
+                                    value={answers[rule.id] ?? ''}
+                                    onChange={(event) => setAnswer(rule.id, event.target.value)}
+                                />
+                                <span className="test__bounds">0–{COUNT_MAX}</span>
+                            </span>
+                        </label>
+                    ))}
+
+                    <Button className="test__submit" type="submit" variant="primary" size="md">
+                        Проверить
+                    </Button>
+                </form>
+
+                {result && (
+                    <div className="result" role="status">
+                        <span className={`verdict-chip verdict-chip--${result.passed ? 'pass' : 'fail'}`}>
+                            {result.passed ? 'Зачтено' : 'Не зачтено'}
+                        </span>
+                        {result.passed ? (
+                            <p className="result__note">Все правила совпали с тем, как элемент используется в процессе.</p>
+                        ) : (
+                            <>
+                                <p className="result__note">Правила, где ответ разошёлся:</p>
+                                <ul className="result__list">
+                                    {result.failures.map((failure) => (
+                                        <li key={failure.statement}>
+                                            {failure.statement} — {failure.answer}
+                                        </li>
+                                    ))}
+                                </ul>
+                            </>
+                        )}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+const GROUPS = {
+    'Подпроцесс': ['subProcess', 'callActivity'],
+    'Сообщения': ['messageEvent'],
+    'Таймер': ['timerEvent'],
+    'Активность': ['task'],
+    'Развилки': ['exclusiveGateway', 'parallelGateway'],
+    'События': ['startEvent', 'boundaryEvent'],
+};
+
+/**
+ * Аккордеон один на всю группу: `Accordion` строит id панелей по индексу внутри
+ * своего списка, поэтому несколько экземпляров на странице дали бы повторяющиеся
+ * `faq-trigger-0` и сломали бы `aria-labelledby`.
+ */
+const Guideline = () => {
+    const [activeGroup, setActiveGroup] = useState(null);
+    const [verdicts, setVerdicts] = useState({});
+
+    const setVerdict = (key, verdict) => {
+        setVerdicts((current) => ({ ...current, [key]: verdict }));
+    };
+
+    const topics = activeGroup ? GROUPS[activeGroup] : [];
+    const items = topics.map((key) => {
+        const data = guidelineExamples[key];
+        const verdict = verdicts[key];
+        return {
+            question: (
+                <span className="guideline-heading">
+                    <span className="guideline-heading__title">{data.title}</span>
+                    {verdict && (
+                        <span className={`verdict-chip verdict-chip--${verdict.passed ? 'pass' : 'fail'}`}>
+                            {verdict.passed ? 'зачтено' : 'не зачтено'}
+                        </span>
+                    )}
+                </span>
+            ),
+            answer: <GuidelineTopic data={data} onVerdict={(verdict) => setVerdict(key, verdict)} />,
+        };
+    });
+
+    return (
+        <WorkPage
+            title="Мастерская BPMN"
+            eyebrow="обучение"
+            description="Разбирайте элементы схемы на коротких примерах: что сработает, что запутает команду и как это исправить."
+            className="guideline">
             <div className="guideline-content">
-                <motion.div className="guideline-sidebar" initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.1, duration: 0.3 }}>
-                    {Object.keys(groups).map((group) => (
-                        <motion.button
+                <motion.div
+                    className="guideline-sidebar"
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: 0.1, duration: 0.3 }}>
+                    {Object.keys(GROUPS).map((group) => (
+                        <button
                             type="button"
                             key={group}
                             className={`sidebar-item ${activeGroup === group ? 'active' : ''}`}
-                            onClick={() => setActiveGroup(activeGroup === group ? null : group)}
-                            whileHover={{ backgroundColor: 'var(--color-surface-mist)' }}
-                            transition={{ duration: 0.2 }}
-                        >
+                            aria-pressed={activeGroup === group}
+                            onClick={() => setActiveGroup(activeGroup === group ? null : group)}>
                             {group}
-                        </motion.button>
+                        </button>
                     ))}
                 </motion.div>
-                <motion.div className="guideline-main" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2, duration: 0.3 }}>
-                    <AnimatePresence>
-                        {activeGroup && (
-                            <motion.div
-                                className="guideline-sections"
-                                initial={{ opacity: 0, y: 5 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                exit={{ opacity: 0, y: -5 }}
-                                transition={{ duration: 0.3 }}
-                            >
-                                {groups[activeGroup].map((key) => (
-                                    <GuidelineSection key={key} elementKey={key} data={guidelineExamples[key]} />
-                                ))}
-                            </motion.div>
-                        )}
-                    </AnimatePresence>
+
+                <motion.div
+                    className="guideline-main"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: 0.2, duration: 0.3 }}>
+                    {activeGroup ? (
+                        <Accordion items={items} />
+                    ) : (
+                        <EmptyState
+                            title="Выберите тему слева"
+                            description="Тема — это короткое правило, два примера схемы «как нельзя» и «как надо», и проверка на несколько утверждений по этому элементу."
+                        />
+                    )}
                 </motion.div>
             </div>
         </WorkPage>

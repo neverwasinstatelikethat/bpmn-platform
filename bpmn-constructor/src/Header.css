@@ -1,6 +1,10 @@
 /* ============================================================
    Плавающая навигация-пилюля (ВкусВилл × Softly)
-   70% белого + 20px blur, ширина 100% − 32px
+   Сплошной --color-canvas без blur и стеклянных подложек,
+   нижняя hairline-граница, ширина 100% − 2 × --page-gutter.
+   Компактность шапки держится токеном --nav-height: зоны нажатия
+   контролов вытянуты до --control-min-height псевдоэлементами,
+   а не размером в потоке, — высота пилюли от них не растёт.
    ============================================================ */
 
 .nav {
@@ -100,8 +104,89 @@
         color: var(--color-primary);
     }
 
-.nav__link--static {
-    cursor: default;
+    /* Активный пункт — подчёркиванием и весом, не цветом состояния. */
+    .nav__link--current {
+        color: var(--color-ink);
+        font-weight: 600;
+        text-decoration: underline;
+        text-decoration-thickness: 2px;
+        text-underline-offset: 5px;
+    }
+
+/* Зона нажатие контролов шапки — минимум --control-min-height. Внутри пилюли
+   высота остаётся компактной, поэтому добавка идёт абсолютным псевдоэлементом. */
+.nav__brand,
+.nav__links > .nav__link,
+.nav__trigger,
+.nav__avatar,
+.nav__burger,
+.nav__actions .ui-btn {
+    position: relative;
+}
+
+    .nav__brand::after,
+    .nav__links > .nav__link::after,
+    .nav__trigger::after,
+    .nav__avatar::after,
+    .nav__burger::after,
+    .nav__actions .ui-btn::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        min-height: var(--control-min-height);
+    }
+
+    .nav__avatar::after,
+    .nav__burger::after {
+        left: -6px;
+        right: -6px;
+    }
+
+/* ---------- Групповая кнопка «Обучение» ---------- */
+
+.nav__trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: inherit;
+    line-height: inherit;
+    background: none;
+    border: none;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+/* Клавиатурный фокус обязателен и виден: глобальный :focus-visible
+   дополняем явным правилом, чтобы пилюля не сливалась с шапкой. */
+.nav__trigger:focus-visible,
+.nav__link:focus-visible,
+.nav__brand:focus-visible,
+.nav__avatar:focus-visible,
+.nav__burger:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+}
+
+.nav__trigger-caret {
+    width: 7px;
+    height: 7px;
+    flex: none;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(45deg) translateY(-2px);
+    transition: transform var(--duration-fast) var(--ease-soft);
+}
+
+.nav__trigger[aria-expanded='true'] .nav__trigger-caret {
+    transform: rotate(-135deg) translateY(-2px);
+}
+
+.nav__trigger[aria-expanded='true'] {
+    background: var(--color-surface-mist);
+    color: var(--color-ink);
 }
 
 /* ---------- Выпадающее меню «Обучение» ---------- */
@@ -126,7 +211,11 @@
     z-index: 101;
 }
 
+    /* В плавающей панели места достаточно, поэтому там размер реальный. */
     .nav__dropdown-menu .nav__link {
+        display: flex;
+        align-items: center;
+        min-height: var(--control-min-height);
         font-size: 14px;
         color: var(--color-ink-soft);
     }
@@ -208,7 +297,14 @@
 }
 
     .nav__mobile .nav__link {
+        display: flex;
+        align-items: center;
+        min-height: var(--control-min-height);
         padding: 12px 16px;
+    }
+
+    .nav__mobile .ui-btn {
+        min-height: var(--control-min-height);
     }
 
 /* ---------- Адаптивность ---------- */
@@ -238,5 +334,40 @@
 
     .nav__brand-tag {
         display: none;
+    }
+}
+
+/* Пилюля не переносится по строкам, а .nav — position:fixed: при нехватке
+   ширины содержимое не уходит в скролл, а обрезается за краем экрана.
+   На узких ширинах уплотняем группы и даём бренду сжаться с многоточием. */
+@media (max-width: 380px) {
+    .nav {
+        padding: 0 var(--space-sm);
+    }
+
+    .nav__pill {
+        gap: var(--space-xs);
+    }
+
+    .nav__actions {
+        gap: var(--space-xxs);
+    }
+
+    .nav__actions .ui-btn {
+        padding-inline: 12px;
+    }
+
+    .nav__brand {
+        min-width: 0;
+    }
+
+    .nav__brand-text {
+        min-width: 0;
+    }
+
+    .nav__brand-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
 }

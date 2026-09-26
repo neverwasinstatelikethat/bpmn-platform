@@ -1,5 +1,8 @@
 .invite-accept-container {
+    /* 100vh на мобильном считается с учётом сворачивающейся панели браузера,
+       поэтому нижняя часть карточки обрезалась: сначала фолбэк, затем dvh. */
     min-height: 100vh;
+    min-height: 100dvh;
     padding: calc(var(--nav-height) + var(--space-3xl)) var(--page-gutter) var(--space-section);
 }
 
@@ -29,3 +32,16 @@
     margin: 0 0 var(--space-xl);
     color: var(--color-ink-soft);
 }
+
+/* Действия в карточке — одна строка с переносом: повтор, вход и возврат
+   одинаково доступны и с клавиатуры, и касанием. */
+.invite-accept-card__actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+    .invite-accept-card__actions .ui-btn {
+        min-height: var(--control-min-height);
+    }

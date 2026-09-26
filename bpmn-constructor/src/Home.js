@@ -1,43 +1,18 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from './context/AuthContext';
-import { Button, Badge, SectionHeading, Accordion, Reveal, Aurora, Switch, Slider, Typewriter, ImageTrail } from './components/ui';
+import { Button, Badge, SectionHeading, Accordion, Reveal, Aurora, Typewriter, ImageTrail } from './components/ui';
 import { API_BASE_URL } from './config';
 import './Home.css';
 
+// Хронология без меток времени: «09:15 → 09:17» читалось как замер скорости,
+// которого мы не делали.
 const scenarios = [
-    { time: '09:15', text: 'Описала закупку обычными словами' },
-    { time: '09:17', text: 'ИИ собрал схему — осталась пара штрихов' },
-    { time: '11:40', text: 'Нашли узкое место в согласовании' },
-    { time: '14:05', text: 'Поделилась схемой с командой' },
-    { time: '16:30', text: 'Процесс готов — экспорт в PDF' },
-];
-
-const notes = [
-    {
-        text: 'Раньше рисовала квадратики в блокноте. Теперь описываю процесс словами — и схема готова.',
-        name: 'Марина',
-        role: 'закупки',
-        tilt: 'left',
-    },
-    {
-        text: 'Нашли узкое место в согласовании договоров за один вечер. Теперь экономим два дня на каждом.',
-        name: 'Илья',
-        role: 'комплаенс',
-        tilt: 'right',
-    },
-    {
-        text: 'ИИ не рисует за меня — он забирает рутину. Так честнее и спокойнее.',
-        name: 'Света',
-        role: 'аналитика',
-        tilt: 'right',
-    },
-    {
-        text: 'Подключил команду за пять минут. Никто даже не спросил инструкцию.',
-        name: 'Павел',
-        role: 'ИТ',
-        tilt: 'left',
-    },
+    { key: 'describe', text: 'Описываете закупку обычными словами' },
+    { key: 'generate', text: 'ИИ собирает схему — остаётся пара штрихов' },
+    { key: 'find', text: 'В согласовании находится узкое место' },
+    { key: 'share', text: 'Схемой делитесь с командой' },
+    { key: 'export', text: 'Процесс готов — экспорт в PDF' },
 ];
 
 const faqItems = [
@@ -59,37 +34,30 @@ const faqItems = [
     },
     {
         question: 'Как работать вместе с командой?',
-        answer: 'Поделитесь схемой по ссылке: коллеги смогут смотреть и комментировать. Все изменения сохраняются автоматически.',
+        answer: 'Нажмите «Поделиться» в редакторе: ссылка живёт неделю и открывает схему на чтение — без входа в аккаунт. Если доступ дан на изменение, по ссылке можно открыть редактируемую копию. Коллеги увидят правки только после «Сохранить» в редакторе: автосохранения и комментариев на странице доступа нет.',
     },
 ];
 
-/* фразы для печатной машинки в мок-чате героя */
+/* фразы для печатной машинки в мок-чате героя: только то, что ИИ делает по факту */
 const aiPhrases = [
-    'Собрала схему из трёх шагов и двух проверок.',
-    'Нашла узкое место: согласование занимает два дня.',
-    'Подскажу, где процесс можно упростить.',
+    'Собрала черновик схемы по вашему описанию.',
+    'Отметила шаги, которые можно упростить.',
+    'Правьте в редакторе — схема остаётся вашей.',
 ];
 
-/* скриншоты для следа за курсором */
+/* Единственный ассет, за который мы ручаемся: реальная BPMN-схема кредитного
+   процесса с пулами и шлюзами. Два SVG рядом с ним в static/ — graphviz-кластеры
+   («adds new user», «sends notification»), к BPMN отношения не имеют.
+   Свежие снимки текущего интерфейса добавим, когда редактор и реестр улягутся. */
 const staticAsset = (file) => `${API_BASE_URL}/static/${file}`;
 const trailImages = [
-    { src: staticAsset('bpmn_diagram.png'), alt: 'Пример BPMN-схемы', label: 'Схема процесса' },
-    { src: staticAsset('a1132323-a375-4e27-940e-8fec0cbd9768.svg'), alt: 'Визуальный пример процесса', label: 'Процесс' },
-    { src: staticAsset('bb84aded-8e6b-4b43-a334-dbf855046a22.svg'), alt: 'Визуальный пример BPMN', label: 'BPMN' },
-];
-
-/* слайды для карусели возможностей */
-const featureSlides = [
-    { src: staticAsset('bpmn_diagram.png'), alt: 'Пример BPMN-схемы', caption: 'ИИ собирает черновик из обычного описания' },
-    { src: staticAsset('a1132323-a375-4e27-940e-8fec0cbd9768.svg'), alt: 'Визуальный пример процесса', caption: 'Редактор сохраняет логику процесса ясной' },
-    { src: staticAsset('bb84aded-8e6b-4b43-a334-dbf855046a22.svg'), alt: 'Визуальный пример BPMN', caption: 'Анализ помогает увидеть узкие места' },
+    { src: staticAsset('bpmn_diagram.png'), alt: 'Схема кредитного процесса с пулами и шлюзами', label: 'Пулы, шлюзы, события' },
 ];
 
 const Home = () => {
     const { user } = useAuth();
     const navigate = useNavigate();
     const [email, setEmail] = useState('');
-    const [aiHints, setAiHints] = useState(true);
 
     const handleStart = (e) => {
         e.preventDefault();
@@ -132,16 +100,21 @@ const Home = () => {
                 <section className="scenarios">
                     <Reveal>
                         <SectionHeading
-                            eyebrow="один день"
+                            eyebrow="путь схемы"
                             title="С конструктором — спокойно"
-                            subtitle="Никаких пустых холстов и «а с чего начать». Вот как проходит обычный день."
+                            subtitle="Никаких пустых холстов и «а с чего начать». От описания словами до экспорта — пять шагов."
                         />
                     </Reveal>
                     <Reveal delay={0.1}>
-                        <div className="scenarios__track" role="list">
-                            {scenarios.map((item) => (
-                                <article key={item.time} className="scenario-card" role="listitem">
-                                    <span className="scenario-card__time">{item.time}</span>
+                        <div
+                            className="scenarios__track"
+                            role="list"
+                            tabIndex={0}
+                            aria-label="Лента сценариев, прокручивается по горизонтали"
+                        >
+                            {scenarios.map((item, index) => (
+                                <article key={item.key} className="scenario-card" role="listitem">
+                                    <span className="scenario-card__step">{String(index + 1).padStart(2, '0')}</span>
                                     <span className="scenario-card__text">{item.text}</span>
                                 </article>
                             ))}
@@ -161,9 +134,6 @@ const Home = () => {
                     <Reveal delay={0.15}>
                         <div className="preview__stage">
                             <div className="screen screen--side screen--left" aria-hidden="true">
-                                <div className="screen__bar">
-                                    <span className="screen__dot" /><span className="screen__dot" /><span className="screen__dot" />
-                                </div>
                                 <div className="screen__body screen__body--sage">
                                     <div className="mock-flow">
                                         <div className="mock-node" />
@@ -194,97 +164,63 @@ const Home = () => {
                                                 <span className="chat__chip">Директор</span>
                                             </span>
                                         </div>
-                                        <button type="button" className="ui-btn ui-btn--primary ui-btn--md btn-pulse">
+                                        <Button className="btn-pulse" to={user ? '/editor' : '/register'}>
                                             Создать схему
-                                        </button>
+                                        </Button>
                                     </div>
                                 </div>
                             </div>
 
+                            {/* декоративный экран: абстрактная геометрия без шкалы,
+                                подписей и вердиктов — это не график с данными */}
                             <div className="screen screen--side screen--right" aria-hidden="true">
-                                <div className="screen__bar">
-                                    <span className="screen__dot" /><span className="screen__dot" /><span className="screen__dot" />
-                                </div>
                                 <div className="screen__body screen__body--lavender">
-                                    <div className="screen__switch">
-                                        <Switch size="sm" checked={aiHints} onChange={setAiHints} label="ИИ-подсветка" />
-                                    </div>
                                     <div className="mock-bars">
-                                        <div className="mock-bar" style={{ height: '38%' }} />
-                                        <div className="mock-bar" style={{ height: '62%' }} />
-                                        <div className="mock-bar" style={{ height: '46%' }} />
-                                        <div className={`mock-bar ${aiHints ? 'mock-bar--accent' : ''}`} style={{ height: '82%' }} />
-                                        <div className="mock-bar" style={{ height: '54%' }} />
+                                        <div className="mock-bar" />
+                                        <div className="mock-bar" />
+                                        <div className="mock-bar" />
+                                        <div className="mock-bar" />
+                                        <div className="mock-bar" />
                                     </div>
-                                    <div className="mock-stat">{aiHints ? 'узкое место найдено' : 'анализ на паузе'}</div>
                                 </div>
                             </div>
                         </div>
                     </Reveal>
                 </section>
 
-                {/* ---------- Витрина: след за курсором и карусель ---------- */}
+                {/* ---------- Витрина: след за курсором (на тач — слайдер) ---------- */}
                 <section className="showcase" id="showcase">
                     <Reveal>
                         <SectionHeading
                             eyebrow="вот что внутри"
                             title="Побегайте курсором по продукту"
-                            subtitle="Скриншоты настоящие: редактор, ИИ-чат, аналитика и совместный доступ."
+                            subtitle="Схемы процессов, а не макеты интерфейса: так выглядит результат, с которым работает редактор."
                         />
                     </Reveal>
                     <Reveal delay={0.1}>
                         <ImageTrail
                             images={trailImages}
-                            hint="Поведите курсором — скриншоты потянутся за ним"
-                        />
-                    </Reveal>
-                    <Reveal delay={0.15}>
-                        <Slider
-                            slides={featureSlides}
-                            autoPlay={4200}
-                            className="showcase__slider"
-                            ariaLabel="Возможности конструктора"
+                            className="showcase__trail"
+                            ariaLabel="Схемы процессов"
+                            hint="Поведите курсором — схемы потянутся за ним"
                         />
                     </Reveal>
                 </section>
 
-                {/* ---------- Заметки команды ---------- */}
-                <section className="notes">
-                    <Reveal>
-                        <SectionHeading
-                            eyebrow="живые отзывы"
-                            title="Заметки на полях"
-                            subtitle="Что говорят коллеги, которые уже перестали рисовать квадратики вручную."
-                        />
-                    </Reveal>
-                    <div className="notes__grid">
-                        {notes.map((note, index) => (
-                            <Reveal key={note.name} delay={index * 0.08}>
-                                <article className={`note note--tilt-${note.tilt}`}>
-                                    <p className="note__text">«{note.text}»</p>
-                                    <div className="note__sign">
-                                        <span className="note__sign-line" aria-hidden="true" />
-                                        <span className="note__sign-name">{note.name}, {note.role}</span>
-                                    </div>
-                                </article>
-                            </Reveal>
-                        ))}
-                    </div>
-                </section>
-
-                {/* ---------- Конверсионный блок ---------- */}
+                {/* ---------- Конверсионный блок: финальная сцена ---------- */}
+                {/* Одна большая зелёная плоскость действия (green — цвет действия)
+                    вместо тёмной плиты с блобами; характер держат дисплейный
+                    заголовок с зелёным акцентом и одна кнопка. Подсветка Aurora
+                    остаётся только в hero. */}
                 <section className="convert">
                     <Reveal>
                         <div className="convert__panel">
-                            <div className="convert__glow convert__glow--green" aria-hidden="true" />
-                            <div className="convert__glow convert__glow--berry" aria-hidden="true" />
-                            <div className="convert__icon" aria-hidden="true">
-                                <span className="convert__icon-dot" />
-                            </div>
-                            <h2 className="convert__title">Начните в своём темпе</h2>
+                            <h2 className="convert__title">
+                                Начните в <span className="convert__accent">своём темпе</span>
+                            </h2>
                             <p className="convert__subtitle">
-                                Бесплатно для команды ВкусВилла. Первая схема — уже через пять минут,
-                                без обучения и настройки.
+                                Бесплатно для команды ВкусВилла. Первая схема собирается
+                                с обычного описания процесса — без обучения и настройки.
                             </p>
                             {user ? (
                                 <Button size="lg" to="/editor">Открыть редактор</Button>
@@ -292,13 +228,16 @@ const Home = () => {
                                 <form className="convert__form" onSubmit={handleStart}>
                                     <input
                                         type="email"
-                                        className="convert__input"
+                                        className="ui-input convert__field"
                                         placeholder="Рабочая почта"
                                         aria-label="Рабочая почта"
+                                        autoComplete="email"
                                         value={email}
                                         onChange={(e) => setEmail(e.target.value)}
                                     />
-                                    <button type="submit" className="convert__submit">Начать</button>
+                                    <button type="submit" className="ui-btn ui-btn--primary ui-btn--lg convert__submit">
+                                        Начать
+                                    </button>
                                 </form>
                             )}
                         </div>
@@ -327,8 +266,8 @@ const Home = () => {
                         ВкусВилл · конструктор процессов
                     </div>
                     <nav className="footer__links" aria-label="Подвал">
-                        {!user && <a href="/login">Вход</a>}
-                        {!user && <a href="/register">Регистрация</a>}
+                        {!user && <Link to="/login">Вход</Link>}
+                        {!user && <Link to="/register">Регистрация</Link>}
                         <a href="#faq">Вопросы</a>
                         <a href="#how">Как это работает</a>
                     </nav>

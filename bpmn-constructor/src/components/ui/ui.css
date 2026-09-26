@@ -110,6 +110,18 @@
         color: var(--color-ink);
     }
 
+/* Деструктивное действие — текстовое, а не залитое: ягода как плашка
+   конкурирует с primary за внимание и придаёт удалению вес подтверждения. */
+.ui-btn--danger {
+    background: transparent;
+    color: var(--color-danger-text);
+}
+
+    .ui-btn--danger:hover {
+        background: var(--color-danger-soft);
+        color: var(--color-danger-text);
+    }
+
 .ui-btn--block {
     width: 100%;
 }
@@ -161,6 +173,32 @@
     flex: none;
 }
 
+/* Статусные тона: фон и текст всегда парами из одной пары токенов. */
+.ui-badge--danger {
+    background: var(--color-danger-soft);
+    color: var(--color-danger-text);
+}
+
+.ui-badge--warning {
+    background: var(--color-warning-soft);
+    color: var(--color-warning-text);
+}
+
+/* Нейтральный тон — «значения нет» (например, схема без оценки): подложка как у
+   инпутов, текст приглушённый. Статусного цвета здесь нет намеренно. */
+.ui-badge--neutral {
+    background: var(--color-surface-mist);
+    color: var(--color-muted);
+}
+
+/* Плотная метка: строки таблиц и бумаги папок, где важна ширина, а не воздух. */
+.ui-badge--sm {
+    padding: 4px 8px;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
 /* ---------- Input ---------- */
 
 .ui-field {
@@ -200,6 +238,116 @@
         background: var(--color-surface);
         box-shadow: 0 0 0 4px var(--color-primary-soft);
     }
+
+/* ---------- Select ---------- */
+
+.ui-select {
+    min-height: var(--control-min-height);
+    width: 100%;
+    padding: 0 var(--space-lg) 0 22px;
+    border: 1px solid var(--color-hairline);
+    border-radius: var(--radius-pill);
+    background: var(--color-surface-mist);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    color: var(--color-ink);
+    cursor: pointer;
+    transition:
+        border-color var(--duration-fast) var(--ease-soft),
+        box-shadow var(--duration-fast) var(--ease-soft),
+        background-color var(--duration-fast) var(--ease-soft);
+}
+
+    .ui-select:hover {
+        border-color: var(--color-faint);
+    }
+
+    .ui-select:focus-visible {
+        outline: none;
+        border-color: var(--color-primary);
+        background: var(--color-surface);
+        box-shadow: var(--focus-ring);
+    }
+
+/* ---------- Textarea ---------- */
+
+.ui-textarea {
+    min-height: 92px;
+    width: 100%;
+    padding: 14px 22px;
+    border: 1px solid var(--color-hairline);
+    border-radius: var(--radius-md);
+    background: var(--color-surface-mist);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: 1.5;
+    color: var(--color-ink);
+    resize: vertical;
+    transition:
+        border-color var(--duration-fast) var(--ease-soft),
+        box-shadow var(--duration-fast) var(--ease-soft),
+        background-color var(--duration-fast) var(--ease-soft);
+}
+
+    .ui-textarea::placeholder {
+        color: var(--color-faint);
+    }
+
+    .ui-textarea:focus {
+        outline: none;
+        border-color: var(--color-primary);
+        background: var(--color-surface);
+        box-shadow: var(--focus-ring);
+    }
+
+.ui-textarea__count {
+    margin: 0;
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+    text-align: end;
+}
+
+/* ---------- Modal ---------- */
+
+.ui-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 70;
+    display: grid;
+    place-items: center;
+    padding: var(--page-gutter);
+    background: var(--color-scrim);
+}
+
+.ui-modal__panel {
+    width: min(100%, 460px);
+    /* Без min-width:0 длинная ссылка-приглашение или строка кнопок растягивают
+       панель за экран на 375 px (замер: 423 px). */
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding: var(--space-xl);
+    border-radius: var(--radius-panel);
+    background: var(--color-surface);
+    box-shadow: var(--shadow-lift);
+}
+
+.ui-modal__title {
+    margin: 0 0 var(--space-sm);
+    font-size: var(--text-h3);
+}
+
+.ui-modal__description {
+    margin: 0;
+    color: var(--color-ink-soft);
+}
+
+.ui-modal__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+    margin-top: var(--space-xl);
+}
 
 /* ---------- SectionHeading ---------- */
 
@@ -558,26 +706,43 @@
     margin-top: var(--space-md);
 }
 
+/* Сама метка остаётся 8 px — зона нажатия вынесена в бокс кнопки,
+   чтобы на тач-устройстве попадание было не 8×8. */
 .ui-slider__dot {
-    width: 8px;
-    height: 8px;
+    width: 28px;
+    height: var(--control-min-height);
     padding: 0;
     border: none;
-    border-radius: 50%;
-    background: var(--color-hairline);
+    display: grid;
+    place-items: center;
+    background: none;
     cursor: pointer;
-    transition: background-color var(--duration-fast) var(--ease-soft), transform var(--duration-fast) var(--ease-soft), width var(--duration-fast) var(--ease-soft);
 }
 
-.ui-slider__dot:hover {
-    background: var(--color-faint);
-}
+    .ui-slider__dot::before {
+        content: '';
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--color-hairline);
+        transition: background-color var(--duration-fast) var(--ease-soft), width var(--duration-fast) var(--ease-soft), border-radius var(--duration-fast) var(--ease-soft);
+    }
 
-.ui-slider__dot.is-active {
-    width: 24px;
-    border-radius: var(--radius-pill);
-    background: var(--color-primary);
-}
+    .ui-slider__dot:hover::before {
+        background: var(--color-faint);
+    }
+
+    .ui-slider__dot.is-active::before {
+        width: 24px;
+        border-radius: var(--radius-pill);
+        background: var(--color-primary);
+    }
+
+    .ui-slider__dot:focus-visible {
+        outline: 2px solid var(--color-primary);
+        outline-offset: -2px;
+        border-radius: var(--radius-pill);
+    }
 
 /* ---------- ImageTrail ---------- */
 

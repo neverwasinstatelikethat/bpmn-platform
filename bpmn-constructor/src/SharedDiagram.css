@@ -1,8 +1,65 @@
+/* Холст общего просмотра. Высота ограничена сверху 640 px и берётся от
+   динамической высоты окна (dvh), а не от 100vh: на мобильном с
+   сворачивающейся панелью браузера резерв считался по полной высоте,
+   и низ схемы уходил за экран. Минимум 260 px держит диаграмму
+   читаемой на небольших окнах. */
 .shared-diagram__canvas {
-    height: min(640px, 70vh);
+    height: min(640px, 70dvh);
+    min-height: 260px;
     background: var(--color-surface);
     border: 1px solid var(--color-hairline-soft);
     border-radius: var(--radius-card);
     box-shadow: var(--shadow-soft);
     overflow: hidden;
+}
+
+@supports not (height: 70dvh) {
+    .shared-diagram__canvas {
+        height: min(640px, 70vh);
+    }
+}
+
+.shared-diagram__toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-xs);
+    margin-bottom: var(--space-sm);
+}
+
+    .shared-diagram__toolbar .ui-btn--sm {
+        min-width: var(--control-min-height);
+        min-height: var(--control-min-height);
+        padding-inline: var(--space-md);
+        font-size: var(--text-body);
+    }
+
+.shared-diagram__hint {
+    margin: var(--space-sm) 0 0;
+    color: var(--color-muted);
+    font-size: var(--text-sm);
+}
+
+@media (max-height: 560px) {
+    .shared-diagram__canvas {
+        height: 60dvh;
+    }
+}
+
+/* От 641 px холст берёт остаток окна, а не 70dvh: шапка страницы с заголовком,
+   описанием, действием и панелью масштаба занимает ~460 px, и при 70dvh низ
+   схемы уезжал за границу экрана — до неё надо было скроллить. */
+@media (min-width: 641px) {
+    .shared-diagram__canvas {
+        height: max(320px, min(640px, calc(100dvh - 460px)));
+    }
+}
+
+/* На узком телефоне шапка, заголовок и панель масштаба занимают треть
+   экрана: при 70dvh нижний край холста уходил за сгиб, и схема,
+   вписанная в невидимую часть, казалась обрезанной. */
+@media (max-width: 640px) {
+    .shared-diagram__canvas {
+        height: max(260px, 46dvh);
+    }
 }

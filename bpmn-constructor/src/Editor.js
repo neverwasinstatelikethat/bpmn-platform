@@ -5,12 +5,14 @@ import { layoutDiagram } from './bpmnLayout';
 import 'bpmn-js/dist/assets/diagram-js.css';
 import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
 import { apiClient, toUserMessage } from './api/client';
+import { humanizeBpmnNote } from './i18n/labels';
 import { v4 as uuid } from 'uuid';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
 import GenerateChat from './GenerateChat';
 import ImproveChat from './ImproveChat';
 import ScorePanel from './ScorePanel';
+import { describeRulesDelta } from './scoreRules';
 import { getDi } from 'bpmn-js/lib/util/ModelUtil';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Button, Input } from './components/ui';
@@ -40,6 +42,86 @@ const FILL_COLORS = [
 
 /* Подсветка найденных элементов берёт цвет из дизайн-токена. */
 const HIGHLIGHT_TOKEN = '--color-primary-soft';
+
+/* ---------- Язык интерфейса вместо языка реализации ---------- */
+
+/* Имя схемы по умолчанию: `Process_<uuid>` аналитику ни о чём не говорит. */
+const DEFAULT_DIAGRAM_NAME = 'Новая схема';
+
+/* Внутренний id BPMN-элемента: тип + хвост из base36/uuid (`Task_0x8y9z1`).
+   Хвост бывает и из двух символов (`Task_3a`) — его тоже ловим. */
+const BPMN_INTERNAL_ID = /^[A-Z][a-zA-Z ]*_[0-9a-zA-Z]{2,}/;
+
+/** Заголовок схемы: пустое значение и авто-id меняем на человеческое имя. */
+const displayDiagramName = (raw, fallback = DEFAULT_DIAGRAM_NAME) => {
+    const value = String(raw ?? '').trim();
+    if (!value || BPMN_INTERNAL_ID.test(value)) return fallback;
+    return value;
+};
+
+/** true, если в строке не осталось служебных id — только такую показываем. */
+const hasNoInternalIds = (text) => !/[A-Z][a-zA-Z ]*_[0-9a-zA-Z]{2,}/.test(text);
+
+/**
+ * Заметки детерминированной починки (core/bpmn_generator.py) для чата.
+ * humanizeBpmnNote переводит известные формулировки; строки, где после
+ * перевода остались служебные id, в чат не выпускаем — сводим их в число.
+ */
+const describeGeneratorFixes = (notes) => {
+    const list = Array.isArray(notes) ? notes : [];
+    if (!list.length) return 'Схема готова.';
+    const clean = [];
+    for (const note of list) {
+        const text = humanizeBpmnNote(note);
+        if (text && hasNoInternalIds(text) && !clean.includes(text)) clean.push(text);
+    }
+    if (!clean.length) {
+        return `Схема готова. Автоматика поправила структуру в ${list.length} местах — `
+            + 'подробности увидите при проверке схемы.';
+    }
+    const shown = clean.slice(0, 3);
+    const hidden = list.length - shown.length;
+    return `Схема готова. Автоматика поправила структуру: ${shown.join('; ')}`
+        + (hidden > 0 ? `; и ещё правок: ${hidden}.` : '.');
+};
+
+/**
+ * Закрытие всплывающего слоя по Escape и клику вне, фокус возвращается на
+ * триггер. Локальная реализация для двух слоёв редактора (меню экспорта и
+ * палитра заливок): общего Popover из `components/ui` ещё нет — он в плане,
+ * фаза 3, и тогда этот хук переедет туда.
+ */
+const useFloatingLayer = ({ open, onClose, triggerRef, layerRef }) => {
+    useEffect(() => {
+        if (!open) return undefined;
+        const onKeyDown = (event) => {
+            if (event.key !== 'Escape') return;
+            onClose();
+            triggerRef.current?.focus();
+        };
+        const onMouseDown = (event) => {
+            const target = event.target;
+            if (layerRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
+            onClose();
+        };
+        // Tab уносит фокус из слоя — висящее открытое меню оставляем только
+        // пока фокус внутри слоя или на триггере.
+        const onFocusOut = (event) => {
+            const next = event.relatedTarget;
+            if (!next) return;
+            if (layerRef.current?.contains(next) || triggerRef.current?.contains(next)) return;
+            onClose();
+        };
+        document.addEventListener('keydown', onKeyDown);
+        document.addEventListener('mousedown', onMouseDown);
+        document.addEventListener('focusout', onFocusOut);
+        return () => {
+            document.removeEventListener('keydown', onKeyDown);
+            document.removeEventListener('mousedown', onMouseDown);
+            document.removeEventListener('focusout', onFocusOut);
+        };
+    }, [open, onClose, triggerRef, layerRef]);
+};
 
 class BPMNExporter {
     constructor(bpmnViewer) {
@@ -276,11 +358,11 @@ const emptyBpmn = `<?xml version="1.0" encoding="UTF-8"?>
   xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
   id="Definitions_${uuid()}"
   targetNamespace="http://bpmn.io/schema/bpmn">
-  <bpmn:process id="Process_${uuid()}" isExecutable="false">
-    <bpmn:startEvent id="StartEvent_${uuid()}" name="Start">
+  <bpmn:process id="Process_${uuid()}" name="Новая схема" isExecutable="false">
+    <bpmn:startEvent id="StartEvent_${uuid()}" name="Начало">
       <bpmn:outgoing>Flow_${uuid()}</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:task id="Task_${uuid()}" name="Task">
+    <bpmn:task id="Task_${uuid()}" name="Шаг">
       <bpmn:incoming>Flow_${uuid()}</bpmn:incoming>
     </bpmn:task>
     <bpmn:sequenceFlow id="Flow_${uuid()}" sourceRef="StartEvent_${uuid()}" targetRef="Task_${uuid()}" />
@@ -305,11 +387,17 @@ const Editor = () => {
     const modelerRef = useRef(null);
     const containerRef = useRef(null);
     const paletteRef = useRef(null);
-    const [diagramName, setDiagramName] = useState('Новая схема');
+    const [diagramName, setDiagramName] = useState(DEFAULT_DIAGRAM_NAME);
     const [diagramId, setDiagramId] = useState(null);
     const [validationResult, setValidationResult] = useState(null);
+    // id элемента -> его название: отчёт оценки показывает имена, а не Task_0x8y9z1.
+    const [elementNames, setElementNames] = useState({});
     const [score, setScore] = useState(0);
     const [showScorePanel, setShowScorePanel] = useState(false);
+    // Отдельное состояние «нечего проверять»: это не ошибка запроса и не
+    // «оценки ещё нет» — схема до сих пор стартовый шаблон.
+    const [scoreEmpty, setScoreEmpty] = useState(false);
+    const [scorable, setScorable] = useState(false);
     const [scoreBusy, setScoreBusy] = useState(false);
     const [notification, setNotification] = useState(null);
     const [canvasBusy, setCanvasBusy] = useState(false);
@@ -317,24 +405,29 @@ const Editor = () => {
     const [chatType, setChatType] = useState(null);
     const [showColorPicker, setShowColorPicker] = useState(false);
     const [pendingDelete, setPendingDelete] = useState(false);
-    const [, setCurrentXml] = useState(emptyBpmn);
     const location = useLocation();
     const navigate = useNavigate();
     const notificationTimeoutRef = useRef(null);
+    // Все отложенные центрирования канваса: при unmount снимаем целиком, иначе
+    // колбэк доезжает до уже уничтоженного modeler.
+    const pendingTimersRef = useRef(new Set());
     const elementsOriginalColors = useRef(new Map());
     const [chatExpanded, setChatExpanded] = useState(false);
-    const [chatHeight] = useState('70vh');
-    const [chatPosition, setChatPosition] = useState({ top: 120, right: 20 });
     const [showDownloadOptions, setShowDownloadOptions] = useState(false);
     const [scoreExpanded, setScoreExpanded] = useState(false);
-    const [scorePosition, setScorePosition] = useState({ top: 120, right: 20 });
-    const [scoreHeight, setScoreHeight] = useState('70vh');
+    // Слои поверх канваса: меню экспорта и палитра заливок. Нужны для закрытия
+    // по Escape и клику вне (refs на триггер и на сам слой).
+    const downloadTriggerRef = useRef(null);
+    const downloadMenuRef = useRef(null);
+    const colorTriggerRef = useRef(null);
+    const colorPopoverRef = useRef(null);
     const [messagesGenerate, setMessagesGenerate] = useState([]);
     const [messagesImprove, setMessagesImprove] = useState([]);
     const [messagesScore, setMessagesScore] = useState([]);
     // Последнее сообщение скоринга показывается в панели инструментов,
     // чтобы ошибка /api/evaluate не оставалась невидимой.
     const scoreMessage = messagesScore.length ? messagesScore[messagesScore.length - 1] : null;
+    const scoreError = scoreMessage?.isError ? scoreMessage.text : null;
     // Цвета заливки резолвим из токенов: в компоненте нет ни одного хардкод-цвета.
     const fillSwatches = useMemo(
         () => FILL_COLORS.map(({ token, label }) => ({ color: cssVar(token), label }))
@@ -354,6 +447,28 @@ const Editor = () => {
         if (!canvas.getRootElement()) return;
         canvas.zoom('fit-viewport');
         if (canvas.zoom() > 1) canvas.zoom(1);
+    }, []);
+
+    // Отложенное центрирование: id таймера живёт в ref, чтобы при unmount
+    // (уход со страницы, смена схемы) ни один из них не доехал до modeler.
+    const scheduleCanvasFit = useCallback(() => {
+        const id = window.setTimeout(() => {
+            pendingTimersRef.current.delete(id);
+            autoFitDiagram();
+        }, 800);
+        pendingTimersRef.current.add(id);
+    }, [autoFitDiagram]);
+
+    useEffect(() => {
+        const timers = pendingTimersRef.current;
+        return () => {
+            timers.forEach((id) => window.clearTimeout(id));
+            timers.clear();
+            if (notificationTimeoutRef.current) {
+                window.clearTimeout(notificationTimeoutRef.current);
+                notificationTimeoutRef.current = null;
+            }
+        };
     }, []);
 
     // Оптимизированная функция поиска с debounce
@@ -431,26 +546,6 @@ const Editor = () => {
         };
     }, [searchQuery, handleSearch]);
 
-    const toggleChatExpand = (expanded) => {
-        setChatExpanded(expanded);
-        if (expanded) {
-            setChatPosition({ top: 80, right: 0 });
-        } else {
-            setChatPosition({ top: 120, right: 20 });
-        }
-    };
-
-    const toggleScoreExpand = (expanded) => {
-        setScoreExpanded(expanded);
-        if (expanded) {
-            setScorePosition({ top: 80, right: 0 });
-            setScoreHeight('80vh');
-        } else {
-            setScorePosition({ top: 120, right: 20 });
-            setScoreHeight('70vh');
-        }
-    };
-
     const showNotification = useCallback((message) => {
         if (notificationTimeoutRef.current) {
             clearTimeout(notificationTimeoutRef.current);
@@ -473,16 +568,40 @@ const Editor = () => {
     }, [pendingDelete]);
 
     // Escape закрывает плавающие панели: сначала чат, затем скоринг.
+    // Всплывающий слой (меню экспорта, палитра заливок) имеет приоритет —
+    // его закрывает собственный обработчик, иначе Escape убирал бы и слой,
+    // и панель одновременно.
     useEffect(() => {
         if (!chatType && !showScorePanel) return undefined;
         const onKeyDown = (event) => {
             if (event.key !== 'Escape') return;
+            if (showDownloadOptions || showColorPicker || pendingDelete) return;
             if (chatType) setChatType(null);
             else setShowScorePanel(false);
         };
         document.addEventListener('keydown', onKeyDown);
         return () => document.removeEventListener('keydown', onKeyDown);
-    }, [chatType, showScorePanel]);
+    }, [chatType, showScorePanel, showDownloadOptions, showColorPicker, pendingDelete]);
+
+    /**
+     * Схема, которую проверять нечем: стартовый шаблон — один «Шаг» без
+     * завершения, без шлюзов и без участников. Балл на таком наборе —
+     * шум из 17 нарушений, а не разбор.
+     */
+    const isStarterScheme = useCallback(() => {
+        const modeler = modelerRef.current;
+        if (!modeler) return true;
+        const registry = modeler.get('elementRegistry');
+        const FLOW_NODE = /(?:Task|Gateway|SubProcess|CallActivity|EndEvent|IntermediateCatchEvent|IntermediateThrowEvent|BoundaryEvent)$/;
+        let flowNodes = 0;
+        let containers = 0;
+        registry.forEach((element) => {
+            const type = element.type || '';
+            if (FLOW_NODE.test(type)) flowNodes += 1;
+            if (type === 'bpmn:Participant' || type === 'bpmn:Lane') containers += 1;
+        });
+        return flowNodes <= 1 && containers === 0;
+    }, []);
 
     useEffect(() => {
         console.log('Инициализация BPMN редактора');
@@ -500,6 +619,12 @@ const Editor = () => {
             }
         });
         modelerRef.current = modeler;
+        // Кнопка «Проверить» живёт вместе со схемой: на стартовом шаблоне
+        // она неактивна, а не обещает балл из воздуха.
+        const syncScorable = () => setScorable(!isStarterScheme());
+        const eventBus = modeler.get('eventBus');
+        eventBus.on('commandStack.changed', syncScorable);
+        eventBus.on('import.done', syncScorable);
         // В StrictMode эффект отрабатывает дважды: загрузка устаревшего экземпляра
         // должна остановиться, иначе два importXML спорят за один канвас.
         let cancelled = false;
@@ -516,22 +641,24 @@ const Editor = () => {
                     const response = await apiClient.get(`/api/diagrams/${loadedDiagramId}`);
                     if (cancelled) return;
                     initialXML = response.data.xml_content;
-                    setDiagramName(response.data.name || `Схема ${loadedDiagramId}`);
+                    // В колонке name лежит и служебный id процесса — в заголовке
+                    // его быть не должно.
+                    setDiagramName(displayDiagramName(response.data.name));
                     setDiagramId(loadedDiagramId);
                 } else if (location.state?.id) {
                     console.log('Загрузка диаграммы из состояния:', location.state.id);
                     const response = await apiClient.get(`/api/diagrams/${location.state.id}`);
                     if (cancelled) return;
                     initialXML = response.data.xml_content;
-                    setDiagramName(response.data.name || 'Новая схема');
+                    setDiagramName(displayDiagramName(response.data.name));
                     setDiagramId(location.state.id);
                 } else if (location.state?.bpmnXML) {
                     console.log('Загрузка диаграммы из XML');
                     initialXML = location.state.bpmnXML;
-                    setDiagramName(location.state.name || 'Загруженная схема');
+                    setDiagramName(displayDiagramName(location.state.name, 'Загруженная схема'));
                 } else {
                     console.log('Создание новой диаграммы');
-                    setDiagramName('Новая схема');
+                    setDiagramName(DEFAULT_DIAGRAM_NAME);
                 }
                 const parser = new DOMParser();
                 const xmlDoc = parser.parseFromString(initialXML, 'text/xml');
@@ -556,24 +683,16 @@ const Editor = () => {
                     const di = getDi(element);
                     if (di && di.fill) elementsOriginalColors.current.set(element.id, di.fill);
                 });
-                setCurrentXml(layoutedXML);
                 // Увеличиваем задержку для правильного центрирования
                 console.log('Планирование центрирования после загрузки');
-                setTimeout(() => {
-                    autoFitDiagram();
-                }, 800);
+                scheduleCanvasFit();
             } catch (err) {
                 if (cancelled) return;
                 console.error('Ошибка загрузки диаграммы:', err);
                 modeler.clear();
                 await modeler.importXML(emptyBpmn);
-                setCurrentXml(emptyBpmn);
-                setTimeout(() => {
-                    if (modelerRef.current === modeler) {
-                        autoFitDiagram();
-                    }
-                }, 800);
-                showNotification('Ошибка загрузки диаграммы, загружено начальное состояние.');
+                scheduleCanvasFit();
+                showNotification('Схему не удалось открыть — показали пустой шаблон. Попробуйте открыть её ещё раз.');
             } finally {
                 if (!cancelled) setCanvasBusy(false);
             }
@@ -581,24 +700,18 @@ const Editor = () => {
 
         loadDiagram();
 
-        const eventBus = modeler.get('eventBus');
-        eventBus.on('element.changed', async () => {
-            const { xml } = await modeler.saveXML({ format: true });
-            setCurrentXml(xml);
-        });
-
         return () => {
             cancelled = true;
             modeler.destroy();
             if (modelerRef.current === modeler) modelerRef.current = null;
         };
-    }, [location.search, location.state, showNotification, autoFitDiagram]);
+    }, [location.search, location.state, showNotification, scheduleCanvasFit, isStarterScheme]);
 
     const handleGenerate = async (prompt) => {
         console.log('Генерация диаграммы с промптом:', prompt);
         setMessagesGenerate(prev => [...prev,
         { sender: 'user', text: prompt, id: Date.now() },
-        { sender: 'AI', text: 'Схема генерируется...', id: Date.now() + 1 }
+        { sender: 'AI', isLoading: true, id: Date.now() + 1 }
         ]);
         try {
             const response = await apiClient.post('/api/generate', {
@@ -612,28 +725,23 @@ const Editor = () => {
                     if (modelerRef.current) modelerRef.current.clear();
                     const layoutedXML = await layoutDiagram(newBpmnXML);
                     await modelerRef.current.importXML(layoutedXML);
-                    setDiagramName(`Сгенерировано: ${prompt?.slice(0, 20) || 'Новая схема'}`);
+                    setDiagramName(`Сгенерировано: ${displayDiagramName(prompt?.slice(0, 20))}`);
                     // Модель часто возвращает структуру, которую сервер чинит
                     // детерминированно (перенос шага в другой пул, удалённый
                     // поток, добавленное событие). Пользователь обязан видеть,
-                    // что схему поправили за него.
+                    // что схему поправили за него, — но служебные id и английские
+                    // типы из заметок генератора в чат не идут.
                     const notes = response.data.notes || [];
+                    if (notes.length) console.log('Заметки автоматики:', notes);
                     setMessagesGenerate(prev => [
                         ...prev.slice(0, -1),
                         {
                             sender: 'AI',
-                            text: notes.length
-                                ? `Диаграмма сгенерирована. Исправлено автоматикой (${notes.length}): ${notes.slice(0, 3).join(' ')}`
-                                : 'Диаграмма успешно сгенерирована.',
+                            text: describeGeneratorFixes(notes),
                             id: Date.now()
                         }
                     ]);
-                    setCurrentXml(layoutedXML);
-                    setTimeout(() => {
-                        if (modelerRef.current) {
-                            autoFitDiagram();
-                        }
-                    }, 800);
+                    scheduleCanvasFit();
                 } finally {
                     setCanvasBusy(false);
                 }
@@ -645,8 +753,81 @@ const Editor = () => {
         }
     };
 
+    // Отчёт оценки ссылается на элементы их служебными id (core/bpmn_scoring.py).
+    // Снимаем с текущей модели словарь id -> название, чтобы панель говорила
+    // «Согласовать заявку», а не «Task_0x8y9z1».
+    const collectElementNames = useCallback(() => {
+        const modeler = modelerRef.current;
+        if (!modeler) return {};
+        const names = {};
+        modeler.get('elementRegistry').forEach((element) => {
+            const name = element.businessObject?.name;
+            if (name && element.id) names[element.id] = name;
+        });
+        return names;
+    }, []);
+
+    // Подсветка элементов, на которые указывает правило отчёта: без неё
+    // «нет завершающего события» остаётся строкой текста, а не местом на схеме.
+    const reportedIdsRef = useRef(new Set());
+
+    const revealReported = useCallback((ids) => {
+        const modeler = modelerRef.current;
+        if (!modeler) return;
+        const canvas = modeler.get('canvas');
+        const registry = modeler.get('elementRegistry');
+        const next = new Set(Array.isArray(ids) ? ids : []);
+        reportedIdsRef.current.forEach((id) => {
+            if (!next.has(id) && registry.get(id)) canvas.removeMarker(id, 'reported');
+        });
+        next.forEach((id) => {
+            if (registry.get(id)) canvas.addMarker(id, 'reported');
+        });
+        reportedIdsRef.current = next;
+    }, []);
+
+    // Клик по строке отчёта наводит холст на нарушение: аналитику не нужно
+    // искать элемент глазами на большой схеме.
+    const focusReported = useCallback((ids) => {
+        const modeler = modelerRef.current;
+        if (!modeler || !ids?.length) return;
+        const canvas = modeler.get('canvas');
+        const registry = modeler.get('elementRegistry');
+        const boxes = ids
+            .map((id) => registry.get(id))
+            .filter((element) => element && element.width)
+            .map((element) => ({
+                x1: element.x, y1: element.y,
+                x2: element.x + element.width, y2: element.y + element.height,
+            }));
+        if (!boxes.length) return;
+        const left = Math.min(...boxes.map((b) => b.x1));
+        const top = Math.min(...boxes.map((b) => b.y1));
+        const right = Math.max(...boxes.map((b) => b.x2));
+        const bottom = Math.max(...boxes.map((b) => b.y2));
+        canvas.scrollTo({ x: (left + right) / 2, y: (top + bottom) / 2 });
+        revealReported(ids);
+    }, [revealReported]);
+
     const handleValidate = async () => {
         console.log('Валидация диаграммы');
+        if (isStarterScheme()) {
+            // Отказ до запроса: показывать 17 нарушений на стартовом
+            // шаблоне — значит выдавать шум за разбор.
+            setShowScorePanel(true);
+            setChatType(null);
+            setValidationResult(null);
+            setElementNames({});
+            setScore(0);
+            setMessagesScore([]);
+            setScoreEmpty(true);
+            return;
+        }
+        setScoreEmpty(false);
+        // Прежняя подсветка отчёта снимается до нового запроса: иначе
+        // элементы прошлого разбора остаются обведёнными, хотя разбор
+        // уже устарел.
+        revealReported([]);
         try {
             const { xml } = await modelerRef.current.saveXML({ format: true });
             const fixedXML = await fixXMLStructure(xml);
@@ -657,6 +838,8 @@ const Editor = () => {
                 console.warn('Layout failed, using original XML:', layoutError);
                 layoutedXML = fixedXML;
             }
+            const namesById = collectElementNames();
+            setChatType(null);
             setShowScorePanel(true);
             setScoreBusy(true);
             let response;
@@ -668,15 +851,18 @@ const Editor = () => {
                 setScoreBusy(false);
             }
             setValidationResult(response.data);
+            setElementNames(namesById);
             setScore(response.data.score);
+            // В шапке — только балл: разбор рекомендаций живёт в панели,
+            // там он читается, а не склеивается в одну строку.
             setMessagesScore([{
                 sender: 'AI',
-                text: `Проверка завершена. Оценка: ${response.data.score}/100. ${response.data.recommendations?.join(' ') || ''}`,
+                text: `Проверка завершена: ${response.data.score}/100.`,
                 id: Date.now()
             }]);
         } catch (err) {
             console.error('Ошибка проверки:', err);
-            const message = `Ошибка проверки: ${err.message}`;
+            const message = toUserMessage(err, 'Проверку не удалось выполнить. Попробуйте ещё раз.');
             setMessagesScore([{
                 sender: 'AI',
                 text: message,
@@ -691,7 +877,7 @@ const Editor = () => {
         console.log('Улучшение диаграммы с промптом:', prompt);
         setMessagesImprove(prev => [...prev,
         { sender: 'user', text: prompt, id: Date.now() },
-        { sender: 'AI', text: 'Анализирую схему...', id: Date.now() + 1 }
+        { sender: 'AI', isLoading: true, id: Date.now() + 1 }
         ]);
         try {
             const { xml } = await modelerRef.current.saveXML({ format: true });
@@ -709,6 +895,9 @@ const Editor = () => {
                     sender: 'AI',
                     text: recommendations || 'Изменения подготовлены.',
                     improvementId: response.data.improvement_id,
+                    // Без status чат не отличает «предложен XML» от «только анализ»
+                    // и показал бы кнопку принятия там, где принимать нечего.
+                    status: response.data.status,
                     id: Date.now()
                 }
             ]);
@@ -782,7 +971,7 @@ const Editor = () => {
                     console.warn('Process without start event, adding one');
                     const startEvent = xmlDoc.createElementNS(bpmnNamespace, 'bpmn:startEvent');
                     startEvent.setAttribute('id', `StartEvent_${uuid()}`);
-                    startEvent.setAttribute('name', 'Start');
+                    startEvent.setAttribute('name', 'Начало');
                     process.appendChild(startEvent);
                 }
             }
@@ -865,32 +1054,57 @@ const Editor = () => {
                             elementsOriginalColors.current.set(element.id, di.fill);
                         }
                     });
-                    setCurrentXml(layoutedXML);
                     setDiagramId(response.data.diagram_id);
                     // Балл пересчитывает backend по уже принятому XML: без этого
                     // панель остаётся с оценкой прежней схемы.
-                    setScore(response.data.score);
-                    const dropped = response.data.score_before != null
-                        && response.data.score < response.data.score_before;
+                    const acceptedScore = response.data.score;
+                    const previousScore = response.data.score_before;
+                    setScore(acceptedScore);
+                    // Дельта по правилам, а не только цифра: «85 → 85» выглядит
+                    // как бесполезное принятие, хотя часть правил починена.
+                    const { fixed, broken } = describeRulesDelta(response.data.rules_delta);
+                    const verdict = [];
+                    if (previousScore != null && previousScore !== acceptedScore) {
+                        verdict.push(`Оценка схемы: ${previousScore} → ${acceptedScore}.`);
+                    }
+                    if (fixed.length) verdict.push(`Починено: ${fixed.join('; ')}.`);
+                    if (broken.length) verdict.push(`Стало хуже: ${broken.join('; ')}.`);
                     setMessagesImprove(prev => [...prev,
                     { sender: 'AI', text: 'Изменения успешно применены.'
-                        + (dropped ? ` Оценка схемы снизилась: ${response.data.score_before} → ${response.data.score}.` : ''),
+                        + (verdict.length ? ' ' + verdict.join(' ') : ''),
                         id: Date.now()
                     }
                     ]);
                     // Центрируем после принятия улучшения
-                    setTimeout(() => {
-                        autoFitDiagram();
-                    }, 800);
+                    scheduleCanvasFit();
                 } finally {
                     setCanvasBusy(false);
                 }
             }
+            return true;
         } catch (err) {
             console.error('Ошибка принятия изменений:', err);
             setMessagesImprove(prev => [...prev,
-            { sender: 'AI', text: `Ошибка принятия изменений: ${err.message}`, id: Date.now() }
+            {
+                sender: 'AI',
+                isError: true,
+                text: toUserMessage(err, 'Изменения не применены. Схема осталась прежней — попробуйте ещё раз.'),
+                id: Date.now()
+            }
             ]);
+            // false keeps the decision action available for a retry in the chat.
+            return false;
+        }
+    };
+
+    const handleRejectImprovement = async (improvementId) => {
+        try {
+            await apiClient.post('/api/ai/reject-improvement', { improvement_id: improvementId });
+            return true;
+        } catch (err) {
+            console.error('Не удалось отклонить улучшение:', err);
+            showNotification(toUserMessage(err, 'Улучшение не отклонено.'));
+            return false;
         }
     };
 
@@ -912,10 +1126,10 @@ const Editor = () => {
                 score: score,
             });
             setDiagramId(newDiagramId);
-            showNotification('Диаграмма успешно сохранена!');
+            showNotification('Схема сохранена.');
         } catch (err) {
             console.error('Ошибка сохранения:', err);
-            showNotification('Ошибка сохранения диаграммы.');
+            showNotification(toUserMessage(err, 'Схема не сохранена. Проверьте соединение и попробуйте ещё раз.'));
         }
     };
 
@@ -937,25 +1151,32 @@ const Editor = () => {
             }
         } catch (err) {
             console.error('Ошибка создания ссылки:', err);
-            showNotification('Ошибка создания ссылки.');
+            showNotification(toUserMessage(err, 'Ссылку не удалось получить. Попробуйте ещё раз.'));
         }
     };
 
     const handleDelete = async () => {
         console.log('Удаление диаграммы');
         try {
-            if (diagramId) {
-                await apiClient.delete(`/api/diagrams/${diagramId}`);
-                navigate('/my-schemas');
-            } else showNotification('Сначала сохраните схему.');
+            await apiClient.delete(`/api/diagrams/${diagramId}`);
+            navigate('/my-schemas');
         } catch (err) {
             console.error('Ошибка удаления:', err);
-            showNotification('Ошибка удаления диаграммы.');
+            showNotification(toUserMessage(err, 'Схема не удалена. Попробуйте ещё раз или удалите её из реестра.'));
         }
     };
 
-    // Удаление запускается только после подтверждения в диалоге.
-    const handleRequestDelete = () => setPendingDelete(true);
+    // Удаление запускается только после подтверждения в диалоге и только для
+    // сохранённой схемы: несохранённую удалять нечего, кнопка не активна.
+    const canDelete = Boolean(diagramId);
+
+    const handleRequestDelete = () => {
+        if (!canDelete) {
+            showNotification('Несохранённую схему удалять нечего — сохраните её или очистите холст.');
+            return;
+        }
+        setPendingDelete(true);
+    };
 
     const handleCancelDelete = () => setPendingDelete(false);
 
@@ -987,7 +1208,14 @@ const Editor = () => {
             }
         } catch (err) {
             console.error(`Ошибка экспорта в ${format.toUpperCase()}:`, err);
-            showNotification(`Ошибка при экспорте в ${format.toUpperCase()}: ${err.message}`);
+            // Экспорт — локальная операция: сетевых ошибок здесь почти не
+            // бывает, а внутренние сообщения html2canvas пользователю не читаемы.
+            const localMessage = format === 'bpmn'
+                ? 'Файл не сохранён. Попробуйте ещё раз.'
+                : 'Картинку не удалось собрать. Попробуйте ещё раз или скачайте схему в формате BPMN.';
+            showNotification(err.response
+                ? toUserMessage(err, 'Файл не сохранён. Попробуйте ещё раз.')
+                : localMessage);
         } finally {
             setShowDownloadOptions(false);
         }
@@ -1016,25 +1244,30 @@ const Editor = () => {
         try {
             if (modelerRef.current) modelerRef.current.clear();
             await modelerRef.current.importXML(emptyBpmn);
-            setDiagramName('Новая схема');
+            setDiagramName(DEFAULT_DIAGRAM_NAME);
             setDiagramId(null);
+            setValidationResult(null);
+            setElementNames({});
+            setScore(0);
+            setMessagesScore([]);
             elementsOriginalColors.current.clear();
-            showNotification('Канвас очищен.');
-            setCurrentXml(emptyBpmn);
+            showNotification('Холст очищен: на нём пустой шаблон. Сохранённая версия осталась в реестре.');
             // Центрируем после очистки
-            setTimeout(() => {
-                autoFitDiagram();
-            }, 800);
+            scheduleCanvasFit();
         } finally {
             setCanvasBusy(false);
         }
     };
 
+    // Цвет заливки лежит в слое Diagram Interchange; у стрелок и соединений его
+    // нет, и «отсутствует DI» пользователю ничего не говорит.
+    const NO_DI_MESSAGE = 'Цвет можно менять только для фигур и событий — у стрелок заливки нет.';
+
     const handleColorChange = (color) => {
         const selection = modelerRef.current.get('selection');
         const selectedElements = selection.get();
         if (selectedElements.length === 0) {
-            showNotification('Выберите элемент для изменения цвета.');
+            showNotification('Сначала выделите фигуру или событие на схеме.');
             return;
         }
         const element = selectedElements[0];
@@ -1044,7 +1277,7 @@ const Editor = () => {
             modeling.updateProperties(element, { 'di': { ...di, fill: color } });
             elementsOriginalColors.current.set(element.id, color);
             showNotification('Цвет элемента изменён.');
-        } else showNotification('Не удалось изменить цвет: отсутствует DI.');
+        } else showNotification(NO_DI_MESSAGE);
         setShowColorPicker(false);
     };
 
@@ -1052,7 +1285,7 @@ const Editor = () => {
         const selection = modelerRef.current.get('selection');
         const selectedElements = selection.get();
         if (selectedElements.length === 0) {
-            showNotification('Выберите элемент для сброса цвета.');
+            showNotification('Сначала выделите фигуру или событие на схеме.');
             return;
         }
         const element = selectedElements[0];
@@ -1062,12 +1295,39 @@ const Editor = () => {
             const originalColor = elementsOriginalColors.current.get(element.id) || '#ffffff';
             modeling.updateProperties(element, { 'di': { ...di, fill: originalColor } });
             showNotification('Цвет элемента сброшен.');
-        } else showNotification('Не удалось сбросить цвет: отсутствует DI.');
+        } else showNotification(NO_DI_MESSAGE);
         setShowColorPicker(false);
     };
 
-    // Позицию меню экспорта задаёт CSS: оно заякорено на блоке действий шапки.
-    const handleShowDownloadOptions = () => setShowDownloadOptions(true);
+    // Меню экспорта: открывается по кнопке и закрывается повторным нажатием,
+    // Escape или кликом вне (useFloatingLayer). Позицию задаёт CSS — слой
+    // заякорен на кнопке, а не на прокручиваемой полосе действий.
+    const closeDownloadOptions = useCallback(() => setShowDownloadOptions(false), []);
+    useFloatingLayer({
+        open: showDownloadOptions,
+        onClose: closeDownloadOptions,
+        triggerRef: downloadTriggerRef,
+        layerRef: downloadMenuRef,
+    });
+
+    const closeColorPicker = useCallback(() => setShowColorPicker(false), []);
+    useFloatingLayer({
+        open: showColorPicker,
+        onClose: closeColorPicker,
+        triggerRef: colorTriggerRef,
+        layerRef: colorPopoverRef,
+    });
+
+    const handleShowDownloadOptions = () => setShowDownloadOptions((open) => !open);
+
+    // Пропсы панели оценки стабилизированы: панель мемоизирована, а каждый рендер
+    // редактора с новыми `|| []` сбрасывал бы прокрутку отчёта наверх.
+    const scorePanelData = useMemo(() => ({
+        recommendations: validationResult?.recommendations ?? [],
+        errors: validationResult?.details ?? {},
+        detailsMeta: validationResult?.details_meta ?? {},
+        elementNames,
+    }), [validationResult, elementNames]);
 
     return (
         <div className="editor-wrapper">
@@ -1091,31 +1351,47 @@ const Editor = () => {
                         <Button variant="primary" size="sm" onClick={handleSave}>
                             Сохранить
                         </Button>
-                        <Button variant="dark" size="sm" onClick={handleShare}>
+                        <Button variant="secondary" size="sm" onClick={handleShare}>
                             Поделиться
                         </Button>
                         <div className="editor-download-group">
-                            <Button variant="dark" size="sm" onClick={handleShowDownloadOptions} aria-expanded={showDownloadOptions}>
+                            <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={handleShowDownloadOptions}
+                                ref={downloadTriggerRef}
+                                aria-haspopup="menu"
+                                aria-expanded={showDownloadOptions}
+                            >
                                 Скачать
                             </Button>
                             <AnimatePresence>
                                 {showDownloadOptions && (
                                     <motion.div
                                         className="editor-download-options-modal"
+                                        ref={downloadMenuRef}
+                                        role="menu"
+                                        aria-label="Формат скачивания схемы"
                                         initial={{ opacity: 0, y: -6 }}
                                         animate={{ opacity: 1, y: 0 }}
                                         exit={{ opacity: 0, y: -6 }}
                                         transition={{ duration: 0.2 }}
                                     >
-                                        <Button variant="secondary" size="sm" onClick={() => handleDownload('bpmn')}>BPMN</Button>
-                                        <Button variant="secondary" size="sm" onClick={() => handleDownload('png')}>PNG</Button>
-                                        <Button variant="secondary" size="sm" onClick={() => handleDownload('pdf')}>PDF</Button>
-                                        <Button variant="ghost" size="sm" onClick={() => setShowDownloadOptions(false)}>Закрыть</Button>
+                                        <Button variant="ghost" size="sm" role="menuitem" onClick={() => handleDownload('bpmn')}>Схема (.bpmn)</Button>
+                                        <Button variant="ghost" size="sm" role="menuitem" onClick={() => handleDownload('png')}>Картинка (.png)</Button>
+                                        <Button variant="ghost" size="sm" role="menuitem" onClick={() => handleDownload('pdf')}>Документ (.pdf)</Button>
                                     </motion.div>
                                 )}
                             </AnimatePresence>
                         </div>
-                        <Button variant="secondary" size="sm" className="editor-btn-danger" onClick={handleRequestDelete}>
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            className="editor-btn-danger-text"
+                            onClick={handleRequestDelete}
+                            disabled={!canDelete}
+                            title={canDelete ? undefined : 'Несохранённую схему удалить нельзя'}
+                        >
                             Удалить
                         </Button>
                     </div>
@@ -1169,6 +1445,7 @@ const Editor = () => {
                             {showColorPicker && (
                                 <motion.div
                                     className="editor-color-picker"
+                                    ref={colorPopoverRef}
                                     initial={{ opacity: 0, y: -10 }}
                                     animate={{ opacity: 1, y: 0 }}
                                     exit={{ opacity: 0, y: -10 }}
@@ -1202,12 +1479,52 @@ const Editor = () => {
                             )}
                         </AnimatePresence>
                         <div className="editor-canvas-controls">
-                            <Button variant="ghost" size="sm" onClick={handleZoomIn} aria-label="Приблизить">+</Button>
-                            <Button variant="ghost" size="sm" onClick={handleZoomOut} aria-label="Отдалить">-</Button>
-                            <Button variant="ghost" size="sm" onClick={handleResetZoom}>Сбросить</Button>
-                            <Button variant="ghost" size="sm" onClick={handleClearCanvas}>Очистить</Button>
+                            <Button variant="ghost" size="sm" onClick={handleZoomIn} aria-label="Приблизить схему">+</Button>
+                            <Button variant="ghost" size="sm" onClick={handleZoomOut} aria-label="Отдалить схему">-</Button>
+                            <Button variant="ghost" size="sm" onClick={handleResetZoom} aria-label="Сбросить масштаб схемы">Сбросить</Button>
+                            <Button variant="ghost" size="sm" onClick={handleClearCanvas} aria-label="Очистить холст">Очистить</Button>
                         </div>
                     </div>
+                    {/* Панели ИИ живут в одном flex-ряду с канвасом: CSS панелей
+                        (.ai-chat-container) рассчитан на строку редактора — вынос
+                        в колонку страницы уводил их под канвас. Рельс остаётся
+                        прижат к краю, панель появляется между ним и канвасом. */}
+                    <GenerateChat
+                        isOpen={chatType === 'generate'}
+                        onClose={() => setChatType(null)}
+                        onGenerate={handleGenerate}
+                        messages={messagesGenerate}
+                        isExpanded={chatExpanded}
+                        onToggleExpand={setChatExpanded}
+                    />
+                    <ImproveChat
+                        isOpen={chatType === 'improve'}
+                        onClose={() => setChatType(null)}
+                        messages={messagesImprove}
+                        onImprove={handleImprove}
+                        onAcceptImprovement={handleAcceptImprovement}
+                        onRejectImprovement={handleRejectImprovement}
+                        isExpanded={chatExpanded}
+                        onToggleExpand={setChatExpanded}
+                    />
+                    {showScorePanel && (
+                        <ScorePanel
+                            score={score}
+                            {...scorePanelData}
+                            onClose={() => {
+                                setShowScorePanel(false);
+                                revealReported([]);
+                            }}
+                            busy={scoreBusy}
+                            error={scoreError}
+                            empty={scoreEmpty}
+                            onRetry={handleValidate}
+                            onRevealElements={revealReported}
+                            onFocusElements={focusReported}
+                            isExpanded={scoreExpanded}
+                            onToggleExpand={setScoreExpanded}
+                        />
+                    )}
                     <motion.div
                         className="editor-right-panel"
                         initial={{ opacity: 0 }}
@@ -1224,6 +1541,9 @@ const Editor = () => {
                                     } else {
                                         setChatType('improve');
                                         setChatExpanded(false);
+                                        // Панели редактора исключают друг друга:
+                                        // две сразу сжимали канвас до нуля.
+                                        setShowScorePanel(false);
                                     }
                                 }}
                                 className={`editor-icon-btn editor-chat-btn ${chatType === 'improve' ? 'is-active' : ''}`}
@@ -1244,6 +1564,7 @@ const Editor = () => {
                                     } else {
                                         setChatType('generate');
                                         setChatExpanded(false);
+                                        setShowScorePanel(false);
                                     }
                                 }}
                                 className={`editor-icon-btn editor-generate-btn ${chatType === 'generate' ? 'is-active' : ''}`}
@@ -1262,7 +1583,10 @@ const Editor = () => {
                                 className={`editor-icon-btn editor-score-btn ${showScorePanel ? 'is-active' : ''}`}
                                 aria-pressed={showScorePanel}
                                 aria-label="Проверить схему"
-                                data-tooltip="Проверить"
+                                aria-disabled={!scorable}
+                                disabled={!scorable}
+                                data-tooltip={scorable ? 'Проверить' : 'Нечего проверять'}
+                                title={scorable ? undefined : 'Добавьте шаги и завершение процесса — проверять пока нечего'}
                             >
                                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                                     <path d="M9 16.17L4.83 12L3.41 13.41L9 19L21 7L19.59 5.59L9 16.17Z" fill="currentColor" />
@@ -1274,8 +1598,11 @@ const Editor = () => {
                                 onClick={() => setShowColorPicker(!showColorPicker)}
                                 className={`editor-icon-btn editor-color-btn ${showColorPicker ? 'is-active' : ''}`}
                                 aria-pressed={showColorPicker}
+                                aria-expanded={showColorPicker}
+                                aria-haspopup="true"
                                 aria-label="Изменить цвет элемента"
                                 data-tooltip="Изменить цвет"
+                                ref={colorTriggerRef}
                             >
                                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                                     <path d="M12 3C7.03 3 3 7.03 3 12C3 16.97 7.03 21 12 21C12.83 21 13.5 20.33 13.5 19.5C13.5 19.11 13.41 18.74 13.25 18.41C13.09 18.07 12.83 17.83 12.5 17.73C12.17 17.63 11.83 17.67 11.53 17.83C10.54 18.37 9.37 18.5 8 18.5C5.24 18.5 3 16.26 3 13.5C3 10.74 5.24 8.5 8 8.5C9.37 8.5 10.54 8.63 11.53 9.17C11.83 9.33 12.17 9.37 12.5 9.27C12.83 9.17 13.09 8.93 13.25 8.59C13.41 8.26 13.5 7.89 13.5 7.5C13.5 6.67 12.83 6 12 6C7.03 6 3 10.03 3 15C3 19.97 7.03 24 12 24C16.97 24 21 19.97 21 15C21 10.03 16.97 6 12 6C11.17 6 10.5 6.67 10.5 7.5C10.5 7.89 10.59 8.26 10.75 8.59C10.91 8.93 11.17 9.17 11.5 9.27C11.83 9.37 12.17 9.33 12.47 9.17C13.46 8.63 14.63 8.5 16 8.5C18.76 8.5 21 10.74 21 13.5C21 16.26 18.76 18.5 16 18.5C14.63 18.5 13.46 18.37 12.47 17.83C12.17 17.67 11.83 17.63 11.5 17.73C11.17 17.83 10.91 18.07 10.75 18.41C10.59 18.74 10.5 19.11 10.5 19.5C10.5 20.33 11.17 21 12 21ZM8 10C7.45 10 7 10.45 7 11C7 11.55 7.45 12 8 12C8.55 12 9 11.55 9 11C9 10.45 8.55 10 8 10ZM16 10C15.45 10 15 10.45 15 11C15 11.55 15.45 12 16 12C16.55 12 17 11.55 17 11C17 10.45 16.55 10 16 10Z" fill="currentColor" />
@@ -1290,9 +1617,9 @@ const Editor = () => {
                             className="editor-notification"
                             role="status"
                             aria-live="polite"
-                            initial={{ opacity: 0, y: 20 }}
+                            initial={{ opacity: 0, y: -16 }}
                             animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: 20 }}
+                            exit={{ opacity: 0, y: -16 }}
                             transition={{ duration: 0.3 }}
                         >
                             {notification}
@@ -1323,9 +1650,8 @@ const Editor = () => {
                             >
                                 <h2 id="editor-delete-title">Удалить «{diagramName}»?</h2>
                                 <p>
-                                    {diagramId
-                                        ? 'Схема будет удалена из реестра — вернуть её не получится.'
-                                        : 'Схема ещё не сохранена: удаление станет доступно после сохранения.'}
+                                    Схема удалится из реестра — вернуть её будет нельзя.
+                                    Файлы, скачанные из этой схемы, останутся у вас.
                                 </p>
                                 <div className="editor-dialog__actions">
                                     <Button variant="secondary" size="md" onClick={handleCancelDelete}>Отмена</Button>
@@ -1335,41 +1661,6 @@ const Editor = () => {
                         </motion.div>
                     )}
                 </AnimatePresence>
-                <GenerateChat
-                    isOpen={chatType === 'generate'}
-                    onClose={() => setChatType(null)}
-                    onGenerate={handleGenerate}
-                    messages={messagesGenerate}
-                    isExpanded={chatExpanded}
-                    onToggleExpand={toggleChatExpand}
-                    chatHeight={chatHeight}
-                    position={chatPosition}
-                />
-                <ImproveChat
-                    isOpen={chatType === 'improve'}
-                    onClose={() => setChatType(null)}
-                    messages={messagesImprove}
-                    onImprove={handleImprove}
-                    onAcceptImprovement={handleAcceptImprovement}
-                    isExpanded={chatExpanded}
-                    onToggleExpand={toggleChatExpand}
-                    chatHeight={chatHeight}
-                    position={chatPosition}
-                />
-                {showScorePanel && (
-                    <ScorePanel
-                        score={score}
-                        recommendations={validationResult?.recommendations || []}
-                        errors={validationResult?.details || {}}
-                        detailsMeta={validationResult?.details_meta || {}}
-                        onClose={() => setShowScorePanel(false)}
-                        busy={scoreBusy}
-                        isExpanded={scoreExpanded}
-                        onToggleExpand={toggleScoreExpand}
-                        position={scorePosition}
-                        chatHeight={scoreHeight}
-                    />
-                )}
             </div>
         </div>
     );

@@ -1,48 +1,56 @@
 /* ============================================================
-   Чаты ИИ: генерация и улучшение схемы.
-   Файл самодостаточен: только токены (../styles/tokens.css),
-   никаких primeflex-утилит и никакой зависимости от порядка
-   подключения сторонних CSS — переопределения ui-кита берутся
-   более специфичным селектором, а не очередью импортов.
+   Панели ИИ редактора: задание, протокол разбора, решение.
+   Режим Operate: панель — рабочий инструмент рядом с холстом,
+   а не чатбот. Поэтому: без аватаров и «welcome-героя», иерархия
+   строится типографикой и расстоянием, рамка появляется только
+   там, где она объясняет границу взаимодействия (поле ввода).
+
+   Файл самодостаточен: только токены (../styles/tokens.css).
+   Классы-хуки (.message.user, .typing-indicator, .chat-send-btn…)
+   держат тесты AiChat.test.jsx — переименовывать нельзя.
    ============================================================ */
 
-/* ---------- Панель чата ---------- */
-/* Высота приходит из Editor через inline-переменную --chat-height;
-   в раскрытом состоянии панель шире и выше — см. .expanded. */
+/* ---------- Оболочка панели ---------- */
+/* Flex-ребёнок .editor-content: высоту берёт из строки редактора.
+   Ширина сжимается на узком десктопе (clamp), чтобы канвас не выдавливало;
+   ниже 761px панель уходит в мобильный лист и из потока выходит.
+   Панель оценки (.ai-chat-container.score) — та же оболочка, но своё
+   внутреннее деление (ScorePanel.css): шапка, статус, отчёт. */
 .ai-chat-container.generate,
 .ai-chat-container.improve {
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
+    align-self: stretch;
     flex: 0 0 auto;
-    width: min(100vw - 2 * var(--page-gutter), 390px);
-    height: var(--chat-height, 70vh);
+    min-height: 0;
+    max-height: 100%;
     overflow: hidden;
     background: var(--color-surface);
     border: 1px solid var(--color-hairline-soft);
     border-radius: var(--radius-card);
     box-shadow: var(--shadow-lift);
-    transition:
-        width var(--duration-base) var(--ease-soft),
-        height var(--duration-base) var(--ease-soft);
+    /* Ширину не анимируем: перестроение канваса на каждый кадр.
+       Пол 300 px: уже этого запрос аналитика и подпись правила не читаются. */
+    width: clamp(300px, 32vw, 420px);
 }
 
 .ai-chat-container.generate.expanded,
 .ai-chat-container.improve.expanded {
-    /* Раскрытая панель шире и вытягивается на всё свободное место
-       flex-колонки редактора — без привязки к высоте вьюпорта. */
+    /* Раскрытая панель забирает свободное место строки. */
     flex: 1 1 auto;
     width: min(100vw - 2 * var(--page-gutter), 560px);
-    height: auto;
-    min-height: var(--chat-height, 70vh);
 }
 
-/* ---------- Шапка ---------- */
+/* ---------- Шапка: имя инструмента, не постер ---------- */
+/* Display-шрифт здесь запрещён design.md: шапка панели — плотный UI-подпись.
+   Идентичность инструмента несёт акцентная линия слева от названия
+   (тот же цвет, что точка на кнопке рельса). */
 .ai-chat-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: var(--space-sm);
-    padding: var(--space-md) var(--space-lg);
+    min-height: 56px;
+    padding: 0 var(--space-md) 0 var(--space-lg);
     border-bottom: 1px solid var(--color-hairline-soft);
 }
 
@@ -53,26 +61,37 @@
     min-width: 0;
 }
 
-.ai-chat-header__icon {
-    display: grid;
-    place-items: center;
-    flex: none;
-    width: 28px;
-    height: 28px;
-    border-radius: var(--radius-sm);
-    background: var(--color-primary-soft);
-    color: var(--color-primary-active);
-    font-size: var(--text-body-lg);
+    /* Акцент задаёт режим через --tool-accent (см. модификаторы ниже). */
+    .ai-chat-header__title::before {
+        content: '';
+        flex: none;
+        width: 3px;
+        height: 18px;
+        border-radius: var(--radius-pill);
+        background: var(--tool-accent, var(--color-primary));
+    }
+
+.ai-chat-container.generate {
+    --tool-accent: var(--color-info);
+}
+
+.ai-chat-container.improve {
+    --tool-accent: var(--color-berry);
+}
+
+.ai-chat-container.score {
+    --tool-accent: var(--color-warn);
 }
 
 .ai-chat-header h3 {
     margin: 0;
     overflow: hidden;
     color: var(--color-ink);
-    font-size: var(--text-h3);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
     font-weight: 600;
     letter-spacing: var(--tracking-tight);
-    line-height: 1.2;
+    line-height: 1.25;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
@@ -80,14 +99,17 @@
 .ai-chat-header-buttons {
     display: flex;
     flex: none;
+    margin-left: auto;
     gap: var(--space-xxs);
 }
 
 .header-button {
     display: grid;
     place-items: center;
-    width: 34px;
-    height: 34px;
+    /* Правило владельца: не меньше 44 px. Иконка остаётся 16 px,
+       попадание — вся кнопка. */
+    width: var(--control-min-height);
+    height: var(--control-min-height);
     padding: 0;
     border: 0;
     border-radius: var(--radius-sm);
@@ -109,177 +131,152 @@
         box-shadow: var(--focus-ring);
     }
 
-/* ---------- Лента сообщений ---------- */
+/* ---------- Лента: протокол задания и ответа ---------- */
 .ai-chat-messages {
     min-height: 0;
     overflow-y: auto;
-    padding: var(--space-md);
+    padding: var(--space-lg) var(--space-lg) var(--space-md);
 }
 
+/* Стартовое состояние: одна строка объяснения и индекс типовых заданий.
+   Без героя, без карточек — список читается расстоянием.
+   min-height + align-content держат стартау по центру панели: короткая
+   композиция в высоком контейнере иначе читается как незавершённый экран. */
 .welcome-message {
     display: grid;
     gap: var(--space-lg);
-    padding: var(--space-md) 0;
+    min-height: 100%;
+    align-content: center;
 }
 
 .welcome-message__hero {
     display: grid;
-    gap: var(--space-xs);
-}
-
-.ai-icon {
-    display: grid;
-    place-items: center;
-    width: 42px;
-    height: 42px;
-    margin-bottom: var(--space-xxs);
-    border-radius: var(--radius-md);
-    background: var(--color-primary-soft);
-    color: var(--color-primary-active);
-    font-size: 1.375rem;
+    gap: var(--space-xxs);
 }
 
 .welcome-title {
     margin: 0;
     color: var(--color-ink);
-    font-size: var(--text-h3);
+    font-family: var(--font-sans);
+    font-size: var(--text-body-lg);
     font-weight: 600;
     letter-spacing: var(--tracking-tight);
-    line-height: 1.2;
+    line-height: 1.35;
 }
 
 .welcome-subtitle {
     margin: 0;
     color: var(--color-muted);
     font-size: var(--text-sm);
-    line-height: 1.5;
+    line-height: 1.55;
 }
 
 .examples-container {
     display: grid;
-    gap: var(--space-xs);
+    gap: 2px;
+}
+
+/* Надпись-«эйброу» над списком: разрядка, приглушённый цвет.
+   --color-faint для текста не годится (2.5:1 к белому) — muted даёт 4.8:1. */
+.examples-label {
+    padding-bottom: var(--space-xs);
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
 }
 
 .example-card {
     display: grid;
-    grid-template-columns: auto 1fr;
-    align-items: center;
-    gap: var(--space-sm);
+    grid-template-columns: var(--space-lg) 1fr;
+    align-items: baseline;
     width: 100%;
-    padding: var(--space-sm) var(--space-md);
-    border: 1px solid var(--color-hairline-soft);
-    border-radius: var(--radius-md);
-    background: var(--color-surface);
+    min-height: var(--control-min-height);
+    padding: var(--space-sm) 0;
+    border: 0;
+    background: transparent;
     color: var(--color-ink-soft);
+    font-family: var(--font-sans);
     text-align: left;
     cursor: pointer;
+    transition:
+        color var(--duration-fast) var(--ease-soft);
 }
 
-    .example-card:hover {
-        border-color: var(--color-primary);
-        background: var(--color-primary-soft);
+    /* Маркер строки — короткая линия: показывает, что строка нажимается,
+       и не рисует лишнюю рамку. */
+    .example-card::before {
+        content: '';
+        width: var(--space-md);
+        height: 1px;
+        background: var(--color-faint);
+        transition:
+            background-color var(--duration-fast) var(--ease-soft),
+            width var(--duration-fast) var(--ease-soft);
     }
+
+    .example-card:hover {
+        color: var(--color-ink);
+    }
+
+        .example-card:hover::before {
+            width: var(--space-lg);
+            background: var(--tool-accent, var(--color-primary));
+        }
 
     .example-card:focus-visible {
         outline: none;
         box-shadow: var(--focus-ring);
+        border-radius: var(--radius-sm);
     }
 
-.example-icon {
-    color: var(--color-warning);
-    font-size: var(--text-body);
-}
-
 .example-text {
-    margin: 0;
     font-size: var(--text-sm);
-    line-height: 1.4;
+    line-height: 1.5;
 }
 
-/* ---------- Пузыри сообщений ---------- */
+/* ---------- Реплики ---------- */
+/* Отступ между репликами больше отступов внутри неё — иначе лента читается
+   как список одинаковых блоков. */
 .message {
     display: grid;
-    grid-template-columns: 26px minmax(0, 1fr);
-    gap: var(--space-sm);
-    align-items: start;
-    margin-bottom: var(--space-md);
+    margin-bottom: var(--space-lg);
 }
 
     .message:last-child {
         margin-bottom: 0;
     }
 
-.message-avatar {
-    display: grid;
-    place-items: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    font-size: var(--text-xs);
-}
-
-.message-content {
-    min-width: 0;
+/* Реплика пользователя — «задание»: подложка только у неё, чтобы
+   чередование задание/ответ считывалось без подписей. */
+.message.user .message-content {
     padding: var(--space-sm) var(--space-md);
-    border: 1px solid transparent;
     border-radius: var(--radius-md);
+    background: var(--color-surface-mist);
+    color: var(--color-ink-soft);
     font-size: var(--text-sm);
     line-height: 1.55;
 }
 
-    /* Подпись инпута и системные реплики — без глобального отступа <p>. */
+/* Ответ ИИ — текст без контейнера: его роль несёт размер и цвет, а не рамка. */
+.message.AI .message-content {
+    color: var(--color-ink);
+    font-size: var(--text-sm);
+    line-height: 1.6;
+}
+
     .message-content > p {
         margin: 0;
         overflow-wrap: break-word;
     }
 
-/* Ответ ассистента — спокойная поверхность с мягкой обводкой. */
-.message.AI {
-    grid-template-columns: 26px minmax(0, 1fr);
-}
-
-    .message.AI .message-avatar {
-        background: var(--color-primary-soft);
-        color: var(--color-primary-active);
-    }
-
-    .message.AI .message-content {
-        border-color: var(--color-hairline-soft);
-        border-top-left-radius: var(--radius-sm);
-        background: var(--color-surface-mist);
-        color: var(--color-ink-soft);
-    }
-
-/* Реплика пользователя — зеркалится и остаётся фирменно-зелёной. */
-.message.user {
-    grid-template-columns: minmax(0, 1fr) 26px;
-}
-
-    .message.user .message-avatar {
-        order: 2;
-        background: var(--color-ink);
-        color: var(--color-surface);
-    }
-
-    .message.user .message-content {
-        order: 1;
-        border-color: var(--color-primary);
-        border-top-right-radius: var(--radius-sm);
-        background: var(--color-primary);
-        color: var(--color-on-primary);
-    }
-
-/* Системное уведомление чата (ошибка запроса, недоступный голосовой ввод).
-   Идёт после правил .message.AI и потому их перебивает. */
-.message--alert .message-avatar {
-    background: var(--color-danger-soft);
-    color: var(--color-danger);
-}
-
+/* Системная реплика (ошибка запроса, недоступный голосовой ввод).
+   Цвет не единственный носитель: слева — линия статуса, текст сохранён. */
 .message--alert .message-content {
-    border-color: var(--color-danger-soft);
-    background: var(--color-danger-soft);
-    color: var(--color-danger);
+    padding-left: var(--space-md);
+    border-left: 2px solid var(--color-berry);
+    color: var(--color-danger-text);
 }
 
 .message-text {
@@ -318,7 +315,7 @@
     }
 }
 
-/* ---------- Индикаторы «печатает» ---------- */
+/* ---------- Индикаторы «работает» ---------- */
 .typing-indicator {
     display: flex;
     gap: var(--space-xxs);
@@ -326,8 +323,7 @@
     min-height: 20px;
 }
 
-.typing-indicator__dot,
-.think-typing__dot {
+.typing-indicator__dot {
     width: 5px;
     height: 5px;
     border-radius: 50%;
@@ -335,15 +331,13 @@
     animation: ai-dot 1s ease-in-out infinite;
 }
 
-.typing-indicator__dot:nth-child(2),
-.think-typing__dot:nth-child(2) {
-    animation-delay: .15s;
-}
+    .typing-indicator__dot:nth-child(2) {
+        animation-delay: .15s;
+    }
 
-.typing-indicator__dot:nth-child(3),
-.think-typing__dot:nth-child(3) {
-    animation-delay: .3s;
-}
+    .typing-indicator__dot:nth-child(3) {
+        animation-delay: .3s;
+    }
 
 .typing-indicator__label {
     margin-left: var(--space-xxs);
@@ -358,93 +352,53 @@
     }
 }
 
-/* ---------- Блок размышлений ---------- */
-.think-section {
-    margin: var(--space-sm) 0;
-    overflow: hidden;
-    border: 1px solid var(--color-hairline);
-    border-radius: var(--radius-md);
-    background: var(--color-surface);
-}
-
-.think-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-xs);
-    width: 100%;
-    min-height: 36px;
-    padding: 0 var(--space-sm);
-    border: 0;
-    background: transparent;
-    color: var(--color-ink-soft);
-    font: 600 var(--text-xs) var(--font-sans);
-    text-align: left;
-    cursor: pointer;
-}
-
-    .think-header:focus-visible {
-        outline: none;
-        box-shadow: var(--focus-ring);
-    }
-
-.think-header__icon {
-    color: var(--color-warning);
-}
-
-.think-header__chevron {
-    margin-left: auto;
-    color: var(--color-faint);
-}
-
-.think-content {
-    padding: 0 var(--space-sm) var(--space-sm);
-    color: var(--color-muted);
-    font-size: var(--text-xs);
-    line-height: 1.5;
-}
-
-    .think-content p {
-        margin: 0 0 4px;
-        overflow-wrap: break-word;
-    }
-
-.think-typing {
-    display: flex;
-    gap: var(--space-xxs);
-    padding-top: 4px;
-}
-
 /* ---------- Ввод ---------- */
+/* Поле — единственное место панели с явной рамкой: здесь она объясняет
+   границу взаимодействия. Кнопки живут под текстом, а не сбоку: в узкой
+   панели боковой ряд съедал треть ширины запроса. */
 .ai-chat-input {
     display: grid;
     gap: var(--space-xs);
-    padding: var(--space-md);
+    padding: var(--space-md) var(--space-lg) var(--space-lg);
     border-top: 1px solid var(--color-hairline-soft);
     background: var(--color-surface);
 }
 
-.ai-chat-input__row {
+.ai-chat-input__field {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: end;
     gap: var(--space-xs);
-}
-
-.chat-input {
-    width: 100%;
-    min-height: 42px;
-    max-height: 120px;
     padding: var(--space-sm) var(--space-md);
     border: 1px solid var(--color-hairline);
     border-radius: var(--radius-md);
     background: var(--color-surface-mist);
-    color: var(--color-ink);
-    font: var(--text-sm)/1.5 var(--font-sans);
-    resize: vertical;
     transition:
         border-color var(--duration-fast) var(--ease-soft),
         background-color var(--duration-fast) var(--ease-soft),
         box-shadow var(--duration-fast) var(--ease-soft);
+}
+
+    /* Фокус внутри блока — сигнал получает всё поле, а не только textarea. */
+    .ai-chat-input__field:focus-within {
+        border-color: var(--color-primary);
+        background: var(--color-surface);
+        box-shadow: var(--focus-ring);
+    }
+
+.chat-input {
+    width: 100%;
+    /* Минимум — три строки: на двух запрос аналитика не помещается,
+       а высота растёт скриптом до 140 px, пока текст влезает. */
+    min-height: calc(3 * 1.5em);
+    max-height: 140px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--color-ink);
+    font: var(--text-sm)/1.5 var(--font-sans);
+    /* Резать геометрию панели перетаскиванием нельзя: ряд с кнопками
+       ломается, а высота ограничена сверху. */
+    resize: none;
+    overflow-y: auto;
 }
 
     .chat-input::placeholder {
@@ -453,14 +407,12 @@
 
     .chat-input:focus {
         outline: none;
-        border-color: var(--color-primary);
-        background: var(--color-surface);
-        box-shadow: var(--focus-ring);
     }
 
 .ai-chat-buttons {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: var(--space-xs);
 }
 
@@ -468,16 +420,16 @@
     display: inline-flex;
 }
 
-/* Переопределения ui-кита через scopes (.ai-chat-input .ui-btn…) —
-   порядок импорта AiChat.css и ui.css на каскад не влияет. */
+/* Переопределения ui-кита — через scopes, а не порядок импортов. */
 .ai-chat-input .chat-send-btn {
     align-self: end;
+    min-height: var(--control-min-height);
 }
 
 .ai-chat-input .chat-voice-btn {
-    min-width: 42px;
+    min-width: var(--control-min-height);
     padding-inline: var(--space-sm);
-    background: var(--color-surface-mist);
+    background: transparent;
     color: var(--color-ink-soft);
 }
 
@@ -488,46 +440,88 @@
 
     .ai-chat-input .chat-voice-btn.is-active,
     .ai-chat-input .chat-voice-btn.is-active:hover {
-        background: var(--color-danger);
+        background: var(--color-berry);
         color: var(--color-on-primary);
     }
 
-.message .accept-improvement-btn {
-    width: 100%;
-    min-height: 40px;
-    margin-top: var(--space-sm);
+.ai-chat-container .chat-retry-btn,
+.ai-chat-container .accept-improvement-btn,
+.ai-chat-container .reject-improvement-btn {
+    min-height: var(--control-min-height);
+}
+
+.ai-chat-input .chat-send-btn:disabled,
+.ai-chat-input .chat-voice-btn:disabled {
+    cursor: not-allowed;
+    opacity: var(--disabled-opacity);
+}
+
+/* Действие по предложению ИИ: принять / отклонить — под ответом.
+   Принятие — единственное заливаемое действие в этом месте. */
+.message-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    margin-top: var(--space-md);
+}
+
+    .message-actions .accept-improvement-btn {
+        flex: 1 1 auto;
+    }
+
+/* Итог решения — уже не кнопка: повторное принятие бэкенд не примет. */
+.message-content > p.message-decision {
+    margin-top: var(--space-xs);
+    color: var(--color-muted);
+    font-size: var(--text-xs);
 }
 
 .message .chat-retry-btn {
     margin-top: var(--space-sm);
 }
 
-.voice-input-animation {
-    height: 2px;
-    border-radius: var(--radius-pill);
-    background: var(--color-primary);
-    transform-origin: left;
+/* Честная подпись записи: шкалы «громкости» нет — распознавание отдаёт
+   только текст и confidence, которая громкостью не является. */
+.voice-hint {
+    margin: 0;
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+    line-height: 1.4;
 }
 
 /* ---------- Адаптив и reduced motion ---------- */
-@media (max-width: 640px) {
+/* На узком экране панель не встраивается в ряд — нижний лист поверх канваса:
+   открыла чат = чат виден, без прокрутки страницы за ним. У панели оценки
+   то же правило живёт в ScorePanel.css: переопределение должно стоять
+   в том же файле, что и базовое, иначе порядок импортов решает исход. */
+@media (max-width: 760px) {
     .ai-chat-container.generate,
     .ai-chat-container.improve,
     .ai-chat-container.generate.expanded,
     .ai-chat-container.improve.expanded {
-        width: calc(100vw - 2 * var(--space-md));
+        position: fixed;
+        top: auto;
+        right: var(--page-gutter);
+        bottom: var(--space-lg);
+        left: var(--page-gutter);
+        z-index: 900;
+        flex: none;
+        width: auto;
+        max-height: min(78dvh, 100dvh - var(--editor-nav-space));
+    }
+
+    .ai-chat-messages {
+        padding: var(--space-md) var(--space-md) var(--space-sm);
+    }
+
+    .ai-chat-input {
+        padding: var(--space-sm) var(--space-md) var(--space-md);
     }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .ai-chat-container.generate,
-    .ai-chat-container.improve {
-        transition: none;
-    }
-
     .cursor,
-    .typing-indicator__dot,
-    .think-typing__dot {
+    .typing-indicator__dot {
         animation: none;
     }
 }

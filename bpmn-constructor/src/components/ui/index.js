@@ -1,6 +1,10 @@
 export { default as Button } from './Button';
 export { default as Badge } from './Badge';
+export { default as ScoreBadge } from './ScoreBadge';
 export { default as Input } from './Input';
+export { default as Select } from './Select';
+export { default as Textarea } from './Textarea';
+export { default as Modal } from './Modal';
 export { default as Accordion } from './Accordion';
 export { default as SectionHeading } from './SectionHeading';
 export { default as Reveal } from './Reveal';

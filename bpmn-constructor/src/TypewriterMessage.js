@@ -1,10 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { usePrefersReducedMotion } from './components/ui/Typewriter';
 
 /**
  * Печатающийся текст ответа ИИ.
  * `shouldAnimate` — печатать ли при первом появлении текста;
  * дальше текст показывается целиком, чтобы не перепечатывать
  * на каждом рендере родителя.
+ *
+ * `prefers-reduced-motion: reduce` — анимации нет вовсе: сразу стабильный
+ * финальный текст (design.md:34-35). Оба таймера снимаются при unmount.
  */
 const TypewriterMessage = ({ text, speed = 50, shouldAnimate = true }) => {
     const [displayText, setDisplayText] = useState('');
@@ -12,26 +16,34 @@ const TypewriterMessage = ({ text, speed = 50, shouldAnimate = true }) => {
     const animationRef = useRef(null);
     const startTimerRef = useRef(null);
     const hasAnimatedRef = useRef(false);
+    const reducedMotion = usePrefersReducedMotion();
 
     useEffect(() => {
+        const stop = () => {
+            clearTimeout(startTimerRef.current);
+            startTimerRef.current = null;
+            if (animationRef.current) {
+                clearInterval(animationRef.current);
+                animationRef.current = null;
+            }
+        };
+
         if (!text) {
             setDisplayText('');
             setIsTyping(false);
-            return undefined;
+            return stop;
         }
 
-        // Уже печатали — показываем актуальный текст без новой анимации.
-        if (!shouldAnimate || hasAnimatedRef.current) {
+        // Уже печатали (либо печать не нужна) — показываем актуальный текст
+        // целиком без новой анимации.
+        if (reducedMotion || !shouldAnimate || hasAnimatedRef.current) {
             setDisplayText(text);
             setIsTyping(false);
-            return undefined;
+            return stop;
         }
         hasAnimatedRef.current = true;
 
-        if (animationRef.current) {
-            clearInterval(animationRef.current);
-        }
-
+        stop();
         setIsTyping(true);
         setDisplayText('');
 
@@ -49,23 +61,17 @@ const TypewriterMessage = ({ text, speed = 50, shouldAnimate = true }) => {
             }, speed);
         };
 
-        // Небольшая задержка для предотвращения конфликтов
+        // Задержка старта, чтобы печать не накладывалась на перерисовку ленты.
         startTimerRef.current = setTimeout(startAnimation, 50);
 
-        return () => {
-            clearTimeout(startTimerRef.current);
-            if (animationRef.current) {
-                clearInterval(animationRef.current);
-                animationRef.current = null;
-            }
-        };
-    }, [text, speed, shouldAnimate]);
+        return stop;
+    }, [text, speed, shouldAnimate, reducedMotion]);
 
     // Пустой ответ: только курсор, без мёртвой области.
     if (!text) {
         return (
             <div className="message-text message-text--empty">
-                <span className="cursor">|</span>
+                <span className="cursor" aria-hidden="true">|</span>
             </div>
         );
     }
@@ -79,7 +85,7 @@ const TypewriterMessage = ({ text, speed = 50, shouldAnimate = true }) => {
                     <p key={i}>{line || '\u00A0'}</p>
                 ))
                 : <p>{'\u00A0'}</p>}
-            {isTyping && <span className="cursor">|</span>}
+            {isTyping && <span className="cursor" aria-hidden="true">|</span>}
         </div>
     );
 };

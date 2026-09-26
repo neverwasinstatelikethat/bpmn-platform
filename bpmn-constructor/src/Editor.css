@@ -30,7 +30,11 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
+    /* 100vh на мобильном браузере считается по развёрнутой панели, то есть
+       ниже видимого окна: нижняя строка каркаса уезжала за экран. dvh — с
+       фолбэком на vh там, где динамической высоты нет. */
     height: 100vh;
+    height: 100dvh;
     padding: calc(var(--editor-nav-space) + var(--space-xxs)) var(--page-gutter) var(--space-md);
     overflow: hidden;
     background: var(--color-canvas);
@@ -58,7 +62,7 @@
     flex: 1 1 auto;
     min-width: 0;
     max-width: 420px;
-    min-height: 40px;
+    min-height: var(--control-min-height);
     padding: var(--space-xs) var(--space-md);
     font-size: var(--text-body);
 }
@@ -70,9 +74,11 @@
     margin-left: auto;
 }
 
-    /* Компакт-размер кнопок только внутри шапки редактора. */
+    /* Компакт-размер кнопок только внутри шапки редактора: ниже
+       --control-min-height контрол не уходит — зона нажатия считается ею,
+       а не тем, как кнопка выглядит. */
     .editor-header-actions .ui-btn {
-        min-height: 36px;
+        min-height: var(--control-min-height);
         padding: 6px var(--space-md);
     }
 
@@ -99,7 +105,7 @@
 
     .editor-download-options-modal .ui-btn {
         justify-content: flex-start;
-        min-height: 36px;
+        min-height: var(--control-min-height);
         padding: 6px var(--space-sm);
         box-shadow: none;
     }
@@ -125,7 +131,7 @@
     flex: 1 1 auto;
     min-width: 0;
     max-width: 420px;
-    min-height: 38px;
+    min-height: var(--control-min-height);
     padding: var(--space-xs) var(--space-md);
     font-size: var(--text-sm);
 }
@@ -271,7 +277,9 @@
 .editor-canvas-area {
     position: relative;
     flex: 1 1 auto;
-    min-width: 0;
+    /* Пол канваса при открытой панели ИИ: схема остаётся рабочей, а
+       ниже 761px панель уходит в мобильный лист и место возвращает. */
+    min-width: 240px;
     background: var(--color-surface);
     border: 1px solid var(--color-hairline-soft);
     border-radius: var(--radius-card);
@@ -301,6 +309,9 @@
             background-position: -1px -1px;
         }
 
+/* Водяной знак bpmn.io скрыт глобально (index.css): он не нужен ни здесь,
+   ни в общем просмотре, ни в учебных схемах. */
+
 /* Слой занятости канваса: прозрачная подложка + статус загрузчика. */
 .editor-canvas-busy {
     position: absolute;
@@ -321,7 +332,9 @@
         font-size: var(--text-sm);
     }
 
-/* Управление масштабом и очисткой — компактная группа поверх канваса. */
+/* Управление масштабом и очисткой — компактная группа поверх канваса.
+   Высота кнопок — по --control-min-height: рейс остаётся узким (группа
+   прижата к левому нижнему углу), но попадать по «+» и «−» можно пальцем. */
 .editor-canvas-controls {
     position: absolute;
     bottom: var(--space-md);
@@ -338,8 +351,8 @@
 }
 
     .editor-canvas-controls .ui-btn {
-        min-height: 32px;
-        padding: 4px var(--space-sm);
+        min-height: var(--control-min-height);
+        padding: 0 var(--space-sm);
         font-size: var(--text-sm);
     }
 
@@ -367,8 +380,8 @@
 }
 
 .editor-swatch {
-    width: 32px;
-    height: 32px;
+    width: var(--control-min-height);
+    height: var(--control-min-height);
     padding: 0;
     border: 1px solid var(--color-hairline);
     border-radius: var(--radius-sm);
@@ -489,6 +502,25 @@
             transform: translateY(-50%) scale(1.5);
         }
 
+    /* Неактивный инструмент должен читаться недоступным: на стартовом
+       шаблоне проверки нет, и кнопка не притворяется рабочей. */
+    .editor-icon-btn:disabled {
+        color: var(--color-faint);
+        cursor: not-allowed;
+        opacity: var(--disabled-opacity);
+    }
+
+        .editor-icon-btn:disabled::before {
+            opacity: .2;
+        }
+
+        .editor-icon-btn:disabled:hover {
+            background: transparent;
+            border-color: transparent;
+            box-shadow: none;
+            color: var(--color-faint);
+        }
+
 /* Идентичность инструментов. */
 .editor-chat-btn {
     --tool-accent: var(--color-berry);
@@ -552,7 +584,9 @@
     display: grid;
     place-items: center;
     padding: var(--page-gutter);
-    background: rgba(41, 37, 36, 0.45);
+    /* Подложка модального окна: ink в 45% — отдельного токена --color-scrim
+       в дизайн-системе пока нет (запрос на него у оркестратора). */
+    background: color-mix(in srgb, var(--color-ink) 45%, transparent);
     backdrop-filter: blur(var(--blur-nav));
 }
 
@@ -608,6 +642,42 @@
         transform: translateY(0);
     }
 
+/* Удаление в шапке — текстовый danger, а не залипуха в одно вес с «Сохранить»:
+   primary в шапке один. Залитая ягода остаётся только в диалоге подтверждения.
+   Неактивная кнопка не кликается — ui-kit сам гасит [disabled]. */
+.ui-btn.editor-btn-danger-text,
+.ui-btn--ghost.editor-btn-danger-text {
+    background: transparent;
+    color: var(--color-danger-text);
+}
+
+    .ui-btn.editor-btn-danger-text:hover:not([disabled]),
+    .ui-btn--ghost.editor-btn-danger-text:hover:not([disabled]) {
+        background: var(--color-danger-soft);
+        color: var(--color-danger-text);
+    }
+
+    .ui-btn.editor-btn-danger-text:active:not([disabled]) {
+        background: var(--color-danger-soft);
+        color: var(--color-berry-deep);
+    }
+
+/* ---------- Подсветка элементов из отчёта оценки ---------- */
+/* Отличается от поиска: янтарь вместо фирменного зелёного и без подмены
+   fill — заливку элемента ставил пользователь, отчёт её не трогает. */
+.djs-element.reported .djs-visual {
+    filter: drop-shadow(0 0 6px var(--color-warn));
+}
+
+    .djs-element.reported .djs-visual > :first-child {
+        stroke: var(--color-warn) !important;
+        stroke-width: 3px !important;
+    }
+
+    .djs-element.reported .djs-visual path {
+        stroke: var(--color-warn) !important;
+    }
+
 /* ---------- Подсветка найденных элементов ---------- */
 
 .djs-element.highlight .djs-visual {
@@ -637,6 +707,7 @@
     .editor-container {
         height: auto;
         min-height: 100vh;
+        min-height: 100dvh;
     }
 
     .editor-header {
@@ -647,11 +718,17 @@
         max-width: none;
     }
 
+    /* Было `overflow-x: auto`: горизонтальный скролл контейнера уводил
+       заякоренное меню от кнопки и резал его. Действия переносятся строкой. */
     .editor-header-actions {
         width: 100%;
         margin-left: 0;
-        overflow-x: auto;
-        padding-bottom: var(--space-xxs);
+        flex-wrap: wrap;
+    }
+
+    .editor-download-options-modal {
+        left: 0;
+        right: auto;
     }
 
     .editor-toolbar {
@@ -670,7 +747,10 @@
 
     .editor-content {
         flex-direction: column;
+        /* 70dvh вместо 70vh: на мобильном vh считается по развёрнутой панели
+           браузера, и нижняя часть холста уходила за экран. */
         min-height: 70vh;
+        min-height: 70dvh;
     }
 
     .editor-left-panel,
@@ -703,6 +783,17 @@
 
     .editor-canvas-area {
         min-height: 55vh;
+        min-height: 55dvh;
         order: -1;
+    }
+
+    /* Уведомление уходит наверх: панель ИИ на мобильном — нижний лист,
+       и в прежнем положении внизу справа тост на 3 с закрывал кнопку отправки. */
+    .editor-notification {
+        top: calc(var(--nav-height) + var(--space-sm));
+        right: var(--page-gutter);
+        bottom: auto;
+        left: var(--page-gutter);
+        max-width: none;
     }
 }

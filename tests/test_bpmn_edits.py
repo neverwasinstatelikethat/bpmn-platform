@@ -1050,6 +1050,31 @@ class TestBoundaryEvent:
         ])
         assert report["skipped"][0]["reason"] == "'G_paid' не является задачей"
 
+    def test_refusal_names_the_step_that_leads_into_the_event(self, single_pool_xml):
+        """Пакет пристёгивает срок к ожидающему событию, потому что рецепт и
+        говорит «на шаге ожидания», а шаг ожидания в схеме — событие. Отказ
+        обязан назвать законного хозяина, иначе повтор приносит тот же id."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_BE", "attached_to": "End_ok",
+             "event_type": "timer", "name": "Прошло два часа"},
+        ])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "'End_ok' не является задачей"
+        assert 'attached_to="T_ship"' in skip["hint"]
+        assert "ногу развилки" in skip["hint"]
+
+    def test_hint_stays_silent_when_the_host_has_no_step_before_it(
+            self, single_pool_xml):
+        """У стартового события предшественника нет: подсказка не имеет права
+        выдумывать опору, она остаётся правилом."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_BE", "attached_to": "Start_1",
+             "event_type": "timer", "name": "Таймер"},
+        ])
+        hint = report["skipped"][0]["hint"]
+        assert "attached_to=" not in hint
+        assert "только к задаче" in hint
+
     def test_unsupported_event_type_is_skipped(self, single_pool_xml):
         _, report = apply_operations(single_pool_xml, [
             {"op": "add_boundary_event", "id": "new_BE", "attached_to": "T_collect",

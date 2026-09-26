@@ -1987,6 +1987,32 @@ def _op_move(op: Dict[str, Any], index: _Index) -> List[str]:
     return notes
 
 
+def _boundary_host_hint(index: _Index, host: ET.Element, host_id: str) -> str:
+    """Отказ по неверному хозяину таймера обязан называть законный.
+
+    Живые прогоны: пакет пристёгивает `timer` к ожидающему событию
+    (`intermediateCatchEvent`), потому что рецепт срока говорит «граничный
+    таймер на шаге ожидания», а шаг ожидания в схеме и есть событие. Формулировка
+    «цепляется только к задаче» не говорила, где именно законный хозяин, и
+    корректирующий повтор приносил тот же id.
+    """
+    rule = "граничное событие цепляется только к задаче или подпроцессу"
+    sources: List[str] = []
+    for flow in index.flows_by_id.values():
+        if (flow.get("targetRef") or "") != host_id:
+            continue
+        source = index.elements.get((flow.get("sourceRef") or ""))
+        if source is not None and _local(source.tag) in TASK_TAGS:
+            step = (flow.get("sourceRef") or "").strip()
+            if step not in sources:
+                sources.append(step)
+    if len(sources) == 1:
+        return (f"{rule}: к '{host_id}' ведёт шаг '{sources[0]}' — "
+                f"пристегните `attached_to=\"{sources[0]}\"`, либо заведите "
+                "ногу развилки «срок вышел»")
+    return rule
+
+
 def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     op_id = _require_new_id(op.get("id"), index)
     name = (op.get("name") or "").strip()
@@ -2009,7 +2035,7 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     if _local(host.tag) not in TASK_TAGS:
         raise _Skip(
             f"'{host_id}' не является задачей",
-            "граничное событие цепляется только к задаче или подпроцессу",
+            _boundary_host_hint(index, host, host_id),
         )
     process = index.process_of.get(host_id)
     if process is None:

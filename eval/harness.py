@@ -46,10 +46,18 @@ LOWER_IS_BETTER = frozenset({
     "improve/noop_share", "improve/package_revert_share",
     "improve/rules_regressed_share", "improve/plan_truncated_share",
     "improve/repeat_rejection_share", "improve/defects_introduced",
-    "improve/base_advice_drift",
+    "improve/base_advice_drift", "improve/advice_off_target_share",
     "business/smells",
     "spread/score_cv", "spread/score_cv_per_case",
 })
+
+# Претензия живого кейса «по факту схемы». Текст общий намеренно: ни id, ни
+# имён участников, ни названий правил — какой именно дефект чинить, оркестратор
+# достаёт сам из скоринга (`core/llm_improve.py:1013`), а харнесс не имеет права
+# подсказывать модели ответ, которого нет в продукте.
+ADVICE_PROMPT = ("В схеме есть проблемы. Убери то, что находят проверка нотации и "
+                 "скоринг, и не меняй то, что уже проходит. Не выдумывай "
+                 "участников и шагов, которых нет в описании процесса.")
 
 
 class HarnessError(RuntimeError):
@@ -478,6 +486,23 @@ class ImproveCase:
     #: прогоном.
     base_xml: str = ""
 
+    #: инварианты, дефект которых описывает претензия фикстуры. В live фикстура —
+    #: только слот прогона: текст жалобится на дефект *своей* базовой схемы, а
+    #: пакет паркуют к живой, где того дефекта может не быть. Прогон #55 на этом
+    #: попался: `loops_have_a_guard` и `no_blind_rework` прошли 1/1, а претензия
+    #: пары про цикл всё равно требовала развилку, модель её вставляла и ловила
+    #: `gateway_split_join` в колонке «сломано пакетом» — `score_delta` мерил
+    #: несоответствие текста и схемы, а не качество пакета.
+    targets: List[str] = field(default_factory=list)
+    #: ключ `targets` в фикстуре был: пустой список — осознанная разметка
+    #: «претензия просит улучшение, а не снимает нарушение», а отсутствие ключа —
+    #: незафиксированный факт, который попадает в `unmeasured`.
+    targets_declared: bool = False
+    #: претензия не про эту базовую схему: кейс не получил вызова модели и не
+    #: входит ни в одну метрику качества (пакета, которого не было, не бывает).
+    off_target: bool = False
+    off_target_note: str = ""
+
     @property
     def key(self) -> str:
         return f"{self.scenario}/{self.fixture}"
@@ -628,6 +653,8 @@ class ImproveCase:
             if self.checks_before else {},
             "checks_before": {k: v.as_dict() for k, v in self.checks_before.items()},
             "latency_ms": round(self.latency_ms, 1), "llm_calls": self.llm_calls,
+            "targets": self.targets, "off_target": self.off_target,
+            "off_target_note": self.off_target_note,
         }
 
 
@@ -999,6 +1026,35 @@ def _as_int_or_none(value: Any) -> Optional[int]:
     return None if value is None else int(value)
 
 
+def _advice_fixtures(scenario: Scenario, case: GenCase) -> List[Dict[str, Any]]:
+    """Один «претензия по факту» кейс на живую схему.
+
+    Фикстурная претензия в live обязана совпадать с дефектом схемы (см.
+    `_mark_off_target`), и с узкими `targets` это случается редко: контур
+    улучшения оставался бы без живой выборки вовсе. Здесь же требование к модели
+    строится из того, что в схеме нашли независимый оракул и скоринг, — ровно так
+    же, как это делает продукт: оркестратор сам подставляет секцию «УЗКИЕ МЕСТА ПО
+    СКОРИНГУ» (`core/llm_improve.py:1013`), поэтому в промпте нет ни id, ни
+    названий участников, ни подсказки ответа.
+
+    Схема без единого нарушения получает кейс с пустыми `targets`: это
+    осознанная разметка «просят улучшить, а не снять дефект», и она меряется
+    дельтой балла и регрессиями правил, но не долей ремонтов.
+    """
+    if not case.ok or not case.xml:
+        return []
+    failing = [c.name for c in invariants.applicable_checks(case.checks_xml)
+               if not c.ok]
+    advice = (score_xml(case.xml).get("recommendations_by_rule") or {})
+    if not failing and not advice:
+        return []
+    return [{"id": f"{scenario.id}.advice", "kind": "improve",
+             "scenario": scenario.id,
+             "label": "претензия по факту схемы: что нашлось, то и чиним",
+             "quality": "advice", "operations": [], "targets": failing,
+             "prompt": ADVICE_PROMPT}]
+
+
 def run_improvement_case(scenario: Scenario, fixture: Mapping[str, Any],
                          base: GenCase, mode: str = "replay",
                          repeat: int = 0) -> ImproveCase:
@@ -1022,12 +1078,23 @@ def run_improvement_case(scenario: Scenario, fixture: Mapping[str, Any],
         case.checks_before = invariants.check_xml(base.xml, expectations)
         case.scorer_before = score_xml(base.xml)
         case.score_before = case.scorer_before.get("score")
+        case.targets = [str(t) for t in (fixture.get("targets") or [])]
+        case.targets_declared = "targets" in fixture
+        _mark_off_target(case)
+        pre_unmeasured = list(case.unmeasured)
+        if case.off_target:
+            # Ни одного вызова модели: спрашивать «почини это» у схемы, у которой
+            # этого нет, — измерять несоответствие текста, а не контур.
+            return case
         if mode == "live":
             xml_after, report, case.llm_calls = _live_improve(
                 base.xml, fixture.get("prompt", "") or scenario.improve_prompt)
         else:
             xml_after, report = _replay_improve(base.xml, fixture)
         _absorb_improve_report(case, report)
+        # Отчёт приносит СВОИ замечания о недомере; разметка фикстуры,
+        # поставленная до вызова, от этого не исчезает.
+        case.unmeasured = pre_unmeasured + list(case.unmeasured)
         case.xml_after = xml_after
         if case.xml_after:
             case.checks_after = invariants.check_xml(case.xml_after, expectations)
@@ -1316,6 +1383,42 @@ def _base_advice_drift(case: "ImproveCase") -> Optional[float]:
     return float(len(invariants.business_disagreements(case.drift_before)))
 
 
+def _mark_off_target(case: "ImproveCase") -> None:
+    """Претензия фикстуры обязана описывать дефект, который у базовой схемы есть.
+
+    Сверяется по независимому оракулу (`checks_before`), а не по тексту подсказки:
+    у скоринга и оракула на базовой схеме пороги расходятся (см.
+    `DOCUMENTED_DIVERGENCES`), а решение «чинить или не спрашивать модель» должно
+    приниматься по той же мере, которой потом мерят `defects_repaired`.
+    Фикстура без `targets` — не размечена: кейс считается как раньше, но факт
+    «применимость не проверялась» попадает в `unmeasured`, а не молчит.
+    """
+    if not case.targets:
+        if not case.targets_declared:
+            case.unmeasured.append(
+                "применимость претензии не размечена (нет ключа `targets`)")
+        return
+    failing = {c.name for c in invariants.applicable_checks(case.checks_before)
+               if not c.ok}
+    if set(case.targets) & failing:
+        return
+    case.off_target = True
+    case.off_target_note = (
+        "претензия описывает дефект, которого в базовой схеме нет: названо "
+        + ", ".join(case.targets)
+        + "; проваливаются " + (", ".join(sorted(failing)) or "нет ни одного"))
+
+
+def _advice_off_target_share(case: "ImproveCase") -> Optional[float]:
+    """1.0 — претензия пакета не про эту базовую схему, 0.0 — про неё, None —
+    не проверялось (фикстура без `targets` или осознанно пустой список).
+    Метрика LOWER: ненулевое среднее значит, что часть выборки улучшения собрана
+    вопросами не по адресу и в качество пакета не входит."""
+    if not case.targets:
+        return None
+    return 1.0 if case.off_target else 0.0
+
+
 def build_improvement_suite() -> metrics.EvaluationSuite:
     """Метрики улучшения: только факты отчёта применения и исходы оракула.
 
@@ -1371,6 +1474,21 @@ def build_improvement_suite() -> metrics.EvaluationSuite:
     suite.metric("improve/error_share", lambda case: 0.0 if case.ok else 1.0,
                  description="доля пакетов, которые не удалось применить",
                  direction=metrics.LOWER)
+    suite.metric("improve/advice_off_target_share", _advice_off_target_share,
+                 description="доля кейсов, где претензия пакета не про эту "
+                             "базовую схему: правку не запрашивали, и в качество "
+                             "пакета такой кейс не входит",
+                 direction=metrics.LOWER)
+    # Кейс «претензия не про эту схему» не получил пакета вовсе: он не может ни
+    # починить, ни сломать, ни применить, и в знаменателе качества ему делать
+    # нечего. Исключение — сама применимость: её и надо видеть отдельным числом,
+    # а не спрятанной внутри доли ремонтов.
+    for m in suite.metrics:
+        if m.name == "improve/advice_off_target_share":
+            continue
+        inner = m.fn
+        m.fn = (lambda case, _f=inner:
+                None if getattr(case, "off_target", False) else _f(case))
     return suite
 
 
@@ -1531,6 +1649,12 @@ def render_table(report: RunReport) -> str:
     if not report.improve_cases:
         lines.append("  нет improve-фикстур для выбранных сценариев")
     for case in report.improve_cases:
+        if case.off_target:
+            # Отдельная строка, а не «0/0 операций»: кейс без запроса в модель
+            # иначе читается как пакет, который ничего не смог.
+            lines.append(f"  [⊘ ] {case.key} — правка не запрашивалась: "
+                         f"{case.off_target_note}")
+            continue
         total = len(case.applied) + len(case.skipped)
         done = 0 if case.noop_rows is None else len(case.applied) - case.noop_rows
         lines.append(f"  [{('OK ' if case.ok else 'FAIL')}] {case.key} — схему "
@@ -1706,6 +1830,15 @@ def run(mode: str = "replay", scenarios_spec: str = "all", repeat: int = 1,
             for index in range(repeat):
                 improve_cases.append(run_improvement_case(scenario, fixture, base,
                                                           mode=mode, repeat=index))
+        if mode == "live":
+            # Фикстурные слоты теперь честные, но почти всегда вне цели: живая
+            # схема редко болеет ровно тем, чем больна фикстура. Чтобы контур
+            # улучшения мерился на живых ответах, к каждой собранной схеме
+            # добавляется кейс с претензией по её же фактическим нарушениям.
+            for index, (_, base) in enumerate(bases):
+                for advice_fixture in _advice_fixtures(scenario, base):
+                    improve_cases.append(run_improvement_case(
+                        scenario, advice_fixture, base, mode=mode, repeat=index))
 
     names = [name for name in invariants.ALL_CHECKS
              if any(name in case.checks_xml for case in gen_cases)]

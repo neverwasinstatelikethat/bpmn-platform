@@ -14,6 +14,7 @@
 функции по имени, поэтому правки в `core/*` эти тесты не ломают.
 """
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -886,9 +887,14 @@ def test_live_case_reads_facts_instead_of_guessing_the_retry(monkeypatch):
     monkeypatch.setattr(
         harness, "_live_improve",
         lambda xml, prompt: (xml, report, 2))
-    case = harness.run_improvement_case(scenarios.get("purchase_approval"),
-                                        {"id": "fx", "label": "", "quality": "live"},
-                                        _base_gencase(GUARANTEE_XML), mode="live")
+    case = harness.run_improvement_case(
+        scenarios.get("purchase_approval"),
+        {"id": "fx", "label": "", "quality": "live",
+         # претензия заявлена и совпадает с тем, что схема проваливает: иначе
+         # замечание о неразмеченной фикстуре попадёт в `unmeasured` вместо
+         # фактов отчёта, а проверяется здесь именно отчёт
+         "targets": sorted(_failing_invariants(GUARANTEE_XML))},
+        _base_gencase(GUARANTEE_XML), mode="live")
     assert case.retry_attempted is True and case.retry_closed == 1
     assert harness._retry_gain(case) == 1.0
     assert harness._repeat_rejection_share(case) == 0.5
@@ -1358,6 +1364,171 @@ def test_replay_never_touches_the_env_file(monkeypatch):
     monkeypatch.setattr(run_module, "_load_env_file", _boom)
     assert run_module.main(["--mode", "replay", "--scenarios",
                             "product_return", "--no-report"]) == 0
+
+
+def _failing_invariants(xml: str, scenario_id: str = "purchase_approval") -> set:
+    """Проваленные применимые инварианты схемы по независимому оракулу — тот же
+    слой, которым харнесс решает, стоит ли вообще спрашивать модель."""
+    checks = invariants.check_xml(xml, scenarios.get(scenario_id).expectations())
+    return {name for name, ch in checks.items() if ch.applicable and not ch.ok}
+
+
+def test_live_improve_skips_a_complaint_that_is_not_about_this_scheme(monkeypatch):
+    """В live фикстура — только слот прогона: её претензия описывает дефект своей
+    базовой схемы, а пакет паркуют к живой. Прогон #55 на этом и попал: цикл в
+    живой схеме был закрыт (`loops_have_a_guard` прошёл), а текст пары про цикл
+    всё равно требовал развилку — модель её вставляла и получала «сломано
+    пакетом» за правку, которую не просили. Теперь несоответствующая претензия не
+    стоит ни одного обращения к модели и не попадает в метрики качества.
+
+    Проверяется на живом вызове: заглушка `_live_improve` считает обращения,
+    поэтому тест ломается, если харнесс спросит модель «на всякий случай».
+    """
+    calls = []
+
+    def _fake_live(xml, prompt):
+        calls.append(prompt)
+        return xml, {}, 1
+
+    monkeypatch.setattr(harness, "_live_improve", _fake_live)
+    off_target = sorted(set(invariants.ALL_CHECKS)
+                        - _failing_invariants(GUARANTEE_XML))[0]
+    case = harness.run_improvement_case(
+        scenarios.get("purchase_approval"),
+        {"id": "fx.off", "scenario": "purchase_approval", "label": "не про это",
+         "quality": "real", "prompt": "почини нарушение", "operations": [],
+         "targets": [off_target]},
+        _base_gencase(GUARANTEE_XML), mode="live")
+    assert case.off_target is True
+    assert calls == [], "несоответствующая претензия потратила обращение к модели"
+    assert off_target in case.off_target_note
+    assert not case.error, "кейс вне цели — не провал контура"
+
+
+def test_off_target_case_leaves_every_quality_metric():
+    """Кейс без пакета не может ни починить, ни сломать, ни «не примениться»:
+    он обязан выпасть из знаменателя всех метрик улучшения, кроме самой
+    применимости. Иначе `advice_applicable` — просто ещё одна строка, а
+    `defects_repaired` по-прежнему считает мусор."""
+    off = harness.ImproveCase(
+        scenario="s", fixture="off", label="", quality="real", mode="live",
+        targets=["no_unrouted"], targets_declared=True, off_target=True,
+        off_target_note="претензия не про эту схему", checks_before={})
+    good = harness.ImproveCase(
+        scenario="s", fixture="good", label="", quality="real", mode="replay",
+        ok=True, targets=["waits_have_sla"], targets_declared=True,
+        applied=[{"op": "rename"}], noop_rows=0,
+        score_before=90.0, score_after=95.0)
+    result = harness.build_improvement_suite().run(
+        [{"name": "off", "payload": off}, {"name": "good", "payload": good}])
+    assert result.metrics["improve/advice_off_target_share"].values == [1.0, 0.0]
+    assert result.metrics["improve/advice_off_target_share"].mean == 0.5
+    assert result.metrics["improve/error_share"].values[0] is None
+    assert result.metrics["improve/score_delta"].values == [None, 5.0]
+    assert result.metrics["improve/op_acceptance"].values[0] is None
+
+
+def test_improve_fixture_without_targets_is_reported_unmeasured():
+    """Пустой `targets` — осознанная разметка («просят улучшение, а не снимают
+    нарушение»), а отсутствие ключа — дыра в фикстуре: она обязана быть видна в
+    отчёте, а не молча считаться применимой."""
+    unnamed = harness.ImproveCase(scenario="s", fixture="f", label="",
+                                  quality="real", mode="replay")
+    harness._mark_off_target(unnamed)
+    assert not unnamed.off_target
+    assert any("targets" in note for note in unnamed.unmeasured)
+    declared = harness.ImproveCase(scenario="s", fixture="f", label="",
+                                   quality="real", mode="replay",
+                                   targets=[], targets_declared=True)
+    harness._mark_off_target(declared)
+    assert not declared.off_target and not declared.unmeasured
+
+
+def _live_gencase(xml: str, scenario_id: str = "purchase_approval") -> harness.GenCase:
+    """Живая схема как кейс генерации: с прогоном по оракулу, как это делает
+    `run_generation_case` после `_live_plan`."""
+    case = harness.GenCase(scenario=scenario_id, fixture="live", label="",
+                           quality="live", mode="live", ok=True, xml=xml)
+    case.checks_xml = invariants.check_xml(
+        xml, scenarios.get(scenario_id).expectations())
+    return case
+
+
+def _case_without_violations(case: harness.GenCase) -> harness.GenCase:
+    """Тот же кейс, но оракул на нём молчит: проверка ветки «чинить нечего»."""
+    case.checks_xml = {name: dataclasses.replace(ch, ok=True, reason="")
+                       for name, ch in case.checks_xml.items()}
+    return case
+
+
+def test_advice_fixture_complains_only_about_what_the_scheme_fails():
+    """Кейс «по факту» строит претензию из того, что в схеме нашёл независимый
+    оракул, — иначе live-выборка улучшения пуста (фикстурная жалоба редко болит
+    живой схеме). Промпт при этом статичен: ни id, ни имён участников, ни
+    названий правил — подсказывать ответ харнесс не имеет права, детали дефекта
+    оркестратор достаёт из скоринга сам."""
+    case = _live_gencase(GUARANTEE_XML)
+    fixtures = harness._advice_fixtures(scenarios.get("purchase_approval"), case)
+    assert len(fixtures) == 1
+    failing = {c.name for c in invariants.applicable_checks(case.checks_xml)
+               if not c.ok}
+    assert set(fixtures[0]["targets"]) <= failing
+    assert fixtures[0]["targets"]
+    blob = fixtures[0]["prompt"] + harness.ADVICE_PROMPT
+    assert fixtures[0]["prompt"] == harness.ADVICE_PROMPT
+    for leak in ("A1", "F1", "ВкусВилл", "Поставщик", "has_branching"):
+        assert leak not in blob, f"промпт улучшения подсказывает {leak}"
+
+
+def test_advice_fixture_skips_a_scheme_with_nothing_to_fix(monkeypatch):
+    """Нет нарушения и нет подсказки скоринга — нет и кейса: просить «сделай
+    лучше» у схемы, где мерить нечего, значит раздувать выборку нулями."""
+    case = _case_without_violations(_live_gencase(GUARANTEE_XML))
+    assert not [c for c in invariants.applicable_checks(case.checks_xml)
+                if not c.ok], "заглушка не почистила провалы"
+    monkeypatch.setattr(harness, "score_xml",
+                        lambda xml: {"recommendations_by_rule": {}})
+    assert harness._advice_fixtures(
+        scenarios.get("purchase_approval"), case) == []
+
+
+def test_advice_case_reaches_the_quality_metrics(monkeypatch):
+    """Кейс «по факту» обязан давать выборку метрикам улучшения: с узкими
+    `targets` фикстурные слоты почти всегда вне цели, и без этого прогона
+    `defects_repaired` в live снова считался бы по нулям или не считался вовсе."""
+    case = _live_gencase(GUARANTEE_XML)
+    fixture = harness._advice_fixtures(scenarios.get("purchase_approval"), case)[0]
+    monkeypatch.setattr(harness, "_live_improve",
+                        lambda xml, prompt: (xml, {"applied": [
+                            {"op": "rename", "id": "A1", "name": "Новое имя"}],
+                            "noop_rows": 0}, 1))
+    out = harness.run_improvement_case(scenarios.get("purchase_approval"),
+                                       fixture, case, mode="live")
+    assert out.off_target is False
+    assert out.quality == "advice"
+    assert out.repaired_share == 0.0, "пакет ничего не снял — метрика обязана это видеть"
+    assert out.score_delta is not None
+
+
+def test_every_improve_fixture_declares_targets_of_its_own_base():
+    """Рэтчет набора: претензия каждой improve-фикстуры обязана быть размечена и
+    соответствовать нарушению её же базовой схемы. Без этого live-кейс измеряет
+    несоответствие текста и схемы (прогон #55), а replay — пакет, который чинит
+    то, чего в базе не было."""
+    plans = _fixtures("plan")
+    for fixture in _fixtures("improve"):
+        assert "targets" in fixture, f"у {fixture['id']} нет ключа `targets`"
+        if not fixture["targets"]:
+            continue  # осознанно: пакет просит улучшение, нарушение не снимает
+        base = harness.fixture_by_id(fixture.get("base_plan", ""), plans)
+        assert base is not None, f"{fixture['id']} ссылается на несуществующий план"
+        gen = harness.run_generation_case(scenarios.get(fixture["scenario"]),
+                                          base, mode="replay")
+        failing = {name for name, ch in gen.checks_structure.items()
+                   if ch.applicable and not ch.ok}
+        assert set(fixture["targets"]) & failing, (
+            f"{fixture['id']} заявляет {fixture['targets']}, а базовая схема "
+            f"проваливает {sorted(failing)}")
 
 
 def test_scenarios_cover_every_process_and_fixture_is_wired():

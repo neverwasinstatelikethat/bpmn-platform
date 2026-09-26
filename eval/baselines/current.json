@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-09-25T18:28:30",
+ "generated_at": "2026-09-26T03:22:37",
  "mode": "replay",
  "repeat": 1,
  "scenarios": [
@@ -61,6 +61,7 @@
   "improve/base_advice_drift": "lower",
   "improve/defects_introduced": "lower",
   "improve/error_share": "lower",
+  "improve/advice_off_target_share": "lower",
   "spread/score_p50": "higher",
   "spread/score_p95": "higher",
   "spread/score_min": "higher",
@@ -118,6 +119,7 @@
   "improve/base_advice_drift": 0.0,
   "improve/defects_introduced": 0.0,
   "improve/error_share": 0.0,
+  "improve/advice_off_target_share": 0.0,
   "spread/score_p50": 92.0,
   "spread/score_p95": 97.0,
   "spread/score_cv": 0.051461013516160864,

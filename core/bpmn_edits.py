@@ -1179,6 +1179,36 @@ def _pool_skip(index: "_Index", key: Any) -> "_Skip":
         "(самостоятельный участник)")
 
 
+def _lane_pool_skip(index: _Index, lane_key: str, lane_process: ET.Element,
+                    process: ET.Element) -> "_Skip":
+    """Отказ «дорожка принадлежит другому пулу» с формами, которые можно
+    скопать.
+
+    Самый частый живой пропуск дня (12 строк в прогонах 25–26 сентября) и
+    одновременно самый молчаливый: прежняя подсказка («указывайте дорожку того же
+    пула») не называла ни владельца дорожки, ни того, что модель может ответить,
+    и повтор приносил ровно ту же операцию. Здесь отказ остаётся отказом — пул
+    не подменяется, — но подсказка говорит оба пула, уже готовые дорожки нужного
+    пула и точную форму `add_lane` с ним."""
+    owner = index.participant_name(lane_process) or lane_process.get("id") or "?"
+    here = index.participant_name(process) or process.get("id") or "?"
+    ours = sorted({str(l.get("name") or l.get("id") or "").strip()
+                   for l in index.lanes
+                   if index.enclosing_process(l) is process} - {""})
+    if ours:
+        legal = ("дорожка пула «" + here + "»: "
+                 + ", ".join(f"«{n}»" for n in ours[:5]))
+    else:
+        legal = (f"в пуле «{here}» дорожек пока нет — заведите её: "
+                 f'add_lane(id="new_Lane_1", name="…", participant="{here}")')
+    return _Skip(
+        "дорожка принадлежит другому пулу",
+        f"дорожка '{lane_key}' — в пуле «{owner}», а элемент живёт в пуле "
+        f"«{here}»; {legal}. Либо оставьте дорожку пула «{owner}» и укажите "
+        f'participant="{owner}"',
+    )
+
+
 def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
     op_id = _require_new_id(op.get("id"), index)
     name = (op.get("name") or "").strip()
@@ -1239,10 +1269,8 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                 needs=(lane_key,),
             )
         if index.enclosing_process(lane) is not process:
-            raise _Skip(
-                "дорожка принадлежит другому пулу",
-                "указывайте lane дорожкой того же пула, где создаёте элемент",
-            )
+            raise _lane_pool_skip(index, lane_key, index.enclosing_process(lane),
+                                  process)
     definition = _event_definition_key(op)
     alias_note = ""
 
@@ -1536,11 +1564,14 @@ def _op_move_to_lane(op: Dict[str, Any], index: _Index) -> List[str]:
             needs=(lane_key,),
         )
     process = index.process_of.get(elem_id)
-    if process is None or index.enclosing_process(lane) is not process:
+    lane_process = index.enclosing_process(lane)
+    if process is None:
         raise _Skip(
             "дорожка принадлежит другому пулу",
             "переносить элемент можно только в дорожку своего процесса",
         )
+    if lane_process is not process:
+        raise _lane_pool_skip(index, lane_key, lane_process, process)
     # flowNodeRef переставляется, а не дублируется: ссылка обязана остаться
     # ровно в одной дорожке, иначе bpmn-js покажет элемент дважды.
     current_lane = next((other.get("id") or "" for other in index.lanes

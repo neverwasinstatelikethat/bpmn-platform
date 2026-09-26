@@ -476,6 +476,55 @@ class TestLanes:
         assert report["status"] == "partial"
         assert report["skipped"][0]["reason"] == "дорожка принадлежит другому пулу"
 
+    def test_lane_pool_conflict_hint_is_copy_pasteable(self, two_pool_xml):
+        """Отказ «дорожка другому пулу» был самым частым живым пропуском дня
+        (12 строк в прогоне #55+), и лечился он не умной подсказкой: текст
+        «указывайте дорожку того же пула» не называет ни владельца дорожки, ни
+        того, что модель может ответить. Повтор приносил ровно ту же операцию.
+        Подсказка обязана назвать оба пула и дать форму, которую можно
+        скопировать: перенос в дорожку пула элемента — либо дорожка нужного пула,
+        созданная `add_lane`."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_shop", "name": "Сборка",
+             "participant": "Магазин"},
+            {"op": "move_to_lane", "id": "C_request", "lane": "new_Lane_shop"},
+        ])
+        hint = report["skipped"][0]["hint"]
+        assert "Магазин" in hint, "не назван пул-владелец дорожки"
+        assert "Клиент" in hint, "не назван пул самого элемента"
+        assert "new_Lane_shop" in hint, "не названа дорожка, о которой речь"
+        assert "add_lane" in hint and "participant=" in hint
+
+    def test_add_task_lane_pool_conflict_hint_offers_the_existing_lane(
+            self, two_pool_xml):
+        """У `add_task` та же ловушка: модель просит дорожку чужого пула и
+        получает отказ без альтернативы. Если в пуле названного участника
+        дорожки нет, подсказка обязана сказать это прямо и назвать `add_lane`
+        с этим пулом — иначе повтор снова приведёт к чужой дорожке."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_shop", "name": "Сборка",
+             "participant": "Магазин"},
+            {"op": "add_task", "id": "new_C_check", "name": "Проверка",
+             "participant": "Клиент", "lane": "new_Lane_shop", "after": "C_request"},
+        ])
+        assert report["skipped"][0]["reason"] == "дорожка принадлежит другому пулу"
+        hint = report["skipped"][0]["hint"]
+        assert "Клиент" in hint and "Магазин" in hint
+        assert "add_lane" in hint and 'participant="Клиент"' in hint
+
+    def test_lane_conflict_hint_lists_a_lane_the_model_can_use(self, two_pool_xml):
+        """Если в пуле элемента дорожки уже есть, подсказка обязана их назвать:
+        «возьмите id из инвентаря» без имён — это снова приказ угадывать."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_lane", "id": "new_Lane_client", "name": "Продавец",
+             "participant": "Клиент"},
+            {"op": "add_lane", "id": "new_Lane_shop", "name": "Сборка",
+             "participant": "Магазин"},
+            {"op": "move_to_lane", "id": "C_request", "lane": "new_Lane_shop"},
+        ])
+        hint = report["skipped"][0]["hint"]
+        assert "Продавец" in hint, "не названа законная дорожка того же пула"
+
     def test_move_unknown_element_is_skipped(self, single_pool_xml):
         _, report = apply_operations(single_pool_xml, [
             {"op": "move_to_lane", "id": "no_such_id", "lane": "new_Lane_1"},

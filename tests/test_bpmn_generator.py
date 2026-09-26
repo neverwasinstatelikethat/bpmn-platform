@@ -1738,22 +1738,50 @@ class TestVacantPools:
         assert _note(result["notes"], "Пул «Кладовщик» удалён")
 
     def test_pool_named_in_description_survives_the_cleanup(self, monkeypatch):
-        """Пустой пул участника, названного в описании, остаётся на схеме.
+        """Пустой пул участника, чьи шаги лежат в чужом пуле, остаётся на схеме.
 
         Живой прогон #58: пять провалов `expected_participants` из десяти — это
         пулы, которые план объявлял («WMS», «Бюро кредитных историй», «Система
-        мониторинга»), а починка вычистила вместе с шагами. Нарушение
-        `pool_has_steps` у оставленного пула есть и оно чинится пакетом
-        (`participant="имя"` из инвентаря), а исчезнувший участник из инвентаря
-        уходит, и ссылаться в правке становится не на что.
+        мониторинга», «компания-перевозчик»), а починка вычистила их вместе с
+        событиями. Перенос исполним и вопросом о принадлежности, и пакетом
+        (`participant="имя"` из инвентаря); удалённый пул из инвентаря уходит, и
+        ссылаться в правке становится не на что.
         """
-        FakeLLM(monkeypatch, self._vacant())
+        plan = _plan(
+            participants=["ВкусВилл", "Кладовщик"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ", "L_m"),
+                _e("T1", "userTask", "Собрать заказ кладовщиком", "L_m"),
+                _e("E1", "endEvent", "Осмотрен", "L_m"),
+                _e("S2", "startEvent", "Старт", "", "Кладовщик"),
+                _e("E2", "endEvent", "Завершение", "", "Кладовщик"),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1"),
+                   _f("F3", "S2", "E2")],
+        )
+        FakeLLM(monkeypatch, plan)
         result = BPMNGenerator().generate(
             "ВкусВилл: менеджер проверяет остатки, Кладовщик собирает заказ.")
         assert "Кладовщик" in [p["name"] for p
                                in result["structure"]["participants"]]
         assert _note(result["notes"], "Пул «Кладовщик» оставлен без шагов")
         assert not _note(result["notes"], "Пул «Кладовщик» удалён")
+
+    def test_pool_without_a_step_to_wait_for_is_still_dropped(self, monkeypatch):
+        """Названный в описании пустой пул без чужого шага в его честь удаляется:
+        оставлять нечего, и нарушение `pool_has_steps` осталось бы навсегда.
+
+        Проверка «на всякий случай» в прогоне #61 удвоила пустые пулы с нуля до
+        семи из шестнадцати схем: сводка гейта упала 0.876 → 0.821, когда
+        `expected_participants` выросла лишь 0.75 → 0.81.
+        """
+        FakeLLM(monkeypatch, self._vacant())
+        result = BPMNGenerator().generate(
+            "ВкусВилл: менеджер проверяет остатки, Кладовщик собирает груз.")
+        assert _note(result["notes"], "Пул «Кладовщик» удалён")
+        assert "Кладовщик" not in [p["name"] for p
+                                   in result["structure"]["participants"]]
 
     def test_flows_of_removed_pool_do_not_survive(self, monkeypatch):
         result = _generate(monkeypatch, self._vacant())

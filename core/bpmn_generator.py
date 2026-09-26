@@ -3558,13 +3558,18 @@ def _drop_vacant_pools(elements: List[Dict[str, Any]],
     шаги нельзя — это выдуманное содержание, а оставить — раздуть коллаборацию
     пустыми прямоугольниками, за которые скоринг правомерно снимает балл.
 
-    Названный в описании участник не удаляется, даже оставшись пустым:
-    живой прогон #58 потерял так пять схем из десяти провалов
-    `expected_participants` («WMS», «Бюро кредитных историй», «Система
-    мониторинга»). Пустой пул — нарушение `pool_has_steps`, у которого есть
-    исполнимая правка (`participant="имя"` из инвентаря), а удалённый пул
-    исчезает из инвентаря, и пакету уже не на что ссылаться: дефект
-    переходит из чинимого в нечинимый.
+    Названный в описании участник не удаляется, только если его шаги и правда
+    лежат в чужом пуле: живой прогон #58 потерял так пять схем из десяти
+    провалов `expected_participants` («WMS», «Бюро кредитных историй», «Система
+    мониторинга», «компания-перевозчик»). Перенос исполним и вопросом о
+    принадлежности, и пакетом (`participant="имя"` из инвентаря), а удалённый
+    пул исчезает из инвентаря, и правке остаётся выдумывать id.
+
+    Когда шага, названного в честь пула, в плане нет вовсе, оставлять нечего:
+    нарушение `pool_has_steps` осталось бы навсегда. Проверка «на всякий
+    случай» в прогоне #61 удвоила пустые пулы с нуля до семи из шестнадцати
+    схем и уронила сводку гейта с 0.876 до 0.821 — при том что
+    `expected_participants` выросла только с 0.75 до 0.81.
     """
     words = _text_words(description)
 
@@ -3572,14 +3577,25 @@ def _drop_vacant_pools(elements: List[Dict[str, Any]],
         """Участник назван в описании — с любым окончанием, как его ищет оракул.
 
         Терпимость та же, что у `_mentioned`: «расчёт с перевозчиком» называет
-        пул «компания-перевозчик» (в прогоне #58 он и был тем пустым пулом,
-        которого оракул потом не досчитался). Родовое слово вместо имени
-        («Организация», «Система») участником не считается: `_generic_actor_name`
-        уже отсекает такие ярлыки в плане.
+        пул «компания-перевозчик». Родовое слово вместо имени («Организация»,
+        «Система») участником не считается: `_generic_actor_name` отсекает такие
+        ярлыки и в плане.
         """
         parts = _name_parts(name)
         return bool(parts) and not _generic_actor_name(name) \
             and all(len(p) >= 3 and _mentioned(p, words) for p in parts)
+
+    def steps_wait_elsewhere(name: str) -> bool:
+        """В чужом пуле есть шаг, названный в честь этого участника."""
+        for element in elements:
+            if element.get("kind") not in STEP_KINDS:
+                continue
+            if _norm_name(str(element.get("participant") or "")) == \
+                    _norm_name(name):
+                continue
+            if _mentioned(name, _text_words(str(element.get("name") or ""))):
+                return True
+        return False
 
     live = [pool for pool in participants
             if any(e["kind"] in STEP_KINDS for e in elements
@@ -3589,10 +3605,11 @@ def _drop_vacant_pools(elements: List[Dict[str, Any]],
     for pool in list(participants):
         if pool in live:
             continue
-        if words and named_in_text(str(pool.get("name") or "")):
+        if words and named_in_text(str(pool.get("name") or "")) \
+                and steps_wait_elsewhere(str(pool.get("name") or "")):
             notes.append(f"Пул «{pool['name']}» оставлен без шагов: участник "
-                         "назван в описании, поэтому удаление забрало бы его "
-                         "с схемы целиком")
+                         "назван в описании, а его шаги лежат в чужом пуле — "
+                         "удаление забрало бы участника с схемы целиком")
             continue
         own = [e for e in elements if e["participant"] == pool["name"]]
         ids = {e["id"] for e in own}

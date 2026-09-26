@@ -1413,14 +1413,25 @@ def _noop_share(case: ImproveCase) -> Optional[float]:
 
 
 def _retry_gain(case: ImproveCase) -> Optional[float]:
-    """Сколько отказов первого раунда закрыл корректирующий повтор.
+    """Доля отказов первого раунда, закрытых корректирующим повтором.
 
-    Выборка — только кейсы с состоявшимся повтором: на остальных метрика
-    физически не определена, и нули там только дешевле выглядели бы.
+    Прежняя версия возвращала АБСОЛЮТНОЕ число закрытых строк (`retry_closed`) и
+    агрегировалась средним по кейсам: прогон #58 давал 0.18, #59–#62 — 0, и ни
+    одно из этих чисел нельзя было прочесть как «повтор помогает». Кейс с одним
+    отказом и кейс с десятью входили в среднее с одинаковым весом, а
+    знаменатель метрика не видел вовсе. Теперь это доля: 0 читается как «из
+    названных отказов не закрыт ни один», 1.0 — как «закрыты все».
+
+    Выборка — только кейсы с состоявшимся повтором и с отказом первого раунда:
+    на остальных метрика физически не определена, и нули там только дешевле
+    выглядели бы.
     """
     if case.retry_attempted is not True or case.retry_closed is None:
         return None
-    return float(case.retry_closed)
+    first_round = [s for s in case.skipped if s.get("stage") != "retry"]
+    if not first_round:
+        return None
+    return float(case.retry_closed) / len(first_round)
 
 
 def _flag(value: Any) -> Optional[float]:
@@ -1540,8 +1551,8 @@ def build_improvement_suite() -> metrics.EvaluationSuite:
     suite.metric("improve/noop_share", _noop_share, direction=metrics.LOWER,
                  description="доля «применённых» строк, не изменивших схему")
     suite.metric("improve/retry_gain", _retry_gain,
-                 description="сколько отказов первого раунда закрыл повтор "
-                             "(только кейсы с состоявшимся повтором)", unit="правка")
+                 description="доля отказов первого раунда, закрытых повтором "
+                             "(только кейсы с состоявшимся повтором)")
     suite.metric("improve/package_revert_share", _package_revert_share,
                  direction=metrics.LOWER,
                  description="гарант откатил пакет целиком к базовой схеме")

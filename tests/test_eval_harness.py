@@ -897,7 +897,9 @@ def test_live_case_reads_facts_instead_of_guessing_the_retry(monkeypatch):
          "targets": sorted(_failing_invariants(GUARANTEE_XML))},
         _base_gencase(GUARANTEE_XML), mode="live")
     assert case.retry_attempted is True and case.retry_closed == 1
-    assert harness._retry_gain(case) == 1.0
+    # Из двух отказов первого раунда повтор закрыл один: доля 0.5, а не «1
+    # правка» — прежняя версия метрики отдавала наружу абсолютное число.
+    assert harness._retry_gain(case) == 0.5
     assert harness._repeat_rejection_share(case) == 0.5
     assert harness._plan_truncated_share(case) == 1.0
     assert harness._rules_regressed_share(case) == 1.0
@@ -906,6 +908,29 @@ def test_live_case_reads_facts_instead_of_guessing_the_retry(monkeypatch):
     assert case.truncated_operations == 3 and case.noop_rows == 0
     # live-отчёт не знает, чего харнесс не доиграл: список пуст, а не «всё хорошо»
     assert case.unmeasured == []
+
+
+def test_retry_gain_is_a_share_not_a_count():
+    """Закрытый отказ из десяти и закрытый отказ из одного — разная работа
+    повтора, и среднее по абсолютным числам это стирало (#58 давал 0.18 «правок»
+    вместо доли)."""
+    many = harness.ImproveCase(
+        scenario="s", fixture="f", label="l", quality="advice", mode="live",
+        retry_attempted=True, retry_closed=1,
+        skipped=[{"op": "connect", "stage": "plan", "reason": "нет опоры"}
+                 for _ in range(10)])
+    assert harness._retry_gain(many) == 0.1
+    lone = harness.ImproveCase(
+        scenario="s", fixture="f", label="l", quality="advice", mode="live",
+        retry_attempted=True, retry_closed=1,
+        skipped=[{"op": "connect", "stage": "plan", "reason": "нет опоры"}])
+    assert harness._retry_gain(lone) == 1.0
+    # Отказы второго раунда в знаменатель не входят: они про повтор, а не до него
+    second_only = harness.ImproveCase(
+        scenario="s", fixture="f", label="l", quality="advice", mode="live",
+        retry_attempted=True, retry_closed=0,
+        skipped=[{"op": "connect", "stage": "retry", "reason": "нет опоры"}])
+    assert harness._retry_gain(second_only) is None
 
 
 def test_missing_guarantor_is_recorded_not_raised(monkeypatch):

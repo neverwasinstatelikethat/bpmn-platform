@@ -36,9 +36,12 @@ MOJIBAKE = re.compile("[À-ÖØ-öø-ÿ]")
 # Латиница, приклеенная к кириллице без разделителя: «лimit», «уbuilt-in»,
 # «differить». Это тот же класс дефекта, что и идеограмма, только маскируется под
 # осознанную кальку. Разделители `-`, `_`, пробел и обратный слэш (буква
-# escape-последовательности вроде `\n`) склейкой не считаются.
+# escape-последовательности вроде `\n`) склейкой не считаются. Верхний регистр
+# кириллицы обязан быть в классе: склейка чаще всего прилетает в начало
+# предложения («Рatchet» вместо «Ratchet»), где буква заглавная, и прошлый
+# вариант проверки это пропускал.
 GLUE_LATIN_CYRILLIC = re.compile(r"(?<![A-Za-z0-9\\])[A-Za-z]{2,}[а-яё]")
-GLUE_CYRILLIC_LATIN = re.compile(r"[а-яё][A-Za-z]{2,}(?![A-Za-z])")
+GLUE_CYRILLIC_LATIN = re.compile(r"[а-яёА-ЯЁ][A-Za-z]{2,}(?![A-Za-z])")
 # Регулярный класс символов вроде `[^0-9a-zа-яё]` легален: там русская буква и
 # латинская стоят рядом по замыслу.
 CHAR_CLASS = re.compile(r"\[[^\]]*\]")
@@ -119,6 +122,22 @@ def test_no_latin_glued_into_cyrillic_prose():
     bad = (_scan(_python_files(), _text_chunks, matcher)
            + _scan(_doc_files(), _md_chunks, matcher))
     assert not bad, ("латиница склеена с кириллицей:\n" + "\n".join(bad))
+
+
+def test_glue_pattern_catches_a_capitalised_cyrillic_letter():
+    """Самопроверка паттерна: «Рatchet» (заглавная «Р» + латиница) проходил
+    мимо проверки, пока класс кириллицы был только строчным. Без этого теста
+    расширение класса выглядит лишним и его легко вернуть назад.
+
+    Обратные случаи — легальные формы, которые паттерн трогать не должен:
+    раздельные слова, дефис и идентификатор целиком латиницей.
+    """
+    assert GLUE_CYRILLIC_LATIN.search("Рatchet нужен")
+    assert GLUE_CYRILLIC_LATIN.search("лimit")
+    assert GLUE_LATIN_CYRILLIC.search("differить")
+    assert not GLUE_CYRILLIC_LATIN.search("Ratchet нужен")
+    assert not GLUE_CYRILLIC_LATIN.search("Бизнес-совет")
+    assert not GLUE_LATIN_CYRILLIC.search("бизнес совет")
 
 
 def test_repo_root_has_no_scratch_files():

@@ -59,6 +59,23 @@ ADVICE_PROMPT = ("В схеме есть проблемы. Убери то, чт
                  "скоринг, и не меняй то, что уже проходит. Не выдумывай "
                  "участников и шагов, которых нет в описании процесса.")
 
+# Планка сводного качества: доля применимых гейт-проверок, пройденных одной
+# схемой. Числом совпадает с прежним обещанием харнесса («каждый инвариант
+# корректности ≥0.8»), но считается по схеме, а не по конъюнкции: среднее по
+# живому прогону #56 уже 0.853 там, где `pass@1/scenario` даёт 0.062.
+QUALITY_BAR = 0.8
+# Что в итоговой схеме решает человек, а не линейка. Формулировки — вопросы, а не
+# критерии с числом: у ответа нет меры, и выдумывать её значило бы подменить
+# ручной вердикт ещё одной самоподтверждающейся метрикой.
+MANUAL_REVIEW_ITEMS = (
+    "имя каждого шага читается как действие, а не как отглагольное существительное",
+    "в схеме нет шага, которого нет в описании — выдуманное действие остаётся "
+    "браком, даже когда нотация цела",
+    "участники названы словами описания: роль — дорожка, система — пул, срок — "
+    "таймер там, где в тексте срок",
+    "схема открывается в bpmn-js, и маршрут виден без разбора id",
+)
+
 
 class HarnessError(RuntimeError):
     """Непреодолимая проблема харнесса: нет фикстур, не найден вход и т. п."""
@@ -360,6 +377,58 @@ class GenCase:
         return [c.name for c in invariants.business_smells(self.checks_xml)]
 
     @property
+    def gate_share(self) -> Optional[float]:
+        """Доля пройденных гейт-проверок ЭТОЙ схемы — сводная мера вместо
+        конъюнкции.
+
+        `pass@1/scenario` требовал, чтобы одна схема прошла все применимые
+        проверки сразу: в живом прогоне #56 это 0.062 при том, что в среднем по
+        кейсам провалено 15% проверок (сводная доля — 0.853). Конъюнкция полезна
+        как сигнал «ноль дефектов», но как планка она меряет не контур, а
+        геометрическую вероятность собрать семнадцать независимых условий, и
+        поднять её можно только всею охотой за классами сразу. Эта доля — та же
+        самая проверка, но монотонная: каждое снятое нарушение добавляет число,
+        ничего не срезая, и на ней планка ≥0.8 достижима уже сегодня.
+        Конъюнкция из данных не пропала — она осталась фактом кейса
+        (`scenario_pass`, он же в имени файла `--dump-schemes`); метрикой в
+        таблице она перестала быть, потому что отчитываться таким числом —
+        всегда ноль.
+        None, когда применимых проверок нет (пустая схема, не разобралась).
+        """
+        checks = invariants.deciding_checks(self.checks_xml)
+        if not checks:
+            return None
+        return float(sum(1 for c in checks if c.ok)) / len(checks)
+
+    @property
+    def structure_gate_share(self) -> Optional[float]:
+        """То же число по починенной структуре — до генерации XML.
+
+        Нужна отдельной строкой, потому что гейт на структуре и гейт на XML
+        ловят разных виновников: здесь видно, что план уже был неполон, ещё до
+        транспорта XML (разграничение в `eval/attribution.py`).
+        """
+        checks = invariants.deciding_checks(self.checks_structure)
+        if not checks:
+            return None
+        return float(sum(1 for c in checks if c.ok)) / len(checks)
+
+    @property
+    def business_share(self) -> Optional[float]:
+        """Доля пройденных бизнес-проверок той же схемы.
+
+        Числом она ниже гейт-доли и не является планкой: потолок задан набором,
+        а не контуром (ожидания без срока есть и в эталонном ответе —
+        `EXPECTED_ETALON_BUSINESS_DEBT`). Нужна для того, чтобы движение
+        бизнес-слоя было видно без чтения плотности узких мест.
+        """
+        checks = [c for c in invariants.applicable_checks(self.checks_xml)
+                  if c.name in invariants.BUSINESS_INVARIANTS]
+        if not checks:
+            return None
+        return float(sum(1 for c in checks if c.ok)) / len(checks)
+
+    @property
     def drift(self) -> Dict[str, Dict[str, Any]]:
         """Таблица «оракул ↔ скоринг» по бизнес-слою этой же схемы.
 
@@ -524,6 +593,39 @@ class ImproveCase:
         if not self.checks_after:
             return None
         return all(c.ok for c in invariants.deciding_checks(self.checks_after))
+
+    @property
+    def gate_share(self) -> Optional[float]:
+        """Доля пройденных гейт-проверок улучшенной схемы.
+
+        Парная к `GenCase.gate_share` и введена вместо `improve/pass@1`: тот
+        конъюнкционный числовой ряд был 0.056 в живом прогоне именно потому,
+        что мерил и починку, и генерацию одним битом. Здесь же пакет отвечает
+        за свою долю, а «чинить было нечего / было нечего чинить» остаётся у
+        `repaired_share`.
+        """
+        checks = invariants.deciding_checks(self.checks_after)
+        if not checks:
+            return None
+        return float(sum(1 for c in checks if c.ok)) / len(checks)
+
+    @property
+    def base_gate_share(self) -> Optional[float]:
+        """Доля пройденных гейт-проверок БАЗОВОЙ схемы — знаменатель выше.
+
+        Без неё `gate_share` улучшенной схемы неотличим от «такая база была»:
+        0.8 после пакета на базе 0.5 и 0.8 после пакета на базе 0.8 — это разные
+        результаты, и дельта этих двух чисел есть вклад пакета в нотацию.
+        Парность важна и как условие: без состоявшегося пакета (`checks_after`
+        пуст) сравнивать нечего, и число о базе стало бы метрикой по кейсу без
+        данных — как если бы `improve/op_acceptance` считалась по отказу.
+        """
+        if not self.checks_after:
+            return None
+        checks = invariants.deciding_checks(self.checks_before)
+        if not checks:
+            return None
+        return float(sum(1 for c in checks if c.ok)) / len(checks)
 
     @property
     def repaired_share(self) -> Optional[float]:
@@ -1194,22 +1296,26 @@ def _not_worse_than_etalon(case: GenCase,
 
 
 def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
-    """Метрики генерации: pass@1 по инвариантам и сводно, правки починки, балл,
-    задержка и ретраи.
+    """Метрики генерации: доля пройденных гейт-проверок и они же поштучно,
+    правки починки, балл, задержка и ретраи.
 
     Бизнес-слой оракула дан двумя отдельными метриками (`business/smells`,
-    `business/not_worse_than_etalon`) и в `pass@1` не входит; почему —
-    `invariants.deciding_checks`.
+    `business/not_worse_than_etalon`) и в гейт-долю не входит; почему —
+    `invariants.deciding_checks`. Сводной конъюнкции («схема без единого
+    провала») в таблице нет: см. `GenCase.gate_share`.
     """
     suite = metrics.EvaluationSuite()
     etalon = etalon_business_smells()
     for name in names:
         suite.metric(f"pass@1/{name}", lambda case, n=name: _check_value(case, n),
                      description=f"инвариант «{name}» по итоговому XML")
-    suite.metric("pass@1/scenario",
-                 lambda case: None if case.scenario_pass is None
-                 else float(case.scenario_pass),
-                 description="корректностные инварианты сцены пройдены (итоговый XML)")
+    suite.metric("quality/scheme_checks_share", lambda case: case.gate_share,
+                 description="доля пройденных гейт-проверок на схему (планка ≥0.8: "
+                             "монотонно по каждому снятому нарушению; конъюнкция "
+                             "этого ряда из таблицы снята — она всегда ноль)")
+    suite.metric("quality/business_checks_share", lambda case: case.business_share,
+                 description="то же по бизнес-слою; вне планки — потолок задан "
+                             "набором (эталон тоже держит узкое место)")
     suite.metric("business/smells",
                  lambda case: None if not case.ok
                  else float(len(case.business_smells)),
@@ -1222,11 +1328,10 @@ def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
                  lambda case: agreement_share(case.drift),
                  description="доля бизнес-правил, где оракул и скоринг сказали "
                              "одно и то же по одной схеме")
-    suite.metric("pass@1/structure",
-                 lambda case: None if not case.checks_structure else float(
-                     all(c.ok for c in invariants.deciding_checks(
-                         case.checks_structure))),
-                 description="то же по починенной структуре (до генерации XML)")
+    suite.metric("quality/structure_checks_share",
+                 lambda case: case.structure_gate_share,
+                 description="то же число по починенной структуре (до генерации "
+                             "XML): здесь план, а не транспорт")
     suite.metric("structure_xml_agreement",
                  lambda case: None if not case.ok else (
                      0.0 if case.disagreements else 1.0),
@@ -1451,9 +1556,13 @@ def build_improvement_suite() -> metrics.EvaluationSuite:
     suite.metric("improve/repeat_rejection_share", _repeat_rejection_share,
                  direction=metrics.LOWER,
                  description="повтор вернул дословно тот же отказ")
-    suite.metric("improve/pass@1", lambda case: case.pass_after,
-                 description="инварианты улучшенной схемы (наследует провалы "
-                             "генерации)")
+    suite.metric("improve/scheme_checks_share", lambda case: case.gate_share,
+                 description="доля пройденных гейт-проверок в улучшенной схеме "
+                             "(конъюнкция `improve/pass@1` из таблицы снята: 0.056 "
+                             "живого прогона — наследие генерации, а не пакет)")
+    suite.metric("improve/base_checks_share", lambda case: case.base_gate_share,
+                 description="то же число до пакета: пара «до/после» и есть вклад "
+                             "пакета в нотацию, без наследования провалов генерации")
     suite.metric("improve/score_delta", lambda case: case.score_delta,
                  description="дельта балла после применения пакета", unit="балл")
     suite.metric("improve/defects_repaired", lambda case: case.repaired_share,
@@ -1539,6 +1648,33 @@ class RunReport:
     ruler: Dict[str, Any] = field(default_factory=ruler_fingerprint)
     provenance: Dict[str, Any] = field(default_factory=dict)
 
+    def manual_review(self) -> Dict[str, Any]:
+        """Лист ручной оценки: то, что линейка мерить не имеет права.
+
+        Читается глазами, а не оракулом: имя шага звучит как действие или как
+        отглагольное существительное, выдуман ли шаг, которого в описании нет,
+        видит ли человек маршрут без разбора id. Ни одной метрики здесь нет
+        намеренно: второй шумная модель, оценивающая первую, добавила бы к шуму
+        генерации ещё шум оценки, а «довести метрику» незаметно превратилось бы
+        в «Самооценка». Поэтому — список того, на что смотреть, и адрес схемы;
+        вердикт выносит человек и записывает его вне отчёта.
+
+        В список попадают схемы, которые автоматика уже пропустила (сводная доля
+        гейт-проверок ≥ планки): у брака владелец назван в атрибуции, и
+        рассматривать его руками смысла нет — чинить надо названный класс.
+        """
+        shown = [c for c in self.cases
+                 if c.ok and c.gate_share is not None
+                 and c.gate_share >= QUALITY_BAR]
+        return {
+            "items": list(MANUAL_REVIEW_ITEMS),
+            "bar": QUALITY_BAR,
+            "cases": [{"case": c.key, "gate_share": round(c.gate_share, 3),
+                       "business_smells": c.business_smells,
+                       "pools": c.pools, "elements": c.elements}
+                      for c in shown],
+        }
+
     def metrics_flat(self) -> Dict[str, Optional[float]]:
         """Метрики для baseline и сверки.
 
@@ -1581,6 +1717,7 @@ class RunReport:
             "coverage_note": self.coverage_note,
             "regressions": [r.as_dict() for r in self.regressions],
             "provenance": self.provenance,
+            "manual_review": self.manual_review(),
             "cases": [c.as_dict() for c in self.cases],
             "improvements": [c.as_dict() for c in self.improve_cases],
         }
@@ -1700,6 +1837,21 @@ def render_table(report: RunReport) -> str:
     lines += ["", "УЛУЧШЕНИЕ: КТО ПОРОДИЛ ДЕФЕКТЫ"]
     lines += ["  " + line for line in attribution.format_tally(
         attribution.tally(*[c.attribution for c in report.improve_cases]))]
+    review = report.manual_review()
+    lines += ["", "РУЧНАЯ ОЦЕНКА (метрик здесь нет и быть не должно)"]
+    lines += [f"  · {item}" for item in review["items"]]
+    if not review["cases"]:
+        lines.append(f"  смотреть нечего: ни одна схема не прошла гейт на "
+                     f"{review['bar']:.0%} — сначала владелец дефекта из "
+                     "атрибуции выше")
+    else:
+        lines.append(f"  схемы, пропущенные автоматикой (≥{review['bar']:.0%} "
+                     f"гейт-проверок), их и смотрят глазами:")
+        for row in review["cases"]:
+            lines.append(f"    {row['case']} — гейт {row['gate_share']:.0%}, "
+                         f"пулов {row['pools']}, элементов {row['elements']}"
+                         + (", узкие места: " + ", ".join(row["business_smells"])
+                            if row["business_smells"] else ""))
     lines += ["", "ПРОВЕНАНС КЕЙСОВ"]
     # Метрика стоит ровно столько, сколько стоит её набор: кейс, ответ которого
     # есть в few-shot промпта, мерит копирование, а не контур.

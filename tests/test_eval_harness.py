@@ -122,7 +122,8 @@ def test_etalon_business_debt_is_exactly_the_documented_one(fixture):
     """Бизнес-узкие места эталона заперты таблицей, а не спрятаны под ковёр.
 
     Вынесение бизнес-слоя из гейта — решение, которое обязано оставаться
-    видимым: без этого теста `pass@1/scenario` мог бы тихо перестать замечать,
+    видимым: без этого теста гейт (`scenario_pass`, он же в сводной доле
+    `quality/scheme_checks_share`) мог бы тихо перестать замечать,
     что оракул нашёл в эталоне новое узкое место, и
     `business/not_worse_than_etalon` стал бы мерить плотность по устаревшей опоре.
     """
@@ -681,7 +682,7 @@ def test_replay_generation_produces_metrics_and_scores():
     assert report.mode == "replay"
     assert len(report.cases) == len(_fixtures("plan"))
     assert flat["pass@1/pool_has_steps"] is not None
-    assert 0.0 <= flat["pass@1/scenario"] <= 1.0
+    assert 0.0 <= flat["quality/scheme_checks_share"] <= 1.0
     # в replay генерация детерминирована и модели не дёргает
     assert flat["llm_retries"] == 0.0
     assert all(0 <= case.score <= 100 for case in report.cases if case.score is not None)
@@ -1079,8 +1080,8 @@ def test_write_baseline_then_compare_is_clean(tmp_path):
     report.write_baseline(baseline_path)
     stored = json.loads(baseline_path.read_text(encoding="utf-8"))
     assert stored["mode"] == "replay"
-    assert stored["metrics"]["pass@1/scenario"] == pytest.approx(
-        report.metrics_flat()["pass@1/scenario"])
+    assert stored["metrics"]["quality/scheme_checks_share"] == pytest.approx(
+        report.metrics_flat()["quality/scheme_checks_share"])
     rerun = harness.run(mode="replay", scenarios_spec="all", repeat=1,
                         baseline_path=baseline_path)
     assert rerun.regressions == []
@@ -1151,20 +1152,25 @@ def test_baseline_without_ruler_is_compared_but_says_so(tmp_path):
 
 def test_same_mode_baseline_still_reports_a_real_drop(tmp_path):
     """Пропуск сверки по режиму не должен превратиться в «сверки нет вообще»:
-    то же падение метрики в своём режиме обязано быть замечено."""
+    то же падение метрики в своём режиме обязано быть замечено.
+
+    Метрика взята та, что реально меряется на этом подмножестве ниже единицы
+    (бизнес-доля 0.708): базовый `pass@1/scenario` из таблицы снят, и подставить
+    сюда несуществующее имя значило бы проверить не детектор, а его молчаливый
+    пропуск."""
     baseline_path = tmp_path / "current.json"
     report = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
                          repeat=1)
     report.write_baseline(baseline_path)
     stored = json.loads(baseline_path.read_text(encoding="utf-8"))
-    stored["metrics"]["pass@1/scenario"] = 1.0
+    stored["metrics"]["quality/business_checks_share"] = 1.0
     baseline_path.write_text(json.dumps(stored, ensure_ascii=False),
                              encoding="utf-8")
 
     rerun = harness.run(mode="replay", scenarios_spec="warehouse_delivery",
                         repeat=1, baseline_path=baseline_path)
     assert rerun.baseline_note == ""
-    assert [r.name for r in rerun.regressions] == ["pass@1/scenario"]
+    assert [r.name for r in rerun.regressions] == ["quality/business_checks_share"]
 
 
 def test_metric_newer_than_baseline_is_reported_and_not_failed(tmp_path):
@@ -1529,6 +1535,64 @@ def test_every_improve_fixture_declares_targets_of_its_own_base():
         assert set(fixture["targets"]) & failing, (
             f"{fixture['id']} заявляет {fixture['targets']}, а базовая схема "
             f"проваливает {sorted(failing)}")
+
+
+def test_quality_share_is_the_bar_and_the_conjunction_is_not_a_metric():
+    """Сводная доля пройденных гейт-проверок вместо конъюнкции в планке.
+
+    Причина измерена, а не предполагана: в живом прогоне #56 `pass@1/scenario`
+    дал 0.062, а #57 — 0, потому что каждая схема проваливает хотя бы одну из
+    ~17 проверок, тогда как в среднем провалено 15% проверок (сводная доля
+    0.853/0.814). Планка на конъюнкции физически недостижима без одновременной
+    починки всех классов, то есть меряла бы не контур, а геометрию произведения,
+    и отчитываться таким числом — всегда ноль. Строка из таблицы снята; факт
+    кейса («схема без единого провала») остался и в `scenario_pass`, и в имени
+    файла `--dump-schemes`, и в атрибуции.
+    """
+    report = harness.run(mode="replay", scenarios_spec="all", repeat=1)
+    share = report.generation.metrics["quality/scheme_checks_share"]
+    assert share.mean is not None and share.mean >= harness.QUALITY_BAR, share.mean
+    assert share.n == len([c for c in report.cases if c.ok])
+    for gone in ("pass@1/scenario", "pass@1/structure"):
+        assert gone not in report.generation.metrics, gone
+        assert gone not in report.improvement.metrics, gone
+    assert "improve/pass@1" not in report.improvement.metrics
+    # сам факт никуда не делся: без него нечем было бы называть владельца провала
+    assert any(c.scenario_pass is False for c in report.cases)
+    dumped = report.cases[0].as_dict()
+    assert "scenario_pass" in dumped and "checks_xml" in dumped
+    # доля по структуре и по XML считаются раздельно: план и транспорт
+    assert "quality/structure_checks_share" in report.generation.metrics
+    assert report.generation.metrics["quality/structure_checks_share"].mean is not None
+
+
+def test_business_share_is_reported_but_never_a_bar():
+    """Бизнес-слой сводится в долю тех же проверок, но планкой не становится:
+    потолок задан набором, и эталон держит узкое место наравне с моделью."""
+    report = harness.run(mode="replay", scenarios_spec="all", repeat=1)
+    biz = report.generation.metrics["quality/business_checks_share"]
+    assert biz.mean is not None and 0.0 <= biz.mean <= 1.0
+    assert "потолок задан набором" in biz.description
+    assert "quality/business_checks_share" not in harness.LOWER_IS_BETTER
+
+
+def test_manual_review_lists_schemes_without_inventing_a_metric():
+    """Ручная оценка — список того, что смотрит человек, плюс адрес схемы. Ни
+    числа, ни вердикта от харнесса здесь нет: второй оценивающая модель
+    добавила бы шум к шуму генерации и превратила «довести метрику» в самооценку.
+
+    В лист попадают только схемы, которые автоматика уже пропустила: у брака
+    владелец назван в атрибуции, и смотреть его глазами бессмысленно."""
+    report = harness.run(mode="replay", scenarios_spec="all", repeat=1)
+    review = report.manual_review()
+    assert len(review["items"]) >= 3
+    assert review["bar"] == harness.QUALITY_BAR
+    good = {c.key for c in report.cases
+            if c.ok and c.gate_share is not None and c.gate_share >= harness.QUALITY_BAR}
+    assert {row["case"] for row in review["cases"]} == good
+    rendered = harness.render_table(report)
+    assert "РУЧНАЯ ОЦЕНКА" in rendered and "метрик здесь нет" in rendered
+    assert report.as_dict()["manual_review"]["items"] == review["items"]
 
 
 def test_scenarios_cover_every_process_and_fixture_is_wired():

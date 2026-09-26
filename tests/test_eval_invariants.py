@@ -30,7 +30,7 @@ import pytest
 from core.bpmn_scoring import BPMNScorer
 from eval import invariants
 from eval.invariants import (AGREE, ALL_CHECKS, CORE_INVARIANTS, NO_DATA,
-                             NOT_COMPARABLE, ORACLE_STRICTER, SCORER_STRICTER,
+                             NOT_COMPARABLE, ORACLE_STRICTER,
                              business_agreement, business_disagreements,
                              check_structure, check_xml)
 from eval.scenarios import SCENARIOS
@@ -451,17 +451,25 @@ def test_two_lane_monopoly_is_checked_by_both_layers():
     скоринга против 2 у оракула) стоило контуру подсказки на дежурной смене из
     production_incident, где 4 работы из 5 лежат на одном исполнителе.
 
-    Разом это не делает две линейки одной: знаменатель остался разным (скоринг
-    делит на работы размеченных дорожек, оракул — на все работы пула), и
-    `laned_doc([4, 1, 1])` по-прежнему `scorer_stricter` — см.
-    `test_business_agreement_maps_rules_and_verdicts`."""
+    С этого прохода слои сходятся и по порогу: 4 работы из 6 на одной из трёх
+    дорожек — 67%, и оракул больше не считает это нормой (прежнее решение
+    «67% пула — не монополия» отменено по измерению: на 18 схемах корпуса
+    скоринг ругался, а независимая приёмка молчала). Различие в знаменателе
+    остаётся и проверяется отдельно — `test_unlaned_work_is_in_the_denominator`."""
     xml = laned_doc([4, 1, 1])
-    assert check_xml(xml)["no_overloaded_lane"].ok, "67% пула — не монополия"
+    assert not check_xml(xml)["no_overloaded_lane"].ok, "67% при трёх ролях — узкое место"
+    assert check_xml(xml)["no_overloaded_lane"].ids == ("L1",)
     assert status_of(xml, "lane_overload") == "failed"
+    assert "60% в 3 дорожках" in check_xml(xml)["no_overloaded_lane"].reason
     two_lanes = laned_doc([1, 7])
     assert not check_xml(two_lanes)["no_overloaded_lane"].ok
     assert check_xml(two_lanes)["no_overloaded_lane"].ids == ("L2",)
     assert status_of(two_lanes, "lane_overload") == "failed"
+    # Порог пары дорожек не изменился: 6 из 8 (75%) — не монополия, а «делает /
+    # ждёт», и ровно так же это видит скоринг.
+    both_easy = laned_doc([6, 2])
+    assert check_xml(both_easy)["no_overloaded_lane"].ok
+    assert status_of(both_easy, "lane_overload") == "passed"
 
 
 def test_empty_lane_takes_the_blame_like_the_scorer_says_it_should():
@@ -476,22 +484,28 @@ def test_single_lane_pool_is_not_applicable_not_a_pass():
 
 
 def test_unlaned_work_is_in_the_denominator():
-    """Знаменатель — все работы пула, а не только разложенные по дорожкам: шаг
-    без роли разбавляет долю дорожки (тут скоринг находит монополию 100%, а
-    оракул — 3 из 5) и не даёт схеме без laneSet право молчать."""
-    xml = _doc('<laneSet id="LS">' + _lane("L1", "Все на нём", ["A1", "A2", "A3"])
-               + _lane("L2", "Роль-фишка", []) + _lane("L3", "И ещё роль", [])
+    """Знаменатель — все работы пула, а не только разложенные по дорожкам.
+    Единственное различие двух слоёв после того, как пороги совпали: шаг без роли
+    разбавляет долю дорожки (тут скоринг видит 4 из 5 размеченных = 80% и ругается,
+    оракул — 4 из 7 работ пула = 57% и молчит), зато схема без laneSet не получает
+    права молчать."""
+    xml = _doc('<laneSet id="LS">'
+               + _lane("L1", "Все на нём", ["A1", "A2", "A3", "A4"])
+               + _lane("L2", "Роль-фишка", ["A5"]) + _lane("L3", "И ещё роль", [])
                + '</laneSet>'
                '<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "A1")
                + '<userTask id="A1" name="Шаг 1"/>' + _flow("f1", "A1", "A2")
                + '<userTask id="A2" name="Шаг 2"/>' + _flow("f2", "A2", "A3")
                + '<userTask id="A3" name="Шаг 3"/>' + _flow("f3", "A3", "A4")
-               + '<userTask id="A4" name="Шаг без дорожки"/>'
-               + _flow("f4", "A4", "E")
+               + '<userTask id="A4" name="Шаг 4"/>' + _flow("f4", "A4", "A5")
+               + '<userTask id="A5" name="Шаг 5"/>' + _flow("f5", "A5", "A6")
+               + '<userTask id="A6" name="Без дороги 1"/>' + _flow("f6", "A6", "A7")
+               + '<userTask id="A7" name="Без дороги 2"/>' + _flow("f7", "A7", "E")
                + '<endEvent id="E" name="Готово"/>')
     check = check_xml(xml)["no_overloaded_lane"]
     assert check.ok, check.reason
-    assert "3 из 4 работ" not in check.reason
+    assert "57%" in check.reason, "проход обязан назвать меру, которой мерили"
+    assert "60%" in check.reason
     assert status_of(xml, "lane_overload") == "failed"
 
 
@@ -695,9 +709,14 @@ def test_business_agreement_maps_rules_and_verdicts():
     assert set(agreement) == set(invariants.SCORING_TO_ORACLE)
     row = agreement["lane_overload"]
     assert row["invariant"] == "no_overloaded_lane"
-    assert row["scorer"] == "failed" and row["oracle"] == "passed"
-    assert row["verdict"] == SCORER_STRICTER
-    assert business_disagreements(agreement) == ["lane_overload"]
+    # Порог оракула совпал со скоринговым (60% при трёх и более дорожках, 75% при
+    # двух): прежнее расхождение читалось не как «две независимые меры», а как
+    # «продукт ругается, а приёмка молчит». На корпусе это ровно те 18 схем,
+    # которые перепись помечала `overcharged`, и на них оракул теперь находит то
+    # же, что скоринг, — расхождение по этому признаку исчезло с обеих сторон.
+    assert row["scorer"] == "failed" and row["oracle"] == "failed", row
+    assert row["verdict"] == AGREE, row
+    assert business_disagreements(agreement) == [], agreement
     # `approval_chain` обрёл независимую пару (`signoffs_need_a_gate`) в этом
     # проходе. Раньше здесь стояло обратное решение: «четыре согласующих подряд —
     # много» не выводится из семантики BPMN, и зеркало считалось самоподтверждением
@@ -827,9 +846,11 @@ SCHEMES = _fixture_schemes()
 # Расхождения двух слоёв на текущем наборе — с перечислением по имени, потому
 # что каждое из них подписано в docstring соответствующей проверки. Все они
 # односторонние: дефект находит оракул, а скоринг его не видит.
-#   lane_overload / no_overloaded_lane — у оракула нет калитки «дорожек ≥3»: две
-#     дорожки с 80% работ на одной он видит, скоринг туда не смотрит вовсе
-#     (`oracle_stricter` на production_incident.bad);
+#   lane_overload / no_overloaded_lane — расхождений нет с тех пор, как оракул
+#     взял тот же двухпороговый признак, что и скоринг (60% при трёх дорожках,
+#     75% при двух): прежняя калитка «дорожек ≥3» стоила приёмке 18 схем корпуса,
+#     где продукт ругался в одиночку. Знаменатель при этом остался свой — оракул
+#     делит на все работы пула, а не на работы размеченных дорожек;
 #   wait_without_sla / waits_have_sla — на наборе расхождений нет: скоринг
 #     перестал требовать «таймер где-то в процессе» и знает `receiveTask`, а
 #     складская подпись получателя ждётся без срока в обоих слоях. Вывернутое
@@ -955,7 +976,7 @@ def test_a_message_flow_ending_on_a_participant_interacts_that_pool():
     """Конец messageFlow — участник целиком: BPMN 2.0 это разрешает, и Signavio
     рисует так «фронт» банка. Оракул раньше видел только концы-шаги и объявлял
     такой пул немым на 35 схемах корпуса из 367, а `participant_interacts` стоит
-    в гейте `pass@1/scenario`: гейт оштрафовал схему, в которой обмен есть."""
+    в гейте (`scenario_pass`): гейт оштрафовал схему, в которой обмен есть."""
     flows = ('<messageFlow id="M1" sourceRef="A1" targetRef="P2"/>'
              '<messageFlow id="M2" sourceRef="P2" targetRef="A2"/>')
     xml = pools_doc([pool_body(1), pool_body(2)], flows)

@@ -1301,7 +1301,7 @@ class TestRepairWiresEvents:
 class TestNodeOutlet:
     """`to` — явный исход нового узла. Модель в живых прогонах добавляла шаг и
     один connect к нему, а про исход забывала: шаг откатывался тупиком и правка
-    уходила в отказ (applied_share 0.607, improve/pass@1 0)."""
+    уходила в отказ (applied_share 0.607, улучшенная схема не проходила гейт)."""
 
     def test_after_and_outlet_keep_the_route_single(self, single_pool_xml):
         """Когда `after` уже ведёт узел туда же, второй поток не создаётся:

@@ -808,6 +808,13 @@ def _check_no_unrouted(g: _Graph, _exp: Mapping[str, Any]) -> Check:
 # разделение «оператор делает 7 шагов из 12». 0.75 — это «второй роли досталась
 # дорожка-фишка».
 LANE_MONOPOLY_SHARE = 0.75
+# Порог для пула из трёх и более дорожек. Дублирует `LANE_OVERLOAD_SHARE`
+# скоринга осознанно (оракул не импортирует `core/`): при трёх ролях перевес
+# 60% — это «один делает, двое наблюдают», а не разделение «делает / проверяет»,
+# которое держится на двух дорожках. Прежняя одиночка на 75% стоила приёмке 18
+# схем корпуса, где продукт ругался, а независимая мера молчала: расхождение
+# читалось не как две разные меры одного вопроса, а как прощённый дефект.
+LANE_OVERLOAD_SHARE = 0.6
 
 # Ожидание, блокирующее маршрут: `intermediateCatchEvent` не-таймера (сообщение,
 # сигнал, условие — токен стоит до наступления) и `receiveTask`, который по BPMN
@@ -1128,15 +1135,19 @@ def _check_no_overloaded_lane(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     4 работы из 5 лежат на одном исполнителе — теперь этот случай ловят оба).
     Знаменатель: скоринг делит на работы размеченных дорожек, оракул — на все
     шаги пула, поэтому не размеченная по ролям работа разбавляет долю дорожки,
-    зато схема без laneSet не получает права молчать. Порог: 75% здесь против 60%
-    у скоринга при трёх и более дорожках, поэтому `laned_doc([4, 1, 1])` —
-    `scorer_stricter`. Оба расхождения видит `business_agreement`.
+    зато схема без laneSet не получает права молчать. Порог был вторым расхождением
+    и выровнен по измерению: 75% на все случаи означали, что на 18 схемах корпуса
+    продукт ругается, а независимая приёмка молчит — это не две меры одного
+    вопроса, а прощённый дефект. Теперь оракул берёт ту же пару порогов (60% при
+    трёх и более дорожках, 75% при двух) и называет применённый в сообщении,
+    чтобы читатель видел, по какой мере схема прошла.
     """
     split = [(pool, lanes) for pool, lanes in _lane_groups(g) if len(lanes) >= 2]
     if not split:
         return _na("no_overloaded_lane",
                    "пулов с двумя и более дорожками нет — делить работу не между кем")
     checked = 0
+    worst = 0.0
     bad: List[str] = []
     ids: List[str] = []
     for pool, lanes in split:
@@ -1144,6 +1155,9 @@ def _check_no_overloaded_lane(g: _Graph, _exp: Mapping[str, Any]) -> Check:
         if not work:
             continue
         checked += 1
+        # Тот же двухпороговый признак, что у скоринга: 75% для пары дорожек,
+        # 60% — когда ролей три и больше.
+        threshold = LANE_OVERLOAD_SHARE if len(lanes) >= 3 else LANE_MONOPOLY_SHARE
         by_lane: Dict[str, int] = {}
         for node in work:
             if node.lane:
@@ -1151,19 +1165,23 @@ def _check_no_overloaded_lane(g: _Graph, _exp: Mapping[str, Any]) -> Check:
         for lane in lanes:
             count = by_lane.get(lane.get("id", ""), 0)
             share = count / len(work)
-            if share <= LANE_MONOPOLY_SHARE:
+            worst = max(worst, share)
+            if share <= threshold:
                 continue
             name = lane.get("name") or lane.get("id", "")
             bad.append(f"дорожка «{name}» держит {count} из {len(work)} работ пула "
-                       f"«{pool or 'без имени'}» ({round(share * 100)}%)")
+                       f"«{pool or 'без имени'}» ({round(share * 100)}% при пороге "
+                       f"{round(threshold * 100)}% в {len(lanes)} дорожках)")
             ids.append(lane.get("id", ""))
     if not checked:
         return _na("no_overloaded_lane",
                    "в пулах с дорожками нет ни одной работы — сравнивать нечего")
     if not bad:
         return _pass("no_overloaded_lane",
-                     f"пулов с ≥2 дорожками: {checked}, ни одна дорожка не держит "
-                     f"больше {round(LANE_MONOPOLY_SHARE * 100)}% работ пула")
+                     f"пулов с ≥2 дорожками: {checked}, доля работ на дорожках — "
+                     f"не больше {round(worst * 100)}% при пороге "
+                     f"{round(LANE_MONOPOLY_SHARE * 100)}% для пары и "
+                     f"{round(LANE_OVERLOAD_SHARE * 100)}% для трёх и более")
     return _fail("no_overloaded_lane",
                  "работа сосредоточена на одном исполнителе: " + "; ".join(bad)
                  + " — роли есть, а процесса у них нет",
@@ -1493,7 +1511,8 @@ def applicable_checks(results: Mapping[str, Check]) -> List[Check]:
 
 
 def deciding_checks(results: Mapping[str, Check]) -> List[Check]:
-    """Инварианты, по которым схема считается принятой (`scenario_pass`, ядро `pass@1`).
+    """Инварианты, по которым схема считается принятой: сводный исход кейса
+    `scenario_pass` и знаменатель доли `quality/scheme_checks_share`.
 
     Это корректностный слой: нотация плюс заявленные сценарием ожидания.
     Бизнес-слой (`BUSINESS_INVARIANTS`) из гейта исключён — и это не смягчение

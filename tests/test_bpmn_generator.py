@@ -253,16 +253,19 @@ def test_counterparty_named_inside_a_phrase_is_a_gap():
     assert any("«Перевозчик»" in g and "заведи" in g for g in gaps)
 
 
-def test_start_of_a_phrase_is_not_taken_for_a_participant():
-    """Заглавная буква в начале фразы — не признак имени: так каждый «Далее»
-    и «Если» стал бы участником, а план-гейт честно просил бы завести под него
-    пул. Ограничение осознанное: ловим только то написание, которое русская
-    орфография оставляем именем собственным."""
+def test_start_of_a_phrase_needs_a_predicate_to_be_a_participant():
+    """Заглавная буква в начале фразы сама по себе — не признак имени: так каждый
+    «Далее» и «Если» стал бы участником, а план-гейт честно просил бы завести под
+    него пул. Поэтому кандидат обязан ещё и стоять перед сказуемым: «Перевозчик
+    вывозит заказ» — это действующее лицо, которого гейт раньше не видел вовсе
+    (прогон #58: `vehicle_reservation` молчал обе попытки, а оракул терял
+    «Клиента»), а «Далее получатель ставит подпись» — наречие."""
     gaps = bpmn_generator.plan_gaps(
         _plan_dict(),
         "Перевозчик вывозит заказ. Далее получатель ставит подпись.")
-    assert not any("«Перевозчик»" in g for g in gaps)
+    assert any("«Перевозчик»" in g and "заведи пул" in g for g in gaps), gaps
     assert not any("«Далее»" in g for g in gaps)
+    assert not any("«Получатель»" in g for g in gaps)
 
 
 def test_generate_asks_about_a_counterparty_the_plan_never_named(monkeypatch):
@@ -652,6 +655,62 @@ class TestTwoStageGeneration:
         fake = FakeLLM(monkeypatch, _plan())
         result = BPMNGenerator().generate("ВкусВилл согласует заявку")
         assert result["status"] == "success" and len(fake.calls) == 1
+
+
+class TestPhraseStartActor:
+    """Участник, написанный с заглавной в начале фразы, — не слепое пятно гейта.
+
+    `_proper_names` отбрасывает заглавное слово после точки: в начале фразы
+    стоят и нарицательные. Из-за этого «Клиент подтверждает дату погрузки»
+    план-гейт не видел вовсе, и по `vehicle_reservation` в прогоне #58 обе
+    попытки молчали (`gaps` пустой) там, где оракул терял обещанного участника.
+    """
+
+    TEXT = ("Резервирование транспорта под заявку на перевозку во ВкусВилле. "
+            "Диспетчер получает заявку клиента. Если свободной машины нет, "
+            "заявка отклоняется. Клиент подтверждает дату погрузки.")
+
+    def test_subject_of_a_verb_is_an_actor_candidate(self):
+        assert bpmn_generator._phrase_start_subjects(self.TEXT) == \
+            ["Диспетчер", "Клиент"]
+
+    def test_noun_at_phrase_start_without_a_predicate_is_not(self):
+        """«Резервирование транспорта под заявку» и «заявка отклоняется» — не
+        действующие лица: первое отглагольное существительное, вторая пассив."""
+        assert "Резервирование" not in bpmn_generator._phrase_start_subjects(
+            self.TEXT)
+        assert "Если" not in bpmn_generator._phrase_start_subjects(self.TEXT)
+
+    def test_the_plan_gate_asks_about_the_actor_it_used_to_miss(self):
+        raw = _plan_dict(
+            participants=["Диспетчер"],
+            lanes=[],
+            elements=[
+                _e("D1", "startEvent", "Заявка", "", "Диспетчер"),
+                _e("D2", "userTask", "Проверить парк", "", "Диспетчер"),
+                _e("D3", "endEvent", "Рейс закрыт", "", "Диспетчер"),
+            ],
+            flows=[_f("F1", "D1", "D2"), _f("F2", "D2", "D3")],
+        )
+        gaps = bpmn_generator.plan_gaps(raw, self.TEXT)
+        hint = [g for g in gaps if "Клиент" in g and "заведи пул" in g]
+        assert hint, gaps
+
+    def test_lane_with_the_same_name_closes_the_gap(self):
+        """Действующее лицо уже названо дорожкой — вопроса не будет: иначе гейт
+        звал бы модель заводить пул там, где участник на схеме есть."""
+        raw = _plan_dict(
+            participants=["ВкусВилл"],
+            lanes=[{"id": "L_c", "name": "Клиент", "participant": "ВкусВилл"}],
+            elements=[
+                _e("C1", "startEvent", "Заявка", "L_c"),
+                _e("C2", "userTask", "Подтвердить дату", "L_c"),
+                _e("C3", "endEvent", "Согласовано", "L_c"),
+            ],
+            flows=[_f("F1", "C1", "C2"), _f("F2", "C2", "C3")],
+        )
+        gaps = bpmn_generator.plan_gaps(raw, self.TEXT)
+        assert not [g for g in gaps if "заведи пул «Клиент»" in g]
 
 
 class TestUnknownParticipant:
@@ -1677,6 +1736,24 @@ class TestVacantPools:
         ids = {e["id"] for e in result["structure"]["elements"]}
         assert not {"S2", "E2"} & ids
         assert _note(result["notes"], "Пул «Кладовщик» удалён")
+
+    def test_pool_named_in_description_survives_the_cleanup(self, monkeypatch):
+        """Пустой пул участника, названного в описании, остаётся на схеме.
+
+        Живой прогон #58: пять провалов `expected_participants` из десяти — это
+        пулы, которые план объявлял («WMS», «Бюро кредитных историй», «Система
+        мониторинга»), а починка вычистила вместе с шагами. Нарушение
+        `pool_has_steps` у оставленного пула есть и оно чинится пакетом
+        (`participant="имя"` из инвентаря), а исчезнувший участник из инвентаря
+        уходит, и ссылаться в правке становится не на что.
+        """
+        FakeLLM(monkeypatch, self._vacant())
+        result = BPMNGenerator().generate(
+            "ВкусВилл: менеджер проверяет остатки, Кладовщик собирает заказ.")
+        assert "Кладовщик" in [p["name"] for p
+                               in result["structure"]["participants"]]
+        assert _note(result["notes"], "Пул «Кладовщик» оставлен без шагов")
+        assert not _note(result["notes"], "Пул «Кладовщик» удалён")
 
     def test_flows_of_removed_pool_do_not_survive(self, monkeypatch):
         result = _generate(monkeypatch, self._vacant())
@@ -2816,13 +2893,18 @@ class TestOwnershipClarification:
 
     def test_actor_gap_is_asked_first(self):
         """Переспрос один: потерянный участник обязан стоять в списке нарушений
-        раньше подписей имён, иначе модель доходит только до подписей."""
+        раньше подписей имён, иначе модель доходит только до подписей. Обоими
+        формулировками — и про то, что план сам назвал действующее лицо, и про
+        то, что его нет в описании."""
         raw = {"actors": ["Поставщик"],
                "participants": ["Что-то не из текста"],
                "elements": [{"id": "A1", "kind": "userTask", "name": "Заявка",
                              "participant": "Что-то не из текста"}]}
         gaps = bpmn_generator.plan_gaps(raw, "Поставщик подтверждает отгрузку.")
-        assert len(gaps) > 1 and "действующим лицом" in gaps[0]
+        assert len(gaps) > 1 and "Поставщик" in gaps[0]
+        assert any("действующим лицом" in g for g in gaps)
+        assert not any("не упоминается в описании" in g and gaps.index(g) == 0
+                       for g in gaps)
 
     def test_actor_covered_by_a_lane_is_not_a_gap(self):
         """Дорожка «HR-партнёр» закрывает действующее лицо «HR»: требовать от
@@ -2853,7 +2935,7 @@ class TestOwnershipClarification:
                                             '"missing": []}')
         result = BPMNGenerator().generate(
             "ВкусВилл заводит заявку, согласует её, собирает груз, отгружает, "
-            "закрывает заявку. Поставщик подтверждает отгрузку.")
+            "закрывает заявку. Нужно подтверждение от поставщика.")
         assert result["attempts"] == 1, result["notes"]
         assert len(fake.calls) == 2, fake.calls
         assert "Верни moves, roles и missing" in fake.calls[-1][1]["content"]
@@ -2945,7 +3027,13 @@ class TestOwnershipClarification:
         assert structure["elements"][1]["participant"] == "Склад"
 
     def test_rescue_refuses_to_empty_the_donor_pool(self, monkeypatch):
-        """Перенос не должен делать из организации ещё один пустой пул."""
+        """Перенос не должен делать из организации ещё один пустой пул.
+
+        Сам пул «Поставщик» при этом остаётся на схеме: он назван в описании,
+        и удаление забрало бы участника вместе с обещанным обменом (см.
+        `_drop_vacant_pools`). Проверяется именно отказ переноса: шаг остаётся
+        в том пуле, где стоял.
+        """
         plan = {"participants": ["ВкусВилл", "Поставщик"],
                 "elements": [
                     {"id": "A2", "kind": "userTask",
@@ -2955,8 +3043,8 @@ class TestOwnershipClarification:
         FakeLLM(monkeypatch, fenced, fenced, llm_client.LLMError("сбой"))
         result = BPMNGenerator().generate("ВкусВилл ждёт подтверждения от поставщика.")
         assert _note(result["notes"], "остался без действий")
-        assert "Поставщик" not in [
-            p["name"] for p in result["structure"]["participants"]]
+        step = next(e for e in result["structure"]["elements"] if e["id"] == "A2")
+        assert step["participant"] == "ВкусВилл"
 
     @staticmethod
     def _role_plan():

@@ -1160,7 +1160,7 @@ class BPMNGenerator:
                    for n in patch_notes):
                 gaps = plan_gaps(structure, text)
             repair_steps: List[Dict[str, Any]] = []
-            repaired, notes = repair_structure(structure, repair_steps)
+            repaired, notes = repair_structure(structure, repair_steps, text)
             trace.append({"node": "починка структуры", "steps": repair_steps})
             if retry_note:
                 notes.append(retry_note)
@@ -1885,6 +1885,48 @@ def _text_words(text: str) -> List[str]:
     return [w for w in (_norm_name(m) for m in re.findall(r"[\w]+", text)) if w]
 
 
+# Служебные слова, которые стоят в начале фразы и потому выглядят как имя
+# собственное для поиска заглавных.
+_PHRASE_FUNCTION_WORDS = frozenset({
+    "если", "когда", "затем", "после", "перед", "при", "по", "в", "во", "на",
+    "из", "от", "до", "и", "а", "но", "да", "то", "же", "бы", "не", "нет",
+    "есть", "это", "он", "она", "они", "оно", "мы", "вы", "все", "всё",
+    "также", "однако", "поэтому", "кроме", "помимо", "обычно", "как", "или",
+    "что", "чем", "либо", "тогда", "далее", "всего", "зачем", "почему",
+})
+# Форма сказуемого третьего лица: «клиент подтверждает», «склад отправляет».
+_SUBJECT_VERB_RE = re.compile(
+    r"[а-яёА-ЯЁ]{3,}(?:ает|яет|ует|юет|ет|ит|ают|яют|ут)$")
+
+
+def _phrase_start_subjects(text: str) -> List[str]:
+    """Действующие лица, написанные с заглавной буквы в начале фразы.
+
+    `_proper_names` отбрасывает заглавное слово после точки намеренно: в начале
+    фразы стоят и нарицательные («Резервирование транспорта под заявку…»).
+    Отбрасывая их, план-гейт терял и настоящих участников: в прогоне #58
+    «Клиент подтверждает дату погрузки» — единственное упоминание клиента в
+    именительном падеже, и по `vehicle_reservation` гейт молчал обоим прогонам
+    (строка `gaps` пустая, а нарушение `expected_participants` на месте).
+
+    Признак, что заглавное слово — подлежащее, а не отглагольное существительное:
+    следующее за ним слово (или одно через два) стоит в форме третьего лица.
+    """
+    out: List[str] = []
+    for found in _PROPER_RE.finditer(text or ""):
+        head = (text or "")[:found.start()].rstrip()
+        if head and head[-1] not in _PHRASE_START:
+            continue
+        word = found.group(0)
+        if word.lower() in _PHRASE_FUNCTION_WORDS or word in out:
+            continue
+        tail = (text or "")[found.end():found.end() + 40]
+        following = re.findall(r"[А-Яа-яЁёA-Za-z]+", tail)[:2]
+        if any(_SUBJECT_VERB_RE.match(item.lower()) for item in following):
+            out.append(word)
+    return out
+
+
 def _name_parts(name: str) -> List[str]:
     """Значимые части имени: «Бюджетный контролёр» — это два слова, и по одному
     из него участник в тексте не ищется."""
@@ -1979,7 +2021,8 @@ def _unclaimed_tokens(pools: List[str], lanes: List[Dict[str, Any]],
     named.discard("")
     out: List[str] = []
     tokens = {m for m in _ACRONYM_RE.findall(text)
-              if m not in _NON_PARTICIPANT_ACRONYMS} | set(_proper_names(text))
+              if m not in _NON_PARTICIPANT_ACRONYMS} | set(_proper_names(text)) \
+        | set(_phrase_start_subjects(text))
     for token in sorted(tokens):
         low = token.lower()
         if any(low == name or low in name or (name in low and len(name) >= 3)
@@ -2887,6 +2930,7 @@ def _structure_ids(participants: List[Dict[str, Any]], lanes: List[Dict[str, Any
 
 def repair_structure(raw: Dict[str, Any],
                      trace: Optional[List[Dict[str, Any]]] = None,
+                     description: str = "",
                      ) -> Tuple[Dict[str, Any], List[str]]:
     """Приводит произвольный ответ модели к валидной структуре.
 
@@ -2899,6 +2943,9 @@ def repair_structure(raw: Dict[str, Any],
     шаг что добавил и что убрал, чтобы провал инварианта можно было атрибутировать
     по узлу, а не гадать по тексту пометок. Продуктовый путь список не передаёт
     и ничего не платит.
+
+    `description` — исходное описание процесса: по нему пустой пул узнаётся как
+    названный участник, и починка оставляет его на схеме (см. `_drop_vacant_pools`).
     """
     notes: List[str] = []
     used_ids: Set[str] = set()
@@ -2962,7 +3009,7 @@ def repair_structure(raw: Dict[str, Any],
     _merge_role_pools(elements, flows, participants, lanes, notes)
     _close(participants, lanes, elements, flows)
     _mark("удаление пустых пулов", participants, lanes, elements, flows)
-    _drop_vacant_pools(elements, flows, participants, lanes, notes)
+    _drop_vacant_pools(elements, flows, participants, lanes, notes, description)
     _close(participants, lanes, elements, flows)
     _mark("события пула", participants, lanes, elements, flows)
     _ensure_pool_events(elements, flows, participants, used_ids, notes)
@@ -3502,14 +3549,38 @@ def _drop_vacant_pools(elements: List[Dict[str, Any]],
                        flows: List[Dict[str, Any]],
                        participants: List[Dict[str, Any]],
                        lanes: List[Dict[str, Any]],
-                       notes: List[str]) -> None:
+                       notes: List[str],
+                       description: str = "") -> None:
     """Пул без единого шага — артефакт, а не участник.
 
     Модель заводит «Кладовщика» пулом, но все его шаги оставляет в другом
     процессе: внутри пула остаются «Старт» и «Завершение». Дорисовать туда
     шаги нельзя — это выдуманное содержание, а оставить — раздуть коллаборацию
     пустыми прямоугольниками, за которые скоринг правомерно снимает балл.
+
+    Названный в описании участник не удаляется, даже оставшись пустым:
+    живой прогон #58 потерял так пять схем из десяти провалов
+    `expected_participants` («WMS», «Бюро кредитных историй», «Система
+    мониторинга»). Пустой пул — нарушение `pool_has_steps`, у которого есть
+    исполнимая правка (`participant="имя"` из инвентаря), а удалённый пул
+    исчезает из инвентаря, и пакету уже не на что ссылаться: дефект
+    переходит из чинимого в нечинимый.
     """
+    words = _text_words(description)
+
+    def named_in_text(name: str) -> bool:
+        """Участник назван в описании — с любым окончанием, как его ищет оракул.
+
+        Терпимость та же, что у `_mentioned`: «расчёт с перевозчиком» называет
+        пул «компания-перевозчик» (в прогоне #58 он и был тем пустым пулом,
+        которого оракул потом не досчитался). Родовое слово вместо имени
+        («Организация», «Система») участником не считается: `_generic_actor_name`
+        уже отсекает такие ярлыки в плане.
+        """
+        parts = _name_parts(name)
+        return bool(parts) and not _generic_actor_name(name) \
+            and all(len(p) >= 3 and _mentioned(p, words) for p in parts)
+
     live = [pool for pool in participants
             if any(e["kind"] in STEP_KINDS for e in elements
                    if e["participant"] == pool["name"])]
@@ -3517,6 +3588,11 @@ def _drop_vacant_pools(elements: List[Dict[str, Any]],
         return
     for pool in list(participants):
         if pool in live:
+            continue
+        if words and named_in_text(str(pool.get("name") or "")):
+            notes.append(f"Пул «{pool['name']}» оставлен без шагов: участник "
+                         "назван в описании, поэтому удаление забрало бы его "
+                         "с схемы целиком")
             continue
         own = [e for e in elements if e["participant"] == pool["name"]]
         ids = {e["id"] for e in own}

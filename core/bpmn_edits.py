@@ -2933,6 +2933,30 @@ def _rollback_hint(elem_id: str, gap: str, op_name: str) -> str:
     return f"перевставьте шаг операцией с after ({gone})"
 
 
+def _bootstraps_empty_process(index: _Index, added: Set[str], elem_id: str) -> bool:
+    """Первый ли это узел в процессе, где до пакета не было ни одного узла.
+
+    Прежний откат отказывал такому пакету с подсказкой «указывайте якорь в
+    `after`», которого в пустом процессе нет: неисполнимый отказ — тот же
+    класс, что уже запрещён для текстов подсказок скоринга, и он делал правку
+    «нарастить процесс» невозможной в принципе. Узел без предшественника здесь
+    не тупик, а начало маршрута: стартовое событие и конец скоринг требует
+    отдельными операциями, и они исполнимы.
+
+    Ослабление точечное: процесс, где был хотя бы один чужой узел, проверяется
+    как раньше — иначе пакет мог бы бросить изолированный шаг в собранной схеме.
+    """
+    process = index.process_of.get(elem_id)
+    if process is None:
+        return False
+    nodes = [pid for pid, _node in _process_nodes(index, process)]
+    if any(pid not in added for pid in nodes):
+        return False
+    # Ровно один новый узел: два изолированных кружка в пустом процессе — это
+    # не начало маршрута, а набор тупиков, и их откатывать нужно.
+    return len(nodes) == 1 and elem_id in nodes
+
+
 def _rollback_unrouted(index: _Index,
                        added: List[str]) -> Tuple[Dict[str, str], Set[str]]:
     """Убрать новые узлы, которые остались вне маршрута.
@@ -2948,6 +2972,7 @@ def _rollback_unrouted(index: _Index,
     """
     dropped: Dict[str, str] = {}
     flows: Set[str] = set()
+    bootstrap = set(added)
     changed = True
     while changed:
         changed = False
@@ -2956,6 +2981,8 @@ def _rollback_unrouted(index: _Index,
                 continue
             gap = _routing_gap(index, elem_id)
             if gap is None:
+                continue
+            if _bootstraps_empty_process(index, bootstrap, elem_id):
                 continue
             removed_flows, removed_boundaries = _remove_node(
                 index, index.elements[elem_id])

@@ -4476,3 +4476,63 @@ class TestDiagramAndReferencesStayConsistent:
         assert report["status"] in ("success", "partial"), report["skipped"]
         assert _unresolved_refs(out) == [], _unresolved_refs(out)
         assert not _dangling(out), _dangling(out)
+
+
+EMPTY_PROCESS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn">
+  <process id="Process_empty" name="Пустой"></process>
+</definitions>"""
+
+
+class TestBootstrapOfAnEmptyProcess:
+    """Пакет обязан уметь начать маршрут там, где узлов ещё нет.
+
+    Прежняя гарантия «узел вне маршрута откатывается» отказывала и первому
+    узлу пустого процесса с подсказкой «указывайте якорь в after» — якоря там
+    нет физически, то есть правка «нарастить процесс из ничего» была невыполнима
+    в принципе. Это тот же класс, что запрещён для подсказок скоринга: отказ
+    обязан называть операнд, который модель в состоянии взять из схемы.
+    """
+
+    def _ids(self, xml):
+        root = ET.fromstring(xml)
+        return sorted(e.get("id") for e in root.iter()
+                      if e.get("id") and e.tag.split("}")[-1] in
+                      ("task", "userTask", "startEvent", "endEvent"))
+
+    def test_first_node_without_anchor_is_kept(self):
+        out, report = apply_operations(EMPTY_PROCESS_XML, [
+            {"op": "add_task", "id": "new_T", "name": "Собрать заказ",
+             "task_type": "userTask"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        assert report["skipped"] == []
+        assert self._ids(out) == ["new_T"]
+
+    def test_a_package_can_grow_a_whole_route(self):
+        out, report = apply_operations(EMPTY_PROCESS_XML, [
+            {"op": "add_event", "id": "new_S", "name": "Заказ создан",
+             "event_type": "start", "to": "new_T"},
+            {"op": "add_task", "id": "new_T", "name": "Собрать заказ",
+             "task_type": "userTask"},
+            {"op": "add_event", "id": "new_E", "name": "Заказ выдан",
+             "event_type": "end", "after": "new_T"},
+        ])
+        assert report["status"] == "success", report["skipped"]
+        assert self._ids(out) == ["new_E", "new_S", "new_T"]
+        # Маршрут связен: стартовал, сделал, закончился — тупика нет.
+        assert validate_and_repair(out)[1] == []
+
+    def test_isolated_second_node_is_still_refused(self):
+        """Ослабление точечное: в пустом процессе остаётся не больше одного узла
+        без маршрута. Два изолированных кружка — набор тупиков, и их откатывать
+        нужно, иначе «улучшение» сделало бы схему хуже исходной."""
+        out, report = apply_operations(EMPTY_PROCESS_XML, [
+            {"op": "add_task", "id": "new_A", "name": "А", "task_type": "userTask"},
+            {"op": "add_task", "id": "new_B", "name": "Б", "task_type": "userTask",
+             "after": "new_A"},
+            {"op": "add_task", "id": "new_C", "name": "В", "task_type": "userTask"},
+        ])
+        assert report["status"] == "partial", report["applied"]
+        assert len(self._ids(out)) <= 1, self._ids(out)
+        assert report["skipped"], "пакет из трёх несвязанных шагов обязан быть с отказом"

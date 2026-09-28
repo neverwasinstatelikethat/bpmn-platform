@@ -131,8 +131,20 @@ export const AuthProvider = ({ children }) => {
     const updateUserProfile = useCallback(async (profileData) => {
         try {
             const { data } = await accountApi.updateProfile(profileData);
-            setUser((current) => current ? { ...current, ...data } : current);
-            return data;
+            /* Смена почты или пароля меняет основание, по которому сервер
+               узнаёт сессию, поэтому ответ приносит новый токен: без замены
+               пользователь терял вход на первом же следующем запросе. Поля
+               токена не попадают в профиль — в состоянии живёт только `token`. */
+            const { access_token: issued, token_type: _type,
+                    token_rotated: rotated, ...profile } = data || {};
+            if (rotated && issued) {
+                localStorage.setItem('token', issued);
+                setSessionToken(issued);
+            }
+            setUser((current) => current
+                ? { ...current, ...profile, ...(issued ? { token: issued } : {}) }
+                : current);
+            return profile;
         } catch (error) {
             throw new Error(toUserMessage(error, 'Не удалось обновить профиль.'));
         }

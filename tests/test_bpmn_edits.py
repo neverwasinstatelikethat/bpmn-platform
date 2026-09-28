@@ -533,6 +533,55 @@ class TestLanes:
 
 
 # ---------------------------------------------------------------------------
+# Отказ «элемента нет»: подсказка называет, что в схеме есть
+# ---------------------------------------------------------------------------
+
+class TestUnknownIdNamesCandidates:
+    """Живой прогон #65: 15 отказов `connect` и 4 `add_event_definition` —
+    «узла с таким id нет». Инвентарь в промпт попадает, поэтому это выбор модели,
+    но отказ «используйте id из инвентаря» не даёт повтору ничего, кроме приказа
+    угадать снова: модель держит тот же адрес. Подсказка обязана назвать
+    ближайшие id — иначе `improve/op_acceptance` приписывает контуру то, что
+    одним текстом поправимо на его стороне."""
+
+    def test_typo_in_node_id_is_answered_with_the_real_id(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "move_to_lane", "id": "G_payd", "lane": "new_Lane_1"},
+        ])
+        skipped = report["skipped"][0]
+        assert skipped["reason"] == "элемент не найден"
+        assert "G_paid" in skipped["hint"], "не назван ближайший id инвентаря"
+
+    def test_connect_refusal_names_candidates_for_the_missing_end(
+            self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "connect", "source": "T_collec", "target": "T_ship"},
+        ])
+        skipped = report["skipped"][0]
+        assert skipped["reason"] == "источник или цель не найдены"
+        assert "T_collect" in skipped["hint"]
+
+    def test_new_prefixed_id_gets_no_candidates(self, single_pool_xml):
+        """`new_…` — намерение создать узел, а не опечатка в существующем id.
+        Предложить переименование здесь значило бы увести повтор в правку чужого
+        узла вместо недостающего `add_task`."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "connect", "source": "new_Invoice", "target": "T_ship"},
+        ])
+        hint = report["skipped"][0]["hint"]
+        assert "ближайшие" not in hint
+        assert "add_task" in hint or "инвентар" in hint
+
+    def test_far_from_every_id_the_hint_stays_plain(self, single_pool_xml):
+        """Если рядом ничего нет, список кандидатов — шум: он подписывает
+        правку на несвязанный узел."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "move_to_lane", "id": "zzz", "lane": "new_Lane_1"},
+        ])
+        assert "ближайшие" not in report["skipped"][0]["hint"]
+
+
+# ---------------------------------------------------------------------------
 # Порядок операций внутри пакета
 # ---------------------------------------------------------------------------
 

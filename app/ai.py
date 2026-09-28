@@ -33,7 +33,8 @@ def init_orchestrator() -> None:
         logger.info("LLM-оркестратор инициализирован")
     try:
         llm_client.ensure_llm_ready()
-        logger.info("Авторизация LLM подтверждена (модель %s)", llm_client.get_model_name())
+        logger.info("Авторизация LLM подтверждена (пул моделей: %s)",
+                    ", ".join(llm_client.get_model_pool()))
     except llm_client.LLMError as e:
         logger.error("LLM недоступна, ИИ-эндпоинты будут отвечать ошибкой: %s", e)
     # Корпус эталонов собирается секунды: иначе первый же «найди узкие места»

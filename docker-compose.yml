@@ -43,7 +43,11 @@ services:
       # В контейнере нет корневого сертификата российского УЦ, поэтому проверка
       # TLS по умолчанию выключена. Для прода: смонтируйте CA-bundle и поставьте true.
       GIGACHAT_VERIFY_SSL: ${GIGACHAT_VERIFY_SSL:-false}
-      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-GigaChat}
+      # Имя модели старого API («GigaChat») шлюз api.giga.chat не знает —
+      # отвечает 404. Пусто = пул по умолчанию из core/llm_client.py; через
+      # запятую можно свой порядок, следующий берётся, когда провайдер не знает
+      # модель.
+      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-}
       # PERS/B2B тариф — один одновременный запрос к модели.
       GIGACHAT_MAX_CONCURRENT: ${GIGACHAT_MAX_CONCURRENT:-1}
     ports:

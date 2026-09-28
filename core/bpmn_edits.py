@@ -790,6 +790,42 @@ class _Skip(Exception):
         self.needs = tuple(n for n in needs if n)
 
 
+def _nearby_ids(index: _Index, wanted: Any) -> List[str]:
+    key = str(wanted or "")
+    if not key or key.startswith("new_"):
+        return []  # намерение создать узел, а не опечатка в существующем адресе
+    return difflib.get_close_matches(key, list(index.elements), n=3, cutoff=0.6)
+
+
+def _missing_id_hint(index: _Index, wanted: Any) -> str:
+    """Отказ «узла нет» называет, во что это правится.
+
+    Из замера live-прогона #65: 19 из 85 отказов пакета — «узла нет» (15 у
+    `connect`, 4 у `add_event_definition`) при полном инвентаре в промпте, то
+    есть адрес взят с опечаткой или по памяти. «Используйте id из инвентаря»
+    повтору ничего не даёт, кроме приказа угадать снова, и прогон носит тот же
+    id во второй раунд."""
+    near = _nearby_ids(index, wanted)
+    if not near:
+        return "используйте id из инвентаря"
+    return "ближайшие id схемы: " + ", ".join(near)
+
+
+def _connect_endpoints_hint(index: _Index, source_id: str, target_id: str) -> str:
+    """Кандидаты по каждому отсутствующему концу дуги, а не по обоим разом:
+    модель правит тот конец, который она и назвала неверно."""
+    parts: List[str] = []
+    for role, value in (("источник", source_id), ("цель", target_id)):
+        if index.elements.get(value) is not None:
+            continue
+        near = _nearby_ids(index, value)
+        parts.append(f"{role} '{value}': "
+                     + (", ".join(near) if near else "нет в схеме"))
+    if not parts:
+        return "используйте id из инвентаря"
+    return "укажите узлы из инвентаря; " + "; ".join(parts)
+
+
 def _require_element(index: _Index, elem_id: Any) -> ET.Element:
     """Узел по его id. Id потока — отдельный отказ: «элемент не найден» модель
     читает как «id выдуман», хотя инвентарь поток называет, и в корректирующий
@@ -805,7 +841,7 @@ def _require_element(index: _Index, elem_id: Any) -> ET.Element:
             "узлу (задаче или шлюзу) правят имя, описание и дорожку; из потоков "
             "по id принимает правку только add_condition",
         )
-    raise _Skip("элемент не найден", "используйте id из инвентаря")
+    raise _Skip("элемент не найден", _missing_id_hint(index, key))
 
 
 def _new_id_hint(op_id: str, index: _Index) -> str:
@@ -921,7 +957,7 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
     if after is None:
         raise _Skip(
             f"элемент '{after_id}' не найден",
-            "используйте существующие id из инвентаря",
+            _missing_id_hint(index, after_id),
             needs=(after_id,),
         )
     if _local(after.tag) in SEQUENCE_FORBIDDEN_SOURCES:
@@ -1720,7 +1756,7 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     if source is None or target is None:
         raise _Skip(
             "источник или цель не найдены",
-            "используйте существующие id из инвентаря",
+            _connect_endpoints_hint(index, source_id, target_id),
             needs=(source_id if source is None else "",
                    target_id if target is None else ""),
         )
@@ -2061,7 +2097,7 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     if host is None:
         raise _Skip(
             f"задача '{host_id}' не найдена",
-            "используйте существующие id из инвентаря",
+            _missing_id_hint(index, host_id),
             needs=(host_id,),
         )
     if _local(host.tag) not in TASK_TAGS:

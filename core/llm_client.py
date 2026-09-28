@@ -4,6 +4,7 @@
 # настройки только из окружения, ограниченное число попыток, таймауты.
 # Синхронные функции — вызывать из async-контура через asyncio.to_thread,
 # чтобы не блокировать событийный цикл.
+import contextlib
 import json
 import logging
 import os
@@ -80,17 +81,39 @@ class _LLMModelRejectedError(LLMError):
     """
 
 
+class LLMBudgetExceededError(LLMError):
+    """Исчерпан wall-clock бюджет обращения: провайдер не отказал, он не успел.
+
+    Отличается от LLMRequestTooLargeError тем, что уменьшение входа не помогает,
+    а от «сервис лёг» — что время ушло конкретное и названо в сообщении. Без
+    различимого класса медленный прогон прятался за «LLM недоступна после N
+    попыток», а потребитель без бюджета не отличает «повторить сейчас бесполезно,
+    очередь занята» от «провайдер чинится».
+    """
+
+
 # Формулировки отказа «модели нет» тоже разбросаны: часть шлюзов отвечает 400
 # вместо 404. Подстроки нижним регистром — по телу ответа.
 _UNKNOWN_MODEL_HINTS = ("no such model", "unknown model", "model not found",
                         "нет модели", "несуществующ")
 
 # Формулировки отказов из-за длины разбросаны (GigaChat и OpenAI-совместимые
-# шлюзы пишут по-разному), поэтому ищем по подстроке в теле ответа.
-_CONTEXT_LIMIT_HINTS = (
-    "context length", "maximum context", "token", "too long",
-    "длин", "контекст", "токен", "превыс",
-)
+# шлюзы пишут по-разному). Голый «token»/«токен» признаком быть не может: он
+# стоит в честных отказах авторизации («invalid token») и квоты («daily token
+# quota exceeded»), и раньше любой 400 со словом про токен становился
+# LLMRequestTooLargeError — не ретраится вообще, а пользователь читал
+# «сократите описание» при нормальном описании. Признак теперь парный: слово о
+# длине/размере В СОЧЕТАНИИ со словом про токены/контекст; маркеры отказа
+# доступа и лимита запросов снимают признак даже при обоих словах.
+_CONTEXT_SIZE_WORDS = ("length", "too long", "too large", "too many",
+                       "maximum", "exceed", "overflow",
+                       "длин", "размер", "превыс", "максимальн", "слишком")
+_CONTEXT_TOKEN_WORDS = ("context", "контекст", "token", "токен")
+_CONTEXT_DENIED_MARKERS = ("quota", "квот", "authorization", "авторизац",
+                           "invalid token", "expired", "просрочен",
+                           "revoked", "отозван", "api key", "apikey",
+                           "too many requests", "слишком много запросов",
+                           "rate limit", "лимит запросов", "ключ", "секрет")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -105,6 +128,14 @@ MAX_CONCURRENT = _env_int("GIGACHAT_MAX_CONCURRENT", 1)
 # Scope GIGACHAT_API_PERS/B2B разрешает по одному одновременному запросу:
 # лишние параллельные вызовы провайдер отбивает 429, поэтому очередь у нас.
 _GATE = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+# Wall-clock бюджет одного обращения (весь `call_json`, включая корректирующий
+# разбор и обход пула). Без него MAX_ATTEMPTS × REQUEST_TIMEOUT_SECONDS × число
+# моделей в пуле перемножаются, а семафор держит всю очередь пользователей:
+# одна медленная схема стояла бы за неё десятками минут. Исчерпание —
+# различимая ошибка LLMBudgetExceededError: не «модель не знает» и не
+# «не влезло», провайдер жив, но не успел.
+CALL_BUDGET_SECONDS = _env_int("GIGACHAT_CALL_BUDGET_SECONDS", 600)
 
 _client: Optional[GigaChat] = None
 _client_guard = threading.Lock()
@@ -179,19 +210,23 @@ def _error_text(error: ResponseError) -> str:
 
 
 def _is_too_large(error: ResponseError) -> bool:
-    """Отказ «запрос не влезает»: 413 по размеру тела, 400/422 по тексту ответа.
+    """Отказ «запрос не влезает»: 413 по размеру тела, 400/422 — по тексту.
 
-    Тот же BadRequestError приходит и по другим причинам, поэтому для него
-    решающим является содержание: без подсказки про длину это обычная ошибка
-    запроса. Авторизация проверяется раньше, так что 400 от эндпоинта токена
-    сюда не доходит.
+    Для текста нужно оба слова: длина/размер И токен/контекст (см.
+    `_CONTEXT_SIZE_WORDS`). Тот же BadRequestError приходит и по другим
+    причинам, поэтому одиночное «token» решющим быть не перестало: честные
+    401/403/429 сюда не доходят ни по классу ответа (ветки проверяются
+    раньше), ни по телу (маркеры доступа/квоты снимают признак).
     """
     if isinstance(error, RequestEntityTooLargeError):
         return True
     if not isinstance(error, (BadRequestError, UnprocessableEntityError)):
         return False
     text = _error_text(error)
-    return any(hint in text for hint in _CONTEXT_LIMIT_HINTS)
+    if any(marker in text for marker in _CONTEXT_DENIED_MARKERS):
+        return False
+    return (any(word in text for word in _CONTEXT_TOKEN_WORDS)
+            and any(word in text for word in _CONTEXT_SIZE_WORDS))
 
 
 def _is_unknown_model(error: ResponseError) -> bool:
@@ -236,18 +271,131 @@ def _content_of(response: Any) -> Optional[str]:
     return content if isinstance(content, str) else None
 
 
+_USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def _usage_dict(usage: Any) -> Dict[str, int]:
+    """Числовые поля токенов ответа: SDK отдаёт их объектом или None."""
+    out: Dict[str, int] = {}
+    for field in _USAGE_FIELDS:
+        value = getattr(usage, field, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            out[field] = value
+    return out
+
+
 def _log_usage(model: str, attempt: int, elapsed_ms: int,
-               response: Any) -> Optional[str]:
+               response: Any) -> Tuple[Optional[str], Dict[str, int]]:
     usage = getattr(response, "usage", None)
     choices = getattr(response, "choices", None)
     finish = getattr(choices[0], "finish_reason", None) if choices else None
+    usage_fields = _usage_dict(usage)
     logger.info(
         "Вызов LLM %s (попытка %s): %s мс, токены prompt=%s/completion=%s, finish=%s",
         model, attempt, elapsed_ms,
-        getattr(usage, "prompt_tokens", "?"),
-        getattr(usage, "completion_tokens", "?"), finish,
+        usage_fields.get("prompt_tokens", "?"),
+        usage_fields.get("completion_tokens", "?"), finish,
     )
-    return finish
+    return finish, usage_fields
+
+
+class _CallContext:
+    """Единая точка учёта времени и авторов ответов одного обращения к модели.
+
+    Попытки, паузы на 429 и обход пула складываются здесь, а не пересказываются
+    на каждом пути: без общего wall-clock бюджета MAX_ATTEMPTS ×
+    REQUEST_TIMEOUT_SECONDS × размер пула перемножаются, и одна медленная схема
+    держит глобальный семафор, пока очередь пользователей стоит. Здесь же
+    рождается журнал «какая модель ответила и сколько ушло токенов» — раньше
+    это таяло в строке лога, и переход пула посреди прогона не оставлял следа
+    в результате.
+    """
+
+    def __init__(self, seconds: float):
+        self.budget = max(0.0, float(seconds))
+        self.started = time.monotonic()
+        self.model_s = 0.0   # время внутри запросов к провайдеру
+        self.wait_s = 0.0    # паузы повторов и ожидания 429
+        self.attempts = 0
+        self.answers: List[Dict[str, Any]] = []
+        self.rejected: List[str] = []
+
+    def remaining(self) -> float:
+        return self.started + self.budget - time.monotonic()
+
+    def spent_s(self) -> float:
+        return self.model_s + self.wait_s
+
+    def note_attempt(self, elapsed: float) -> None:
+        self.attempts += 1
+        self.model_s += max(0.0, elapsed)
+
+    def note_wait(self, seconds: float) -> None:
+        self.wait_s += max(0.0, seconds)
+
+    def note_answer(self, model: str, usage: Dict[str, int],
+                    elapsed: float) -> None:
+        self.answers.append({"model": model, "usage": dict(usage),
+                             "elapsed_ms": int(elapsed * 1000)})
+
+    def note_rejected(self, model: str) -> None:
+        self.rejected.append(model)
+
+    def check(self, tried: str = "") -> None:
+        """Бюджет исчерпан — дальше стоять в очереди к провайдеру нельзя.
+
+        Проверяется до каждой попытки и перед переходом к следующей модели:
+        начатый запрос мы не прерываем (транспортный таймаут у него свой), но
+        новый при нуле остатка уже не отправляем.
+        """
+        if self.remaining() > 0:
+            return
+        details = f" ({tried})" if tried else ""
+        raise LLMBudgetExceededError(
+            f"Обращение к модели не уложилось в бюджет {int(self.budget)} c: "
+            f"{self.attempts} попыток, {self.spent_s():.0f} c суммарного "
+            f"ожидания{details}. Это не «модель не знает ответа» и не размер "
+            "запроса: провайдер не ответил за отведённое время — повторите "
+            "позже или уменьшите параллельность "
+            "(GIGACHAT_MAX_CONCURRENT/GIGACHAT_CALL_BUDGET_SECONDS)."
+        )
+
+
+_CALL_CTX = threading.local()
+
+
+@contextlib.contextmanager
+def _call_scope():
+    """Контекст одного обращения: `call_json` открывает его один раз на весь
+    вызов (включая корректирующий разбор), одиночный `_complete` — на себя.
+    Вложенный вызов наследует бюджет и журнал внешнего: повтор разбора не
+    должен получать «свежие» минуты сверх очередь."""
+    previous = getattr(_CALL_CTX, "active", None)
+    if previous is not None:
+        yield previous
+        return
+    ctx = _CallContext(CALL_BUDGET_SECONDS)
+    _CALL_CTX.active = ctx
+    try:
+        yield ctx
+    finally:
+        _CALL_CTX.active = None
+
+
+def fill_call_trace(trace: Dict[str, Any], ctx: _CallContext) -> None:
+    """Журнал обращения в словарь вызывающей стороны: имя ответившей модели на
+    каждый вызов, отвергнутые 404-ми имена, суммарный usage и время. Наружу
+    уходит копия — `_CallContext` остаётся служебным."""
+    trace["models"] = [answer["model"] for answer in ctx.answers]
+    trace["rejected_models"] = list(ctx.rejected)
+    trace["calls"] = [dict(answer) for answer in ctx.answers]
+    usage: Dict[str, int] = {}
+    for answer in ctx.answers:
+        for field, value in answer["usage"].items():
+            usage[field] = usage.get(field, 0) + value
+    trace["usage"] = usage
+    trace["attempts"] = ctx.attempts
+    trace["spent_s"] = round(ctx.spent_s(), 3)
 
 
 def _complete(messages: List[Dict[str, str]], temperature: float,
@@ -257,25 +405,33 @@ def _complete(messages: List[Dict[str, str]], temperature: float,
 
     Транспортный сбой (5xx, 429, сеть) пул не перебирает: та же ошибка на
     каждой модели означала бы прогон всех попыток впустую — наружу идёт
-    отказ от первой.
+    отказ от первой. Отвергнутые имена и ответившую модель пишет в журнал
+    обращения: схема, собранная после mid-run 404 с переходом на другую
+    модель, обязана нести этот след в отчёте, а не выглядеть ответом одной.
     """
-    pool = get_model_pool()
-    for index, model in enumerate(pool):
-        try:
-            return _complete_with_model(model, messages, temperature, max_tokens)
-        except _LLMModelRejectedError as e:
-            if index + 1 == len(pool):
-                raise LLMError(
-                    f"Ни одна из моделей пула ({', '.join(pool)}) провайдеру "
-                    f"неизвестна: {e}. Проверьте GIGACHAT_MODEL — список "
-                    "доступных имён отдаёт GET /v1/models."
-                ) from e
-            logger.warning("Модель %s провайдер не знает — перехожу на %s",
-                           model, pool[index + 1])
-    raise LLMError("Пул моделей пуст")  # get_model_pool гарантирует непустоту
+    with _call_scope() as ctx:
+        pool = get_model_pool()
+        for index, model in enumerate(pool):
+            if index:
+                ctx.check("испробованы модели: " + ", ".join(pool[:index]))
+            try:
+                return _complete_with_model(ctx, model, messages, temperature,
+                                            max_tokens)
+            except _LLMModelRejectedError as e:
+                ctx.note_rejected(model)
+                if index + 1 == len(pool):
+                    raise LLMError(
+                        f"Ни одна из моделей пула ({', '.join(pool)}) "
+                        f"провайдеру неизвестна: {e}. Проверьте GIGACHAT_MODEL — "
+                        "список доступных имён отдаёт GET /v1/models."
+                    ) from e
+                logger.warning("Модель %s провайдер не знает — перехожу на %s",
+                               model, pool[index + 1])
+        raise LLMError("Пул моделей пуст")  # get_model_pool гарантирует непустоту
 
 
-def _complete_with_model(model: str, messages: List[Dict[str, str]],
+def _complete_with_model(ctx: _CallContext, model: str,
+                         messages: List[Dict[str, str]],
                          temperature: float,
                          max_tokens: Optional[int]) -> str:
     """Один раунд с ограниченными повторами. Только транспортные повторы
@@ -297,8 +453,12 @@ def _complete_with_model(model: str, messages: List[Dict[str, str]],
     # лимитной, и «растущий» цикл превратил бы 5xx в бесконечный.
     limit = MAX_ATTEMPTS
     while attempt < limit:
+        # Общее время обращения перевешивает локальные счётчики попыток:
+        # бюджет кончился — ждать дальше не за чем, и очередь из-за нас тоже.
+        ctx.check(f"модель {model}, попыток {attempt}")
         attempt += 1
         if attempt > 1:
+            ctx.note_wait(pause)
             time.sleep(pause)
             pause = RETRY_PAUSE_SECONDS
         started = time.monotonic()
@@ -320,7 +480,7 @@ def _complete_with_model(model: str, messages: List[Dict[str, str]],
                 last_error = str(e)
                 if waited >= RATE_LIMIT_WAIT_BUDGET_SECONDS:
                     break
-                # Окно провайдера шире, чем одна пауза: 429 на втором вызове
+                # Окно провайера шире, чем одна пауза: 429 на втором вызове
                 # означал бы «схема не собралась», хотя модель ничего не
                 # испортила — прогон #54 потерял так 5 кейсов из 24 и молча
                 # поменял выборку всех долей. Дополнительная попытка оплачивается
@@ -333,6 +493,9 @@ def _complete_with_model(model: str, messages: List[Dict[str, str]],
                 pause = min(max(e.retry_after,
                                 RETRY_PAUSE_SECONDS * (2 ** rate_streak)),
                             RATE_LIMIT_WAIT_BUDGET_SECONDS - waited)
+                # и в общий wall-clock бюджет тоже: пауза не имеет права
+                # пережить дедлайн обращения
+                pause = max(0.0, min(pause, ctx.remaining()))
                 waited += pause
                 logger.warning("Попытка %s: лимит запросов (%s), пауза %s с",
                                attempt, last_error, pause)
@@ -353,8 +516,10 @@ def _complete_with_model(model: str, messages: List[Dict[str, str]],
             last_error = str(e)
             logger.warning("Попытка %s: ошибка обращения к LLM: %s", attempt, last_error)
             continue
-        finish = _log_usage(model, attempt,
-                            int((time.monotonic() - started) * 1000), response)
+        finally:
+            ctx.note_attempt(time.monotonic() - started)
+        elapsed = time.monotonic() - started
+        finish, usage = _log_usage(model, attempt, int(elapsed * 1000), response)
         if finish == "length":
             raise LLMTruncatedError(
                 "Ответ модели обрезан по лимиту токенов — структура неполная"
@@ -364,36 +529,50 @@ def _complete_with_model(model: str, messages: List[Dict[str, str]],
             last_error = "пустой ответ модели"
             logger.warning("Попытка %s: %s", attempt, last_error)
             continue
+        ctx.note_answer(model, usage, elapsed)
         return content
-    raise LLMError(f"LLM недоступна после {attempt} попыток: {last_error}")
+    raise LLMError(f"LLM недоступна после {attempt} попыток "
+                   f"({ctx.spent_s():.0f} с суммарного ожидания): {last_error}")
 
 
 def call_json(system: str, user: str, *, temperature: float = 0.2,
-              max_tokens: Optional[int] = 16000) -> Dict[str, Any]:
+              max_tokens: Optional[int] = 16000,
+              trace: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """JSON-ответ модели с устойчивым извлечением.
 
     Ошибка разбора повторяется один раз с указанием проблемы — это единственная
     «смысловая» повторная попытка в системе.
+
+    `trace` — необязательный словарь вызывающей стороны: в него ложится журнал
+    обращения (`models`, `rejected_models`, `usage`, `attempts`, `spent_s`) по
+    обеим попыткам разбора вместе. Без него имя ответившей модели и токены
+    живут только в логе, а генерация/улучшение не могут отдать их в результате —
+    переход пула посреди прогона делал бы схему ответом другой модели без следа.
     """
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    raw = _complete(messages, temperature, max_tokens)
-    try:
-        return extract_json(raw)
-    except ValueError as e:
-        logger.warning("Первый ответ не распарсен (%s): запрашиваю исправленный JSON", e)
-        # Диалог пересобирается, а не дописывается: история с неразобранным
-        # ответом целиком удвоила бы контекст повторного вызова.
-        repair_user = (
-            f"{user}\n\nПредыдущий ответ не удалось разобрать как JSON: {e}. "
-            "Исправь его и верни ТОЛЬКО валидный JSON-объект без пояснений, "
-            "без блоков кода и без тегов рассуждений:\n" + raw[:REPAIR_CONTEXT_LIMIT]
-        )
-        raw = _complete([messages[0], {"role": "user", "content": repair_user}],
-                        temperature, max_tokens)
-        return extract_json(raw)
+    with _call_scope() as ctx:
+        try:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            raw = _complete(messages, temperature, max_tokens)
+            try:
+                return extract_json(raw)
+            except ValueError as e:
+                logger.warning("Первый ответ не распарсен (%s): запрашиваю исправленный JSON", e)
+                # Диалог пересобирается, а не дописывается: история с неразобранным
+                # ответом целиком удвоила бы контекст повторного вызова.
+                repair_user = (
+                    f"{user}\n\nПредыдущий ответ не удалось разобрать как JSON: {e}. "
+                    "Исправь его и верни ТОЛЬКО валидный JSON-объект без пояснений, "
+                    "без блоков кода и без тегов рассуждений:\n" + raw[:REPAIR_CONTEXT_LIMIT]
+                )
+                raw = _complete([messages[0], {"role": "user", "content": repair_user}],
+                                temperature, max_tokens)
+                return extract_json(raw)
+        finally:
+            if trace is not None:
+                fill_call_trace(trace, ctx)
 
 
 _THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)

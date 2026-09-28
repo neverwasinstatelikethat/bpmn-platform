@@ -5,6 +5,7 @@
 произвольный XML, а валидатор требовал полную DI-раскладку. Теперь модель
 возвращает операции, и применяем их мы."""
 import inspect
+import json
 import re
 import sys
 import time
@@ -94,6 +95,34 @@ def _lanes(xml_text):
 
 def _lane_refs(lane):
     return [ref.text for ref in lane.findall("bpmn:flowNodeRef", NS)]
+
+
+def _unresolved_refs(xml_text):
+    """Ссылки BPMN (IDREF), ведущие на id, которого в документе нет.
+
+    `sourceRef`/`targetRef`, `attachedToRef`, `default`, `flowNodeRef`,
+    `incoming`/`outgoing` и `bpmnElement` графики — всё это обязано
+    разрешаться: bpmn-js на битый IDREF разваливает документ, а линейка такую
+    дугу не видит и считает схему целой.
+    """
+    root = _root(xml_text)
+    known = {elem.get("id") for elem in root.iter()
+             if isinstance(elem.tag, str) and elem.get("id")}
+    bad = []
+    for elem in root.iter():
+        if not isinstance(elem.tag, str):
+            continue
+        tag = _tag(elem)
+        for attr in ("sourceRef", "targetRef", "attachedToRef", "default",
+                     "bpmnElement"):
+            value = elem.get(attr)
+            if value and value not in known:
+                bad.append(f"{elem.get('id') or tag}: {attr}={value}")
+        if tag in ("flowNodeRef", "incoming", "outgoing"):
+            text = (elem.text or "").strip()
+            if text and text not in known:
+                bad.append(f"{tag}={text}")
+    return bad
 
 
 def _process(root, process_id):
@@ -203,7 +232,11 @@ def _batch_of_25(nodes=250):
     return (
         [{"op": "add_task", "id": f"new_T{k}", "name": f"Новый шаг {k}",
           "task_type": "userTask", "after": f"T{(k * 17 + 7) % nodes}"} for k in range(9)]
-        + [{"op": "delete", "id": f"T{k * 31 % nodes}"} for k in range(3)]
+        # Удаления — узлы, чей обход однозначен по соседям: удаление T0 снимало
+        # бы единственную дугу стартового события, а замкнуть её нечем, и
+        # аплайер честно отказывает (см. `_delete_rewire_plan`). Для теста
+        # линейности важен объём пакета, а не этот отказ.
+        + [{"op": "delete", "id": f"T{(k * 31 + 3) % nodes}"} for k in range(3)]
         + [{"op": "disconnect", "flow": f"F_c{50 + k}"} for k in range(3)]
         + [{"op": "add_documentation", "id": f"T{60 + k}", "text": "Описание шага"}
            for k in range(2)]
@@ -1693,13 +1726,27 @@ class TestLaneReferences:
     def _refs(self, xml):
         return [r.text for r in _root(xml).findall(".//bpmn:flowNodeRef", NS)]
 
-    def test_ref_to_deleted_element_is_dropped_with_note(self):
+    def test_ref_to_deleted_element_is_dropped_with_the_node(self):
+        """`delete` снимает и flowNodeRef: ссылка дорожки — IDREF, и оставленная
+        отсылка рисует фигуру, которой в процессе больше нет, а `move_to_lane`
+        после этого не находит, откуда её убирать. Раньше это делала только
+        починка, и пакет с `status=success` отдавал пользователю схему с битой
+        ссылкой."""
         out, report = apply_operations(self.LANED, [{"op": "delete", "id": "TA"}])
         assert report["status"] == "success", report["skipped"]
+        assert self._refs(out) == [], "до починки ссылка уже снята аплайером"
         fixed, notes = validate_and_repair(out)
-        assert self._refs(out) == ["TA"], "до починки ссылка ещё есть"
         assert self._refs(fixed) == []
-        assert any("ссылалась на удалённый элемент TA" in n for n in notes)
+        assert not any("ссылалась на удалённый элемент" in n for n in notes), notes
+
+    def test_stale_lane_reference_from_user_xml_is_still_repaired(self):
+        """Сеть починки остаётся на месте: ссылка, пришедшая из пользовательского
+        XML (узел убран вне аплайера), чинится там же и с той же пометкой."""
+        stale = self.LANED.replace("<flowNodeRef>TA</flowNodeRef>",
+                                    "<flowNodeRef>GONE</flowNodeRef>")
+        fixed, notes = validate_and_repair(stale)
+        assert self._refs(fixed) == []
+        assert any("ссылалась на удалённый элемент GONE" in n for n in notes), notes
 
     def test_ref_after_move_to_another_pool_is_dropped(self):
         out, report = apply_operations(self.LANED, [
@@ -2158,23 +2205,59 @@ class TestUnroutedRollback:
     """Пакет не должен оставлять в схеме шаг, который ниоткуда не входит или
     никуда не выходит: принятое улучшение иначе ухудшает качество схемы."""
 
-    def test_insert_into_a_node_deleted_by_the_same_batch_is_rolled_back(
+    def test_insert_into_a_node_deleted_by_the_same_batch_keeps_the_route(
             self, single_pool_xml):
+        """Пакет «вставь шаг после X, затем удали X» больше не теряет вставленный
+        шаг: у удалённого узла один живой вход и один живой выход, поэтому
+        аплайер замыкает обход, а не оставляет дыру.
+
+        Прежнее ожидание («new_T_pack откатан как недостижимый при
+        `status=success`») фиксировало ровно тот дефект, который закрывает
+        `_delete_rewire_plan`: без дуги обхода `End_ok` оставался без входящего
+        потока, и схема, которую «улучшили», была хуже исходной."""
         out, report = apply_operations(single_pool_xml, [
             {"op": "add_task", "id": "new_T_pack", "name": "Упаковать",
              "after": "T_ship", "task_type": "userTask"},
             {"op": "delete", "id": "T_ship"},
         ])
-        assert [a["id"] for a in report["applied"]] == ["T_ship"]
-        rollback = [s for s in report["skipped"] if s.get("id") == "new_T_pack"]
-        assert rollback and "недостижим" in rollback[0]["reason"]
-        assert "вход" in rollback[0]["hint"]
-        assert _by_id(out, "new_T_pack") is None
-        # Остаток схемы цел: удалённый хост и его потоки — след операции
-        # delete, а не отката.
+        assert report["skipped"] == [], report["skipped"]
+        assert [a["op"] for a in report["applied"]] == ["add_task", "delete"]
         assert _by_id(out, "T_ship") is None
-        assert _flow(_root(out), "F1") is not None
-        assert _flow(_root(out), "F5") is None
+        assert _by_id(out, "new_T_pack") is not None
+        # Маршрут цел: ветка шлюза ведёт вставленный шаг, а не в никуда.
+        root = _root(out)
+        bridge = [f for f in root.findall(".//bpmn:sequenceFlow", NS)
+                  if f.get("sourceRef") == "G_paid" and f.get("targetRef") == "new_T_pack"]
+        assert bridge, [(f.get("sourceRef"), f.get("targetRef"))
+                        for f in root.findall(".//bpmn:sequenceFlow", NS)]
+        assert _flow(root, "F1") is not None
+        assert _flow(root, "F3") is None
+        assert not _dangling(out), _dangling(out)
+
+    def test_delete_refuses_to_open_a_hole_it_cannot_bridge(self):
+        """Отказ обязан называть соседа, который остался без ноги: молчаливая
+        дыра при `status=success` — это ухудшенная схема, а не правка."""
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D">
+  <process id="P" name="Слияние" isExecutable="true">
+    <startEvent id="S" name="Старт"><outgoing>FA</outgoing><outgoing>FB</outgoing></startEvent>
+    <sequenceFlow id="FA" sourceRef="S" targetRef="A"/>
+    <sequenceFlow id="FB" sourceRef="S" targetRef="B"/>
+    <userTask id="A" name="Ветка А"><incoming>FA</incoming><outgoing>FC</outgoing></userTask>
+    <userTask id="B" name="Ветка Б"><incoming>FB</incoming><outgoing>FD</outgoing></userTask>
+    <sequenceFlow id="FC" sourceRef="A" targetRef="X"/>
+    <sequenceFlow id="FD" sourceRef="B" targetRef="X"/>
+    <userTask id="X" name="Слияние веток"><incoming>FC</incoming><incoming>FD</incoming><outgoing>FE</outgoing></userTask>
+    <sequenceFlow id="FE" sourceRef="X" targetRef="E"/>
+    <endEvent id="E" name="Финиш"><incoming>FE</incoming></endEvent>
+  </process>
+</definitions>"""
+        out, report = apply_operations(xml, [{"op": "delete", "id": "X"}])
+        skip = report["skipped"][0]
+        assert skip["op"] == "delete" and skip["id"] == "X"
+        assert "дыру в маршруте" in skip["reason"] and "'E'" in skip["reason"]
+        assert "disconnect" in skip["hint"] and "connect" in skip["hint"]
+        assert _by_id(out, "X") is not None, "отказанная правка не трогает схему"
+        assert _flow(_root(out), "FE") is not None
 
     def test_dead_end_hint_names_the_missing_outlet(self, single_pool_xml):
         """Подсказка обязана называть недостающую дугу, а не способ вставки:
@@ -3913,3 +3996,483 @@ class TestSetTaskType:
         notes = str(report["applied"]) + str(report.get("noop_rows"))
         assert "уже тип" in notes, report
         assert _root(out).find(".//bpmn:userTask[@id='A1']", NS) is not None
+
+
+# ---------------------------------------------------------------------------
+# Значения полей: один источник истины для формы имени типа
+# ---------------------------------------------------------------------------
+
+class TestTypeFieldsShareOneRule:
+    """Имена ОПЕРАЦИЙ уже принимаются в синонимах (`OP_ALIASES`), а значения
+    полей типа читались по-разному: `_op_set_task_type` понимал короткое слово и
+    любой регистр, а `_op_add_node` — только точное имя тега из `task_type`.
+
+    Прогон `apply_operations(xml, [{"op":"add_task","id":"new_Q","name":"…",
+    "type":"userTask","after":"T_collect","to":"End_ok"}])` давал
+    `status=success`, `applied=["add_task"]` и `<task>` в XML: тихая
+    неправильная запись в пользовательскую схему плюс отчёт, обещающий правку,
+    которой нет.
+    """
+
+    def test_add_task_reads_the_short_type_field(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_Q", "name": "Проверить срок",
+             "type": "userTask", "participant": "Заказ",
+             "after": "T_collect", "to": "End_ok"}])
+        assert report["status"] == "success", report["skipped"]
+        assert "add_task" in [a["op"] for a in report["applied"]]
+        # Раньше здесь молча ложился `<task>`.
+        assert _tag(_by_id(out, "new_Q")) == "userTask", out
+        assert _by_id(out, "new_Q").get("name") == "Проверить срок"
+
+    @pytest.mark.parametrize("form", ["userTask", "UserTask", "usertask",
+                                      "user", "USER_TASK", "user task"])
+    def test_every_spelling_of_a_task_type_is_the_same_repair(
+            self, single_pool_xml, form):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_Sp", "name": "Шаг",
+             "task_type": form, "participant": "Заказ",
+             "after": "T_collect", "to": "End_ok"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _tag(_by_id(out, "new_Sp")) == "userTask"
+
+    def test_ambiguous_form_is_refused_naming_the_allowed_values(
+            self, single_pool_xml):
+        """Отказ имеет право быть только по существу, а не по форме записи, и
+        обязан перечислить принятые значения."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_task", "id": "new_No", "name": "Шаг",
+             "task_type": "printerTask", "participant": "Заказ",
+             "after": "T_collect", "to": "End_ok"}])
+        skip = report["skipped"][0]
+        assert "printerTask" in skip["reason"]
+        assert "userTask" in skip["hint"] and "businessRuleTask" in skip["hint"]
+
+    def test_add_gateway_accepts_full_tag_and_any_case(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_gateway", "id": "new_Gg", "name": "Оплачен ли",
+             "gateway_type": "ParallelGateway", "participant": "Заказ",
+             "after": "T_collect", "to": "End_ok"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _tag(_by_id(out, "new_Gg")) == "parallelGateway"
+
+    def test_add_event_accepts_definition_tags_and_any_case(
+            self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_event", "id": "new_Ev", "name": "Ожидание ответа",
+             "event_type": "IntermediateCatch", "participant": "Заказ",
+             "after": "T_collect", "to": "End_ok",
+             "event_definition": "TIMEREventDefinition"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _tag(_by_id(out, "new_Ev")) == "intermediateCatchEvent"
+        definition = _by_id(out, "new_Ev").find("bpmn:timerEventDefinition", NS)
+        assert definition is not None
+        # Хронометраж подхвачен по умолчанию: пустой таймер не заведётся.
+        assert (definition.find("bpmn:timeDuration", NS).text
+                == DEFAULT_TIMER_DURATION)
+
+    def test_boundary_event_accepts_the_full_definition_name(self, single_pool_xml):
+        out, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "new_Be",
+             "attached_to": "T_collect", "event_type": "timerEventDefinition",
+             "name": "Просрочка", "to": "T_ship", "duration": "PT1H"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _by_id(out, "new_Be").find(
+            "bpmn:timerEventDefinition", NS) is not None
+
+    def test_connect_accepts_flow_tag_forms(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "connect", "source": "T_ship", "target": "T_cancel",
+             "flow_type": "SequenceFlow"}])
+        assert report["skipped"] == [], report["skipped"]
+
+    def test_flow_type_refusal_lists_both_legal_values(self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "connect", "source": "T_ship", "target": "T_cancel",
+             "flow_type": "correlation"}])
+        skip = report["skipped"][0]
+        assert "correlation" in skip["reason"]
+        assert "sequence" in skip["hint"] and "message" in skip["hint"]
+
+    def test_enumerated_value_is_refused_as_one_unknown_definition(self):
+        """Значение поля обязано быть ОДНИМ определением: перечень через
+        вертикальную черту аплайер всегда читал как неизвестное значение —
+        ровно так печатал старые строки `OP_SPEC`."""
+        _, report = apply_operations(RATCHET_XML, [
+            {"op": "add_event_definition", "id": "W_wait",
+             "event_definition": "timer|message"}])
+        skip = report["skipped"][0]
+        assert "неизвестное определение события" in skip["reason"]
+        assert "timer" in skip["hint"] and "signal" in skip["hint"]
+
+    def test_as_lane_true_string_is_a_flag_not_a_lane_name(self, two_pool_xml):
+        """Прогон `merge_participants(as_lane="true")` заводил в схеме дорожку с
+        именем «true»: строковое булево читалось как название роли, хотя `_flag`
+        умеет разбирать такие значения."""
+        out, report = apply_operations(two_pool_xml, [
+            {"op": "merge_participants", "source": "Клиент", "target": "Магазин",
+             "as_lane": "true"}])
+        assert report["status"] == "success", report["skipped"]
+        names = [lane.get("name") for lane in _lanes(out)]
+        assert "true" not in names, names
+        assert "Клиент" in names, names
+
+    def test_as_lane_false_string_refuses_naming_the_operand(self, two_pool_xml):
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "merge_participants", "source": "Клиент", "target": "Магазин",
+             "as_lane": "false"}])
+        skip = report["skipped"][0]
+        assert "дорожку" in skip["reason"]
+        assert "as_lane" in skip["hint"]
+
+
+# ---------------------------------------------------------------------------
+# OP_SPEC обязан копироваться дословно
+# ---------------------------------------------------------------------------
+
+RATCHET_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_r"
+             xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+             xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+             xmlns:di="http://www.omg.org/spec/DD/20100524/DI">
+  <collaboration id="Collaboration_r">
+    <participant id="Pool_shop" name="Склад" processRef="Process_shop"/>
+    <participant id="Pool_trans" name="Транспорт" processRef="Process_trans"/>
+    <participant id="Pool_void" name="Архив" processRef="Process_void"/>
+  </collaboration>
+  <process id="Process_shop" name="Склад" isExecutable="true">
+    <laneSet id="LS_r"><lane id="L_stock" name="Кладовщик">
+      <flowNodeRef>T_collect</flowNodeRef></lane></laneSet>
+    <startEvent id="Start_r" name="Заказ поступил"><outgoing>r1</outgoing></startEvent>
+    <sequenceFlow id="r1" sourceRef="Start_r" targetRef="T_collect"/>
+    <userTask id="T_collect" name="Собрать заказ">
+      <incoming>r1</incoming><outgoing>r2</outgoing></userTask>
+    <sequenceFlow id="r2" sourceRef="T_collect" targetRef="T_mid"/>
+    <task id="T_mid" name="Взвесить"><incoming>r2</incoming><outgoing>r3</outgoing></task>
+    <sequenceFlow id="r3" sourceRef="T_mid" targetRef="G_r"/>
+    <exclusiveGateway id="G_r" name="Хватает ли">
+      <incoming>r3</incoming><outgoing>r4</outgoing><outgoing>r7</outgoing></exclusiveGateway>
+    <sequenceFlow id="r4" sourceRef="G_r" targetRef="W_wait">
+      <conditionExpression>остаток выше нуля</conditionExpression></sequenceFlow>
+    <intermediateCatchEvent id="W_wait" name="Ждём поставку">
+      <incoming>r4</incoming><outgoing>r5</outgoing></intermediateCatchEvent>
+    <sequenceFlow id="r5" sourceRef="W_wait" targetRef="T_restock"/>
+    <sendTask id="T_restock" name="Заказать довоз">
+      <incoming>r5</incoming><outgoing>r6</outgoing></sendTask>
+    <sequenceFlow id="r6" sourceRef="T_restock" targetRef="End_r"/>
+    <sequenceFlow id="r7" sourceRef="G_r" targetRef="End_r"/>
+    <endEvent id="End_r" name="Заказ выдан"><incoming>r6</incoming></endEvent>
+  </process>
+  <process id="Process_trans" name="Транспорт" isExecutable="true">
+    <startEvent id="Tr_start" name="Рейс открыт"><outgoing>t1</outgoing></startEvent>
+    <sequenceFlow id="t1" sourceRef="Tr_start" targetRef="T_drive"/>
+    <userTask id="T_drive" name="Везти"><incoming>t1</incoming><outgoing>t2</outgoing></userTask>
+    <sequenceFlow id="t2" sourceRef="T_drive" targetRef="Tr_end"/>
+    <endEvent id="Tr_end" name="Рейс закрыт"><incoming>t2</incoming></endEvent>
+  </process>
+  <process id="Process_void" name="Архив" isExecutable="true">
+    <startEvent id="V_start" name="Пусто"><outgoing>v1</outgoing></startEvent>
+    <sequenceFlow id="v1" sourceRef="V_start" targetRef="V_end"/>
+    <endEvent id="V_end" name="Пусто"><incoming>v1</incoming></endEvent>
+  </process>
+  <bpmndi:BPMNDiagram id="Diagram_r">
+    <bpmndi:BPMNPlane id="Plane_r" bpmnElement="Collaboration_r">
+      <bpmndi:BPMNShape id="Shape_collect" bpmnElement="T_collect">
+        <dc:Bounds x="120" y="60" width="80" height="40"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_mid" bpmnElement="T_mid">
+        <dc:Bounds x="220" y="60" width="80" height="40"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_lane" bpmnElement="L_stock">
+        <dc:Bounds x="100" y="40" width="400" height="120"/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Edge_r1" bpmnElement="r1">
+        <di:waypoint x="60" y="80"/><di:waypoint x="120" y="80"/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_r2" bpmnElement="r2">
+        <di:waypoint x="200" y="80"/><di:waypoint x="220" y="80"/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>"""
+
+# Поля OP_SPEC, которыми операция ССЫЛАЕТСЯ на элемент схемы: их подставляет
+# тест, потому что литерал «id элемента» модель скопирует как выдуманный адрес.
+# Всё остальное (`task_type`, `event_definition`, `duration`, `default`,
+# `as_lane`) уходит в пакет ДОСЛОВНО из словаря — ровно так же, как правка,
+# собранная моделью по примеру из промпта.
+OP_SPEC_REFERENCE_FIELDS = ("id", "name", "participant", "after", "to", "lane",
+                            "attached_to", "source", "target", "flow",
+                            "gateway", "text", "condition")
+
+OP_SPEC_BINDINGS = {
+    "add_task": {"id": "new_R_task", "participant": "Склад", "after": "T_mid",
+                 "to": "End_r", "lane": "L_stock"},
+    "add_gateway": {"id": "new_R_gate", "participant": "Склад",
+                    "after": "T_mid", "to": "End_r", "lane": "L_stock"},
+    "add_event": {"id": "new_R_event", "participant": "Склад",
+                  "after": "T_mid", "to": "End_r", "lane": "L_stock"},
+    "add_participant": {"id": "new_R_pool"},
+    "add_documentation": {"id": "T_collect"},
+    "add_event_definition": {"id": "W_wait"},
+    "add_lane": {"id": "new_R_lane", "participant": "Склад"},
+    "move_to_lane": {"id": "T_mid", "lane": "L_stock"},
+    "add_boundary_event": {"id": "new_R_be", "attached_to": "T_collect",
+                           "to": "End_r"},
+    "rename": {"id": "T_collect"},
+    "set_task_type": {"id": "T_mid"},
+    "delete": {"id": "T_mid"},
+    "connect": {"source": "G_r", "target": "T_restock"},
+    "add_condition": {"flow": "r7"},
+    "set_default": {"gateway": "G_r", "flow": "r7"},
+    "disconnect": {"flow": "r2"},
+    "move_to_participant": {"id": "T_restock", "participant": "Транспорт"},
+    "merge_participants": {"source": "Транспорт", "target": "Склад"},
+    "remove_participant": {"participant": "Архив"},
+}
+
+
+def _op_spec_example(name):
+    """JSON-часть строки OP_SPEC (до « — »): то, что модель копирует в ответ."""
+    return json.loads(OP_SPEC[name].split(" — ")[0])
+
+
+class TestOpSpecIsCopyPasteable:
+    """`core/llm_improve.py:_operations_block` печатает OP_SPEC дословно, значит
+    каждое напечатанное значение обязано быть принятым аплайером значением.
+
+    Прежняя редакция словаря печатала перечисления внутри кавычек —
+    `"event_definition":"timer|message|error|signal"`, `"task_type"` через
+    склейку по `"|"`, `"gateway_type":"exclusive|parallel|inclusive"`. Прогон
+    такой строки буквально отвечал «неизвестное определение события» при
+    `status=failed`, а `improve/op_acceptance` записывала расхождение двух
+    словарей качеством модели. Рэтчет `eval.advice` держит тексты скоринга, но
+    блок операций он не видит — этот класс закрывает вторую половину.
+    """
+
+    @pytest.mark.parametrize("name", sorted(OP_SPEC))
+    def test_json_part_parses(self, name):
+        assert _op_spec_example(name)["op"] == name
+
+    @pytest.mark.parametrize("name", sorted(OP_SPEC))
+    def test_no_value_prints_an_alternation(self, name):
+        """Значение поля — одно, а перечень допустимых идёт словами после « — »:
+        `timer|message` внутри кавычек копируется как одно значение."""
+        for field, value in _op_spec_example(name).items():
+            if not isinstance(value, str):
+                continue  # `default: true` и `as_lane: true` — булевы флаги
+            if field in OP_SPEC_REFERENCE_FIELDS:
+                continue  # placeholder-адреса подставляет тест
+            assert "|" not in value, f"{name}: поле {field} печатает перечень"
+
+    @pytest.mark.parametrize("name", sorted(OP_SPEC))
+    def test_example_package_is_applied_verbatim(self, name):
+        example = _op_spec_example(name)
+        example.update(OP_SPEC_BINDINGS[name])
+        out, report = apply_operations(RATCHET_XML, [example])
+        assert report["skipped"] == [], (name, report["skipped"])
+        assert report["applied"], name
+        # Правка из примера не оставляет битых ссылок: пакет из промпта обязан
+        # быть не только принятым, но и цельным по IDREF. Пометки самой починки
+        # здесь ни при чём — фикстура намеренно держит узкое место (ветку
+        # шлюза без условия), которое ровняет `validate_and_repair`.
+        assert _unresolved_refs(out) == [], (name, _unresolved_refs(out))
+
+    def test_the_ratchet_actually_reads_the_json_part(self):
+        """Измеритель самого рэтчета: значение, которого словарь не предполагает,
+        отвергается причиной по существу, а не молча проходит мимо теста."""
+        example = _op_spec_example("add_event")
+        example.update(OP_SPEC_BINDINGS["add_event"])
+        example["event_definition"] = "timer|message|error|signal"
+        _, report = apply_operations(RATCHET_XML, [example])
+        assert report["status"] == "failed"
+        assert "неизвестное определение события" in report["skipped"][0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Отказ обязан называть недостающий операнд
+# ---------------------------------------------------------------------------
+
+class TestRefusalNamesTheMissingOperand:
+    """Правило контура: «отказ называет недостающий операнд», иначе корректирующий
+    повтор приносит ровно ту же операцию, а `improve/op_acceptance` и
+    `improve/repeat_rejection_share` записывают это качеством модели.
+
+    Здесь оно заперто с двух сторон: тексты конкретных отказов и рэтчет по всему
+    модулю аплайера — ни один `_Skip` не вправе появиться без подсказки."""
+
+    def test_rename_without_a_name_names_the_field(self, single_pool_xml):
+        """Прогон до правки: `{"op":"rename","id":"T_collect"}` отвечал
+        `reason="не задано имя"`, `hint=""` — повтору называть было нечего."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "rename", "id": "T_collect"}])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "не задано новое имя"
+        assert "name" in skip["hint"], skip
+        assert skip["hint"].strip(), "подсказка не может быть пустой"
+
+    def test_rename_hint_is_not_an_empty_operand(self, single_pool_xml):
+        """Тот же запрет, что корпусный `test_no_advice_prints_an_empty_operand`,
+        но на стороне аплайера: в подсказке не должно быть операнда-пустоты."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "rename", "id": "T_collect"}])
+        assert " ''" not in report["skipped"][0]["hint"]
+
+    def test_connect_without_a_target_does_not_print_an_empty_operand(
+            self, single_pool_xml):
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "connect", "source": "T_collect", "target": ""}])
+        hint = report["skipped"][0]["hint"]
+        assert "цель ''" not in hint, hint
+        assert "цель не назван" in hint, hint
+
+    def test_new_prefixed_id_in_a_edit_names_the_creation_operation(
+            self, single_pool_xml):
+        """`new_…` у правки, ждущей существующий узел, — намерение создать, а не
+        опечатка: подсказка обязана назвать операцию создания."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "rename", "id": "new_T9", "name": "X"}])
+        hint = report["skipped"][0]["hint"]
+        assert "ближайшие" not in hint
+        assert "add_task" in hint and "инвентар" in hint, hint
+
+    def test_every_refusal_carries_a_hint(self):
+        """Рэтчет по исходнику: ни один `_Skip` не создаётся без подсказки.
+
+        Исключения запрещены: пустая подсказка неотличима от забытой, а новый
+        `_Skip` с пустым `hint` появляется незаметно для тестов на отдельные
+        операции. Строка с `hint` допускается и как positional-аргумент, и как
+        именованный, и как вызов функции-помощника (`_pool_skip`,
+        `_connect_endpoints_hint`) — последнее проверяется на непустом
+        значении по факту прогона."""
+        import ast
+        from pathlib import Path
+
+        import core.bpmn_edits as module
+
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        silent = []
+        for node in ast.walk(ast.parse(source)):
+            if not (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", "") == "_Skip"):
+                continue
+            hint = node.args[1] if len(node.args) > 1 else next(
+                (keyword.value for keyword in node.keywords
+                 if keyword.arg == "hint"), None)
+            if hint is None:
+                silent.append(("нет подсказки", node.lineno))
+            elif isinstance(hint, ast.Constant) and not str(hint.value).strip():
+                silent.append(("пустая подсказка", node.lineno))
+            elif isinstance(hint, ast.JoinedStr):
+                # f-строка без литерального текста — подсказка может собраться
+                # в пустоту на данных, которых нет в тесте.
+                literal = "".join(part.value for part in hint.values
+                                  if isinstance(part, ast.Constant))
+                if not literal.strip():
+                    silent.append(("подсказка из одних переменных", node.lineno))
+        assert silent == [], silent
+
+
+# ---------------------------------------------------------------------------
+# Целостность XML после пакета
+# ---------------------------------------------------------------------------
+
+class TestDiagramAndReferencesStayConsistent:
+    """Пакет правит маршрут, а `bpmndi` живёт рядом с ним: снятый узел без
+    снятого `BPMNShape` — это IDREF в никуда, и редактор разваливает документ,
+    который аплайер посчитал исправным.
+
+    Замер до правки: `delete(id="T_collect")` на схеме с графикой оставлял
+    `<bpmndi:BPMNShape bpmnElement="T_collect">` и `<lane>` со ссылкой на
+    удалённый шаг, при `status=success`."""
+
+    def _di(self, xml_text):
+        root = _root(xml_text)
+        return sorted(node.get("bpmnElement") for node in root.iter()
+                      if isinstance(node.tag, str)
+                      and _tag(node) in ("BPMNShape", "BPMNEdge"))
+
+    def test_deleted_node_loses_its_shape_and_edges(self):
+        out, report = apply_operations(RATCHET_XML, [{"op": "delete",
+                                                      "id": "T_mid"}])
+        assert report["status"] == "success", report["skipped"]
+        assert "T_mid" not in self._di(out), self._di(out)
+        # потоки удалённого узла тоже ушли из графики: r2 ведёт в никуда
+        assert "r2" not in self._di(out) and "r3" not in self._di(out)
+        # чужая графика не тронута
+        assert "T_collect" in self._di(out) and "r1" in self._di(out)
+        assert _unresolved_refs(out) == []
+
+    def test_disconnect_removes_the_edge_of_the_dropped_flow(self):
+        out, report = apply_operations(RATCHET_XML, [
+            {"op": "disconnect", "flow": "r2"}])
+        assert report["status"] == "success", report["skipped"]
+        assert "r2" not in self._di(out)
+        assert "r1" in self._di(out)
+        assert _unresolved_refs(out) == []
+
+    def test_removed_lane_loses_its_shape(self):
+        out, report = apply_operations(RATCHET_XML, [
+            {"op": "add_lane", "id": "new_L_tmp", "name": "Временная",
+             "participant": "Склад"},
+            {"op": "remove_lane", "id": "new_L_tmp"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _by_id(out, "new_L_tmp") is None
+        assert "new_L_tmp" not in self._di(out)
+
+    def test_deleted_lane_keeps_the_step_it_signed(self):
+        """Дорожку с шагами аплайер не снимает, и графика остаётся при живом
+        узле: отказ не должен раскрашивать схему."""
+        out, report = apply_operations(RATCHET_XML, [
+            {"op": "remove_lane", "id": "L_stock"}])
+        assert report["status"] == "failed"
+        assert "ещё есть шаги" in report["skipped"][0]["reason"]
+        assert "T_collect" in self._di(out)
+
+    def test_route_is_bridged_and_no_reference_dangles(self):
+        out, _report = apply_operations(RATCHET_XML, [
+            {"op": "delete", "id": "T_mid"}])
+        root = _root(out)
+        bridged = [flow for flow in root.findall(".//bpmn:sequenceFlow", NS)
+                   if flow.get("sourceRef") == "T_collect"
+                   and flow.get("targetRef") == "G_r"]
+        assert bridged, "обход не замкнут"
+        assert not _dangling(out), _dangling(out)
+        assert _unresolved_refs(out) == []
+
+    def test_references_to_a_deleted_node_id_are_dropped(self):
+        """Ссылка `incoming`/`outgoing` обязана вести на поток, но в рукописных
+        схемах ведёт на id узла: после удаления соседа такой IDREF остаётся
+        битым, и раньше аплайер его не снимал."""
+        broken = RATCHET_XML.replace("<incoming>r2</incoming>",
+                                     "<incoming>T_collect</incoming>")
+        assert _by_id(broken, "T_mid").find("bpmn:incoming", NS).text == "T_collect"
+        out, report = apply_operations(broken, [{"op": "delete", "id": "T_collect"}])
+        assert report["status"] == "success", report["skipped"]
+        assert _unresolved_refs(out) == [], _unresolved_refs(out)
+
+    def test_boundary_attachment_survives_every_removal_path(self):
+        """Защита `attachedToRef` (её трогать не нужно) зафиксирована тестом на
+        всех путях удаления: вместе с хозяином, переносом в чужой пул и снятием
+        пустого пула."""
+        with_timer = apply_operations(RATCHET_XML, [
+            {"op": "add_boundary_event", "id": "new_BE", "attached_to": "T_collect",
+             "event_type": "timer", "name": "Просрочка сборки", "to": "End_r"}
+        ])[0]
+        assert _by_id(with_timer, "new_BE") is not None
+        for package in (
+            [{"op": "delete", "id": "T_collect"}],
+            [{"op": "move_to_participant", "id": "T_collect",
+              "participant": "Транспорт"}],
+        ):
+            out, report = apply_operations(with_timer, package)
+            assert report["skipped"] == [], (package, report["skipped"])
+            assert _unresolved_refs(out) == [], (package, _unresolved_refs(out))
+            text = ET.tostring(_root(out), encoding="unicode")
+            for element in _root(out).iter():
+                if isinstance(element.tag, str) and element.get("attachedToRef"):
+                    assert _by_id(out, element.get("attachedToRef")) is not None, text
+
+    def test_a_whole_package_leaves_no_dangling_reference(self):
+        """Пакет из всех операций словаря сразу: ни одной ссылки в никуда и
+        честный `status` — ни одна правка не «применилась» молча."""
+        packages = [dict(_op_spec_example(name), **OP_SPEC_BINDINGS[name])
+                    for name in sorted(OP_SPEC)]
+        out, report = apply_operations(RATCHET_XML, packages)
+        assert report["status"] in ("success", "partial"), report["skipped"]
+        assert _unresolved_refs(out) == [], _unresolved_refs(out)
+        assert not _dangling(out), _dangling(out)

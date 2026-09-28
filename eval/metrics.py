@@ -23,6 +23,14 @@ DEFAULT_RELATIVE_THRESHOLD = 0.05
 HIGHER = "higher"
 LOWER = "lower"
 
+# Нижний порог выборки для метрики, по которой выносится вердикт. 2 — не «мало
+# для статистики», а ровно то место, где число перестаёт быть долей: при n=1
+# среднее равно первому кейсу, и `improve/redundant_refusals_share` 0.2 в
+# replay-прогоне — это один отказ одного пакета, а не качество контура. Такая
+# метрика печатается как «н/д» и из гейта выпадает, но выпадение обязано быть
+# напечатано: иначе «мало данных» станет способом выключить проверку.
+MIN_GATED_N = 2
+
 
 def mean(values: Sequence[float]) -> Optional[float]:
     values = [float(v) for v in values]
@@ -87,6 +95,11 @@ class Metric:
     `fn` возвращает None, когда метрика к примеру неприменима (например,
     таймера в схеме нет). Такие примеры не входят в знаменатель среднего:
     иначе pass@1 по таймеру занижался бы схемами, где проверять нечего.
+
+    `min_n` — порог выборки, ниже которой вердикта нет (`MIN_GATED_N`). Метрика,
+    у которой порога честно не бывает (например, единственная схема в
+    подмножестве сценариев), объявляется здесь же: `min_n=1` означает «вердикт
+    выносится по одному кейсу», а не «молчим».
     """
 
     name: str
@@ -94,6 +107,7 @@ class Metric:
     description: str = ""
     direction: str = HIGHER
     unit: str = ""
+    min_n: int = MIN_GATED_N
 
     def value_of(self, example: Any) -> Optional[float]:
         return self.fn(example)
@@ -110,15 +124,33 @@ class MetricResult:
     description: str = ""
     direction: str = HIGHER
     unit: str = ""
+    min_n: int = MIN_GATED_N
+    #: падение самой метрики — дыра в харнессе, а не в схеме: молчать оно не
+    #: вправе, потому что из него получается `None`, который детектор регрессий
+    #: читает как «данных нет».
+    error: str = ""
 
     @property
     def n(self) -> int:
         return len([v for v in self.values if v is not None])
 
+    @property
+    def measured(self) -> bool:
+        """Есть ли у метрики вердикт: значение и выборка не ниже порога.
+
+        `None` в `mean` — это «не померено вовсе», он и в гейт не входит, и
+        печатается как «н/д» без отдельной строки: таких метрик в таблице нет,
+        когда в выбранном подмножестве сценариев нечего измерять.
+        """
+        return self.mean is not None and self.n >= self.min_n
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "mean": self.mean,
             "n": self.n,
+            "min_n": self.min_n,
+            "measured": self.measured,
+            "error": self.error,
             "values": self.values,
             "description": self.description,
             "direction": self.direction,
@@ -148,8 +180,33 @@ class SuiteResult:
             return []
         return [v for v in result.values if v is not None]
 
+    def errors(self) -> Dict[str, str]:
+        """Метрики, которые упали внутри себя: имя → текст исключения.
+
+        Отдельным словарём, а не `None` в значении: пометка «данных нет»
+        прятала бы баг харнесса в строке «сверка не проводилась», и прогон с
+        падающей метрикой оставался бы зелёным.
+        """
+        return {name: r.error for name, r in self.metrics.items() if r.error}
+
+    def under_sampled(self) -> List[str]:
+        """Имена метрик с выборкой ниже `min_n` — у них нет вердикта.
+
+        Печатается обязательно (`RunReport.under_sampled`): снятая из-за n=1
+        метрика иначе неотличима от той, что просто не вошла в отчёт, а
+        «регрессий нет» начинало бы читаться как «сверили всё».
+        """
+        return [name for name in self.order
+                if self.metrics[name].mean is not None
+                and not self.metrics[name].measured]
+
     def flat(self) -> Dict[str, Optional[float]]:
-        """Только средние — ровно то, что кладётся в baseline."""
+        """Только средние — ровно то, что кладётся в baseline.
+
+        Значение метрики без вердикта здесь остаётся: иначе она выпадала бы и из
+        `unverified`, и из набора baseline, а «мало данных» превращалось бы в
+        «метрику убрали». От гейта её отделяет `ungated` в `compare`.
+        """
         return {name: self.metrics[name].mean for name in self.order}
 
 
@@ -165,15 +222,16 @@ class EvaluationSuite:
 
     def metric(self, name: str, fn: Callable[[Any], Optional[float]],
                description: str = "", direction: str = HIGHER,
-               unit: str = "") -> Metric:
+               unit: str = "", min_n: int = MIN_GATED_N) -> Metric:
         return self.add(Metric(name=name, fn=fn, description=description,
-                               direction=direction, unit=unit))
+                               direction=direction, unit=unit, min_n=min_n))
 
     def run(self, examples: Sequence[Mapping[str, Any]]) -> SuiteResult:
         result = SuiteResult(order=[m.name for m in self.metrics],
                              metrics={m.name: MetricResult(
                                  name=m.name, description=m.description,
-                                 direction=m.direction, unit=m.unit)
+                                 direction=m.direction, unit=m.unit,
+                                 min_n=m.min_n)
                                  for m in self.metrics})
         for example in examples:
             label = str(example.get("name") or "?")
@@ -183,11 +241,13 @@ class EvaluationSuite:
                     value = metric.value_of(example.get("payload"))
                 except Exception as e:  # noqa: BLE001 — метрика не роняет прогон
                     # Падение одной метрики — дыра в харнессе, а не в схеме:
-                    # фиксируем её в описании результата и продолжаем считать.
+                    # считаем дальше, но фиксируем её отдельным фактом. Прежняя
+                    # запись в `description` превращала сбой в `None`, который
+                    # детектор регрессий и `unverified` пропускали молча.
                     value = None
-                    if not result.metrics[metric.name].description.startswith("ОШИБКА"):
-                        result.metrics[metric.name].description = (
-                            f"ОШИБКА метрики: {e!r}")
+                    if not result.metrics[metric.name].error:
+                        result.metrics[metric.name].error = (
+                            f"{label}: {type(e).__name__}: {e}")
                 row[metric.name] = value
                 result.metrics[metric.name].values.append(value)
             result.per_example[label] = row
@@ -254,10 +314,20 @@ class RegressionDetector:
         return self.directions.get(name, HIGHER)
 
     def compare(self, baseline: Mapping[str, Any],
-                current: Mapping[str, Any]) -> List[Regression]:
+                current: Mapping[str, Any],
+                ungated: Iterable[str] = ()) -> List[Regression]:
+        """Сверка по относительному порогу; `ungated` — имена без вердикта.
+
+        Сюда попадают метрики с выборкой ниже `MIN_GATED_N`: вердикт по одному
+        кейсу — это факт про один прогон, а не свойство контура, и падение с 0.2
+        до 0.0 на одном-единственном отказе не имеет права красить CI. Само
+        число при этом остаётся в baseline и в отчёте — выпадение из гейта
+        печатается отдельной строкой, а не превращается в «метрики нет».
+        """
+        skip = set(ungated or ())
         out: List[Regression] = []
         for name, raw_base in baseline.items():
-            if name not in current:
+            if name not in current or name in skip:
                 continue
             base, now = _as_number(raw_base), _as_number(current[name])
             if base is None or now is None:

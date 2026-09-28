@@ -11,14 +11,42 @@ from core.bpmn_generator import MAX_TEXT_CHARS
 # планировщика, поэтому запрос держим коротким осознанно.
 AI_MAX_PROMPT_CHARS = 4000
 
-# Модели для восстановления пароля
-class PasswordResetRequest(BaseModel):
-    email: EmailStr
+# Границы полей аккаунта совпадают с колонками models.User: name — String(50),
+# email, position, company, website — String(100). На PostgreSQL сверх лимита
+# даёт не 500 «string data right truncation», а честный 422. Поле about — Text,
+# поэтому его длины здесь нет: выдуманный лимит резал бы уже сохранённые анкеты.
+USER_NAME_MAX = 50
+USER_EMAIL_MAX = 100
+USER_TEXT_FIELD_MAX = 100
+# Тот же порог, что у маршрута сброса пароля: правило «минимум 8 символов»
+# не должно зависеть от того, каким из двух маршрутов пользователь меняет пароль.
+MIN_PASSWORD_CHARS = 8
 
-    @field_validator('email')
+
+def normalize_email(value: str) -> str:
+    """Приводит почту к единственной форме: без пробелов и в нижнем регистре.
+
+    Нормализация одна и на записи, и на чтении, иначе на PostgreSQL `==`
+    с регистром различает «ivan@example.com» и «Ivan@example.com»: два ввода
+    заводят второй аккаунт вместо одного, а сброс пароля lower-case'ит адрес
+    и не находит его владельца — письмо не приходит, но ответ выглядит успехом.
+    """
+    return value.strip().lower()
+
+
+class NormalizedEmailModel(BaseModel):
+    """Поле почты с нормализацией: наследуют все входные модели аккаунта."""
+
+    email: EmailStr = Field(..., max_length=USER_EMAIL_MAX)
+
+    @field_validator("email")
     @classmethod
-    def validate_email(cls, v):
-        return v.lower()
+    def email_normalized(cls, v):
+        return normalize_email(v)
+
+# Модели для восстановления пароля
+class PasswordResetRequest(NormalizedEmailModel):
+    pass
 
 class PasswordReset(BaseModel):
     token: str
@@ -62,14 +90,57 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-class LoginRequest(BaseModel):
-    email: str
+class LoginRequest(NormalizedEmailModel):
     password: str
 
-class RegisterRequest(BaseModel):
-    name: str
-    email: str
+
+class RegisterRequest(NormalizedEmailModel):
+    name: str = Field(..., min_length=1, max_length=USER_NAME_MAX)
     password: str
+
+
+class ProfileUpdate(BaseModel):
+    """Обновление профиля: только переданные поля, длины — из колонок User.
+
+    Раньше маршрут принимал «сырой» dict и писал что попало прямо в сессию:
+    чужой или кривой email ловил IntegrityError на 500, а число вместо имени
+    превращалось в 500 же на PostgreSQL. Здесь непроходимые значения
+    отсекаются на 422, а конфликт из-за занятой почты решает роутер понятным 400.
+    """
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=USER_NAME_MAX)
+    email: Optional[EmailStr] = Field(default=None, max_length=USER_EMAIL_MAX)
+    position: Optional[str] = Field(default=None, max_length=USER_TEXT_FIELD_MAX)
+    company: Optional[str] = Field(default=None, max_length=USER_TEXT_FIELD_MAX)
+    website: Optional[str] = Field(default=None, max_length=USER_TEXT_FIELD_MAX)
+    about: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=MIN_PASSWORD_CHARS)
+
+    @field_validator("email")
+    @classmethod
+    def email_normalized(cls, v):
+        return None if v is None else normalize_email(v)
+
+
+class ProfileResponse(BaseModel):
+    """Профиль после записи.
+
+    `access_token` выдаётся, когда меняется email или пароль: `sub` токена —
+    это почта, а `tv` — клеймо версии, поэтому прежний токен после такой правки
+    перестаёт действовать сам собой. Клиент, который сохранит новый токен,
+    не отвалится; старый без него честно получит 401.
+    """
+
+    id: int
+    name: Optional[str] = None
+    email: str
+    position: Optional[str] = None
+    company: Optional[str] = None
+    website: Optional[str] = None
+    about: Optional[str] = None
+    access_token: Optional[str] = None
+    token_type: Optional[str] = None
+    token_rotated: bool = False
 
 class FolderCreate(BaseModel):
     name: str

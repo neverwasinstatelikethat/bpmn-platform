@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import inspect
 import json
@@ -48,8 +49,25 @@ LOWER_IS_BETTER = frozenset({
     "improve/repeat_rejection_share", "improve/defects_introduced",
     "improve/base_advice_drift", "improve/advice_off_target_share",
     "business/smells",
-    "spread/score_cv", "spread/score_cv_per_case",
+    # Размер входа — стоимость, а не качество: «меньше» здесь лучше ровно до тех
+    # пор, пока не начинает резать правила из промпта (красная линия проекта —
+    # не ослаблять их ради числа), поэтому метрика диагностируется, а не гейтится
+    # тем же смыслом, что и доли корректности.
+    "cost/prompt_chars_per_call", "cost/prompt_chars_per_case",
+    "cost/prompt_tokens_per_call", "cost/prompt_tokens_per_case",
+    # Межсценарный разброс балла — свойство набора фикстур, а не контура: он
+    # меняется от того, сколько сценариев выбрали (`--scenarios`), и гейтить его
+    # нельзя. В LOWER_IS_BETTER имя остаётся, чтобы направление было объявлено
+    # и в резервном пути сверки со старым слепком, но в baseline число не
+    # кладётся (см. `RunReport.metrics_flat`).
+    "spread/score_cv_across_scenarios", "spread/score_cv_per_case",
 })
+
+# Минимум повторов, при котором дисперсия живой модели становится мерой: при 2
+# прогонах коэффициент вариации — это разница двух случайностей, и называть её
+# «разбросом live» значило бы выдавать шум за измерение (живые прогоны #56/#57
+# расходятся на 0.05–0.06 между собой именно так).
+MIN_LIVE_REPEATS = 3
 
 # Претензия живого кейса «по факту схемы». Текст общий намеренно: ни id, ни
 # имён участников, ни названий правил — какой именно дефект чинить, оркестратор
@@ -205,6 +223,22 @@ def ruler_fingerprint() -> Dict[str, Any]:
     }
 
 
+def ruler_hash(fingerprint: Mapping[str, Any]) -> str:
+    """Короткий отпечаток линейки — одна строка вместо перечня из 26 правил.
+
+    Нужен потому, что «линейка изменилась» без адреса не проверить: в отчёте и в
+    baseline должно читаться, каким именно набором правил мерил прогон, а
+    разворот всей таблицы в сводку никто не прочтёт. Считается по нормализованному
+    JSON, поэтому не зависит от порядка ключей и переживает перезапись baseline.
+
+    В самом отпечатке (`ruler_fingerprint`) хэша нет намеренно: `ruler_note`
+    сверяет словари целиком, и производный ключ внутри них заставил бы каждый
+    старый baseline выглядеть собранном другой линейкой.
+    """
+    payload = json.dumps(fingerprint, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
 def ruler_note(current: Mapping[str, Any],
                baseline: Mapping[str, Any]) -> str:
     """Почему сверка с baseline пропущена, или пусто, если сверять можно."""
@@ -231,11 +265,14 @@ def ruler_note(current: Mapping[str, Any],
         parts.append("инварианты: " + ", ".join(changed))
     return (f"линейка изменилась ({len(base_rules)} правил, "
             f"вес {base.get('weights_total')} → {len(now_rules)} правил, вес "
-            f"{current.get('weights_total')}; {'; '.join(parts)}): балл и доли "
+            f"{current.get('weights_total')}; отпечатки {ruler_hash(base)} → "
+            f"{ruler_hash(current)}; {'; '.join(parts)}): балл и доли "
             "прохождения несопоставимы, сверка с baseline пропущена. Новые "
             "правила обязаны заряжать то, что раньше прощалось, — проверьте это "
-            "на корпусе (`python -m eval.coverage`) и пересоберите baseline "
-            "--write-baseline")
+            "на корпусе (`python -m eval.coverage` и `python -m eval.advice "
+            "--all-rules`), затем пересоберите baseline (--write-baseline) либо "
+            "прогоните с явным --accept-ruler-change, если изменение линейки "
+            "осознанно и сверка отложена до пересборки")
 
 
 def agreement_share(drift: Mapping[str, Mapping[str, Any]]) -> Optional[float]:
@@ -343,6 +380,9 @@ class GenCase:
     message_flows: int = 0
     latency_ms: float = 0.0
     llm_calls: int = 0
+    #: вызовы этого кейса с размером входа: в live — записанные с транспорта,
+    #: в replay — посчитанные по шаблонам ядра (`observed=False` в каждой строке).
+    prompt_calls: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -394,7 +434,16 @@ class GenCase:
         таблице она перестала быть, потому что отчитываться таким числом —
         всегда ноль.
         None, когда применимых проверок нет (пустая схема, не разобралась).
+
+        Несобравшийся кейс даёт 0.0, а не None: раньше сцена, упавшая на
+        генерации, выпадала из знаменателя, и живой прогон #53–#54 терял пять
+        кейсов из 24 — доли при этом считались по уцелевшим и «has_timer 0.667 →
+        1.0» оказывалось сменой выборки, а не улучшением. Схема, которой нет, не
+        прошла ни одной проверки; что именно из кейсов не собралось — говорит
+        `generation_error_share`, а не молчание в знаменателе.
         """
+        if not self.ok:
+            return 0.0
         checks = invariants.deciding_checks(self.checks_xml)
         if not checks:
             return None
@@ -407,7 +456,12 @@ class GenCase:
         Нужна отдельной строкой, потому что гейт на структуре и гейт на XML
         ловят разных виновников: здесь видно, что план уже был неполон, ещё до
         транспорта XML (разграничение в `eval/attribution.py`).
+
+        Тот же порядок, что у `gate_share`: несобравшийся кейс остаётся в
+        знаменателе с нулём.
         """
+        if not self.ok:
+            return 0.0
         checks = invariants.deciding_checks(self.checks_structure)
         if not checks:
             return None
@@ -493,6 +547,9 @@ class GenCase:
             "pools": self.pools, "elements": self.elements,
             "message_flows": self.message_flows,
             "latency_ms": round(self.latency_ms, 1), "llm_calls": self.llm_calls,
+            "stage_path": stage_path(self),
+            "prompt_calls": list(self.prompt_calls),
+            "prompt_totals": prompt_totals(self.prompt_calls),
             "structure_vs_xml": self.disagreements,
             "attribution": self.attribution,
             "trace": self.trace,
@@ -549,6 +606,17 @@ class ImproveCase:
     attribution: Dict[str, str] = field(default_factory=dict)
     latency_ms: float = 0.0
     llm_calls: int = 0
+    #: вызовы планирования с размером входа (live — с транспорта, replay — по
+    #: шаблонам ядра): см. `rendered_improve_prompt_rows`.
+    prompt_calls: List[Dict[str, Any]] = field(default_factory=list)
+    #: кто прислал пакет операций: живой захват или автор кейса. Метрики
+    #: улучшения по рукописным пакетам мерят аплайер и разметку, а не модель, и
+    #: обязано быть напечатано рядом с числом (`provenance.origin_verdict`).
+    answer_source: str = provenance.UNKNOWN_SOURCE
+    #: ключ `answer_source` в фикстуре записан явно (или происхождение задал сам
+    #: режим — в live ответ всегда живой), а не выведено из `quality`/`source`;
+    #: тот же порядок, что у `targets_declared`.
+    answer_source_declared: bool = False
     xml_after: str = ""
     #: схема, поверх которой работал пакет: без неё `dump_schemes` не отдаёт
     #: пар before/after, и «что именно изменил пакет» читается только повторным
@@ -755,9 +823,274 @@ class ImproveCase:
             if self.checks_before else {},
             "checks_before": {k: v.as_dict() for k, v in self.checks_before.items()},
             "latency_ms": round(self.latency_ms, 1), "llm_calls": self.llm_calls,
+            "prompt_calls": list(self.prompt_calls),
+            "prompt_totals": prompt_totals(self.prompt_calls),
+            "answer_source": self.answer_source,
+            "answer_source_declared": self.answer_source_declared,
             "targets": self.targets, "off_target": self.off_target,
             "off_target_note": self.off_target_note,
         }
+
+
+# ---------------------------------------------------------------------------
+# размер промпта: качество ИИ-контура ограничено бюджетом контекста
+# ---------------------------------------------------------------------------
+
+#: Символов на токен — порядок величины, а не счётчик провайдера. Число нужно,
+#: чтобы сравнение «стало дороже в 1.8 раза» читалось и в replay, где токенов
+#: никто не отдаёт; в live рядом лежит настоящий `usage` из журнала обращения
+#: (`core.llm_client.fill_call_trace`), и расхождение с этой оценкой — про
+#: оценку, а не про промпт.
+CHARS_PER_TOKEN = 3.0
+
+#: Стадии, на которые распадается вход одного вызова. Имена совпадают с узлами
+#: трейса генератора: «состав» и «маршрут» — две стадии `_extract_structure`,
+#: «одношаговый» — путь отката, «переспрос» — `_retry_structure`.
+PROMPT_STAGES = ("состав", "маршрут", "одношаговый", "переспрос",
+                 "вопрос о принадлежности", "улучшение", "повтор улучшения",
+                 "иное")
+
+_PROMPT_TEMPLATES: Optional[Dict[str, str]] = None
+
+
+def prompt_templates() -> Dict[str, str]:
+    """Тексты системных блоков стадий, прочитанные из ядра.
+
+    Харнесс не заводит свою копию промпта: ему нужен размер и тождество блока,
+    а они берутся из того же объекта, который уходит в модель. Ключ — стадия,
+    значение — дословный текст.
+    """
+    global _PROMPT_TEMPLATES
+    if _PROMPT_TEMPLATES is None:
+        gen = _module("core.bpmn_generator")
+        imp = _module("core.llm_improve")
+        _PROMPT_TEMPLATES = {
+            "состав": str(getattr(gen, "_ROSTER_SYSTEM_PROMPT", "") or ""),
+            "маршрут": str(getattr(gen, "_FLOW_SYSTEM_PROMPT", "") or ""),
+            "одношаговый": str(getattr(gen, "_SYSTEM_PROMPT", "") or ""),
+            "переспрос": str(getattr(gen, "_RETRY_TEMPLATE", "") or ""),
+            "вопрос о принадлежности":
+                str(getattr(gen, "_OWNERSHIP_SYSTEM_PROMPT", "") or ""),
+            "улучшение": str(getattr(imp, "_SYSTEM_PROMPT", "") or ""),
+            "повтор улучшения": str(getattr(imp, "_RETRY_TEMPLATE", "") or ""),
+        }
+    return _PROMPT_TEMPLATES
+
+
+def estimate_prompt_tokens(chars: Optional[float]) -> Optional[float]:
+    """Токены из символов: None остаётся None («не померено»), ноль — это ноль."""
+    if chars is None:
+        return None
+    return round(float(chars) / CHARS_PER_TOKEN, 1)
+
+
+def _prompt_row(stage: str, chars: int, observed: bool,
+                note: str = "") -> Dict[str, Any]:
+    """Один вызов: стадия, символы входа, оценка токенов и как число получено.
+
+    `observed=False` читается как «вызова не было, размер посчитан по шаблонам
+    ядра и данным кейса» — в replay иначе неотличимо от записанного обращения.
+    """
+    row: Dict[str, Any] = {"stage": stage, "chars": int(max(0, chars)),
+                           "tokens_est": estimate_prompt_tokens(chars),
+                           "observed": bool(observed)}
+    if note:
+        row["note"] = note
+    return row
+
+
+def prompt_stage(system: str, user: str) -> str:
+    """Стадия вызова по его же тексту: ядро не отдаёт имя стадии наружу.
+
+    Разбор по тождеству системного блока, а не по подстроке: `_FLOW_SYSTEM_PROMPT
+    = _SYSTEM_PROMPT + хвост`, и «содержит» спутало бы одношаговый путь с
+    маршрутом. Переспрос опознаётся по началу пользовательской части — тот же
+    системный блок, что у стадии, поэтому по одному ему стадию не выбрать.
+    """
+    tpl = prompt_templates()
+    sys_text = str(system or "")
+    user_text = str(user or "")
+    retry_head = (tpl.get("переспрос") or "")[:40]
+    improve_retry_head = (tpl.get("повтор улучшения") or "")[:40]
+    if sys_text == tpl.get("состав"):
+        return "состав"
+    if sys_text == tpl.get("вопрос о принадлежности"):
+        return "вопрос о принадлежности"
+    if sys_text == tpl.get("улучшение"):
+        return ("повтор улучшения" if improve_retry_head
+                and user_text.startswith(improve_retry_head) else "улучшение")
+    if sys_text in (tpl.get("маршрут"), tpl.get("одношаговый")):
+        return ("переспрос" if retry_head and user_text.startswith(retry_head)
+                else ("маршрут" if sys_text == tpl.get("маршрут")
+                      else "одношаговый"))
+    return "иное"
+
+
+def _rendered_chars(template: str, values: Mapping[str, str]) -> int:
+    """Длина шаблона после подстановки — без сборки самого текста.
+
+    `str.replace` ядро вызывает на тех же плейсхолдерах; считать длину дословно
+    склеенной строки значило бы второго источника истины о промпте, который
+    расходится с ядром при первой же правке формулировки.
+    """
+    total = len(template)
+    for key, value in values.items():
+        marker = "{" + key + "}"
+        count = template.count(marker)
+        if not count:
+            continue
+        total += (len(value) - len(marker)) * count
+    return total
+
+
+def observed_prompt_rows(messages: Sequence[Mapping[str, str]]) -> List[Dict[str, Any]]:
+    """Строка про вызов, снятая с настоящего обращения (live)."""
+    msgs = list(messages or [])
+    system = str(msgs[0].get("content") or "") if msgs else ""
+    user = " ".join(str(m.get("content") or "") for m in msgs[1:])
+    chars = sum(len(str(m.get("content") or "")) for m in msgs)
+    return [_prompt_row(prompt_stage(system, user), chars, True)]
+
+
+def rendered_prompt_rows(text: str, plan: Mapping[str, Any],
+                         gaps: Sequence[str]) -> List[Dict[str, Any]]:
+    """Вход каждой стадии генерации для этого кейса, посчитанный по ядру.
+
+    В replay обращений к модели нет вовсе, а бюджет контекста обязан быть виден
+    всё равно: именно он ограничивает качество контура (весь свод правил едет в
+    каждом вызове). Поэтому сюда попадают ВСЕ стадии, которые ядро умеет звать,
+    а не одна «выбранная»: путь — двухстадийный или откат в одношаговый — в
+    replay не наблюдался, и `cost/prompt_two_stage_share` остаётся «н/д».
+    Служебная склейка стадии маршрута (абзац про `participant` и `lane`) в сумму
+    не входит: это сотни символов на десятки тысяч — погрешность диагностики,
+    заводить ради неё копию текста ядра харнесс не имеет права.
+    """
+    tpl = prompt_templates()
+    description = "Описание процесса:\n" + str(text or "")
+    rows: List[Dict[str, Any]] = [
+        _prompt_row("состав", len(tpl.get("состав") or "") + len(description),
+                    False, "системный блок стадии + описание процесса"),
+        _prompt_row("одношаговый",
+                    len(tpl.get("одношаговый") or "") + len(description), False,
+                    "путь отката: системный блок со сводом правил + описание"),
+    ]
+    skeleton = ""
+    try:
+        block = getattr(_module("core.bpmn_generator"), "_skeleton_block", None)
+        if callable(block):
+            skeleton = str(block(list((plan or {}).get("participants") or []),
+                                 list((plan or {}).get("lanes") or [])))
+    except Exception:  # noqa: BLE001 — размер не имеет права ронять прогон
+        skeleton = ""
+    rows.insert(1, _prompt_row(
+        "маршрут", len(tpl.get("маршрут") or "") + len(skeleton) + len(description),
+        False, "состав берётся из плана кейса, а не из ответа стадии состава"))
+    if gaps:
+        # Переспрос идёт с тем же системным блоком, что и стадия маршрута
+        # (состав под утверждённым каркасом знает `_FLOW_SYSTEM_PROMPT`), и без
+        # него строка врала бы в минус на размер свода правил.
+        rows.append(_prompt_row(
+            "переспрос",
+            len(tpl.get("маршрут") or "") + _rendered_chars(
+                tpl.get("переспрос") or "", {
+                    "gaps": "\n".join(f"- {g}" for g in gaps),
+                    "text": str(text or ""),
+                    "plan": json.dumps(dict(plan or {}), ensure_ascii=False,
+                                       default=str)}),
+            False, "системный блок стадии + тело шаблона с планом и нарушениями"))
+    return rows
+
+
+def rendered_improve_prompt_rows(xml: str, user_prompt: str) -> List[Dict[str, Any]]:
+    """Вход планировщика улучшения для этой схемы — из тех же кусков, что и продукт.
+
+    Здесь харнесс ничего не дублирует: инвентарь, блок ограничений и разбор узких
+    мест отдаёт ядро теми же функциями, которыми собирает запрос. Блок ЛУЧШИЕ
+    ПРАКТИКИ не учитывается: он требует индекса корпуса и модели эмбеддингов, а
+    replay обязан оставаться дешёвым и детерминированным проходом по фикстурам —
+    об этом говорит пометка в строке.
+    """
+    if not xml:
+        return []
+    try:
+        imp = _module("core.llm_improve")
+        edits = _module("core.bpmn_edits")
+        inventory = edits.build_inventory(xml)
+        content = str(imp._USER_TEMPLATE).format(
+            inventory=json.dumps(inventory, ensure_ascii=False, indent=1),
+            limits_block=str(imp._limits_block(inventory)),
+            findings_block=str(imp._findings_block(xml)),
+            practices_block="",
+            user_prompt=str(user_prompt or ""))
+    except Exception:  # noqa: BLE001 — диагностика стоимости не роняет кейс
+        return []
+    chars = len(str(getattr(imp, "_SYSTEM_PROMPT", "") or "")) + len(content)
+    return [_prompt_row("улучшение", chars, False,
+                        "без блока практик: его RAG-подбор в replay не собирается")]
+
+
+def prompt_totals(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Символы и оценка токенов по списку вызовов: {} на пустом списке.
+
+    Пустой список даёт пустой словарь, а не нули: «не померено» и «ноль
+    символов» в отчёте — разные утверждения.
+    """
+    measured = [r for r in rows or [] if r.get("chars") is not None]
+    if not measured:
+        return {}
+    chars = sum(int(r["chars"]) for r in measured)
+    return {"calls": float(len(measured)), "chars": float(chars),
+            "tokens_est": round(chars / CHARS_PER_TOKEN, 1),
+            "observed": all(bool(r.get("observed")) for r in measured)}
+
+
+def _prompt_case_rows(case: Any) -> List[Dict[str, Any]]:
+    return list(getattr(case, "prompt_calls", None) or [])
+
+
+def _prompt_chars_per_call(case: Any) -> Optional[float]:
+    totals = prompt_totals(_prompt_case_rows(case))
+    return None if not totals else totals["chars"] / totals["calls"]
+
+
+def _prompt_chars_per_case(case: Any) -> Optional[float]:
+    totals = prompt_totals(_prompt_case_rows(case))
+    return None if not totals else totals["chars"]
+
+
+def _prompt_tokens_per_call(case: Any) -> Optional[float]:
+    totals = prompt_totals(_prompt_case_rows(case))
+    return None if not totals else totals["tokens_est"] / totals["calls"]
+
+
+def _prompt_tokens_per_case(case: Any) -> Optional[float]:
+    totals = prompt_totals(_prompt_case_rows(case))
+    return None if not totals else totals["tokens_est"]
+
+
+def stage_path(case: GenCase) -> Optional[str]:
+    """Каким путём собирался план: «двухстадийный» или «одношаговый».
+
+    Читается из трейса живого прогона — генератор пишет туда и «состав утверждён
+    отдельным вызовом», и список деградаций. None, когда трейса стадии нет
+    (replay идёт по записанному плану и путь не наблюдает): метрика печатается
+    как «н/д», а не как «ни один кейс не двухстадийный».
+    """
+    for node in case.trace or []:
+        if str(node.get("node") or "") != "первый ответ модели":
+            continue
+        if (node.get("деградации") or []) and str(node.get("состав") or "") \
+                != "утверждён отдельным вызовом":
+            return "одношаговый"
+        return ("двухстадийный"
+                if str(node.get("состав") or "") == "утверждён отдельным вызовом"
+                else "одношаговый")
+    return None
+
+
+def _two_stage_share(case: GenCase) -> Optional[float]:
+    path = stage_path(case)
+    return None if path is None else (1.0 if path == "двухстадийный" else 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -766,21 +1099,24 @@ class ImproveCase:
 
 
 @contextlib.contextmanager
-def llm_call_counter() -> Iterator[Dict[str, int]]:
+def llm_call_counter() -> Iterator[Dict[str, Any]]:
     """Счётчик обращений к транспорту LLM — только для live-режима.
 
     Число ретраев на задачу измеряется на уровне транспорта
     (`core.llm_client._complete`), а не переписыванием ядра: харнесс наблюдает
-    существующий код, а не подменяет его логику.
+    существующий код, а не подменяет его логику. Там же, на сообщении, которое
+    уже собрано, снимается и его размер: ядро не отдаёт стадию наружу, а
+    запрашиваемый текст харнессу видеть можно — он его не меняет.
     """
     from core import llm_client
 
     original = llm_client._complete
-    state = {"calls": 0}
+    state: Dict[str, Any] = {"calls": 0, "prompt_calls": []}
 
     def counting(messages: Sequence[Mapping[str, str]], temperature: float,
                  max_tokens: Optional[int]) -> str:
         state["calls"] += 1
+        state["prompt_calls"].extend(observed_prompt_rows(messages))
         return original(messages, temperature, max_tokens)
 
     llm_client._complete = counting
@@ -849,6 +1185,7 @@ def run_generation_case(scenario: Scenario, fixture: Optional[Mapping[str, Any]]
                 structure, notes, xml, gaps, trace = _live_plan(scenario.text)
             case.trace = trace
             case.llm_calls = counter["calls"]
+            case.prompt_calls = list(counter.get("prompt_calls") or [])
         else:
             if not fixture or "plan" not in fixture:
                 raise _CaseFailure("у фикстуры нет поля plan")
@@ -860,6 +1197,11 @@ def run_generation_case(scenario: Scenario, fixture: Optional[Mapping[str, Any]]
             # считается сама фикстура (атрибуция решает это по пустому трейсу).
             case.trace = [{"node": "починка структуры", "steps": steps}]
             xml = generate_xml(structure)
+            # Размер входа считается по шаблонам ядра: обращений к модели в replay
+            # нет, но бюджет контекста — ровно то, что ограничивает качество
+            # контура, и CI обязан видеть его движение до живого прогона.
+            case.prompt_calls = rendered_prompt_rows(scenario.text,
+                                                     fixture["plan"], gaps)
         case.structure, case.notes, case.xml = structure, notes, xml
         case.gaps = gaps
         case.measure(expectations)
@@ -1154,6 +1496,9 @@ def _advice_fixtures(scenario: Scenario, case: GenCase) -> List[Dict[str, Any]]:
              "scenario": scenario.id,
              "label": "претензия по факту схемы: что нашлось, то и чиним",
              "quality": "advice", "operations": [], "targets": failing,
+             # Пакет в этом кейсе отвечает модель, а не автор фикстуры: фикстуры
+             # как файла нет, её собирает харнесс из нарушений живой схемы.
+             "answer_source": provenance.MODEL_CAPTURE,
              "prompt": ADVICE_PROMPT}]
 
 
@@ -1169,7 +1514,12 @@ def run_improvement_case(scenario: Scenario, fixture: Mapping[str, Any],
     case = ImproveCase(scenario=scenario.id, fixture=fixture.get("id", "?"),
                        label=fixture.get("label", ""),
                        quality=fixture.get("quality", "unknown"),
-                       mode=mode, repeat=repeat)
+                       mode=mode, repeat=repeat,
+                       answer_source=(provenance.MODEL_CAPTURE if mode == "live"
+                                      else provenance.answer_source(fixture)),
+                       answer_source_declared=(
+                           mode == "live"
+                           or provenance.answer_source_declared(fixture)))
     expectations = scenario.expectations()
     if not base.ok or not base.xml:
         case.error = f"нет базовой схемы: {base.error or 'генерация не собралась'}"
@@ -1189,10 +1539,17 @@ def run_improvement_case(scenario: Scenario, fixture: Mapping[str, Any],
             # этого нет, — измерять несоответствие текста, а не контур.
             return case
         if mode == "live":
-            xml_after, report, case.llm_calls = _live_improve(
-                base.xml, fixture.get("prompt", "") or scenario.improve_prompt)
+            # Свой счётчик: вложенный `llm_call_counter` внутри `_live_improve`
+            # видит те же вызовы, но наружу отдаёт только число обращений, а
+            # строки с размером входа остаются здесь.
+            with llm_call_counter() as counter:
+                xml_after, report, case.llm_calls = _live_improve(
+                    base.xml, fixture.get("prompt", "") or scenario.improve_prompt)
+            case.prompt_calls = list(counter.get("prompt_calls") or [])
         else:
             xml_after, report = _replay_improve(base.xml, fixture)
+            case.prompt_calls = rendered_improve_prompt_rows(
+                base.xml, fixture.get("prompt", "") or scenario.improve_prompt)
         _absorb_improve_report(case, report)
         # Отчёт приносит СВОИ замечания о недомере; разметка фикстуры,
         # поставленная до вызова, от этого не исчезает.
@@ -1279,6 +1636,27 @@ def etalon_business_smells() -> Dict[str, int]:
     return out
 
 
+def _smell_density(case: GenCase) -> Optional[float]:
+    """Плотность бизнес-узких мест схемы: проваленные бизнес-инварианты / все
+    применимые бизнес-инварианты этой же схемы.
+
+    Прежняя версия была АБСОЛЮТНЫМ числом узких мест, усреднённым по кейсам, —
+    ровно тот изъян, который уже починили для `improve/retry_gain`: схема, у
+    которой применима одна бизнес-проверка, и схема, у которой их пять, входили в
+    среднее с одинаковым весом, а знаменателя метрика не видела вовсе. 2 узких
+    места из 2 и 2 из 5 — это «процесс не выдерживает проверки» и «процесс почти
+    чист», а на старом счёте это было одно и то же число 2.
+
+    `None`, когда бизнес-проверок нет вовсе: 0.0 здесь читался бы как «узких мест
+    нет», тогда как проверять было нечего.
+    """
+    if not case.ok:
+        return None
+    checks = [c for c in invariants.applicable_checks(case.checks_xml)
+              if c.name in invariants.BUSINESS_INVARIANTS]
+    return _share(len(case.business_smells), len(checks))
+
+
 def _not_worse_than_etalon(case: GenCase,
                            etalon: Mapping[str, int]) -> Optional[float]:
     """Бизнес-узких мест в схеме не больше, чем в эталоне той же задачи.
@@ -1316,10 +1694,12 @@ def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
     suite.metric("quality/business_checks_share", lambda case: case.business_share,
                  description="то же по бизнес-слою; вне планки — потолок задан "
                              "набором (эталон тоже держит узкое место)")
-    suite.metric("business/smells",
-                 lambda case: None if not case.ok
-                 else float(len(case.business_smells)),
-                 description="бизнес-узких мест по оракулу в итоговой схеме",
+    suite.metric("business/smells", _smell_density,
+                 description="доля бизнес-узких мест оракула среди применимых "
+                             "бизнес-проверок той же схемы (плотность, а не "
+                             "абсолютное число: раньше одна схема с двумя "
+                             "узкими местами и другая с двумя из пяти давали "
+                             "одно среднее)",
                  direction=metrics.LOWER)
     suite.metric("business/not_worse_than_etalon",
                  lambda case: _not_worse_than_etalon(case, etalon),
@@ -1356,6 +1736,33 @@ def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
                  lambda case: max(0, case.llm_calls - 1) if case.mode == "live" else 0.0,
                  description="повторные обращения к модели на задачу",
                  direction=metrics.LOWER)
+    # Размер входа — диагноз стоимости, а не корректности: в гейт
+    # `quality/scheme_checks_share` он не входит и не может его ни поднять, ни
+    # уронить. Смысл строк в том, что промпт растёт молча: весь свод правил едет
+    # в каждом вызове, и без этой пары чисел удвоение входа выглядит как «качество
+    # упало само». В replay строк с транспорта нет, поэтому числа посчитаны по
+    # шаблонам ядра (`observed=False` в JSON), а доля двухстадийных прогонов
+    # остаётся «н/д» — путь в replay не наблюдался.
+    suite.metric("cost/prompt_chars_per_call", _prompt_chars_per_call,
+                 description="символов входа на один вызов стадии (среднее по "
+                             "кейсу)", direction=metrics.LOWER, unit="симв.")
+    suite.metric("cost/prompt_tokens_per_call", _prompt_tokens_per_call,
+                 description=f"оценка токенов на вызов (символов на токен — "
+                             f"{CHARS_PER_TOKEN:g})", direction=metrics.LOWER,
+                 unit="токенов")
+    suite.metric("cost/prompt_chars_per_case", _prompt_chars_per_case,
+                 description="символов входа на все вызовы одного кейса (в replay "
+                             "в сумму сложены обе ветки пути — две стадии и "
+                             "одношаговый откат: сравнение их видно по строкам "
+                             "стадий в секции стоимости)",
+                 direction=metrics.LOWER, unit="симв.")
+    suite.metric("cost/prompt_tokens_per_case", _prompt_tokens_per_case,
+                 description="оценка токенов на кейс целиком (та же сумма)",
+                 direction=metrics.LOWER, unit="токенов")
+    suite.metric("cost/prompt_two_stage_share", _two_stage_share,
+                 description="доля кейсов, где план собирался двумя стадиями "
+                             "(состав + маршрут), а не откатом в одношаговый: "
+                             "в replay «н/д» — путь не наблюдался")
     return suite
 
 
@@ -1492,33 +1899,47 @@ def _repeat_rejection_share(case: ImproveCase) -> Optional[float]:
 
 
 def _defects_introduced(case: ImproveCase) -> Optional[float]:
-    """Инварианты, пройденные на базовой схеме и упавшие после пакета.
+    """Доля инвариантов, проходивших на базовой схеме, которые пакет уронил.
 
     Вторая половина пары к `defects_repaired` и честная замена `no_regression`:
     итоговый балл не отличает «одно правило починили, другое сломали, дельта 0»
     от «ничего не тронули», а счётчик упавших — отличает.
+
+    Знаменатель — то, что на базе проходило: абсолютное число сломанных
+    (прежняя мера, усреднённая по кейсам) у схемы с десятью целыми инвариантами
+    и у схемы с двумя значит разное, а среднее по кейсам делало их равноправными
+    — тот же изъян геометрии, что был у `improve/retry_gain` до перевода на долю.
     """
     if not case.checks_before or not case.checks_after:
         return None
     broken = {c.name for c in invariants.applicable_checks(case.checks_after)
               if not c.ok}
-    return float(sum(1 for c in invariants.applicable_checks(case.checks_before)
-                     if c.ok and c.name in broken))
+    passing_before = [c for c in invariants.applicable_checks(case.checks_before)
+                      if c.ok]
+    return _share(sum(1 for c in passing_before if c.name in broken),
+                  len(passing_before))
 
 
 def _base_advice_drift(case: "ImproveCase") -> Optional[float]:
-    """Сколько бизнес-правил два слоя оценили по-разному на БАЗОВОЙ схеме.
+    """Доля бизнес-правил, где два слоя оценили базовую схему по-разному.
 
-    Это число подсказок, по которым пакет строился вслепую: скоринг объявил
+    Это доля подсказок, по которым пакет строился вслепую: скоринг объявил
     дефект, которого оракул не видит (и тогда правка ушла в `skipped` или в
     несуществующее узкое место), или наоборот — оракул нашёл узкое место, о
     котором модель не услышала и не починила. Ноль здесь и есть гарантия, что
     `defects_repaired` и `op_acceptance` меряют один и тот же список дефектов.
-    None, если сравнивать было нечего (кейс без базовой схемы или без одного
-    из слоёв)."""
+
+    Прежняя мера — абсолютное число расхождений под средним по кейсам: пакет из
+    одного правила и пакет из десяти входили в среднее одинаково, а
+    знаменатель (сколько бизнес-правил вообще сравнивалось на этой схеме) метрика
+    не видела. `None`, если сравнивать было нечего (кейс без базовой схемы, без
+    одного из слоёв или без ни одного сопоставимого правила)."""
     if not case.ok or not case.drift_before:
         return None
-    return float(len(invariants.business_disagreements(case.drift_before)))
+    comparable = [row for row in case.drift_before.values()
+                  if row.get("verdict") != invariants.NO_DATA]
+    return _share(len(invariants.business_disagreements(case.drift_before)),
+                  len(comparable))
 
 
 def _mark_off_target(case: "ImproveCase") -> None:
@@ -1605,18 +2026,25 @@ def build_improvement_suite() -> metrics.EvaluationSuite:
     suite.metric("improve/defects_repaired", lambda case: case.repaired_share,
                  description="доля дефектов базовой схемы, которые пакет убрал "
                              "(нотация и бизнес вместе, по оракулу)")
+    suite.metric("improve/advice_ignored_share", _advice_ignored_share,
+                 direction=metrics.LOWER,
+                 description="доля подсказок базовой схемы, по которым пакет не "
+                             "внёс ни одной правки и не получил отказа (прошёл "
+                             "мимо): repaired_share и op_acceptance на таком "
+                             "молчании остаются приличными")
     suite.metric("improve/business_repaired_share",
                  lambda case: case.business_repaired_share,
                  description="то же по одному бизнес-слою: узкие места процесса, "
                              "а не валидность XML")
     suite.metric("improve/base_advice_drift", _base_advice_drift,
-                 direction=metrics.LOWER, unit="правило",
-                 description="бизнес-правил, где оракул и скоринг разошлись на "
-                             "базовой схеме: по такой подсказке пакет не обязан "
+                 direction=metrics.LOWER,
+                 description="доля бизнес-правил, где оракул и скоринг разошлись "
+                             "на базовой схеме: по такой подсказке пакет не обязан "
                              "улучшать процесс")
     suite.metric("improve/defects_introduced", _defects_introduced,
-                 direction=metrics.LOWER, unit="инвариант",
-                 description="инварианты, прошедшие до пакета и упавшие после")
+                 direction=metrics.LOWER,
+                 description="доля инвариантов, прошедших до пакета, которые он "
+                             "уронил (от всех проходивших на базовой схеме)")
     suite.metric("improve/error_share", lambda case: 0.0 if case.ok else 1.0,
                  description="доля пакетов, которые не удалось применить",
                  direction=metrics.LOWER)
@@ -1638,9 +2066,20 @@ def build_improvement_suite() -> metrics.EvaluationSuite:
     return suite
 
 
-def spread_stats(cases: Sequence[GenCase]) -> Dict[str, Optional[float]]:
-    """Разброс балла между повторами — ровно та проблема живого прогона
-    («87 → 94» против «85 → 85» на одном запросе)."""
+def spread_stats(cases: Sequence[GenCase], repeat: int = 1) -> Dict[str, Optional[float]]:
+    """Разброс балла: два разных числа, а не одно под общим заголовком.
+
+    `score_cv_across_scenarios` — разброс между РАЗНЫМИ кейсами одного прогона.
+    При `--repeat 1` это единственное, что посчитано, и раньше оно печаталось под
+    заголовком «разброс по повторам»: 0.051 в replay — это смесь фикстур
+    (хороший план рядом с плохим), а не шум модели, и в baseline она лежала как
+    LOWER-is-better, то есть гейтилась выборкой сценариев.
+
+    `score_cv_per_case` — настоящая дисперсия живого прогона: СКО повторов одной
+    и той же сцены. Считается, как только повторов ≥2, но в гейт попадает только
+    при `repeat >= MIN_LIVE_REPEATS` (см. `RunReport.metrics_flat`): два прогона
+    дают разность двух случайностей, а не меру разброса.
+    """
     scores = [c.score for c in cases if c.score is not None]
     per_case_cv: List[float] = []
     grouped: Dict[str, List[GenCase]] = {}
@@ -1651,15 +2090,261 @@ def spread_stats(cases: Sequence[GenCase]) -> Dict[str, Optional[float]]:
         cv = metrics.coefficient_of_variation(values)
         if cv is not None:
             per_case_cv.append(cv)
+    widest = max((len(group) for group in grouped.values()), default=0)
     return {
         "runs": float(len(scores)),
+        "repeats_per_case": float(widest),
         "score_p50": metrics.p50(scores),
         "score_p95": metrics.p95(scores),
-        "score_cv": metrics.coefficient_of_variation(scores),
+        "score_cv_across_scenarios": metrics.coefficient_of_variation(scores),
         "score_cv_per_case": metrics.mean(per_case_cv) if per_case_cv else None,
         "score_min": min(scores) if scores else None,
         "score_max": max(scores) if scores else None,
     }
+
+
+def spread_note(spread: Mapping[str, Optional[float]],
+                mode: str = "replay") -> str:
+    """Одной строкой — что именно показывает секция разброса в этом прогоне.
+
+    Без неё читатель принимает межсценарную смесь за дисперсию модели и делает
+    вывод о живом контуре по replay-числам.
+    """
+    repeats = int(spread.get("repeats_per_case") or 0)
+    if repeats >= 2:
+        line = (f"повторов на кейс: {repeats}; `score_cv_per_case` — дисперсия "
+                "повторов одной сцены")
+        if repeats < MIN_LIVE_REPEATS:
+            line += (f"; при {repeats} повторах она печатается, но в baseline и "
+                     f"в гейт не входит — нужно --repeat {MIN_LIVE_REPEATS} или "
+                     "больше")
+    else:
+        line = ("повторов на кейс: 1 — дисперсия модели не мерялась; "
+                "`score_cv_across_scenarios` ниже это разброс между РАЗНЫМИ "
+                f"кейсами (смесь фикстур), а не шум прогона; для живой меры "
+                f"нужно --repeat {MIN_LIVE_REPEATS} и более")
+    if mode == "live" and repeats < MIN_LIVE_REPEATS:
+        line += (f"; live-прогон с {repeats} повтором даёт только межсценарное "
+                 "число — для оценки разброса GigaChat поднимите --repeat")
+    return line
+
+
+def _advice_ignored_share(case: "ImproveCase") -> Optional[float]:
+    """Доля подсказок базовой схемы, по которым пакет не сделал НИЧЕГО.
+
+    `defects_repaired` отвечает на «сколько дефектов убрано», `op_acceptance` —
+    на «сколько правок принято». Между ними дыра: пакет может пройти мимо
+    нарушения, которое ему назвали, — не починить и не попытаться, и тогда оба
+    числа останутся приличными, потому что считать им будет нечего. Это тот же
+    прогон #55, где модель вставляла развилку туда, о её отсутствии её не просили.
+
+    «Попытка» читается по строкам отчёта: если хоть одна применённая или
+    отвергнутая операция называет id из нарушения, правка по этой подсказке шла и
+    отказ был не молчанием, а отказом. None — когда дефектов в базе нет или
+    пакета не было.
+    """
+    if not case.checks_before or not case.checks_after:
+        return None
+    defects = [c for c in invariants.applicable_checks(case.checks_before)
+               if not c.ok]
+    if not defects:
+        return None
+    still_bad = {c.name for c in invariants.applicable_checks(case.checks_after)
+                 if not c.ok}
+    touched = set()
+    for row in list(case.applied) + list(case.skipped):
+        for value in row.values():
+            if isinstance(value, str):
+                touched.update(part for part in re.split(r"[^0-9A-Za-zа-яё_.-]+",
+                                                         value) if part)
+    ignored = [c for c in defects
+               if c.name in still_bad and not (set(c.ids) & touched)]
+    return _share(len(ignored), len(defects))
+
+
+def improve_metric_origins(
+        improve_cases: Sequence[ImproveCase],
+        improvement: metrics.SuiteResult) -> Dict[str, Dict[str, Any]]:
+    """Из чего состоит выборка каждой метрики улучшения — по происхождению ответа.
+
+    `SuiteResult` считает среднее по всем кейсам, а кейсы у него разные: пакет,
+    сочинённый человеком, который знает аплайер, проходит его с первого запроса,
+    и на таком кейсе `improve/op_acceptance` описывает аплайер и автора фикстуры.
+    Числу без этой строки нельзя верить как вердикту модели — поэтому она и едет
+    рядом с каждой метрикой в отчёт (`format_metric_origins`), а не живёт только
+    в JSON.
+
+    Порядок `values` у метрики совпадает с порядком кейсов (suite идёт по одному
+    списку), поэтому значение `None` здесь читается как «этот кейс в знаменатель
+    не попал», а не как «попал с нулём».
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, result in improvement.metrics.items():
+        if not name.startswith("improve/"):
+            continue
+        sources = [case.answer_source
+                   for case, value in zip(improve_cases, result.values)
+                   if value is not None]
+        counts = provenance.origin_counts(sources)
+        out[name] = {
+            "counts": counts,
+            "cases": len(sources),
+            "live": counts[provenance.MODEL_CAPTURE],
+            "hand": counts[provenance.HAND_AUTHORED],
+            "unknown": counts[provenance.UNKNOWN_SOURCE],
+            # Метрика без единого значения — это «не померено», а не «модель
+            # не показала ничего»: вердикт о владельце числа здесь выносить не из
+            # чего, и сочинять его нельзя (та же причина, по которой n=0
+            # печатается как «н/д», а не как 0.0).
+            "verdict": ("выборки нет: ни один кейс не дал значения метрики"
+                        if not sources else
+                        provenance.origin_verdict(counts, metrics.MIN_GATED_N)),
+        }
+    return out
+
+
+def format_metric_origins(origin: Mapping[str, Mapping[str, Any]]) -> List[str]:
+    """Строка рядом с каждой метрикой улучшения: что она мерит по составу выборки."""
+    if not origin:
+        return ["  метрик улучшения в этом прогоне нет — и состава выборки тоже"]
+    lines: List[str] = []
+    for name, row in sorted(origin.items()):
+        lines.append(f"  {name:<38} живых захватов {row['live']}, рукой "
+                     f"{row['hand']}, без разметки {row['unknown']} — "
+                     f"{row['verdict']}")
+    return lines
+
+
+def cost_stats(cases: Sequence[GenCase],
+               improve_cases: Sequence["ImproveCase"],
+               mode: str) -> Dict[str, Any]:
+    """Стоимость и задержка прогона на одну ПРИНТУЮ схему.
+
+    Среднее число обращений на кейс отвечает на другой вопрос («сколько модель
+    болтает»), а платят за результат: 3 вызова на бракованную схему и 3 вызова
+    на принятую — разная цена за один и тот же объём полезного выхода. Числа
+    считаются как отношение сумм, а не как среднее пер-кейсовых долей: доля
+    сумм — единственная мера, которая не меняется от того, в каком порядке
+    разложились провалы.
+
+    В replay обращений к модели нет вовсе (`llm_call_counter` играет только
+    live), поэтому стоимости здесь нет, и `calls_per_accepted_scheme` возвращает
+    None: ноль в этой строке читался бы как «контур бесплатен», чего replay не
+    измерял. Размер входа — другое дело: он задаётся шаблонами ядра и данными
+    кейса, поэтому считается и в replay, но помечен `prompt_observed=False` —
+    это бюджет, а не запись обращения.
+    """
+    accepted = [c for c in cases
+                if c.ok and c.gate_share is not None
+                and c.gate_share >= QUALITY_BAR]
+    calls = sum(int(c.llm_calls or 0) for c in cases) \
+        + sum(int(c.llm_calls or 0) for c in improve_cases)
+    latency = sum(c.latency_ms for c in cases) + sum(c.latency_ms for c in improve_cases)
+    measured = mode == "live" and calls > 0
+    # Размер входа по стадиям — из строк кейсов: в live они записаны с транспорта,
+    # в replay посчитаны по шаблонам ядра, и `observed` в сумме говорит, что из
+    # этих чисел следует (и только за ним), а что — оценка бюджета.
+    rows = [r for c in list(cases) + list(improve_cases) for r in c.prompt_calls]
+    # Знаменатель «на кейс» — кейсы, у которых строка входа есть: делить сумму
+    # на все кейсы прогона значило бы занижать число за счёт тех, где вызов
+    # вообще не проектировался (off-target претензия, несобранная схема).
+    with_rows = [c for c in list(cases) + list(improve_cases) if c.prompt_calls]
+    by_stage: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        stage = str(row.get("stage") or "иное")
+        bucket = by_stage.setdefault(stage, {"calls": 0, "chars": 0,
+                                             "observed": True})
+        bucket["calls"] += 1
+        bucket["chars"] += int(row.get("chars") or 0)
+        bucket["observed"] = bucket["observed"] and bool(row.get("observed"))
+    for bucket in by_stage.values():
+        bucket["tokens_est"] = estimate_prompt_tokens(bucket["chars"])
+    chars_total = sum(int(r.get("chars") or 0) for r in rows)
+    return {
+        "mode": mode,
+        "schemes": float(len(cases)),
+        "accepted_schemes": float(len(accepted)),
+        "model_calls_total": float(calls) if mode == "live" else None,
+        "latency_ms_total": round(latency, 1) if mode == "live" else None,
+        "calls_per_accepted_scheme": (calls / len(accepted)) if measured and accepted else None,
+        "latency_ms_per_accepted_scheme": (round(latency / len(accepted), 1)
+                                           if measured and accepted else None),
+        # Стоимость входа — вторая половина того же вопроса: обращение к модели
+        # стоит столько, сколько в него положили, а число обращений об этом
+        # молчит. None, когда строк нет вовсе: 0 читался бы как «промпт пуст».
+        "prompt_calls_total": float(len(rows)) if rows else None,
+        "prompt_chars_total": float(chars_total) if rows else None,
+        "prompt_tokens_est_total": estimate_prompt_tokens(chars_total) if rows else None,
+        "prompt_chars_per_case": (round(chars_total / len(with_rows), 1)
+                                  if with_rows else None),
+        "prompt_by_stage": by_stage,
+        "prompt_observed": bool(rows) and all(bool(r.get("observed")) for r in rows),
+        "note": ("" if measured else
+                 "в replay обращений к модели нет — стоимость на принятую схему "
+                 "не меряется; для этого числа нужен --mode live"),
+        "prompt_note": ("" if not rows else (
+            "числа сняты с настоящих обращений (live)"
+            if all(bool(r.get("observed")) for r in rows) else
+            "часть чисел посчитана по шаблонам ядра без обращения к модели "
+            "(replay): это бюджет входа, а не запись вызова; в сумме идут обе "
+            "ветки пути (две стадии и одношаговый откат), какая из них что стоит "
+            "— по строкам стадий выше")),
+    }
+
+
+def format_cost(cost: Mapping[str, Any]) -> List[str]:
+    """Секция стоимости: цифры либо явное «не мерялось», но не молчание."""
+    lines = ["СТОИМОСТЬ НА ПРИНЯТУЮ СХЕМУ"]
+    lines.append(f"  принятых схем {int(cost.get('accepted_schemes') or 0)} из "
+                 f"{int(cost.get('schemes') or 0)} (гейт ≥{QUALITY_BAR:.0%})")
+    for key, label in (("model_calls_total", "обращений к модели"),
+                       ("latency_ms_total", "суммарная задержка, мс"),
+                       ("calls_per_accepted_scheme", "обращений на принятую схему"),
+                       ("latency_ms_per_accepted_scheme", "мс на принятую схему")):
+        value = cost.get(key)
+        lines.append(f"  {label:<34}{_fmt(value)}")
+    if cost.get("note"):
+        lines.append(f"  {cost['note']}")
+    lines += format_prompt_sizes(cost)
+    return lines
+
+
+def format_prompt_sizes(cost: Mapping[str, Any]) -> List[str]:
+    """Размер входа по стадиям — отдельная подсекция стоимости.
+
+    Отдельная, а не колонка в таблице метрик: у стадий разные знаменатели.
+    «Состав» зовётся на каждом кейсе, «переспрос» — только там, где план-гейт
+    нашёл что спрашивать, и среднее по всем вызовам спрятало бы, где именно
+    лежит бюджет входа.
+    """
+    by_stage = dict(cost.get("prompt_by_stage") or {})
+    lines = ["", "  РАЗМЕР ПРОМПТА (вход одного вызова и кейса целиком)"]
+    if not by_stage:
+        # Пусто — это «не померено», а не «промпт пустой»: строка обязана
+        # говорить первое, иначе снятая метрика выглядела бы нулевой.
+        lines.append("    н/д: строк с размером входа нет ни у одного кейса")
+        return lines
+    for stage in PROMPT_STAGES:
+        if stage in by_stage:
+            _render_bucket(lines, stage, by_stage.pop(stage))
+    for stage, bucket in sorted(by_stage.items()):
+        _render_bucket(lines, stage, bucket)
+    lines.append(f"    всего: вызовов {int(cost.get('prompt_calls_total') or 0)}, "
+                 f"символов {int(cost.get('prompt_chars_total') or 0)}, оценка "
+                 f"токенов ≈{int(cost.get('prompt_tokens_est_total') or 0)}, на кейс "
+                 f"{int(cost.get('prompt_chars_per_case') or 0)} симв.")
+    if cost.get("prompt_note"):
+        lines.append(f"    {cost['prompt_note']}")
+    return lines
+
+
+def _render_bucket(lines: List[str], stage: str,
+                   bucket: Mapping[str, Any]) -> None:
+    """Одна стадия одной строкой: вызовы, символы, оценка токенов, источник числа."""
+    how = "наблюдено" if bucket.get("observed") else "по шаблонам ядра"
+    lines.append(f"    {stage:<26}вызовов {bucket.get('calls', 0):>3} · "
+                 f"символов {int(bucket.get('chars') or 0):>7} · ≈"
+                 f"{int(bucket.get('tokens_est') or 0):>7} токенов · {how}")
 
 
 # ---------------------------------------------------------------------------
@@ -1682,8 +2367,29 @@ class RunReport:
     baseline_path: str = ""
     baseline_note: str = ""
     coverage_note: str = ""
+    #: причина, по которой сверка с baseline пропущена из-за смены линейки.
+    #: Пусто — значит линейка та же и сверка состоялась.
+    ruler_change: str = ""
+    #: изменение линейки принято явно (`--accept-ruler-change`): код выхода по
+    #: нему не судят, но пометка в отчёте остаётся.
+    ruler_change_accepted: bool = False
+    #: ошибки самих метрик (`ОШИБКА метрики`): дыра в харнессе, а не в схеме.
+    metric_errors: Dict[str, str] = field(default_factory=dict)
+    #: метрики, у которых выборка ниже порога `metrics.MIN_GATED_N`: вердикта по
+    #: ним нет, и в гейт они не входят.
+    under_sampled: List[str] = field(default_factory=list)
+    #: стоимость прогона на принятую схему (обращения и задержка): см. `cost_stats`.
+    cost: Dict[str, Any] = field(default_factory=dict)
+    #: состав выборки каждой метрики улучшения по происхождению ответа: см.
+    #: `improve_metric_origins`. Без него доля принятых операций по рукописным
+    #: пакетам читается как вердикт модели.
+    improve_sample_origin: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     ruler: Dict[str, Any] = field(default_factory=ruler_fingerprint)
     provenance: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def ruler_fingerprint_hash(self) -> str:
+        return ruler_hash(self.ruler)
 
     def manual_review(self) -> Dict[str, Any]:
         """Лист ручной оценки: то, что линейка мерить не имеет права.
@@ -1716,12 +2422,22 @@ class RunReport:
         """Метрики для baseline и сверки.
 
         `spread/runs` — число прогонов, а не качество контура: класть его в
-        baseline нельзя, иначе смена `--repeat` выглядела бы как регрессия.
+        baseline нельзя, иначе смена `--repeat` выглядела бы как регрессия. По
+        той же причине вне сверки остаются `spread/repeats_per_case` (тот же
+        переключатель CLI) и `spread/score_cv_across_scenarios`: межсценарный
+        разброс зависит от выбранного набора сценариев, а не от контура, и
+        гейтить его — значит ловить «регрессию» при `--scenarios`.
         """
         data = self.generation.flat()
         data.update(self.improvement.flat())
+        skip = {"runs", "repeats_per_case", "score_cv_across_scenarios"}
         data.update({f"spread/{name}": value
-                     for name, value in self.spread.items() if name != "runs"})
+                     for name, value in self.spread.items() if name not in skip})
+        # Живая дисперсия становится гейт-метрикой только при достаточном числе
+        # повторов: до `MIN_LIVE_REPEATS` она печатается в отчёте, но в baseline
+        # не кладётся, иначе CI красился бы от двух случайных ответов модели.
+        if self.repeat < MIN_LIVE_REPEATS:
+            data["spread/score_cv_per_case"] = None
         return data
 
     def directions(self) -> Dict[str, str]:
@@ -1733,7 +2449,7 @@ class RunReport:
         out["spread/score_p95"] = metrics.HIGHER
         out["spread/score_min"] = metrics.HIGHER
         out["spread/score_max"] = metrics.HIGHER
-        out["spread/score_cv"] = metrics.LOWER
+        out["spread/score_cv_across_scenarios"] = metrics.LOWER
         out["spread/score_cv_per_case"] = metrics.LOWER
         out["spread/runs"] = metrics.HIGHER
         return out
@@ -1748,9 +2464,17 @@ class RunReport:
                         "improvement": self.improvement.as_dict(),
                         "flat": self.metrics_flat()},
             "spread": self.spread,
+            "spread_note": spread_note(self.spread, self.mode),
             "ruler": self.ruler,
+            "ruler_hash": self.ruler_fingerprint_hash,
             "baseline": self.baseline_path,
             "baseline_note": self.baseline_note,
+            "ruler_change": self.ruler_change,
+            "ruler_change_accepted": self.ruler_change_accepted,
+            "metric_errors": self.metric_errors,
+            "under_sampled": self.under_sampled,
+            "cost": self.cost,
+            "improve_sample_origin": self.improve_sample_origin,
             "coverage_note": self.coverage_note,
             "regressions": [r.as_dict() for r in self.regressions],
             "provenance": self.provenance,
@@ -1770,6 +2494,9 @@ class RunReport:
             "directions": self.directions(),
             "metrics": self.metrics_flat(),
             "ruler": self.ruler,
+            # Отпечаток одной строкой: по нему видно, каким набором правил собран
+            # слепок, не разворачивая всю таблицу весов.
+            "ruler_hash": self.ruler_fingerprint_hash,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                         encoding="utf-8")
@@ -1790,23 +2517,56 @@ def render_table(report: RunReport) -> str:
     """Человекочитаемая сводка: метрики, разброс, провалы по кейсам, регрессии."""
     lines: List[str] = [
         f"Режим {report.mode}, повторов {report.repeat}, сценариев "
-        f"{len(report.scenarios)}, кейсов {len(report.cases)}", "", "МЕТРИКИ",
+        f"{len(report.scenarios)}, кейсов {len(report.cases)}",
+        f"Линейка: правил {len(report.ruler.get('rules') or {})}, вес "
+        f"{report.ruler.get('weights_total')}, инвариантов "
+        f"{len(report.ruler.get('invariants') or [])}, отпечаток "
+        f"{report.ruler_fingerprint_hash}", "", "МЕТРИКИ",
         f"{'метрика':<38}{'значение':>12}{'n':>5}  описание"]
     for suite in (report.generation, report.improvement):
         for name in suite.order:
             result = suite.metrics[name]
-            lines.append(f"{name:<38}{_fmt(result.mean):>12}{result.n:>5}  "
-                         f"{result.description}")
-    lines += ["", "РАЗБРОС БАЛЛА ПО ПОВТОРАМ"]
-    for name in ("runs", "score_p50", "score_p95", "score_cv", "score_cv_per_case",
+            # Вердикта нет — в таблице «н/д», а не среднее по одному кейсу:
+            # 0.2 при n=1 читается как доля, хотя это один отказ одного пакета.
+            # Само число остаётся в JSON (`mean`) и в списке ниже секции.
+            value = _fmt(result.mean) if result.measured else "н/д"
+            if result.error:
+                value = "ошибка"
+            lines.append(f"{name:<38}{value:>12}{result.n:>5}  "
+                         + (f"[{result.error}] " if result.error else "")
+                         + (f"[выборка {result.n} < {result.min_n}] "
+                            if not result.measured and not result.error else "")
+                         + result.description)
+    lines += ["", "МЕТРИКИ УЛУЧШЕНИЯ: ИЗ ЧЕГО СОСТОИТ ВЫБОРКА",
+              "  (живой захват ответа модели — мера модели; рукописный пакет — "
+              "мера аплайера и автора фикстуры)",
+              *format_metric_origins(report.improve_sample_origin)]
+    lines += ["", "РАЗБРОС БАЛЛА", f"  {spread_note(report.spread, report.mode)}"]
+    for name in ("runs", "repeats_per_case", "score_p50", "score_p95",
+                 "score_cv_across_scenarios", "score_cv_per_case",
                  "score_min", "score_max"):
-        lines.append(f"  {name:<20}{_fmt(report.spread.get(name))}")
+        lines.append(f"  {name:<28}{_fmt(report.spread.get(name))}")
+    lines += ["", *format_cost(report.cost)]
+    if report.under_sampled:
+        lines += ["", "МЕТРИКИ БЕЗ МЕРЫ (выборка ниже порога — в гейт не входят)"]
+        lines += [f"  {row}" for row in report.under_sampled]
+    if report.metric_errors:
+        lines += ["", "ОШИБКИ МЕТРИК (харнесс сломан, прогон нечитаем)"]
+        lines += [f"  {name}: {err}"
+                  for name, err in sorted(report.metric_errors.items())]
     lines += ["", "ГЕНЕРАЦИЯ: КЕЙСЫ"]
     for case in report.cases:
         state = "OK " if case.scenario_pass else "FAIL"
+        # Вход кейса и путь: «двухстадийный» против «одношагового» — это разная
+        # цена одного и того же описания, и на глаз она из чисел выше не видна.
+        totals = prompt_totals(case.prompt_calls)
+        path = stage_path(case) or "путь не наблюдался"
         lines.append(f"  [{state}] {case.key} ({case.quality}) — балл {_fmt(case.score)}, "
                      f"пулов {case.pools}, элементов {case.elements}, "
-                     f"правок починки {case.repairs}")
+                     f"правок починки {case.repairs}"
+                     + (f", вход {int(totals.get('chars') or 0)} симв."
+                        f" ({path})" if totals else "")
+                     + ("" if case.mode == "live" else " [по шаблонам ядра]"))
         if case.error:
             lines.append(f"        ошибка: {case.error}")
         for failure in invariants.summarize(case.checks_xml).get("failed", []):
@@ -1833,7 +2593,8 @@ def render_table(report: RunReport) -> str:
         done = 0 if case.noop_rows is None else len(case.applied) - case.noop_rows
         lines.append(f"  [{('OK ' if case.ok else 'FAIL')}] {case.key} — схему "
                      f"изменили {done}/{total} операций, {case.retry_phrase()}; балл "
-                     f"{_fmt(case.score_before)} → {_fmt(case.score_after)}")
+                     f"{_fmt(case.score_before)} → {_fmt(case.score_after)}; ответ: "
+                     f"{provenance.ORIGIN_SHORT.get(case.answer_source, case.answer_source)}")
         if case.error:
             lines.append(f"        ошибка: {case.error}")
         # Факты отчёта по одному на строку и только когда они не пустые: «откат
@@ -1897,6 +2658,11 @@ def render_table(report: RunReport) -> str:
     else:
         lines += ["  " + line
                   for line in provenance.format_findings(report.provenance)]
+        # Не «похож ли ответ на образец из промпта», а «кто вообще его прислал»:
+        # у метрик качества владелец числа меняется вместе с происхождением
+        # ответа, и без этой строки набор фикстур выглядит выборкой модели.
+        for row in report.provenance.get("origin_lines") or []:
+            lines.append("  " + row)
     lines.append("")
     if report.coverage_note:
         lines.append("ПОЛНОТА ПРОГОНА")
@@ -1927,13 +2693,19 @@ def load_baseline(path: Optional[Path]) -> Optional[Dict[str, Any]]:
 
 def detect_regressions(current: Mapping[str, Any], baseline: Mapping[str, Any],
                        threshold: float = metrics.DEFAULT_RELATIVE_THRESHOLD,
+                       ungated: Iterable[str] = (),
                        ) -> List[metrics.Regression]:
-    """Сверка flat-метрик прогона с baseline по относительному порогу."""
+    """Сверка flat-метрик прогона с baseline по относительному порогу.
+
+    `ungated` — метрики без вердикта (выборка ниже порога): они не участвуют в
+    решении, но остаются в наборах, чтобы их исчезновение из сверки не
+    выглядело удалением метрики.
+    """
     directions = {name: metrics.LOWER for name in LOWER_IS_BETTER}
     directions.update(baseline.get("directions") or {})
     detector = metrics.RegressionDetector(threshold=threshold, directions=directions)
     base_metrics = baseline.get("metrics") or baseline
-    return detector.compare(base_metrics, current)
+    return detector.compare(base_metrics, current, ungated=ungated)
 
 
 def unverified_metrics(current: Mapping[str, Any],
@@ -1959,8 +2731,16 @@ def require_live_credentials() -> None:
 
 def run(mode: str = "replay", scenarios_spec: str = "all", repeat: int = 1,
         baseline_path: Optional[Path] = None, fixtures_dir: Path = FIXTURES_DIR,
-        threshold: float = metrics.DEFAULT_RELATIVE_THRESHOLD) -> RunReport:
-    """Полный прогон харнесса по всем фикстурам выбранных сценариев."""
+        threshold: float = metrics.DEFAULT_RELATIVE_THRESHOLD,
+        accept_ruler_change: bool = False) -> RunReport:
+    """Полный прогон харнесса по всем фикстурам выбранных сценариев.
+
+    `accept_ruler_change` — явное принятие смены линейки человеком: сверка с
+    baseline по-прежнему не проводится (меры несопоставимы), но прогон получает
+    право выйти с нулевым кодом. Без флага смена линейки — ненулевой код выхода
+    в `run.py`: иначе «добавили правило» автоматически означало бы «гейт
+    выключен», и первый прогон после любого изменения линейки был бы зелёным.
+    """
     if mode not in ("replay", "live"):
         raise HarnessError(f"неизвестный режим {mode}: нужен replay или live")
     repeat = max(1, int(repeat))
@@ -2041,24 +2821,44 @@ def run(mode: str = "replay", scenarios_spec: str = "all", repeat: int = 1,
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         cases=gen_cases, improve_cases=improve_cases,
         generation=generation, improvement=improvement,
-        spread=spread_stats(gen_cases), regressions=[],
+        spread=spread_stats(gen_cases, repeat), regressions=[],
         provenance=provenance.audit(chosen, fixtures),
+        cost=cost_stats(gen_cases, improve_cases, mode),
+        improve_sample_origin=improve_metric_origins(improve_cases, improvement),
         baseline_path=str(baseline_path) if baseline_path else "",
-        coverage_note=coverage_note(gen_cases, mode))
+        coverage_note=coverage_note(gen_cases, mode),
+        metric_errors={**generation.errors(), **improvement.errors()},
+        under_sampled=[*generation.under_sampled(), *improvement.under_sampled()])
     baseline = load_baseline(baseline_path)
     if baseline:
+        # Метрики без вердикта (n ниже порога) не участвуют в решении, но
+        # остаются в наборах: их отсутствие печатается отдельной секцией
+        # отчёта, а не превращается в «метрику убрали из прогона».
+        ungated = {**{name: generation.metrics[name]
+                      for name in generation.under_sampled()},
+                   **{name: improvement.metrics[name]
+                      for name in improvement.under_sampled()}}
+        report.under_sampled = [
+            f"{name} (n={result.n} < {result.min_n})"
+            for name, result in sorted(ungated.items())]
         ruler_change = ruler_note(report.ruler, baseline)
         base_mode = str(baseline.get("mode") or "")
         if ruler_change:
             # Балл считается линейкой: новые правила роняют его на тех же схемах,
             # и «регрессия» здесь — порождение самой сверки, а не контура.
+            # Но выключать гейт смена линейки больше не вправе: без явного
+            # `--accept-ruler-change` прогон считается непройденным (`run.py`),
+            # иначе любое добавление правила делало CI зелёным автоматически.
             report.baseline_note = ruler_change
+            report.ruler_change = ruler_change
+            report.ruler_change_accepted = bool(accept_ruler_change)
         elif "ruler" not in baseline:
             # Отпечаток заведён позже этого слепка, поэтому судить о линейке
             # прошлых прогонов нечем. Сверку не отменяем (было бы ручное
             # освобождение от гейта), но и выдавать её за полную не можем.
             report.regressions = detect_regressions(report.metrics_flat(),
-                                                    baseline, threshold=threshold)
+                                                    baseline, threshold=threshold,
+                                                    ungated=ungated)
             report.baseline_note = (
                 "в baseline нет отпечатка линейки: он заведён начиная с этого "
                 "прогона, а до него правила могли меняться — регрессии балла "
@@ -2074,7 +2874,8 @@ def run(mode: str = "replay", scenarios_spec: str = "all", repeat: int = 1,
                 "после 3–5 прогонов, чтобы не ловить шум")
         else:
             report.regressions = detect_regressions(report.metrics_flat(),
-                                                   baseline, threshold=threshold)
+                                                    baseline, threshold=threshold,
+                                                    ungated=ungated)
             # Отдельная строка, а не регрессия: сравнивать не с чем, поэтому
             # код выхода у неё прав нет — но молчать про неё харнесс не вправе.
             # Сюда попадают и имена, снятые из прогона: их `compare` не видит

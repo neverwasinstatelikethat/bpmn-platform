@@ -29,6 +29,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     user = db.query(User).filter(User.email == email).first()
     if user is None:
         raise credentials_exception
+
+    # Клеймо `tv` инвалидирует токены, выпущенные до смены пароля
+    # (см. User.token_version). Токен без `tv` считается версией 0 и
+    # принимается, пока у пользователя token_version == 0: альтернатива
+    # «отвергать без клейма» разлогинила бы все сессии одним деплоем этой
+    # правки. После смены пароля версия ненулевая, и безклейменный токен
+    # умирает вместе со старыми.
+    token_version = payload.get("tv", 0)
+    if not isinstance(token_version, int) or token_version != user.token_version:
+        raise credentials_exception
     return user
 
 
@@ -88,6 +98,16 @@ def reset_ai_budget() -> None:
 
 
 async def get_ai_user(user: User = Depends(get_current_user)) -> User:
-    """Пользователь с списанным слотом часового бюджета ИИ."""
-    _ai_window.acquire(str(user.id))
+    """Пользователь ИИ-маршрута; бюджет здесь НЕ списывается.
+
+    Списание в зависимостях стояло до проверки объектного доступа, поэтому
+    перебор чужих `diagram_id` сжигал часовой лимит и отвечал 429 раньше, чем
+    404, — то есть сам отказ в доступе становился инструментом исчерпания
+    бюджета. `consume_ai_budget` вызывают внутри обработчика, после `load_diagram`.
+    """
     return user
+
+
+def consume_ai_budget(user: User) -> None:
+    """Списывает слот часового бюджета ИИ; 429, если бюджет выбран."""
+    _ai_window.acquire(str(user.id))

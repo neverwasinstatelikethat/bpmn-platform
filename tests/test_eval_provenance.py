@@ -667,3 +667,101 @@ class TestEvalSetIsClean:
         assert "ПРОВЕНАНС КЕЙСОВ" in harness.render_table(run)
         assert "пересечений с few-shot образцами промптов нет" in \
             harness.render_table(run)
+
+
+class TestAnswerOrigin:
+    """Происхождение ОТВЕТА кейса — второе измерение провенанса.
+
+    `TestEvalSetIsClean` отвечает на «не переписан ли ответ из few-shot
+    образца». Здесь вопрос другой: кто вообще его прислал. Рукописные пакеты
+    улучшения пишет человек, который знает аплайер и словарь `OP_SPEC`, и они
+    проходят гарант с первого запроса — значит, `improve/op_acceptance` на таком
+    наборе описывает аплайер и автора фикстур, а не модель. Харнесс обязан
+    печатать это рядом с числом, а не прятать за средней долей.
+    """
+
+    def test_live_capture_is_recognised_by_the_existing_division(self):
+        """Вывод берётся тот же, чем уже ранжирует эталоны `audit`: качество
+        `real` и адрес захвата в `source`. Параллельная классификации разъехалась
+        бы с ним при первой же новой фикстуре."""
+        assert provenance.answer_source(
+            {"quality": "real",
+             "source": "reports/warehouse-delivery/improve_response.json"}) \
+            == provenance.MODEL_CAPTURE
+        assert provenance.answer_source({"quality": "real"}) \
+            == provenance.MODEL_CAPTURE
+        assert provenance.answer_source({"quality": "good"}) \
+            == provenance.HAND_AUTHORED
+        assert provenance.answer_source({}) == provenance.HAND_AUTHORED
+
+    def test_declared_key_wins_over_the_derivation(self):
+        assert provenance.answer_source(
+            {"quality": "real", "source": "x.json",
+             "answer_source": provenance.HAND_AUTHORED}) \
+            == provenance.HAND_AUTHORED
+        assert provenance.answer_source_declared(
+            {"answer_source": provenance.HAND_AUTHORED}) is True
+        assert provenance.answer_source_declared({"quality": "real"}) is False
+
+    def test_unreadable_origin_is_not_silently_hand_authored(self):
+        """Опечатка в ключе — это «не знаю», а не «точно не модель»: метрика,
+        которая молча отнесла бы неразобранное происхождение к рукописному,
+        выглядела бы честнее, чем она есть."""
+        assert provenance.answer_source(
+            {"answer_source": "model_captured"}) == provenance.UNKNOWN_SOURCE
+
+    def test_verdict_names_the_owner_of_the_number(self):
+        """Каждый состав выборки обязан называть владельца: ноль живых
+        захватов, один живой захват (ниже `MIN_GATED_N`), только захваты и
+        смесь — четыре разных вердикта, и ни один не сводится к «данных нет»."""
+        from eval import metrics
+
+        cases = {
+            "hand": {provenance.HAND_AUTHORED: 4, provenance.MODEL_CAPTURE: 0},
+            "single_live": {provenance.MODEL_CAPTURE: 1,
+                            provenance.HAND_AUTHORED: 3},
+            "live_only": {provenance.MODEL_CAPTURE: 3},
+            "mixed": {provenance.MODEL_CAPTURE: 3, provenance.HAND_AUTHORED: 2},
+            "unknown": {provenance.HAND_AUTHORED: 2, provenance.UNKNOWN_SOURCE: 1},
+        }
+        verdicts = {name: provenance.origin_verdict(counts, metrics.MIN_GATED_N)
+                    for name, counts in cases.items()}
+        assert "модель не оценивается" in verdicts["hand"]
+        # Один живой кейс — ещё не оценка модели, даже когда вся выборка больше
+        # порога: доля посчитана по нему одному и по трём рукописным.
+        assert "вердикта по модели нет" in verdicts["single_live"]
+        assert "оценка модели" in verdicts["live_only"]
+        assert "смешанная выборка" in verdicts["mixed"]
+        assert "не размечено" in verdicts["unknown"]
+        for text in verdicts.values():
+            assert "оценка модели" not in text or text == verdicts["live_only"]
+
+    def test_origin_counts_keep_every_class_visible(self):
+        counts = provenance.origin_counts([provenance.MODEL_CAPTURE, "мусор"])
+        assert counts == {provenance.MODEL_CAPTURE: 1,
+                          provenance.HAND_AUTHORED: 0,
+                          provenance.UNKNOWN_SOURCE: 1}
+
+    def test_shipped_improve_fixtures_declare_their_origin(self):
+        """Improve-пакеты обязаны объявлять происхождение явно: они и есть
+        выборка метрик улучшения, и выводить её класс из `quality` — значит
+        потерять вердикт при первой правке разметки."""
+        fixtures = [f for f in harness.load_fixtures(kinds=("improve",))]
+        assert fixtures, "в наборе не осталось improve-фикстур"
+        for fixture in fixtures:
+            assert provenance.answer_source_declared(fixture), fixture["id"]
+            assert provenance.answer_source(fixture) != provenance.UNKNOWN_SOURCE
+        live = [f["id"] for f in fixtures
+                if provenance.answer_source(f) == provenance.MODEL_CAPTURE]
+        assert live, ("все improve-фикстуры написаны рукой: метрики улучшения "
+                      "replay не меряют модель вовсе и обязаны это печатать")
+
+    def test_audit_carries_the_origin_of_every_fixture(self):
+        report = provenance.audit([get("warehouse_delivery")],
+                                  harness.load_fixtures())
+        sources = report["answer_sources"]
+        assert sources, "аудит перестал называть происхождение ответов"
+        assert set(sources.values()) <= set(provenance.ANSWER_SOURCES)
+        lines = report["origin_lines"]
+        assert any("improve" in line for line in lines), lines
+        assert any("план" in line or "plan" in line for line in lines), lines

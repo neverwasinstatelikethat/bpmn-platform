@@ -266,12 +266,54 @@ def format_report(report: Dict[str, Any]) -> List[str]:
     return lines
 
 
+# Правила, совет которых обязан быть не только применим, но и безопасен: те же
+# имена, что держит `tests/test_eval_advice.py`.
+SAFE_ADVICE_RULES = ("lane_overload", "wait_without_sla", "event_types",
+                     "rework_loop")
+
+
+def gate_problems(report: Dict[str, Any],
+                  safe_rules: Sequence[str] = SAFE_ADVICE_RULES) -> List[str]:
+    """Находки переписи, которые рэтчеты в pytest считают браком — тем же списком.
+
+    Пока CLI возвращал 0 всегда, «забыли запустить pytest» и «все рецепты
+    исполнимы» печатались одинаково. Между тем именно эта перепись ловит текст
+    правила, который модель читает как «придумай id», а `improve/op_acceptance`
+    записывает это качеством модели.
+    """
+    problems: List[str] = []
+    for rule, s in report["summary"].items():
+        if s["applied"] != s["named"]:
+            problems.append(f"{rule}: правило назвало {s['named']} рецептов, "
+                            f"аплайер принял {s['applied']} — совет не исполним")
+        if s["verbatim"] != s["named"]:
+            problems.append(f"{rule}: дословно применимо {s['verbatim']} из "
+                            f"{s['named']} — в тексте перечисление операндов "
+                            "(`'a|b'`), которое аплайер отвергает")
+        if s["silent"]:
+            problems.append(f"{rule}: {s['silent']} подсказок без рецепта и без "
+                            "объяснения причины")
+        if rule in safe_rules and s["broke"]:
+            problems.append(f"{rule}: правка по совету сломала другое правило "
+                            f"на {s['broke']} схемах")
+    blocked = [(rule, verdict["refused"][:80])
+               for rule, verdicts in (report.get("per_case") or {}).items()
+               for verdict in verdicts if "уже занят" in verdict["refused"]]
+    for rule, refused in blocked:
+        problems.append(f"{rule}: рецепт упёрся в занятый id ({refused}) — id "
+                        "нового узла подбирается по схеме, а не печатается словом")
+    return problems
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
 
     from core.bpmn_scoring import BPMNScorer
     from eval.coverage import corpus_files
 
+    from . import force_utf8_output
+
+    force_utf8_output()
     parser = argparse.ArgumentParser(
         description="Исполнимость подсказок скоринга на реальных схемах корпуса")
     parser.add_argument("--per-rule", type=int, default=8,
@@ -309,6 +351,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   + ("упорлся в лимит кругов переписи " if verdict["exhausted"] else "")
                   + f"отказ={verdict['refused'][:150]} "
                   f"регрессии={verdict['regressions']}")
+    problems = gate_problems(report)
+    if problems:
+        print("")
+        print("ГЕЙТ ПЕРЕРИШИ (то же, что рэтчеты в tests/test_eval_advice.py):")
+        for line in problems:
+            print(f"  ✗ {line}")
+        return 1
+    print("")
+    print("ГЕЙТ ПЕРЕРИШИ: названный рецепт принят, дословно применим, молчаливых "
+          "правил нет.")
     return 0
 
 

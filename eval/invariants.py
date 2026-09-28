@@ -72,6 +72,7 @@ NOTATION_INVARIANTS: Tuple[str, ...] = (
     "timer_schedule",
     "boundary_handled",
     "flow_ends_legal",
+    "dangling_flows",
     "flows_within_pool",
     "message_flow_ends",
     "no_unrouted",
@@ -655,7 +656,7 @@ def _check_flow_ends_legal(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     details: List[str] = []
     for edge in seq:
         source, target = g.by_id.get(edge.source), g.by_id.get(edge.target)
-        # висячая ссылка — забота `no_unrouted`: дважды про неё не рапортуем
+        # висячая ссылка — забота `dangling_flows`: дважды про неё не рапортуем
         if source is None or target is None:
             continue
         problems = []
@@ -677,6 +678,50 @@ def _check_flow_ends_legal(g: _Graph, _exp: Mapping[str, Any]) -> Check:
                  "исходящего потока не бывает", bad)
 
 
+def _check_dangling_flows(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Каждый конец `sequenceFlow` обязан называть узел, который в схеме есть.
+
+    Дуга «в никуда» не была нарушением ни у одного инварианта: `no_unrouted`
+    считает узлы, а узел с такой дугой выглядел соединённым, `flow_ends_legal` и
+    `flows_within_pool` такие ссылки пропускают, а `gateway_split_join` и
+    `gateway_conditions_or_default` её просто не видят — `seq_out` её не
+    содержит, поэтому развилка с потерянной ногой становилась одновходовой и
+    обе проверки уходили в «не применимо». Итог был обратный наказанию:
+    знаменатель гейта уменьшался, и `quality/scheme_checks_share` росла от
+    того, что схема стала битее. Скоринг такие дуги называет давно
+    (`sequence_flows`: 107 дуг в 33 схемах корпуса из 367), то есть провал
+    заряжен реальным, а не выдуманным дефектом.
+
+    Потоки сообщения здесь ни при чём: их битые концы уже ловит
+    `message_flow_ends`, и дублировать отказ двумя правилами нечего.
+    """
+    if not g.edges:
+        return _na("dangling_flows", "потоков в схеме нет")
+    if not g.unresolved:
+        return _pass("dangling_flows",
+                     f"проверено sequence-потоков: {len(g.edges) - len(g.message_edges)}")
+    bad: List[str] = []
+    details: List[str] = []
+    for edge in g.unresolved:
+        missing = []
+        if edge.source not in g.by_id:
+            missing.append("источника")
+        if edge.target not in g.by_id:
+            missing.append("цели")
+        ident = edge.id or f"{edge.source}->{edge.target}"
+        gone = (f"{edge.source}" if missing == ["источника"]
+                else f"{edge.target}" if missing == ["цели"]
+                else f"{edge.source} и {edge.target}")
+        bad.append(ident)
+        details.append(f"{ident}: нет узла-{' и '.join(missing)} — дуга называет "
+                       f"отсутствующий id «{gone}»")
+    return _fail("dangling_flows",
+                 "висячие потоки: " + "; ".join(details)
+                 + " — у `sequenceFlow` оба конца обязаны быть узлами схемы: "
+                 "поток в несуществующий узел не даёт маршрута, а развилку "
+                 "лишает ноги", bad)
+
+
 def _check_flows_within_pool(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     """`sequenceFlow` живёт внутри одного процесса: токен не переезжает из пула
     в пул, для этого есть `messageFlow`.
@@ -694,7 +739,7 @@ def _check_flows_within_pool(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     for edge in seq:
         source, target = g.by_id.get(edge.source), g.by_id.get(edge.target)
         if source is None or target is None:
-            continue  # висячая ссылка — забота `no_unrouted`
+            continue  # висячая ссылка — забота `dangling_flows`
         if not source.pool or not target.pool or source.pool == target.pool:
             continue
         ident = edge.id or f"{edge.source}->{edge.target}"
@@ -1467,6 +1512,7 @@ def _run_checks(g: _Graph, expectations: Mapping[str, Any]) -> Dict[str, Check]:
         "timer_schedule": _check_timer_schedule(g, expectations),
         "boundary_handled": _check_boundary_handled(g, expectations),
         "flow_ends_legal": _check_flow_ends_legal(g, expectations),
+        "dangling_flows": _check_dangling_flows(g, expectations),
         "flows_within_pool": _check_flows_within_pool(g, expectations),
         "message_flow_ends": _check_message_flow_ends(g, expectations),
         "no_unrouted": _check_no_unrouted(g, expectations),

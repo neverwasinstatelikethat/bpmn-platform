@@ -23,14 +23,20 @@ email_conf = ConnectionConfig(
 fast_mail = FastMail(email_conf)
 
 
-async def send_email(message: MessageSchema) -> None:
-    """Отправка письма со закрытым сбоем SMTP.
+async def send_email(message: MessageSchema) -> bool:
+    """Отправка письма с закрытым сбоем. Возвращает, дошло ли оно до сервера.
 
     Используется как фон после ответа клиенту: незакрытое исключение от
     недоступного сервера иначе падает воркер обработчика после успешного
-    ответа.
+    ответа. Молча проглоченный сбой — второй дефект того же места: клиент уже
+    получил «письмо отправлено», а ссылки нет. Поэтому результат возвращается
+    вызывающей стороне (она пишет его в счётчик и в лог), а текст лога держит
+    стабильный маркер — по нему настраивается алерт, а не по шуму исключений.
     """
     try:
         await fast_mail.send_message(message)
+        return True
     except Exception as e:  # noqa: BLE001 — доставка почты не роняет запрос
-        logger.error("Письмо не отправлено (%s): %s", message.subtype, e)
+        logger.error("SMTP_DELIVERY_FAILED: письмо не отправлено (%s): %s",
+                     message.subtype, e)
+        return False

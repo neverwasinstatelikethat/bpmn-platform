@@ -45,6 +45,13 @@ jobs:
           SECRET_KEY: ci-only-secret
       # Дальше схема уже на месте, её только подтверждает фикстура conftest.py.
       - run: python -m pytest tests/ -q
+      # Детерминированный харнесс качества — часть конвейера, а не ручная
+      # процедура: README обещает, что деградации промптов ловит именно
+      # `--fail-on-regression`. Ключей не нужно: replay не читает `.env` и не
+      # ходит в сеть. Расхождение линейки с baseline даёт код 3 и валит CI,
+      # пока изменения линейки не приняты явно (--accept-ruler-change).
+      - name: Харнесс качества (replay) против baseline
+        run: python -m eval.run --mode replay --fail-on-regression
 
   frontend:
     runs-on: ubuntu-latest

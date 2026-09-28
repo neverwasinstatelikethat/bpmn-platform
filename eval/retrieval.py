@@ -423,6 +423,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from core.llm_improve import BPMNKnowledgeBase
     from eval.harness import generate_xml, load_fixtures, repair_structure
 
+    from . import force_utf8_output
+
+    force_utf8_output()
     parser = argparse.ArgumentParser(
         description="Качество подбора эталонов (RAG) по improvement-фикстурам")
     parser.add_argument("--k", type=int, default=DEFAULT_K)

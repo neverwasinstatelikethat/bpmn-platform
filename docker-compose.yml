@@ -26,6 +26,19 @@ services:
       SECRET_KEY: ${SECRET_KEY:?Задайте SECRET_KEY в .env}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      # Пул соединений под удержание соединений ИИ-маршрутами (app/db.py);
+      # source по умолчанию пустой — SQLAlchemy применит свои разумные числа.
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+      # Разрешённые источники CORS (app/config.py). По умолчанию — адрес
+      # фронтенда из этого стека; свой список задаётся в .env.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3456}
+      # Служебный режим без ИИ (перенос данных, прогоны без ключей); в
+      # штатном запуске оставляйте 0.
+      SKIP_LLM_INIT: ${SKIP_LLM_INIT:-0}
+      # Путь к кэшу RAG-индекса внутри контейнера; пусто = рядом с кодом.
+      BPMN_RAG_CACHE_FILE: ${BPMN_RAG_CACHE_FILE:-}
       MAIL_USERNAME: ${MAIL_USERNAME:-}
       MAIL_PASSWORD: ${MAIL_PASSWORD:-}
       # MAIL_FROM обязан быть валидным e-mail: ConnectionConfig валидирует
@@ -50,6 +63,11 @@ services:
       GIGACHAT_MODEL: ${GIGACHAT_MODEL:-}
       # PERS/B2B тариф — один одновременный запрос к модели.
       GIGACHAT_MAX_CONCURRENT: ${GIGACHAT_MAX_CONCURRENT:-1}
+      # Лимиты ИИ-контура из app/config.py: без проброса настройка из .env
+      # в контейнере молча игнорировалась бы.
+      AI_MAX_XML_CHARS: ${AI_MAX_XML_CHARS:-1000000}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-2000000}
+      AI_REQUESTS_PER_HOUR: ${AI_REQUESTS_PER_HOUR:-60}
     ports:
       # Хост-порты 8000/3000 заняты сторонними проектами; внутри сети контейнеров остаются 8000/80.
       - "127.0.0.1:8765:8000"

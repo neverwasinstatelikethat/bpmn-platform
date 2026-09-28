@@ -8,8 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.ai import generator, get_orchestrator, scorer
-from app.db import get_db
-from app.deps import get_ai_user, get_current_user
+from app.db import SessionLocal, get_db
+from app.deps import consume_ai_budget, get_ai_user, get_current_user
 from app.models import Diagram, Improvement, User
 from app.schemas import (AcceptImprovementRequest, EvaluateRequest,
                          GenerateRequest, ImproveRequest)
@@ -44,6 +44,7 @@ _RETRY_AFTER_UNAVAILABLE = {"Retry-After": "30"}
 @router.post("/api/generate")
 async def generate_bpmn(request: GenerateRequest,
                         current_user: User = Depends(get_ai_user)):
+    consume_ai_budget(current_user)
     result = await asyncio.to_thread(generator.generate, request.text)
     if result["status"] != "success":
         step = str(result.get("step") or "internal")
@@ -72,6 +73,7 @@ async def generate_bpmn(request: GenerateRequest,
 @router.post("/api/evaluate")
 async def evaluate_bpmn(request: EvaluateRequest,
                         current_user: User = Depends(get_ai_user)):
+    consume_ai_budget(current_user)
     # Скоринг — разбор и обход дерева пользовательского XML: на событийном
     # цикле одна крупная схема задержала бы весь сервис.
     return await asyncio.to_thread(scorer.evaluate, request.bpmn_xml)
@@ -81,17 +83,26 @@ async def evaluate_bpmn(request: EvaluateRequest,
 async def improve_diagram_endpoint(
     request: ImproveRequest,
     current_user: User = Depends(get_ai_user),
-    db: Session = Depends(get_db)
 ):
-    # Проверка доступа — до всего остального: чужой id не должен отвечать ни
-    # 503, ни 429 раньше, чем 404.
+    # Соединение с БД тут не держат на всё время запроса: сессия из
+    # `Depends(get_db)` жила бы через весь LLM-вызов (минуты при
+    # `GIGACHAT_MAX_CONCURRENT=1` и часовом бюджете попыток), пул маленький —
+    # несколько одновременных улучшений выборали бы соединения и подвесили все
+    # остальные маршруты. Отсюда короткие сессии: проверка доступа до модели,
+    # запись предложения после.
+    #
+    # Проверка доступа — ДО списания бюджета: чужой id не должен отвечать ни
+    # 503, ни 429 раньше, чем 404, иначе перебор чужих `diagram_id` сам по себе
+    # сжигает часовой лимит ИИ-запросов.
     # Предложение привязывается к хранённой схеме: оно снимает в статус
     # superseded чужие незакрытые предложения по ней и отсчитывается от её
     # версии. Значит здесь нужен доступ на правку, а не на просмотр: чистый
     # анализ схемы без привязки вызывается без diagram_id. Заодно вымышленный
     # id превращается из 500 на внешнем ключе в 404.
     if request.diagram_id:
-        load_diagram(db, current_user, request.diagram_id, edit=True)
+        with SessionLocal() as db:
+            load_diagram(db, current_user, request.diagram_id, edit=True)
+    consume_ai_budget(current_user)
 
     orchestrator = get_orchestrator()
     if orchestrator is None:
@@ -122,35 +133,40 @@ async def improve_diagram_endpoint(
     if improved_xml is None:
         # Только анализ: менять схему не нужно, но вывод модели обязан остаться
         # в истории — иначе сценарий «найди узкие места» нечем показать.
-        improvement = record_proposal(
-            db,
-            user_id=current_user.id,
-            diagram_id=request.diagram_id,
-            improved_xml=None,
-            recommendations=recommendations,
-            status=ANALYSIS_ONLY,
-        )
+        with SessionLocal() as db:
+            improvement = record_proposal(
+                db,
+                user_id=current_user.id,
+                diagram_id=request.diagram_id,
+                improved_xml=None,
+                recommendations=recommendations,
+                status=ANALYSIS_ONLY,
+            )
+            improvement_id = improvement.id
         logger.info("Диаграмма %s: только анализ без изменений (%s)",
-                    request.diagram_id, improvement.id)
+                    request.diagram_id, improvement_id)
         return {
             "status": "analysis_only",
-            "improvement_id": improvement.id,
+            "improvement_id": improvement_id,
             "recommendations": recommendations,
             "report": report,
         }
 
-    improvement = record_proposal(
-        db,
-        user_id=current_user.id,
-        diagram_id=request.diagram_id,
-        improved_xml=improved_xml,
-        recommendations=recommendations,
-    )
-    logger.info("Диаграмма %s улучшена, улучшение %s", request.diagram_id, improvement.id)
+    with SessionLocal() as db:
+        improvement = record_proposal(
+            db,
+            user_id=current_user.id,
+            diagram_id=request.diagram_id,
+            improved_xml=improved_xml,
+            recommendations=recommendations,
+        )
+        improvement_id = improvement.id
+    logger.info("Диаграмма %s улучшена, улучшение %s", request.diagram_id,
+                improvement_id)
 
     return {
         "status": "success",
-        "improvement_id": improvement.id,
+        "improvement_id": improvement_id,
         "recommendations": recommendations,
         "report": report,
     }

@@ -11,35 +11,35 @@
 `GIGACHAT_CREDENTIALS`, хотя ключи лежат в файле рядом с репозиторием.
 Код 1 — по `--fail-on-regression`, если относительно baseline что-то упало: CI
 так и должен отличать «правку промпта, которая ухудшила контур».
+Код 2 — харнесс не смог посчитать прогон: нет ключа, нет фикстур, либо упала
+сама метрика (`ОШИБКИ МЕТРИК`): значение такой метрики — None, и пропускать её
+как «данных нет» нельзя, иначе баг харнесса выглядел бы отсутствием регрессий.
+Код 3 — линейка отличается от baseline (новое правило или инвариант): сверка
+несопоставима и регрессий прогон не показывает вовсе, поэтому без явного
+`--accept-ruler-change` он тоже не считается пройденным. Иначе «добавили
+правило» автоматически означало бы «гейт выключен на этом прогоне».
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
 from dotenv import load_dotenv
 
-from . import harness, metrics
+from . import force_utf8_output, harness, metrics
 from .harness import DEFAULT_BASELINE, HarnessError
 
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
 def _force_utf8_output() -> None:
-    """Отчёт печатается символами (✗, ⊘), которых нет в windows-кодировке cp1251.
-
-    Иначе на родной для проекта консоли прогон падал с UnicodeEncodeError уже
-    после того, как всё было посчитано и записано в JSON: код возврата оставался
-    осмысленным, но таблицу метрик человек не видел. Замена символа здесь
-    честнее падения.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        with contextlib.suppress(Exception):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+    """Совместимый с прежними вызовами вход: хелпер переехал в пакет, потому что
+    остальные CLI-входы (`eval.coverage`, `eval.advice`, `eval.retrieval`) его не
+    вызывали и на cp1251 падали с `UnicodeEncodeError`."""
+    force_utf8_output()
 
 
 def _load_env_file(env_file: Optional[Path] = None) -> None:
@@ -76,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="относительный порог регрессии (0.05 = 5%%)")
     parser.add_argument("--fail-on-regression", action="store_true",
                         help="возвращать код 1, если детектор нашёл падение метрик")
+    parser.add_argument("--accept-ruler-change", action="store_true",
+                        help="признать смену линейки (правла или инварианты "
+                             "отличаются от baseline): без этого флага прогон "
+                             "возвращает код 3, даже если регрессий не видно. "
+                             "Сверка с таким baseline всё равно не проводится — "
+                             "меры несопоставимы, — поэтому флаг означает "
+                             "«изменение линейки обзорено и baseline будет "
+                             "пересобран», а не «гейт выключен»")
     parser.add_argument("--no-report", action="store_true",
                         help="не писать JSON-отчёт в eval/reports")
     parser.add_argument("--dump-schemes", default="",
@@ -95,7 +103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report = harness.run(
             mode=args.mode, scenarios_spec=args.scenarios, repeat=args.repeat,
             baseline_path=_baseline_path(args), fixtures_dir=Path(args.fixtures_dir),
-            threshold=args.threshold)
+            threshold=args.threshold, accept_ruler_change=args.accept_ruler_change)
     except HarnessError as e:
         print(f"ХАРНЕСС: {e}", file=sys.stderr)
         return 2
@@ -113,6 +121,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.write_baseline:
         path = report.write_baseline(Path(args.baseline_path))
         print(f"Baseline записан: {path}")
+    # Порядок кодов: сначала то, что делает прогон нечитаемым (упавшая метрика),
+    # затем несопоставимая линейка, и только потом — вердикт по метрикам.
+    if report.metric_errors:
+        # ОШИБКА метрики — не «данных нет»: значение превращалось в None, и
+        # такая метрика не попадала ни в регрессии, ни в `unverified_metrics`.
+        # Гейт по прогону, где линейка сломалась у себя в кармане, не выносится.
+        print("ХАРНЕСС: метрики упали внутри себя — прогон нечитаем: "
+              + ", ".join(sorted(report.metric_errors)), file=sys.stderr)
+        return 2
+    if report.ruler_change and not args.accept_ruler_change:
+        print("ХАРНЕСС: линейка отличается от baseline; сверка не проводилась, "
+              "гейт по такому прогону не выносится. Проверьте, что новое правило "
+              "заряжает реальное (`python -m eval.coverage`, `python -m "
+              "eval.advice --all-rules`), пересоберите baseline --write-baseline "
+              "или передайте --accept-ruler-change, если изменение линейки "
+              "осознанно и сверка отложена до пересборки.", file=sys.stderr)
+        return 3
     if report.regressions and args.fail_on_regression:
         return 1
     return 0

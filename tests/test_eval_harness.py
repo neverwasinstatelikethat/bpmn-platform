@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from eval import harness, invariants, metrics, scenarios
+from eval import harness, invariants, metrics, provenance, scenarios
 from eval.invariants import (ALL_CHECKS, BUSINESS_INVARIANTS, CORE_INVARIANTS,
                              NOTATION_INVARIANTS, check_structure, check_xml,
                              summarize)
@@ -79,6 +79,51 @@ EXPECTED_RAW_FAILS = {
 EXPECTED_ETALON_BUSINESS_DEBT = {
     "loan_application.good.plan": {"pools_not_pingpong"},
     "warehouse_delivery.good.plan": {"waits_have_sla"},
+}
+
+# Ожидания сценариев, запертые числом. До этой таблицы они существовали только
+# в `eval/scenarios.py`, а проверялись ожиданием `min_steps >= 1`: понижение
+# `min_steps` или `max_pools` поднимало `pass@1/min_steps` и `roles_as_lanes`
+# на том же наборе схем, и CI не говорил ни слова. Это ровно тот класс, из-за
+# которого `EXPECTED_RAW_FAILS` держит провалы поимённо: линейка не имеет права
+# тихонько становиться короче, чтобы цифра выросла.
+#
+# Формулировка держит то же правило, что и у таблиц выше: новое имя или другое
+# число здесь = заявленный дефект (или требование) changed, и объяснять его надо
+# в тексте сценария, а не в метрике.
+EXPECTED_SCENARIO_EXPECTATIONS = {
+    "warehouse_delivery": {
+        "min_steps": 10, "max_pools": 4, "must_branch": True,
+        "must_have_timer": False,
+        "expected_participants": ("Склад", "WMS", "Перевозчик")},
+    "purchase_approval": {
+        "min_steps": 9, "max_pools": 2, "must_branch": True,
+        "must_have_timer": False,
+        "expected_participants": ("ВкусВилл", "Поставщик")},
+    "product_return": {
+        "min_steps": 9, "max_pools": 3, "must_branch": True,
+        "must_have_timer": False,
+        "expected_participants": ("ВкусВилл", "Покупатель")},
+    "production_incident": {
+        "min_steps": 8, "max_pools": 3, "must_branch": True,
+        "must_have_timer": True,
+        "expected_participants": ("Дежурный инженер", "Система мониторинга")},
+    "employee_onboarding": {
+        "min_steps": 9, "max_pools": 2, "must_branch": True,
+        "must_have_timer": False,
+        "expected_participants": ("HR", "ИТ")},
+    "loan_application": {
+        "min_steps": 10, "max_pools": 4, "must_branch": True,
+        "must_have_timer": True,
+        "expected_participants": ("Банк", "Клиент", "Бюро кредитных историй")},
+    "support_ticket": {
+        "min_steps": 9, "max_pools": 3, "must_branch": True,
+        "must_have_timer": True,
+        "expected_participants": ("Поддержка", "Клиент")},
+    "vehicle_reservation": {
+        "min_steps": 9, "max_pools": 4, "must_branch": True,
+        "must_have_timer": True,
+        "expected_participants": ("Диспетчер", "Перевозчик", "Клиент")},
 }
 
 
@@ -160,6 +205,34 @@ def test_live_run_schema_fails_pool_and_interaction_invariants():
     assert "A11" in failed["event_definitions"]["ids"]
     # 8 пулов при 4 оправданных текстом — избыток показан списком id
     assert len(failed["roles_as_lanes"]["ids"]) == 4
+
+
+def test_scenario_expectations_are_pinned_by_number():
+    """Ожидания сценариев заперты таблицей, а не словом «минимум один шаг».
+
+    `min_steps >= 1` в прежней проверке означал, что понижать ожидания можно
+    молча: `pass@1/min_steps` и `roles_as_lanes` растут от того, что требование
+    стало мягче, а не от того, что контур стал лучше. Красная линия проекта —
+    не двигать мерку ради числа, поэтому здесь сверяются ровно те же значения,
+    которые задаёт `eval/scenarios.py`: новое число обязано быть объяснённым в
+    описании процесса, а не в метрике.
+    """
+    assert {s.id for s in scenarios.SCENARIOS} == set(EXPECTED_SCENARIO_EXPECTATIONS)
+    for scenario in scenarios.SCENARIOS:
+        want = EXPECTED_SCENARIO_EXPECTATIONS[scenario.id]
+        got = {
+            "min_steps": scenario.min_steps,
+            "max_pools": scenario.max_pools,
+            "must_branch": scenario.must_branch,
+            "must_have_timer": scenario.must_have_timer,
+            "expected_participants": tuple(scenario.expected_participants),
+        }
+        assert got == want, f"{scenario.id}: {got} != {want}"
+        # Жёсткий минимум по шагам: единица в ожиданиях ничего не требует, и
+        # весь ряд `pass@1/min_steps` превращается в констатацию «схема
+        # непустая». Порог ниже восьми — уже не ожидание процесса, а заглушка.
+        assert scenario.min_steps >= 8, scenario.id
+        assert scenario.expected_participants, scenario.id
 
 
 def test_every_failure_comes_with_reason_and_ids():
@@ -1029,7 +1102,12 @@ def test_repeat_rejection_share_only_counts_verbatim_refusals():
 
 def test_defects_introduced_sees_what_no_regression_hid():
     """Один инвариант починен, другой сломан, дельта балла 0 — `no_regression`
-    на этом молчал, счётчик упавших видит обе половины."""
+    на этом молчал, счётчик упавших видит обе половины.
+
+    Мера — доля от того, что на базе проходило: абсолютное число сломанных под
+    средним по кейсам у схемы с двумя целыми инвариантами и у схемы с двадцатью
+    значило бы одно и то же (тот же изъян геометрии, что уже починили у
+    `improve/retry_gain`)."""
     broken = _xml_with('<sequenceFlow id="FX" sourceRef="E1" targetRef="S1"/>')
     case = harness.ImproveCase(scenario="s", fixture="f", label="",
                                quality="live", mode="replay")
@@ -1038,7 +1116,14 @@ def test_defects_introduced_sees_what_no_regression_hid():
     # Ничего не изменилось — и нечего приписывать пакету.
     assert harness._defects_introduced(case) == 0.0
     case.checks_before = check_xml(_xml_with(), {})
-    assert harness._defects_introduced(case) >= 1.0
+    before_ok = [c for c in invariants.applicable_checks(case.checks_before)
+                 if c.ok]
+    after_bad = {c.name for c in invariants.applicable_checks(case.checks_after)
+                 if not c.ok}
+    introduced = sum(1 for c in before_ok if c.name in after_bad)
+    assert introduced >= 1
+    assert harness._defects_introduced(case) == introduced / len(before_ok)
+    assert 0.0 < harness._defects_introduced(case) <= 1.0
     case.checks_before = {}
     assert harness._defects_introduced(case) is None
 
@@ -1662,3 +1747,224 @@ def test_scenarios_cover_every_process_and_fixture_is_wired():
         assert expectations["max_pools"] >= 1
         assert expectations["min_steps"] >= 1
         assert scenario.text.strip()
+
+
+# ---------------------------------------------------------------------------
+# размер промпта: бюджет входа обязан быть виден в отчёте
+# ---------------------------------------------------------------------------
+
+_TWO_STAGE_TRACE = [{"node": "первый ответ модели",
+                     "состав": "утверждён отдельным вызовом",
+                     "стадия состава": "утверждён отдельным вызовом",
+                     "деградации": []},
+                    {"node": "починка структуры", "steps": []}]
+_DEGRADED_TRACE = [{"node": "первый ответ модели", "состав": "один вызов",
+                    "стадия состава": "сбой: ответ обрезан",
+                    "деградации": ["стадия состава: ответ обрезан"]},
+                   {"node": "починка структуры", "steps": []}]
+
+
+def test_replay_prompt_size_is_a_rendered_budget_not_a_call():
+    """Реплай не трогает модель — но бюджет входа у кейса есть и без обращения:
+    шаблоны стадий живут в ядре, и их рост обязан ловиться в CI, а не только в
+    живом прогоне. Строки при этом помечены `observed=False`: иначе оценка
+    бюджета читалась бы как запись настоящего вызова.
+    """
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery")
+    rows = [r for case in report.cases for r in case.prompt_calls]
+    assert rows, "replay не посчитал вход ни одного кейса"
+    assert all(row["observed"] is False for row in rows)
+    stages = {row["stage"] for row in rows}
+    assert {"состав", "маршрут", "одношаговый"} <= stages
+    assert all(row["chars"] > 0 and row["tokens_est"] > 0 for row in rows)
+    cost = report.cost
+    assert cost["prompt_observed"] is False
+    assert cost["prompt_chars_total"] > 0
+    # Путь (две стадии или откат) в replay не наблюдался: «н/д», а не ноль.
+    assert report.generation.metrics["cost/prompt_two_stage_share"].mean is None
+
+
+def test_prompt_size_separates_two_stage_from_one_shot():
+    """Двухстадийный прогон и деградация в одношаговый платят разное число
+    символов, и метрика обязана это различать: ровно тот класс, который
+    генератор сделал видимым через `notes`/`trace`."""
+    text = "Кладовщик собирает заказ, перевозчик подтверждает дату погрузки."
+    plan = {"participants": [{"name": "Кладовщик"}, {"name": "Перевозчик"}],
+            "lanes": [], "elements": [{"id": "A1", "kind": "task",
+                                       "name": "Собрать заказ"}],
+            "flows": []}
+    rows = {r["stage"]: r["chars"] for r in
+            harness.rendered_prompt_rows(text, plan, [])}
+    assert rows["одношаговый"] < rows["состав"] + rows["маршрут"]
+    # Переспрос появляется только тогда, когда план-гейт нашёл что спрашивать.
+    without = harness.rendered_prompt_rows(text, plan, [])
+    with_gap = harness.rendered_prompt_rows(text, plan, ["нет стартового события"])
+    assert [r["stage"] for r in without].count("переспрос") == 0
+    retry = [r for r in with_gap if r["stage"] == "переспрос"]
+    assert len(retry) == 1 and retry[0]["chars"] > rows["одношаговый"]
+
+    two = harness.GenCase(scenario="s", fixture="f", label="", quality="live",
+                          mode="live", ok=True, trace=_TWO_STAGE_TRACE)
+    degraded = dataclasses.replace(two, trace=_DEGRADED_TRACE)
+    replay = harness.GenCase(scenario="s", fixture="f", label="", quality="good",
+                             mode="replay", ok=True,
+                             trace=[{"node": "починка структуры", "steps": []}])
+    assert harness.stage_path(two) == "двухстадийный"
+    assert harness.stage_path(degraded) == "одношаговый"
+    assert harness.stage_path(replay) is None
+    assert harness._two_stage_share(two) == 1.0
+    assert harness._two_stage_share(degraded) == 0.0
+    assert harness._two_stage_share(replay) is None
+
+
+def test_prompt_metric_without_rows_is_unmeasured_not_zero():
+    """Кейс без строк входа не должен давать «ноль символов»: промпт пуст — это
+    другое утверждение, и в таблице оно читалось бы как успех."""
+    empty = harness.GenCase(scenario="s", fixture="f", label="", quality="live",
+                            mode="live")
+    assert harness._prompt_chars_per_case(empty) is None
+    assert harness._prompt_chars_per_call(empty) is None
+    assert harness._prompt_tokens_per_case(empty) is None
+    assert harness.prompt_totals([]) == {}
+    rendered = harness.prompt_totals(
+        [{"stage": "состав", "chars": 900, "tokens_est": 300.0,
+          "observed": False}])
+    assert rendered == {"calls": 1.0, "chars": 900.0, "tokens_est": 300.0,
+                        "observed": False}
+
+
+def test_prompt_size_never_enters_the_quality_gate():
+    """Размер входа — диагностика стоимости: он не вправе ни поднять, ни
+    уронить гейт корректности, иначе «урезать промпт» стало бы способом
+    починить число за счёт правил (красная линия проекта)."""
+    report = harness.run(mode="replay", scenarios_spec="purchase_approval")
+    case = next(c for c in report.cases if c.ok and c.prompt_calls)
+    before, gate_before = case.gate_share, case.scenario_pass
+    case.prompt_calls = [{"stage": "маршрут", "chars": 10 ** 7,
+                          "tokens_est": 10 ** 7 / 3.0, "observed": True}]
+    assert case.gate_share == before
+    assert case.scenario_pass == gate_before
+    names = set(report.generation.metrics) | set(report.improvement.metrics)
+    assert any(n.startswith("cost/prompt_") for n in names)
+    for name in [n for n in names if "prompt" in n]:
+        assert name.startswith("cost/"), name
+        if name != "cost/prompt_two_stage_share":
+            assert name in harness.LOWER_IS_BETTER, name
+
+
+def test_live_prompt_rows_are_read_from_the_transport(monkeypatch):
+    """В live размер снимается с настоящего обращения: харнесс наблюдает
+    `_complete`, не переписывая ядро, и стадия опознаётся по тому же тексту,
+    который ушёл в модель."""
+    from core import llm_client
+
+    seen: list = []
+    monkeypatch.setattr(llm_client, "_complete",
+                        lambda messages, temperature, max_tokens: (
+                            seen.append(messages) or "{}"))
+    templates = harness.prompt_templates()
+    with harness.llm_call_counter() as state:
+        llm_client._complete([{"role": "system",
+                               "content": templates["состав"]},
+                              {"role": "user", "content": "Описание:\nтекст"}],
+                             0.0, 800)
+        llm_client._complete([{"role": "system",
+                               "content": templates["улучшение"]},
+                              {"role": "user",
+                               "content": templates["повтор улучшения"][:60]}],
+                             0.2, 800)
+    rows = state["prompt_calls"]
+    assert [r["stage"] for r in rows] == ["состав", "повтор улучшения"]
+    assert all(r["observed"] is True for r in rows)
+    assert rows[0]["chars"] == len(templates["состав"]) + len("Описание:\nтекст")
+    assert state["calls"] == 2 and len(seen) == 2
+
+
+def test_improve_metric_on_a_single_live_case_is_not_sold_as_model_score():
+    """Один живой захват в четырёх кейсах — это не вердикт модели.
+
+    `improve/redundant_refusals_share` и `improve/retry_gain` живут по n=1, а
+    `improve/op_acceptance` 0.917 в replay считается по трём рукописным пакетам
+    и одному захвату: число описывает аплайера и автора фикстур. Харнесс обязан
+    печатать состав выборки рядом, а не прятать его в JSON.
+    """
+    def case(source, retry=False):
+        rows = [{"op": "add_task", "id": "new_A%s" % i} for i in range(2)]
+        skipped = ([{"op": "connect", "stage": "plan", "reason": "нет опоры"}]
+                   if retry else [])
+        return harness.ImproveCase(scenario="s", fixture="f-%s" % source,
+                                   label="", quality="live", mode="replay",
+                                   applied=rows, skipped=skipped, noop_rows=0,
+                                   ok=True, answer_source=source,
+                                   retry_attempted=retry, retry_closed=1)
+
+    cases = [case(provenance.MODEL_CAPTURE, retry=True)]
+    cases += [case(provenance.HAND_AUTHORED) for _ in range(3)]
+    result = harness.build_improvement_suite().run(
+        [{"name": c.key, "payload": c} for c in cases])
+    origins = harness.improve_metric_origins(cases, result)
+    accepted = origins["improve/op_acceptance"]
+    assert (accepted["live"], accepted["hand"]) == (1, 3)
+    assert "оценка модели" not in accepted["verdict"]
+    assert "вердикта по модели нет" in accepted["verdict"]
+    # Знаменатель — свой у каждой метрики: повтор мерился только на живом кейсе,
+    # и врать про «четыре пакета» эта строка не вправе.
+    assert origins["improve/retry_gain"]["cases"] == 1
+    assert origins["improve/retry_gain"]["hand"] == 0
+    lines = harness.format_metric_origins(origins)
+    assert any("improve/op_acceptance" in line and "живых захватов 1" in line
+               for line in lines), lines
+
+
+def test_report_prints_the_origin_of_the_improvement_sample():
+    """Секция состава обязана доезжать до консоли и отчёта на реальном наборе:
+    в shipped replay один живой захват на четыре пакета — ровно тот случай,
+    ради которого она заведена."""
+    report = harness.run(mode="replay", scenarios_spec="all")
+    rendered = harness.render_table(report)
+    assert "МЕТРИКИ УЛУЧШЕНИЯ: ИЗ ЧЕГО СОСТОИТ ВЫБОРКА" in rendered
+    row = report.improve_sample_origin["improve/op_acceptance"]
+    assert (row["live"], row["hand"]) == (1, 3)
+    assert "improve/op_acceptance" in rendered
+    assert "вердикта по модели нет" in rendered
+    # Происхождение названо и в строке самого кейса: разбор «чья это цифра»
+    # не должен требовать чтения JSON.
+    assert "ответ: рукописный пакет" in rendered
+    assert "ответ написан рукой автора кейса" in rendered
+    assert report.as_dict()["improve_sample_origin"] == report.improve_sample_origin
+    # Метрики корректности состава выборки не касаются: гейт остаётся гейтом.
+    assert report.generation.metrics["quality/scheme_checks_share"].mean is not None
+
+
+def test_improve_case_origin_survives_replay_and_live_modes():
+    """Replay берёт происхождение из фикстуры, live — из режима: там ответ всегда
+    живой, а фикстура даёт только слот прогона (то же правило уже действует для
+    `quality`)."""
+    fixture = {"id": "fx", "scenario": "purchase_approval", "label": "",
+               "quality": "good", "answer_source": provenance.HAND_AUTHORED,
+               "operations": [], "targets": []}
+    replay = harness.run_improvement_case(
+        scenarios.get("purchase_approval"), fixture, _base_gencase(GUARANTEE_XML),
+        mode="replay")
+    assert replay.answer_source == provenance.HAND_AUTHORED
+    assert replay.answer_source_declared is True
+    live = harness.run_improvement_case(
+        scenarios.get("purchase_approval"), fixture, _base_gencase(GUARANTEE_XML),
+        mode="live")
+    assert live.answer_source == provenance.MODEL_CAPTURE
+
+
+def test_prompt_sizes_section_says_what_was_not_measured():
+    """Пустая секция стоимости входа обязана говорить «н/д», а не печатать нули:
+    тот же класс честности, что и «выборка 1 < 2 → н/д» в таблице метрик."""
+    lines = harness.format_prompt_sizes({"prompt_by_stage": {}})
+    assert any("н/д" in line for line in lines)
+    assert not any("0 токенов" in line for line in lines)
+    filled = harness.format_prompt_sizes({
+        "prompt_by_stage": {"состав": {"calls": 2, "chars": 8000,
+                                       "tokens_est": 2666.7, "observed": True}},
+        "prompt_calls_total": 2.0, "prompt_chars_total": 8000.0,
+        "prompt_tokens_est_total": 2666.7, "prompt_chars_per_case": 4000.0,
+        "prompt_note": "числа сняты с настоящих обращений (live)"})
+    assert any("состав" in line and "наблюдено" in line for line in filled)
+    assert any("4000 симв." in line for line in filled)

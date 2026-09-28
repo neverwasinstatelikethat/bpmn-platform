@@ -1826,6 +1826,21 @@ def _pool_hint(s: _Schema, node_id: str) -> str:
     return process_id or "?"
 
 
+def _pool_end_target(s: _Schema, node_id: str) -> str:
+    """Конечное событие того же пула: законный конец ветки «срок вышел» для
+    ожидания, у которого собственной исходящей дуги нет.
+
+    Другого приёмника у рецепта нет: `add_task` без `after` и без исхода
+    откатывается как недостижимый, поэтому подсказка либо называет существующий
+    выход пула, либо честно отказывается от операции."""
+    process_id = s.owner_of_node.get(node_id) or ""
+    for node in s.nodes_by_process.get(process_id, []):
+        node_ref = node.get("id") or ""
+        if node_ref and node_ref != node_id and _local(node.tag) == "endEvent":
+            return node_ref
+    return ""
+
+
 def _single_outlet_ancestor(s: _Schema, node_id: str) -> str:
     """Ближайший предок с единственным исходящим потоком.
 
@@ -1853,7 +1868,8 @@ def _deadline_hint(s: _Schema, wait: ET.Element, ordinal: int = 1) -> str:
     Подсказка без id, из которых собирается операция, читается моделью как
     «придумай id»: аплайер отвечает отказом, а `improve/op_acceptance` записывает
     это как качество модели, хотя виноват текст правила. Активности называется
-    `add_boundary_event` с её собственным id; событию-ожиданию — развилка, и
+    `add_boundary_event` с ЕЁ СОБСТВЕННЫМ id и с `to` — веткой обработки;
+    событию-ожиданию — развилка, и
     порядок шагов в подсказке не украшение: аплайер вставляет новый узел ПОСРЕДИ
     существующей дуги (`after`), поэтому нога «срок вышел» собирается только
     парой `connect` уже после того, как шлюз забрал на себя исход предшественника.
@@ -1880,11 +1896,27 @@ def _deadline_hint(s: _Schema, wait: ET.Element, ordinal: int = 1) -> str:
     вместо него.
     """
     eid = wait.get("id") or "?"
-    if _local(wait.tag) in ACTIVITY_TAGS:
-        return (f"'{eid}': add_boundary_event(attached_to='{eid}', "
-                "event_type='timer', duration='PT2H')")
-    srcs = sorted({f.source for f in s.incoming.get(eid, []) if f.source})
     tgts = sorted({f.target for f in s.outgoing.get(eid, []) if f.target})
+    if _local(wait.tag) in ACTIVITY_TAGS:
+        # Активности срок — граничный таймер, и рецепт обязан назвать ОБА его
+        # операнда: свободный id нового узла (`_require_new_id` отвечает
+        # «не задан id нового элемента» на голый `attached_to`) и ветку
+        # обработки. Без `to` событие откатывается кружком
+        # (`_rollback_unrouted`: «остался без ветки обработки»), и нарушение не
+        # снималось ни одним кругом. В корпусе 367 файлов нет ни одного
+        # `receiveTask`, поэтому перепись `eval.advice` этого класса не видела.
+        timer = _free_new_id(s, f"new_sla_timer_{ordinal}")
+        head = (f"add_boundary_event(id='{timer}', attached_to='{eid}', "
+                f"name='Срок ответа вышел', event_type='timer', duration='PT2H'")
+        if tgts:
+            return f"'{eid}': {head}, to='{tgts[0]}')"
+        outlet = _pool_end_target(s, eid)
+        if outlet:
+            return f"'{eid}': {head}, to='{outlet}')"
+        return (f"'{eid}': граничный таймер невозможна — у ожидания нет "
+                "исходящей дуги, а ветке «срок вышел» некуда уходить; правка не "
+                "выражается операцией, сначала связность маршрута")
+    srcs = sorted({f.source for f in s.incoming.get(eid, []) if f.source})
     if not srcs or not tgts:
         # Нога «срок вышел» вставается в дугу маршрута, а дуги, в которую её
         # ставить, нет: подсказка обязана сказать это прямо, а не слать за

@@ -26,6 +26,13 @@
 переписанная из примера, проходила бы аудит незамеченной: с планом-образцом её
 имена правок не пересекаются вовсе.
 
+Второе измерение того же вопроса — не «на что похож ответ», а «кто его прислал»
+(`answer_source`): рукописный пакет, собранным человеком, который знает аплайер,
+проходит его с первого запроса, и метрика улучшения на таком кейсе мерит аплайер
+и качество разметки, а не модель. Набор живых захватов и набор рукописных ответов
+печатаются в отчёте рядом с метриками (`origin_verdict`), чтобы доля принятых
+операций не выдавалась за оценку модели там, где модели в выборке нет.
+
 Здесь нет порога «достаточно хорошо»: список находок — это описание факта, а
 решение о том, что остаётся в наборе кейсов, принимает человек.
 """
@@ -75,6 +82,40 @@ OP_SPEC_ID = "op_spec"
 # Блок ЛУЧШИЕ ПРАКТИКИ: его содержимое зависит от запроса, поэтому это не
 # статический текст, а отложенная выборка из корпуса эталонов.
 RAG_ID = "rag_practices"
+
+# ---------------------------------------------------------------------------
+# Происхождение ОТВЕТА кейса — другое измерение, чем пересечение с образцом.
+#
+# `fixture_findings` отвечает на «не переписана ли фикстура из few-shot
+# промпта». Здесь вопрос другой: кто вообще прислал ответ, который измеряется.
+# Пакет операций, сочинённый человеком, который знает аплайер и словарь
+# `OP_SPEC`, проходит его с первого запроса, и `improve/op_acceptance` на таких
+# кейсах описывает аплайер и качество разметки, а не модель. Разделение взято то
+# же, чем уже оперирует `audit`: качество `real` и названный `source` — это
+# след живого прогона (у `warehouse_delivery.live.*` он ведётся от адреса
+# захвата), всё остальное — рукописный ответ. Параллельную классификацию
+# заводить нельзя: два слова об одном факте разъезжаются при первой же правке.
+# ---------------------------------------------------------------------------
+
+MODEL_CAPTURE = "model-capture"
+HAND_AUTHORED = "hand-authored"
+#: Ключевое слово отсутствует, вывести нечего, либо declared значение не из списка.
+UNKNOWN_SOURCE = "unknown"
+ANSWER_SOURCES = (MODEL_CAPTURE, HAND_AUTHORED, UNKNOWN_SOURCE)
+ANSWER_SOURCE_KEY = "answer_source"
+
+ORIGIN_LABELS = {
+    MODEL_CAPTURE: "живой захват ответа модели",
+    HAND_AUTHORED: "ответ написан рукой автора кейса",
+    UNKNOWN_SOURCE: "происхождение ответа не размечено",
+}
+# Короткая форма — в строку кейса, где длинная читается как тавтология
+# («ответ живой захват ответа модели»).
+ORIGIN_SHORT = {
+    MODEL_CAPTURE: "живой захват",
+    HAND_AUTHORED: "рукописный пакет",
+    UNKNOWN_SOURCE: "не размечено",
+}
 
 # Служебные слова имён эталонов корпуса: они есть у половины файлов («Exercise»,
 # «Process»), и совпадать сценарием с эталоном по ним нельзя — слов слишком
@@ -554,6 +595,94 @@ def fixture_findings(fixtures: Sequence[Dict[str, Any]],
     return out
 
 
+def answer_source(fixture: Optional[Mapping[str, Any]]) -> str:
+    """Кто прислал ответ кейса: живая модель или автор фикстуры.
+
+    Приоритет у явного ключа `answer_source` — автор кейса знает про своё
+    происхождение больше харнесса. Без ключа вывод берётся по тому же признаку,
+    которым `audit` уже ранжирует эталоны (`quality == "real"` и адрес захвата в
+    `source`): иначе классификация поехала бы двумя независимыми списками, и
+    первый же новый файл получил бы два разных ответа.
+
+    Значение вне списка — `unknown`, а не «рукописный по умолчанию»: метрика,
+    которая молча записала бы неразобранное происхождение в «не модель», выглядела
+    бы честнее, чем она есть.
+    """
+    data = fixture or {}
+    declared = str(data.get(ANSWER_SOURCE_KEY) or "").strip()
+    if declared:
+        return declared if declared in ANSWER_SOURCES else UNKNOWN_SOURCE
+    if str(data.get("quality") or "").strip() == "real" or data.get("source"):
+        return MODEL_CAPTURE
+    return HAND_AUTHORED
+
+
+def answer_source_declared(fixture: Optional[Mapping[str, Any]]) -> bool:
+    """Ключ авторства в фикстуре записан явно (а не выведен из `quality`/`source`)."""
+    return bool(str((fixture or {}).get(ANSWER_SOURCE_KEY) or "").strip())
+
+
+def origin_counts(sources: Sequence[str]) -> Dict[str, int]:
+    """Счёт по классам происхождения; ключи всегда на месте, даже с нулями."""
+    out = {MODEL_CAPTURE: 0, HAND_AUTHORED: 0, UNKNOWN_SOURCE: 0}
+    for source in sources:
+        out[source if source in out else UNKNOWN_SOURCE] += 1
+    return out
+
+
+def origin_verdict(counts: Mapping[str, int], min_n: int = 2) -> str:
+    """Одной строкой: что мерит метрика по составу своей выборки.
+
+    Формулировка обязана называть владельца числа, а не прятать его: доля
+    принятых операций, посчитанная по рукописным пакетам, — это мера аплайера и
+    мера разметки. Порог `min_n` берётся у `metrics.MIN_GATED_N` (там объяснено,
+    почему при одном кейсе вердикта нет), и живые захваты ниже него не дают
+    метрике права называться оценкой модели — даже когда вся выборка больше двух.
+    """
+    live = int(counts.get(MODEL_CAPTURE) or 0)
+    hand = int(counts.get(HAND_AUTHORED) or 0)
+    unknown = int(counts.get(UNKNOWN_SOURCE) or 0)
+    if unknown:
+        return (f"происхождение {unknown} кейса(ов) не размечено — состав выборки "
+                "неполон, выводить владельца метрики не из чего")
+    if not live:
+        return ("модель не оценивается: живых захватов нет, ответ написан рукой — "
+                "число описывает аплайер и автора фикстур")
+    if live < min_n:
+        return (f"живых захватов {live} < {min_n}: вердикта по модели нет, число "
+                f"считается по {live + hand} кейсам, из которых {hand} — рука")
+    if not hand:
+        return f"оценка модели: {live} живых захватов, рукописных ответов нет"
+    return (f"смешанная выборка: {live} живых захватов и {hand} рукописных — "
+            "число о модели размыто рукописными кейсами, читайте его вместе "
+            "с составом")
+
+
+def origin_lines(fixtures: Sequence[Mapping[str, Any]]) -> List[str]:
+    """Состав набора кейсов по происхождению ответа — строки для отчёта.
+
+    Печатается по plans и по improve-фикстурам раздельно: метрики улучшения
+    спорят именно про пакеты, а доля живых захватов среди планов на них не
+    влияет, и общая строка скрыла бы, что выборка улучшения — это один кейс.
+    """
+    out: List[str] = []
+    for kind in ("plan", "improve"):
+        docs = [f for f in fixtures if str(f.get("kind") or "plan") == kind]
+        if not docs:
+            continue
+        counts = origin_counts([answer_source(f) for f in docs])
+        implied = sum(1 for f in docs if not answer_source_declared(f))
+        out.append(
+            f"фикстуры «{kind}»: {len(docs)} — "
+            + f"{ORIGIN_LABELS[MODEL_CAPTURE]}: {counts[MODEL_CAPTURE]}, "
+            + f"{ORIGIN_LABELS[HAND_AUTHORED]}: {counts[HAND_AUTHORED]}"
+            + (f", {ORIGIN_LABELS[UNKNOWN_SOURCE]}: {counts[UNKNOWN_SOURCE]}"
+               if counts[UNKNOWN_SOURCE] else "")
+            + (f" (ключ авторства выведен из quality/source у {implied})"
+               if implied else ""))
+    return out
+
+
 # Форма маршрута: сравнение структур, а не названий. Одинаковая форма у разных
 # процессов — норма, поэтому порог высокий и с минимумом дуг: сходство считается
 # на схеме от MIN_ROUTE_EDGES рёбер, где совпадение формы уже значит больше, чем
@@ -768,6 +897,11 @@ def audit(scenarios: Optional[Sequence[Scenario]] = None,
         # мертва, и это должно быть видно в отчёте, а не выведено молчанием.
         "etalon_scenarios": sorted(etalons),
         "scenarios": sorted(sc.id for sc in chosen),
+        # Кто прислал ответы: метрика качества обязана называть состав своей
+        # выборки, иначе `improve/op_acceptance` по рукописным пакетам читается
+        # как вердикт модели.
+        "answer_sources": {str(f.get("id", "?")): answer_source(f) for f in docs},
+        "origin_lines": origin_lines(docs),
         "findings": findings,
         "covered": sorted({f["scenario"] for f in findings}),
         "clean": not findings,
@@ -805,6 +939,9 @@ def format_findings(report: Dict[str, Any]) -> List[str]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    from . import force_utf8_output
+
+    force_utf8_output()
     report = audit()
     print(f"образцов в промптах: {len(report['examples'])}")
     for sample in report["examples"]:

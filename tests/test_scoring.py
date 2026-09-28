@@ -1944,6 +1944,46 @@ class TestAdviceIsExecutable:
                              "name": "Срок подписи", "duration": "PT2H",
                              "to": "E"}])
 
+    def test_receive_task_recipe_is_applied_exactly_as_printed(self):
+        """Тот же класс, но пакет собирается ИЗ ТЕКСТА рецепта, а не из удобных
+        тесту значений.
+
+        В корпусе 367 файлов нет ни одного `receiveTask`, поэтому перепись
+        `eval.advice` этот класс подсказок не видела вовсе, и совет печатал
+        `add_boundary_event(attached_to='R', event_type='timer', duration='PT2H')`
+        без id нового узла (отказ «не задан id нового элемента») и без ветки
+        обработки (откат `_rollback_unrouted`: «остался без ветки обработки»).
+        Фикстура живёт здесь, а не в датасете: проверять надо текст правила, а не
+        плошить кейсы харнесса чужой зоны.
+        """
+        from eval.advice import parse_recipes
+
+        xml = _doc(
+            '<startEvent id="S" name="Начало"/>' + _flow("f1", "S", "R")
+            + '<receiveTask id="R" name="Зафиксировать подпись"/>'
+            + _flow("f2", "R", "E") + '<endEvent id="E" name="Готово"/>')
+        text = scorer.evaluate(xml)["recommendations_by_rule"]["wait_without_sla"]
+        ops = parse_recipes(text)
+        assert ops, f"в подсказке не осталось вызова операции: {text}"
+        # Оба операнда названы текстом: id нового узла и нога «срок вышел».
+        assert ops[0].get("id", "").startswith("new_"), ops
+        assert ops[0].get("to"), ops
+        self._assert_fixed(xml, "wait_without_sla", ops)
+
+    def test_receive_task_without_a_route_sends_the_timer_to_the_pool_exit(self):
+        """Ожидание без исходящей дуги — не повод советовать кружок в никуда:
+        ветка «срок вышел» ведёт в конечное событие того же пула."""
+        from eval.advice import parse_recipes
+
+        xml = _doc(
+            '<startEvent id="S" name="Начало"/>' + _flow("f1", "S", "R")
+            + '<receiveTask id="R" name="Зафиксировать подпись"/>'
+            + '<endEvent id="E" name="Готово"/>')
+        text = scorer.evaluate(xml)["recommendations_by_rule"]["wait_without_sla"]
+        ops = parse_recipes(text)
+        assert ops and ops[0].get("to") == "E", ops
+        self._assert_fixed(xml, "wait_without_sla", ops)
+
     def test_handoff_pingpong_names_the_step_that_should_receive_the_answer(self):
         """Совет говорит «ответ — следующему шагу», значит обязан назвать и
         следующий шаг, и дугу ответа: без них `connect` нечем заполнить, а

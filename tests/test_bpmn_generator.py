@@ -9,7 +9,9 @@ tests/test_improve_orchestrator.py), поэтому проверяется на�
 """
 import copy
 import json
+import re
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import pytest
 
@@ -1372,7 +1374,16 @@ class TestOutputIsApplierClean:
 
 class TestFailureReporting:
     def test_truncated_answer_is_not_generic_outage(self, monkeypatch):
-        result = _generate(monkeypatch,
+        """Обрезка ответа, из которого строится схема, — объяснимый отказ.
+
+        Прежняя версия теста подсовывала обрезку первому вызову и требовала от
+        него 400. Это сторожило ошибку: бюджет стадии состава
+        (`MAX_ROSTER_TOKENS`) маленький, режется она чаще маршрута, и
+        пользователь терял генерацию там, где одношаговый путь годен. Теперь
+        обрезка состава — деградация со строкой в заметках, а наружу как
+        `llm_truncated` уходит только обрезка того вызова, что даёт план.
+        """
+        result = _generate(monkeypatch, llm_client.LLMError("состава нет"),
                            llm_client.LLMTruncatedError("структура неполная"))
         assert result["status"] == "error"
         assert result["step"] == "llm_truncated"
@@ -1386,14 +1397,22 @@ class TestFailureReporting:
         assert "временно недоступен" in result["error"]
 
     def test_unparsable_answer_keeps_parse_step_and_applies_nothing(self, monkeypatch):
-        fake = FakeLLM(monkeypatch, "не json", "и повтор не json")
+        """Ни состав, ни план разобрать нельзя — отказ по шагу `parse`.
+
+        Стадия состава после этого прохода генерацию не роняет (см.
+        `TestDegradationIsVisible`), поэтому обращений стало четыре: `call_json`
+        повторяет разбор один раз на каждой стадии. Содержание при этом не
+        применяется — ровно то, что проверял прежний тест.
+        """
+        fake = FakeLLM(monkeypatch, "не json", "и повтор не json",
+                       "снова не json", "и снова не json")
         result = BPMNGenerator().generate("ВкусВилл: заявка, согласование, "
                                              "отгрузка со склада")
         assert result["status"] == "error"
         assert result["step"] == "parse"
         assert "bpmn" not in result and "structure" not in result
         # call_json повторяет разбор ровно один раз.
-        assert len(fake.calls) == 2
+        assert len(fake.calls) == 4
 
     def test_plan_without_elements_is_actionable_error(self, monkeypatch):
         result = _generate(monkeypatch, _plan(elements=[], flows=[]))
@@ -4069,3 +4088,546 @@ class TestReaskAcceptanceByPriority:
         reask = next(e for e in result["trace"] if e["node"] == "переспрос плана")
         assert reask["kept"] == "переспрос", reask
         assert "Клиент" in [p["name"] for p in result["structure"]["participants"]]
+
+
+class TestDegradationIsVisible:
+    """Отказ отдельной стадии — деградация в одношаговый путь, а не 400.
+
+    Прежний контур терял генерацию на стадии состава при обрезке ответа
+    (`MAX_ROSTER_TOKENS` маленький, режется она чаще маршрута) и при прозе
+    вместо JSON, хотя одношаговый путь с тем же описанием годен. Обратное было
+    неправдой не меньше: тихий `logger.warning` не отличал двухстадийный прогон
+    от заплатки — тот же класс ошибки, что с переносом участников в прогонах
+    #58–#62.
+    """
+
+    TEXT = "ВкусВилл: клиент оставляет заявку, менеджер её согласует"
+
+    def test_truncated_composition_stage_degrades_to_one_shot(self, monkeypatch):
+        fake = FakeLLM(monkeypatch,
+                       llm_client.LLMTruncatedError("состав обрезан"), _plan())
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["status"] == "success", result
+        assert len(fake.calls) == 2
+        assert _note(result["notes"], "стадия состава не отработала")
+        assert _note(result["notes"], "ответ модели обрезан по лимиту токенов")
+        first = result["trace"][0]
+        assert first["деградации"] == [
+            "стадия состава: ответ модели обрезан по лимиту токенов"], first
+        assert first["состав"] == "один вызов"
+
+    def test_prose_on_the_composition_stage_degrades_to_one_shot(self, monkeypatch):
+        fake = FakeLLM(monkeypatch, "сочинение вместо JSON", "всё равно сочинение",
+                       _plan())
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["status"] == "success", result.get("error")
+        assert _note(result["notes"], "ответ модели не разбирается в JSON")
+        # Два обращения на стадии состава (переспрос разбора живёт в
+        # `call_json`) и одно на одношаговый план.
+        assert len(fake.calls) == 3
+
+    def test_truncated_route_is_distinguishable_in_the_answer(self, monkeypatch):
+        """Обрезка стадии маршрута не превращается в «сервис недоступен»."""
+        roster = ('{"organizations": ["ВкусВилл"], "systems": [], '
+                  '"counterparties": [], "roles": []}')
+        fake = FakeLLM(monkeypatch, roster,
+                       llm_client.LLMTruncatedError("маршрут обрезан"), _plan())
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["status"] == "success"
+        assert len(fake.calls) == 3
+        assert _note(result["notes"], "стадия маршрута не отработала")
+        assert _note(result["notes"], "обрезан по лимиту токенов")
+
+    def test_oversized_request_is_not_swallowed_by_a_fallback(self, monkeypatch):
+        """Переполнение контекста — фатальность: повторять её одношаговым
+        запросом значит отдать ещё один платный вызов за тот же отказ."""
+        fake = FakeLLM(monkeypatch,
+                       llm_client.LLMRequestTooLargeError("не влезло"))
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["status"] == "error"
+        assert result["step"] == "llm_too_large"
+        assert len(fake.calls) == 1
+
+    def test_oversized_route_request_does_not_buy_another_call(self, monkeypatch):
+        roster = ('{"organizations": ["ВкусВилл"], "systems": [], '
+                  '"counterparties": [], "roles": []}')
+        fake = FakeLLM(monkeypatch, roster,
+                       llm_client.LLMRequestTooLargeError("не влезло"))
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["step"] == "llm_too_large"
+        assert len(fake.calls) == 2
+
+    def test_the_whole_plan_answer_is_not_a_degradation(self, monkeypatch):
+        """Стадия состава ответила планом целиком — это штатный одношаговый
+        путь, и врать про сбой в заметках контур не вправе."""
+        FakeLLM(monkeypatch, _plan())
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["trace"][0]["деградации"] == []
+        assert not [n for n in result["notes"] if "не отработала" in n], \
+            result["notes"]
+
+    def test_an_empty_composition_answer_is_visible(self, monkeypatch):
+        """Стадия состава ответила, но состава из ответа не вышло: это откат, и
+        он виден так же, как сбой транспорта."""
+        fake = FakeLLM(monkeypatch, '{"organizations": [], "roles": []}', _plan())
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["status"] == "success"
+        assert len(fake.calls) == 2
+        assert _note(result["notes"], "стадия состава не отработала")
+        assert result["trace"][0]["стадия состава"] == "сбой: состав не назван"
+
+    def test_an_empty_route_answer_is_visible(self, monkeypatch):
+        """Маршрут по утверждённому составу пришёл пустым — двухстадийного
+        прогона не было, и врать про него контур не вправе."""
+        roster = ('{"organizations": ["ВкусВилл"], "systems": [], '
+                  '"counterparties": [], "roles": []}')
+        fake = FakeLLM(monkeypatch, roster, _fence({"elements": []}), _plan())
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["status"] == "success"
+        assert len(fake.calls) == 3
+        assert _note(result["notes"], "стадия маршрута не отработала")
+        assert result["trace"][0]["стадия состава"] == \
+            "состав утверждён, маршрут одним вызовом"
+
+    def test_a_successful_two_stage_run_is_marked_as_such(self, monkeypatch):
+        roster = ('{"organizations": ["ВкусВилл"], "systems": [], '
+                  '"counterparties": [], "roles": []}')
+        FakeLLM(monkeypatch, roster, _plan(), _plan())
+        result = BPMNGenerator().generate(self.TEXT)
+        assert result["trace"][0]["стадия состава"] == \
+            "утверждён отдельным вызовом"
+        assert result["trace"][0]["деградации"] == []
+
+    def test_a_failed_re_ask_says_why(self, monkeypatch):
+        """Причина отказа от повтора читается из заметки, а не только из лога."""
+        bad = TestVacantPools._vacant()
+        FakeLLM(monkeypatch, bad, llm_client.LLMTruncatedError("повтор обрезан"))
+        result = BPMNGenerator().generate("ВкусВилл согласует заявку")
+        assert _note(result["notes"], "Повторный запрос модели не выполнен")
+        assert _note(result["notes"], "Повтор не выполнен: ответ модели обрезан")
+
+    def test_an_oversized_re_ask_is_skipped_not_fatal(self, monkeypatch):
+        """Переспрос не влезает в контекст — остаётся первый план.
+
+        Отказаться от правки можно, а потерять уже годную схему из-за того, что
+        второй запрос не помещается, нельзя: «план с нарушениями честнее отказа
+        генерации». И второй попытки с тем же гигантским запросом контур не
+        делает — это +2 платных обращения ради того же отказа.
+        """
+        bad = TestVacantPools._vacant()
+        fake = FakeLLM(monkeypatch, bad,
+                       llm_client.LLMRequestTooLargeError("не влезло"))
+        result = BPMNGenerator().generate("ВкусВилл согласует заявку")
+        assert result["status"] == "success", result.get("error")
+        assert len(fake.calls) == 2
+        assert _note(result["notes"], "Повтор не выполнен: запрос не помещается "
+                                      "в контекст модели"), result["notes"]
+
+
+class TestReAskGapBudget:
+    """Перечень нарушений в переспросе ограничен, как и остальные его части.
+
+    На схеме из ~300 элементов `plan_gaps` выдаёт десятки пунктов, и без потолка
+    этот блок был крупнейшей частью запроса — то есть источником переполнения
+    контекста и обрезки, которые контур потом читал как сбой модели.
+    """
+
+    GAPS = [
+        "ты сама назвала «Клиент» действующим лицом описания, но в плане нет ни "
+        "пула, ни дорожки с таким именем",
+        "описание задаёт ожидание («в течение двух часов»), а в плане нет ни "
+        "одного таймера",
+    ] + [f"поток F{i} (A{i} -> B{i}) противоречит правилу: выход из конечного "
+         f"события; перестрой маршрут без этой дуги " + "х" * 90
+         for i in range(30)]
+
+    def test_the_cut_keeps_the_important_and_drops_the_tail(self, monkeypatch):
+        monkeypatch.setattr(bpmn_generator, "MAX_RETRY_GAPS_CHARS", 300)
+        asked = bpmn_generator._asked_gaps(self.GAPS, frozen=False)
+        assert asked[0] == self.GAPS[0] and asked[1] == self.GAPS[1]
+        assert len(asked) < len(self.GAPS)
+        assert not any(g in asked for g in self.GAPS[2:])
+
+    def test_a_composition_requirement_is_never_cut(self, monkeypatch):
+        """Требование к составу остаётся даже когда бюджет уже исчерпан:
+        молчаливо обрезать его значило бы спрашивать о косметике и мерить
+        повтором то, о чём не просили."""
+        monkeypatch.setattr(bpmn_generator, "MAX_RETRY_GAPS_CHARS", 10)
+        rank0 = [g for g in self.GAPS if bpmn_generator._gap_priority(g) == 0]
+        assert len(rank0) == 1
+        asked = bpmn_generator._asked_gaps([*self.GAPS, *rank0], frozen=False)
+        for gap in rank0:
+            assert gap in asked
+
+    def test_the_question_carries_exactly_what_the_gate_compares(
+            self, monkeypatch):
+        """Что спросили — с тем и сравнивают: число в трейсе, блок в промпте и
+        список для вердикта «повтор улучшил» обязаны быть одним списком."""
+        monkeypatch.setattr(bpmn_generator, "MAX_RETRY_GAPS_CHARS", 400)
+        asked = bpmn_generator._asked_gaps(self.GAPS, frozen=False)
+        fake = FakeLLM(monkeypatch, '{"fixes": []}')
+        _plan_, notes = BPMNGenerator()._retry_structure(
+            "ВкусВилл заводит заявку",
+            {"participants": [], "elements": [], "flows": []},
+            self.GAPS, frozen=False, trace={})
+        question = fake.calls[0][1]["content"]
+        block = question.split("Нарушения в текущем плане:\n", 1)[1].split(
+            "\n\n")[0]
+        listed = [line[2:] for line in block.splitlines()
+                  if line.startswith("- ")]
+        assert listed == asked
+        assert _note(notes, "сокращён"), notes
+
+    def test_the_gate_counts_what_it_hid_from_the_model(self, monkeypatch):
+        """Скрытые от повтора нарушения видны в трейсе: иначе «контур молчал»
+        неотличимо от «повтора не было»."""
+        bad = TestVacantPools._vacant()
+        FakeLLM(monkeypatch, bad, _fence(bad))
+        baseline = BPMNGenerator().generate("ВкусВилл согласует заявку")
+        reask = next(t for t in baseline["trace"] if t["node"] == "переспрос плана")
+        assert reask["gaps_asked"] == reask["gaps_before"], reask
+        # Бюджет ровно в одно нарушение: следующий по важности пункт не влезает,
+        # и контур обязан признать, что спрашивал не обо всём.
+        gaps = baseline["gaps"]
+        monkeypatch.setattr(bpmn_generator, "MAX_RETRY_GAPS_CHARS",
+                            len(gaps[0]) + 5)
+        FakeLLM(monkeypatch, bad, _fence(bad))
+        cut = BPMNGenerator().generate("ВкусВилл согласует заявку")
+        reask = next(t for t in cut["trace"] if t["node"] == "переспрос плана")
+        assert reask["gaps_asked"] < reask["gaps_before"], reask
+        assert reask["gaps_asked"] + reask["deferred_actor_gaps"] \
+            == reask["gaps_before"]
+        assert _note(cut["notes"], "Перечень нарушений для повтора сокращён"), \
+            cut["notes"]
+
+    def test_an_unbounded_list_is_left_alone(self):
+        short = ["пул «Склад» без единого шага"]
+        assert bpmn_generator._asked_gaps(short, frozen=False) == short
+
+
+class TestRenamedIdsRebindFlows:
+    """Коллизия id не имеет права стоить дуг: починка переименовала узел — за
+    ним ведёт и поток, на него ссылающийся.
+
+    Прежний путь был тихим: проигравший id получал суффикс, потоки, называвшие
+    прежний id, удалялись как «одного из элементов нет в плане», а
+    `_ensure_reachability` присоединял сироту от старта — маршрут модели
+    заменялся выдуманными починкой дугами.
+    """
+
+    def test_a_flow_follows_the_renamed_element(self):
+        raw = {"participants": ["ВкусВилл"],
+               "lanes": [{"id": "T1", "name": "Менеджер",
+                          "participant": "ВкусВилл"}],
+               "elements": [
+                   {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                    "participant": "ВкусВилл", "lane": "T1"},
+                   {"id": "T1", "kind": "userTask", "name": "Проверить заявку",
+                    "participant": "ВкусВилл", "lane": "T1"},
+                   {"id": "E1", "kind": "endEvent", "name": "Готово",
+                    "participant": "ВкусВилл", "lane": "T1"}],
+               "flows": [{"id": "F1", "source": "S1", "target": "T1"},
+                         {"id": "F2", "source": "T1", "target": "E1"}]}
+        structure, notes = repair_structure(copy.deepcopy(raw))
+        renamed = next(e for e in structure["elements"]
+                       if e["name"] == "Проверить заявку")
+        assert renamed["id"] != "T1", structure["elements"]
+        flows = {f["id"]: f for f in structure["flows"]}
+        assert flows["F1"]["target"] == renamed["id"], structure["flows"]
+        assert flows["F2"]["source"] == renamed["id"], structure["flows"]
+        assert _note(notes, "дуга перепривязана"), notes
+        # Выдуманных дуг связности нет: маршрут модели дожил до схемы сам.
+        assert not _note(notes, "подключён от стартового события"), notes
+
+    def test_a_boundary_event_follows_its_renamed_host(self):
+        raw = {"participants": ["ВкусВилл"],
+               "lanes": [{"id": "A1", "name": "Менеджер",
+                          "participant": "ВкусВилл"}],
+               "elements": [
+                   {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                    "participant": "ВкусВилл", "lane": "A1"},
+                   {"id": "A1", "kind": "userTask", "name": "Проверить",
+                    "participant": "ВкусВилл", "lane": "A1"},
+                   {"id": "B1", "kind": "boundaryEvent", "name": "Просрочка",
+                    "participant": "ВкусВилл", "attached_to": "A1",
+                    "event_definition": "timer", "timer": "PT2H"},
+                   {"id": "E1", "kind": "endEvent", "name": "Готово",
+                    "participant": "ВкусВилл", "lane": "A1"}],
+               "flows": [{"id": "F1", "source": "S1", "target": "A1"},
+                         {"id": "F2", "source": "A1", "target": "E1"}]}
+        structure, notes = repair_structure(raw)
+        host = next(e for e in structure["elements"] if e["name"] == "Проверить")
+        boundary = next(e for e in structure["elements"]
+                        if e["kind"] == "boundaryEvent")
+        assert boundary["attached_to"] == host["id"], structure["elements"]
+        assert _note(notes, "событие прикреплено к"), notes
+
+    def test_an_ambiguous_reference_still_points_at_the_winning_id(self):
+        """Два узла с одним id: дуга ведёт туда, где id остался — перепривязка
+        не вправе украсть маршрут победителя."""
+        raw = {"participants": ["ВкусВилл"], "lanes": [],
+               "elements": [
+                   {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                    "participant": "ВкусВилл", "lane": ""},
+                   {"id": "A1", "kind": "userTask", "name": "Первый",
+                    "participant": "ВкусВилл", "lane": ""},
+                   {"id": "A1", "kind": "userTask", "name": "Второй",
+                    "participant": "ВкусВилл", "lane": ""}],
+               "flows": [{"id": "F1", "source": "S1", "target": "A1"}]}
+        structure, notes = repair_structure(raw)
+        flow = next(f for f in structure["flows"] if f["id"] == "F1")
+        assert flow["target"] == "A1", structure["flows"]
+        assert not _note(notes, "дуга перепривязана"), notes
+
+
+class TestControlCharacters:
+    """Непечатаемые символы вычищаются на входе в поле, а не только на эмиссии.
+
+    Эмиссия отдавала `\\x00`–`\\x08` как есть: схема не разбиралась обратно, а
+    API отвечал 200. Заодно разъезжался подсчёт длины: лимит мерился по строке,
+    из которой потом что-то выбрасывалось.
+    """
+
+    def test_a_control_character_never_reaches_the_xml(self):
+        raw = {"participants": ["ВкусВилл"],
+               "lanes": [{"id": "L1", "name": "Менеджер",
+                          "participant": "ВкусВилл"}],
+               "elements": [
+                   {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                    "participant": "ВкусВилл", "lane": "L1"},
+                   {"id": "T1", "kind": "userTask", "name": "Проверить\x02\x07",
+                    "participant": "ВкусВилл", "lane": "L1",
+                    "documentation": "шаг\x00делается\x08тихо"},
+                   {"id": "E1", "kind": "endEvent", "name": "Готово",
+                    "participant": "ВкусВилл", "lane": "L1"}],
+               "flows": [{"id": "F1", "source": "S1", "target": "T1"},
+                         {"id": "F2", "source": "T1", "target": "E1"}]}
+        structure, notes = repair_structure(copy.deepcopy(raw))
+        step = next(e for e in structure["elements"] if e["id"] == "T1")
+        assert step["name"] == "Проверить", structure["elements"]
+        assert step["documentation"] == "шагделаетсятихо"
+        assert _note(notes, "очищен от непечатаемых символов"), notes
+
+        xml = BPMNGenerator()._generate_bpmn_xml(structure)
+        root = ET.fromstring(xml)          # прежний XML на этом падал
+        assert root is not None and build_inventory(xml)["elements"]
+
+    def test_a_limited_field_is_measured_after_the_scrub(self):
+        """Длина считается по чистому тексту: иначе в схему уезжало поле короче,
+        чем ждал подсчёт."""
+        dirty = "\x03" * 30 + "О" * 150
+        notes: list = []
+        clipped = bpmn_generator._clip(dirty, bpmn_generator.NAME_LIMIT, notes,
+                                       "Название элемента")
+        assert len(clipped) == bpmn_generator.NAME_LIMIT
+        assert "\x03" not in clipped
+        assert _note(notes, "укорочен") and _note(notes, "очищен"), notes
+
+    def test_a_pool_created_by_the_contour_is_scrubbed_too(self):
+        raw = {"participants": ["ВкусВилл"], "lanes": [],
+               "elements": [
+                   {"id": "T1", "kind": "userTask", "name": "Шаг",
+                    "participant": "Друг\x01ое", "lane": ""}],
+               "flows": []}
+        structure, notes = repair_structure(raw)
+        pools = [p["name"] for p in structure["participants"]]
+        assert "Другое" in pools, pools
+        assert "\x00" not in "".join(pools)
+        ET.fromstring(BPMNGenerator()._generate_bpmn_xml(structure))
+
+
+class TestBudgetConstantsAreHonest:
+    """Лимиты либо применяются, либо их нет: мёртвая константа с комментарием
+    про несуществующую функцию — обещание, которого код не даёт.
+
+    Срезаться маршрутом модели починка не вправе (см.
+    `test_a_long_route_is_not_cut_by_the_contour`), поэтому потолок над числом
+    элементов и потоков был только текстом. Что реально ограничено — правки
+    самой починки (`MAX_REACH_FLOWS`, `MAX_MERGE_GATEWAYS`,
+    `MAX_SPLIT_GATEWAYS`), и каждая из них оставляет заметку.
+    """
+
+    def test_no_max_budget_constant_is_dead_weight(self):
+        source = Path(bpmn_generator.__file__).read_text(encoding="utf-8")
+        dead = sorted(name for name in
+                      set(re.findall(r"^([A-Z0-9_]+) =", source, re.M))
+                      if name.startswith("MAX_") and source.count(name) < 2)
+        assert not dead, f"константы без применения: {dead}"
+
+    def test_the_stale_claim_about_a_silent_cut_is_gone(self):
+        source = Path(bpmn_generator.__file__).read_text(encoding="utf-8")
+        assert "_over_budget" not in source
+        assert not hasattr(bpmn_generator, "MAX_FLOWS")
+
+    def test_the_repair_expansion_is_still_bounded_and_narrated(self,
+                                                                monkeypatch):
+        monkeypatch.setattr(bpmn_generator, "MAX_REACH_FLOWS", 5)
+        elements = [{"id": f"E{i}", "kind": "task", "name": f"Шаг {i}",
+                     "participant": "ВкусВилл", "lane": ""}
+                    for i in range(30)]
+        elements[0]["kind"] = "startEvent"
+        elements[-1]["kind"] = "endEvent"
+        raw = {"participants": ["ВкусВилл"], "lanes": [], "elements": elements,
+               "flows": [{"id": "F0", "source": "E0", "target": "E1"}]}
+        structure, notes = repair_structure(raw)
+        invented = [f for f in structure["flows"] if f["id"].startswith("Flow_")]
+        # По бюджету на каждый из двух шагов связности — и ни одним больше.
+        assert len(invented) <= 10, len(invented)
+        assert _note(notes, "лимит"), notes[:3]
+
+
+class TestWaitWithoutDeadlineGate:
+    """Ожидание без названного срока — нарушение, которое план-гейт видит.
+
+    Прежний триггер требовал срока (`_DEADLINE_RE`), и «ждёт подрядчика» уезжал
+    в план молча. Расширенный список нарушений уже стоил живым прогонам
+    потерянного состава (сводка гейта 0.876 -> 0.811, `expected_participants`
+    0.75 -> 0.25), поэтому новое нарушение по умолчанию не участвует в
+    переспросе и не может снять утверждённый состав: оно измеряется заметкой и
+    списком нарушений.
+    """
+
+    PLAN = {"participants": ["ВкусВилл"],
+            "lanes": [{"id": "L1", "name": "Менеджер",
+                       "participant": "ВкусВилл"}],
+            "elements": [
+                {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                 "participant": "ВкусВилл", "lane": "L1"},
+                {"id": "T1", "kind": "userTask", "name": "Согласовать заявку",
+                 "participant": "ВкусВилл", "lane": "L1"},
+                {"id": "E1", "kind": "endEvent", "name": "Готово",
+                 "participant": "ВкусВилл", "lane": "L1"}],
+            "flows": [{"id": "F1", "source": "S1", "target": "T1"},
+                      {"id": "F2", "source": "T1", "target": "E1"}]}
+
+    WAIT = "ВкусВилл согласует заявку и ждёт ответа менеджера."
+
+    def test_a_wait_verb_without_a_deadline_is_a_gap(self):
+        gaps = bpmn_generator.plan_gaps(self.PLAN, self.WAIT)
+        hit = [g for g in gaps if "ожидание без срока" in g]
+        assert hit, gaps
+        assert "ждёт" in hit[0]
+
+    def test_it_never_enters_the_re_ask(self):
+        """Ни при незакреплённом, ни при утверждённом составе: переспрос
+        переписывает план, а правка таймером этого плана стоит потерь
+        участников."""
+        gaps = bpmn_generator.plan_gaps(self.PLAN, self.WAIT)
+        wait = [g for g in gaps if "ожидание без срока" in g]
+        assert bpmn_generator._askable_gaps(wait, frozen=False) == []
+        assert bpmn_generator._askable_gaps(wait, frozen=True) == []
+
+    def test_the_gate_still_asks_about_the_named_deadline(self):
+        """Правило со сроком остаётся в переспросе: новое нарушение не должно
+        вытеснить его из общего класса «таймер»."""
+        gaps = bpmn_generator.plan_gaps(
+            self.PLAN, "ВкусВилл ждёт ответ в течение двух часов.")
+        asked = bpmn_generator._askable_gaps(gaps, frozen=False)
+        assert [g for g in asked if "задаёт ожидание" in g], gaps
+        assert not [g for g in gaps if "ожидание без срока" in g]
+
+    def test_a_waiting_event_closes_the_gate(self):
+        plan = json.loads(json.dumps(self.PLAN))
+        plan["elements"].append(
+            {"id": "C1", "kind": "intermediateCatchEvent",
+             "name": "Ждём ответ", "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "message"})
+        assert not [g for g in bpmn_generator.plan_gaps(plan, self.WAIT)
+                    if "ожидание без срока" in g]
+
+    def test_the_contour_does_not_re_ask_because_of_it(self, monkeypatch):
+        fake = FakeLLM(monkeypatch, _fence(self.PLAN))
+        result = BPMNGenerator().generate(self.WAIT)
+        assert result["attempts"] == 1
+        assert len(fake.calls) == 1
+        assert any("ожидание без срока" in g for g in result["gaps"]), result["gaps"]
+        assert _note(result["notes"], "план-гейт:"), result["notes"]
+        assert _note(result["notes"], "в переспрос не отправлено"), result["notes"]
+
+    def test_the_flag_puts_the_demand_into_the_re_ask(self, monkeypatch):
+        """Включённый триггер — тот же переспрос: для живого прогона харнесса,
+        где потерю состава меряют отдельно и готовы за неё платить."""
+        monkeypatch.setattr(bpmn_generator, "WAIT_GAPS_ASKABLE", True)
+        fake = FakeLLM(monkeypatch, _fence(self.PLAN), _fence(self.PLAN))
+        result = BPMNGenerator().generate(self.WAIT)
+        assert result["attempts"] == 2
+        assert "ожидание без срока" in fake.calls[1][1]["content"]
+        assert _note(result["notes"], "отправлено в переспрос"), result["notes"]
+
+    def test_a_text_without_a_wait_is_silent(self):
+        gaps = bpmn_generator.plan_gaps(
+            self.PLAN, "ВкусВилл согласует заявку и закрывает её.")
+        assert not [g for g in gaps if "ожидание без срока" in g], gaps
+
+
+class TestMentionsAreIndexed:
+    """Совпадение имени с описанием читается по основе, но не перебором.
+
+    `_mentioned` вызывается по разу на пул, на роль и на потерянного участника,
+    а план-гейт за прогон читается четыре раза: прежний перебор списка слов на
+    каждое имя — чистая трата процессора на больших схемах.
+    """
+
+    def test_an_inflected_name_still_matches(self):
+        words = bpmn_generator._text_words("Товар передают получателю под "
+                                           "подпись.")
+        assert bpmn_generator._mentioned("Получатель", words)
+        assert not bpmn_generator._mentioned("Отправитель", words)
+
+    def test_a_composite_name_needs_every_part(self):
+        words = bpmn_generator._text_words("Бюджетный контролёр сверяет смету.")
+        assert bpmn_generator._mentioned("Бюджетный контролёр", words)
+        assert not bpmn_generator._mentioned("Бюджетный ревизор", words)
+
+    def test_a_short_name_matches_only_whole(self):
+        """У аббревиатуры и короткого слова основы нет: «банк» в тексте живёт
+        «банком», а аббревиатура «WMS» не находится по половинке своего имени."""
+        words = bpmn_generator._text_words("Банк выдаёт справку.")
+        assert bpmn_generator._mentioned("Банк", words)
+        assert bpmn_generator._mentioned("Банк", ["банк"])
+        assert not bpmn_generator._mentioned("WMS", words)
+
+    def test_the_index_of_a_text_is_built_once(self):
+        first = bpmn_generator._text_words("Кладовщик ждёт перевозчика.")
+        assert bpmn_generator._text_words("Кладовщик ждёт перевозчика.") is first
+        assert isinstance(first, bpmn_generator._Words)
+        assert "кладовщик" in first and "кладовщ" not in first
+        assert first.has_stem("кладовщ")
+
+    def test_the_gate_reads_the_same_words_it_checked_before(self):
+        """Поведение план-гейта на фразе с падежом не изменилось: имя,
+        названное в описании, не считается выдуманным."""
+        plan = {"participants": ["Получатель"],
+                "elements": [{"id": "T1", "kind": "userTask",
+                              "name": "Принять груз",
+                              "participant": "Получатель"}], "flows": []}
+        gaps = bpmn_generator.plan_gaps(
+            plan, "Груз передают получателю под подпись, водитель "
+                  "расписывается.")
+        assert not [g for g in gaps if "Получатель» не упоминается" in g], gaps
+
+
+def test_generation_budget_stops_before_the_next_model_call(monkeypatch):
+    """Общий бюджет времени на прогон проверяется на границе стадий.
+
+    Транспортный `GIGACHAT_CALL_BUDGET_SECONDS` ограничивает ОДИН вызов модели,
+    а генерация — до десяти завершений в очереди к провайдеру
+    (`GIGACHAT_MAX_CONCURRENT=1`): без потолка на прогон один запрос занимает
+    минуты, и отличить его от сбоя провайдера было нечем ни пользователю, ни
+    харнессу. Обрыв — до вызова, а не после: начатый запрос уже оплачен.
+    """
+    from core import bpmn_generator
+
+    monkeypatch.setattr(bpmn_generator, "GENERATION_BUDGET_SECONDS", -1)
+    calls = []
+    monkeypatch.setattr(
+        bpmn_generator, "call_json",
+        lambda *a, **k: (calls.append(1), {})[1])
+
+    result = bpmn_generator.BPMNGenerator().generate(
+        "Кладовщик собирает заказ, бухгалтерия выставляет счёт подрядчику.")
+
+    assert result["status"] == "error"
+    assert result["step"] == "llm"          # 503 + Retry-After, а не 400
+    assert "время" in result["error"]
+    assert calls == []

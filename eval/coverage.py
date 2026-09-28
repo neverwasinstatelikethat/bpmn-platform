@@ -29,8 +29,8 @@ import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from core.bpmn_scoring import ACTIVITY_TAGS, BPMNScorer, _local
-from eval.invariants import (NO_DATA, ORACLE_STRICTER, SCORER_STRICTER,
-                             business_agreement, check_xml)
+from eval.invariants import (AGREE, ALL_CHECKS, NO_DATA, ORACLE_STRICTER,
+                             SCORER_STRICTER, business_agreement, check_xml)
 
 # Правила, которые ОБЯЗАНЫ находить нарушение на реальном корпусе: они про
 # форму, а корпус рукописный и полным формой нарушений. Правило из этого списка,
@@ -148,6 +148,39 @@ def offenders_are_activities(report: Dict[str, Any], rule: str) -> Optional[bool
     if not kinds:
         return None
     return all(tag in ACTIVITY_TAGS for tag in kinds)
+
+
+# Инварианты оракула, которые ОБЯЗАНЫ падать на реальном корпусе: у такого
+# имени провал — найденный класс дефектов, а молчание на 367 схемах означает,
+# что проверка заряжена выдуманным дефектом и в гейте она ничего не держит.
+# `dangling_flows` попала сюда ровно потому, что её класс уже называл скоринг
+# (`sequence_flows`: 107 висячих дуг в 33 схемах) — инвариант добавлен не ради
+# строчки в таблице, а потому что второй читатель её не видел.
+MUST_FIRE_ON_CORPUS_INVARIANTS = ("dangling_flows",)
+
+
+def oracle_firing(xmls: Iterable[str]) -> Dict[str, int]:
+    """Сколько схем корпуса проваливают каждый инвариант оракула (по применимым)."""
+    counts: Dict[str, int] = {}
+    for xml in xmls:
+        try:
+            checks = check_xml(xml)
+        except Exception:  # noqa: BLE001 — оракул не должен ронять перепись
+            continue
+        for check in checks.values():
+            if check.applicable and not check.ok:
+                counts[check.name] = counts.get(check.name, 0) + 1
+    return counts
+
+
+def format_oracle_firing(counts: Dict[str, int]) -> List[str]:
+    lines = ["оракул: по скольким схемам корпуса бьёт каждый инвариант:"]
+    for name in sorted(counts, key=lambda n: (-counts[n], n)):
+        lines.append(f"  {name:28} проваливают {counts[name]:4} схем")
+    silent = sorted(set(ALL_CHECKS) - set(counts))
+    lines.append("  ни на одной схеме не упал: "
+                 + (", ".join(silent) if silent else "нет таких"))
+    return lines
 
 
 def tags_of(xml: str) -> Dict[str, str]:
@@ -314,9 +347,60 @@ def format_agreement(agreement: Dict[str, Any],
     return lines
 
 
+def gate_problems(report: Dict[str, Any],
+                  agreement: Optional[Dict[str, Any]],
+                  notation: Optional[Dict[str, Any]],
+                  firing: Optional[Dict[str, int]] = None) -> List[str]:
+    """То, что рэтчеты из pytest считают браком переписи, — теми же словами.
+
+    До этого CLI возвращал 0 всегда, и «забыли запустить тесты» в отчёте
+    неотличимо от «всё чисто»: ровно те находки, которыми `eval.coverage`
+    когда-то ловил слепые правила (`approval_chain`, 2 схемы с висячим тупиком),
+    молча проходили мимо человека, который запускал перепись руками.
+    """
+    problems: List[str] = []
+    failed_here = {rule for rule, bucket in report["rules"].items()
+                    if bucket["failed"]}
+    blind = sorted(rule for rule in MUST_FIRE_ON_CORPUS
+                   if rule in report["rules"] and rule not in failed_here)
+    if blind:
+        problems.append("правила, обязанные находить нарушение на корпусе, молчат: "
+                        + ", ".join(blind))
+    for rule in ("naming", "documentation"):
+        if offenders_are_activities(report, rule) is False:
+            problems.append(f"{rule}: нарушители не активности — совет правит "
+                            "не те узлы")
+    if firing is not None:
+        quiet = [name for name in MUST_FIRE_ON_CORPUS_INVARIANTS
+                 if not firing.get(name)]
+        if quiet:
+            problems.append("инварианты оракула, не упавшие ни на одной схеме "
+                            "корпуса (заряжены выдуманным дефектом): "
+                            + ", ".join(quiet))
+    for title, table in (("бизнес-слой", agreement), ("нотационный слой", notation)):
+        if table is None:
+            problems.append(f"{title}: сверка с оракулом не выполнялась "
+                            "(--no-agreement) — прощения линейки не проверялись")
+            continue
+        forgiven = sorted(rule for rule, bucket in table["by_rule"].items()
+                          if bucket.get("forgiven") or bucket.get("unseen"))
+        if forgiven:
+            problems.append(
+                f"{title}: линейка прощает то, что видит оракул ("
+                + ", ".join(forgiven) + ")")
+        odd = unexplained(table)
+        if odd:
+            problems.append(f"{title}: расхождения вне объявленных в замысле: "
+                            + ", ".join(odd))
+    return problems
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
 
+    from . import force_utf8_output
+
+    force_utf8_output()
     parser = argparse.ArgumentParser(
         description="Покрытие детекции скоринга на реальных схемах корпуса")
     parser.add_argument("--limit", type=int, default=0,
@@ -333,14 +417,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = census(scorer, xmls, tags_of=tags_of)
     agreement = (None if args.no_agreement
                  else agreement_census(scorer, xmls, names=names))
+    firing = oracle_firing(xmls)
     rules = list((scorer.rules if hasattr(scorer, "rules") else report["rules"]))
     for line in format_report(report, rules, agreement):
         print(line)
+    notation = None
     if agreement is not None:
         notation = agreement_census(scorer, xmls, names=names,
                                     pairs=NOTATION_PAIRS)
         for line in format_agreement(notation, "нотационный слой"):
             print(line)
+    for line in format_oracle_firing(firing):
+        print(line)
+    problems = gate_problems(report, agreement, notation, firing)
+    if problems:
+        print("")
+        print("ГЕЙТ ПЕРЕРИШИ (то же, что рэтчеты в tests/test_eval_coverage.py):")
+        for line in problems:
+            print(f"  ✗ {line}")
+        return 1
+    print("")
+    print("ГЕЙТ ПЕРЕРИШИ: расхождений и молчащих правил нет.")
     return 0
 
 

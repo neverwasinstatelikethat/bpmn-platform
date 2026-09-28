@@ -43,6 +43,14 @@ def _q(local: str) -> str:
     return f"{{{BPMN_NS}}}{local}"
 
 
+def _q_di(local: str) -> str:
+    return f"{{{BPMNDI_NS}}}{local}"
+
+
+# Записи графики, ссылающиеся на элемент схемы атрибутом `bpmnElement` (IDREF).
+DI_ELEMENT_TAGS = (_q_di("BPMNShape"), _q_di("BPMNEdge"))
+
+
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
@@ -119,6 +127,116 @@ EVENT_DEFINITIONS: Dict[str, Tuple[str, str]] = {
     "error": ("errorEventDefinition", ""),
     "signal": ("signalEventDefinition", ""),
 }
+
+# Значения полей типа читаются одним правилом — по той же логике, что уже
+# применена к ИМЕНАМ операций (`OP_ALIASES`). Раньше короткое имя и любой
+# регистр принимал только `_op_set_task_type`, а `_op_add_node` сверял
+# `task_type` дословно и молчал про поле `type`: прогон
+# `apply_operations(xml, [{"op":"add_task","type":"userTask",…}])` давал
+# `status=success`, `applied=["add_task"]` и `<task>` в XML — тихая неправильная
+# запись в пользовательскую схему с отчётом, обещающим правку, которой нет.
+# Форма записи тип не меняет, поэтому её обязан принимать каждый, кто тип читает.
+GATEWAY_TYPE_TAGS = ("exclusiveGateway", "parallelGateway", "inclusiveGateway")
+FLOW_TYPES = ("sequence", "message")
+BOUNDARY_EVENT_TYPES = ("timer", "error")
+
+
+def _alias_key(value: Any) -> str:
+    """Ключ значения поля: слитное написание в нижнем регистре.
+
+    Пробел, дефис и подчёркивание разделителями имени не считаются, иначе
+    `user task` и `user-task` читались бы как неизвестный тип."""
+    return re.sub(r"[\s_\-]+", "", str(value if value is not None else "")).lower()
+
+
+def _stem_aliases(tags: Tuple[str, ...], suffix: str) -> Dict[str, str]:
+    """Полное имя тега и его корень — равноправные ключи одного значения:
+    `userTask` и `user`, `exclusiveGateway` и `exclusive`."""
+    aliases: Dict[str, str] = {}
+    for tag in tags:
+        aliases[_alias_key(tag)] = tag
+        stem = tag[: -len(suffix)] if tag.endswith(suffix) else tag
+        aliases[_alias_key(stem) or _alias_key(tag)] = tag
+    return aliases
+
+
+def _definition_aliases() -> Dict[str, str]:
+    """Имена определений событий: короткое (`timer`) и полное
+    (`timerEventDefinition`) — то и другое принимает `EVENT_DEFINITIONS`."""
+    aliases: Dict[str, str] = {}
+    for key in EVENT_DEFINITIONS:
+        aliases[_alias_key(key)] = key
+        aliases[_alias_key(key + "EventDefinition")] = key
+    return aliases
+
+
+TASK_TYPE_ALIASES = _stem_aliases(TASK_TYPE_TAGS, "Task")
+GATEWAY_TYPE_ALIASES = _stem_aliases(GATEWAY_TYPE_TAGS, "Gateway")
+EVENT_TYPE_ALIASES = _stem_aliases(tuple(EVENT_TYPE_TO_TAG.values()), "Event")
+EVENT_DEFINITION_ALIASES = _definition_aliases()
+# `flow_type` — не имя тега, а его корень: `sequenceFlow` и `messageFlow` в
+# схеме читаются как те же `sequence` и `message`, иначе форма «полное имя
+# потока» из ответа модели отвергалась бы как неизвестный тип.
+FLOW_TYPE_ALIASES = {**_stem_aliases(FLOW_TYPES, "Flow"),
+                     **{_alias_key(f + "Flow"): f for f in FLOW_TYPES}}
+
+
+def _typed_value(op: Dict[str, Any], fields: Tuple[str, ...],
+                 aliases: Dict[str, str], allowed: Tuple[str, ...],
+                 label: str, extra: str = "") -> str:
+    """Значение поля типа из операции в любой принятой форме.
+
+    `fields` — имена, которыми модель может назвать тип: у части операций поле
+    называется также `type`, и `"type":"userTask"` уже работал у
+    `set_task_type`, значит он обязан работать и у `add_task` — иначе тот же
+    текст, прочитанный моделью в промпте, даёт разное поведение в разных
+    операциях.
+
+    Пустое поле — пустая строка, а не отказ: обязательность значения знает
+    вызывающая операция (у `add_event` пустой `event_type` — «событию нужно
+    определение», у `set_task_type` — «неизвестный тип шага»). Отказ называется
+    только когда форма действительно неоднозначна, и перечисляет принятые
+    значения.
+    """
+    raw = ""
+    for field in fields:
+        candidate = str(op.get(field) or "").strip()
+        if candidate:
+            raw = candidate
+            break
+    if not raw:
+        return ""
+    value = aliases.get(_alias_key(raw), "")
+    if value not in allowed:
+        raise _Skip(f"неизвестный {label} '{raw}'",
+                    "допустимы: " + ", ".join(allowed) + extra)
+    return value
+
+
+def _task_type_of(op: Dict[str, Any], allowed: Tuple[str, ...],
+                  extra: str = "") -> str:
+    return _typed_value(op, ("task_type", "type"), TASK_TYPE_ALIASES,
+                        allowed, "тип шага", extra)
+
+
+def _event_definition_of(op: Dict[str, Any]) -> Optional[str]:
+    """Определение события из `event_definition` (или `definition`) в любой
+    принятой форме: `timer`, `TIMER`, `timerEventDefinition`."""
+    raw = ""
+    for field in ("event_definition", "definition"):
+        candidate = str(op.get(field) or "").strip()
+        if candidate:
+            raw = candidate
+            break
+    if not raw:
+        return None
+    key = EVENT_DEFINITION_ALIASES.get(_alias_key(raw), "")
+    if key not in EVENT_DEFINITIONS:
+        raise _Skip(
+            f"неизвестное определение события '{raw}'",
+            "допустимы: " + ", ".join(sorted(EVENT_DEFINITIONS)),
+        )
+    return key
 
 # Хронометраж таймера по умолчанию: 15 минут — типичный SLA ожидания шага.
 # Подставляется, только когда поле не указано вовсе: выдуманное «PT5M» вместо
@@ -210,46 +328,72 @@ def timer_schedule(definition: ET.Element) -> str:
 # аплайер их понимает. Планирующий промпт (core/llm_improve.py) обязан
 # перечислять операции так же, а тест сверяет состав OP_SPEC и _HANDLERS:
 # расхождение означает «модель предлагает то, чего аплайер не умеет».
+#
+# Формулировка значений: до JSON каждое поле имеет ОДНО пример-значение, а
+# перечень допустимых идёт словами после « — ». Раньше словари печатали
+# перечисление прямо внутри значения (`"event_definition":"timer|message|error|
+# signal"`), и прогон `apply_operations` отвечал на дословную копию такой строки
+# «неизвестное определение события», `status=failed`: модель копирует рецепт
+# буквальнее всех, а `improve/op_acceptance` записывала расхождение словарей её
+# качеством. Тот же принцип, что у `_definition_choice` в скоринге. Рэтчет
+# `TestOpSpecIsCopyPasteable` в tests/test_bpmn_edits.py собирает из OP_SPEC
+# пакет и требует, чтобы аплайер его принял, — иначе словарь снова уедет от
+# аплайера незаметно.
 OP_SPEC: Dict[str, str] = {
     # `to` — исход нового узла. Без него модель обязана помнить второй
     # `connect`, и в живых прогонах забывала: шаг откатывался тупиком, а вместе
     # с ним и правка. Одна операция описывает обе стороны маршрута.
-    "add_task": '{"op":"add_task","id":"new_...","name":"...","task_type":"'
-                + "|".join(sorted(ADD_TASK_TAGS))
-                + '","participant":"пул","after":"id элемента",'
-                '"to":"id следующего шага (опц.)",'
-                '"lane":"id или имя дорожки (опц.)"}',
+    "add_task": '{"op":"add_task","id":"new_...","name":"...","task_type":"userTask",'
+                '"participant":"пул","after":"id элемента",'
+                '"to":"id следующего шага","lane":"id или имя дорожки"}'
+                " — поля to и lane опциональны; task_type принимает полное имя тега"
+                ' и короткое слово ("user"), любой регистрации; допустимы'
+                " businessRuleTask, manualTask, receiveTask, scriptTask, sendTask,"
+                " serviceTask, task, userTask",
     "add_gateway": '{"op":"add_gateway","id":"new_...","name":"...",'
-                   '"gateway_type":"exclusive|parallel|inclusive","participant":"пул",'
-                   '"after":"id","to":"id (опц., один выход шлюза)",'
-                   '"lane":"id или имя дорожки (опц.)"}',
+                   '"gateway_type":"exclusive","participant":"пул",'
+                   '"after":"id","to":"id одного выхода шлюза",'
+                   '"lane":"id или имя дорожки"}'
+                   " — поля to и lane опциональны; gateway_type: exclusive,"
+                   " parallel, inclusive (полное имя тега тоже принято)",
     "add_event": '{"op":"add_event","id":"new_...","name":"...",'
-                 '"event_type":"start|end|intermediateCatch|intermediateThrow"'
-                 ' либо определение ловушки: timer|message|error|signal",'
-                 '"participant":"пул","after":"id (опц.)",'
-                 '"to":"id следующего шага (опц., не для end)",'
-                 '"lane":"id или имя дорожки (опц.)",'
-                 '"event_definition":"timer|message|error|signal (опц.)",'
-                 '"duration":"PT15M (опц., таймеру)","cycle":"R3/PT10M (опц., таймеру)"}',
+                 '"event_type":"intermediateCatch","participant":"пул",'
+                 '"after":"id","to":"id следующего шага",'
+                 '"lane":"id или имя дорожки","event_definition":"timer",'
+                 '"duration":"PT15M"}'
+                 " — event_type: start, end, intermediateCatch, intermediateThrow,"
+                 " либо одно определение ловушки: timer, message, error, signal;"
+                 " event_definition из тех же четырёх значений, у таймера срок"
+                 ' задаётся duration (ISO-8601) либо циклом "cycle":"R3/PT10M",'
+                 " но не обоими сразу; поля after, to и lane опциональны, а у end"
+                 " исход не бывает",
     "add_participant": '{"op":"add_participant","id":"new_...","name":"..."}',
     "add_documentation": '{"op":"add_documentation","id":"id элемента","text":"..."}',
     "add_event_definition": '{"op":"add_event_definition","id":"id события",'
-                            '"event_definition":"'
-                            + "|".join(sorted(EVENT_DEFINITIONS))
-                            + '","duration":"PT2H (только таймеру, опц.)"}',
+                            '"event_definition":"timer","duration":"PT2H"}'
+                            " — event_definition: timer, message, error, signal"
+                            " (полное имя определения тоже принято);"
+                            " duration только таймеру и только пустому таймеру",
     "add_lane": '{"op":"add_lane","id":"new_...","name":"...","participant":"пул"}',
-    "move_to_lane": '{"op":"move_to_lane","id":"id элемента","lane":"id|имя дорожки"}',
-    "add_boundary_event": '{"op":"add_boundary_event","id":"new_...","attached_to":"id задачи",'
-                          '"event_type":"timer|error","name":"...",'
-                          '"to":"id шага обработки (опц.)",'
-                          '"duration":"PT15M (опц.)","cycle":"R3/PT10M (опц.)"}',
+    "move_to_lane": '{"op":"move_to_lane","id":"id элемента","lane":"id или имя дорожки"}',
+    "add_boundary_event": '{"op":"add_boundary_event","id":"new_...",'
+                          '"attached_to":"id задачи","event_type":"timer",'
+                          '"name":"...","to":"id шага обработки","duration":"PT15M"}'
+                          " — event_type: timer либо error; поле to опционально,"
+                          " но без ветки обработки событие откатывается кружком;"
+                          ' срок — duration или цикл "cycle":"R3/PT10M",'
+                          " одно из двух",
     "rename": '{"op":"rename","id":"...","name":"..."}',
     "set_task_type": '{"op":"set_task_type","id":"id шага из схемы",'
-                                     '"task_type":"' + "|".join(TASK_TYPE_TAGS) + '"}', 
+                     '"task_type":"serviceTask"}'
+                     " — task_type: task, userTask, serviceTask, scriptTask,"
+                     " manualTask, businessRuleTask, sendTask, receiveTask;"
+                     " короткое имя (service) и любой регистр принимаются",
     "delete": '{"op":"delete","id":"..."}',
     "connect": '{"op":"connect","source":"...","target":"...",'
-               '"flow_type":"sequence|message","condition":"опц.",'
-               '"default":true (опц. — сделать эту ветку шлюза выходом по умолчанию)}',
+               '"flow_type":"sequence","condition":"текст условия","default":true}'
+               " — flow_type: sequence либо message; поля condition и default"
+               " опциональны, default ставят только одной ветке шлюза",
     # Ветка, которая на схеме уже есть, через `connect` условия не получит: он
     # создаёт поток и на готовую пару отвечает «такой поток уже существует».
     "add_condition": '{"op":"add_condition","flow":"id потока шлюза",'
@@ -258,7 +402,11 @@ OP_SPEC: Dict[str, str] = {
     "disconnect": '{"op":"disconnect","flow":"id потока"}',
     "move_to_participant": '{"op":"move_to_participant","id":"...","participant":"пул"}',
     "merge_participants": '{"op":"merge_participants","source":"пул-источник",'
-                          '"target":"пул-приёмник","as_lane":true|"имя дорожки"}',
+                          '"target":"пул-приёмник","as_lane":true}'
+                          " — as_lane: true, и дорожку назовём именем пула-"
+                          "источника; либо строкой имя роли, например"
+                          ' "as_lane":"Кладовщики". Слово true строкой — это'
+                          " флаг, а не имя дорожки",
     "remove_participant": '{"op":"remove_participant","participant":"пустой пул"}',
 }
 
@@ -315,6 +463,9 @@ class _Index:
         self.flows_by_id: Dict[str, ET.Element] = {}
         self.lanes: List[ET.Element] = []
         self.parents: Dict[ET.Element, ET.Element] = {}
+        # Записи графики по bpmnElement — ленивое снимок-дерево: нужен только
+        # тем пакетам, которые удаляют узлы (`_drop_di`).
+        self.di_of_element: Optional[Dict[str, List[ET.Element]]] = None
         # Id элементов, затронутых merge_participants: по ним пакет слияния
         # откатывается, если починка нашла поломку именно в перенесённом.
         self.touched_by_merge: Set[str] = set()
@@ -807,6 +958,15 @@ def _missing_id_hint(index: _Index, wanted: Any) -> str:
     id во второй раунд."""
     near = _nearby_ids(index, wanted)
     if not near:
+        if str(wanted or "").startswith("new_"):
+            # Префикс `new_` — намерение СОЗДАТЬ узел, а не опечатка в адресе
+            # существующего. Кандидаты здесь только уводят повтор в правку чужого
+            # элемента, поэтому отказ называет операцию создания и то, чем она
+            # отличается от правки.
+            return (f"'{wanted}' — id нового элемента, которого на схеме ещё "
+                    "нет: создайте его операцией add_task, add_event или "
+                    "add_gateway с этим же id, а правку существующему узлу "
+                    "ведите по его id из инвентаря")
         return "используйте id из инвентаря"
     return "ближайшие id схемы: " + ", ".join(near)
 
@@ -818,9 +978,14 @@ def _connect_endpoints_hint(index: _Index, source_id: str, target_id: str) -> st
     for role, value in (("источник", source_id), ("цель", target_id)):
         if index.elements.get(value) is not None:
             continue
-        near = _nearby_ids(index, value)
-        parts.append(f"{role} '{value}': "
-                     + (", ".join(near) if near else "нет в схеме"))
+        if not str(value or "").strip():
+            # Пустой операнд запрещён и на стороне аплайера — тем же правилом,
+            # что корпусный `test_no_advice_prints_an_empty_operand` для советов
+            # скоринга: «цель '': нет в схеме» читается как указание на
+            # несуществующий адрес, а не как «операнд не назван».
+            parts.append(f"{role} не назван — укажите id узла из инвентаря")
+            continue
+        parts.append(f"{role} '{value}': " + _missing_id_hint(index, value))
     if not parts:
         return "используйте id из инвентаря"
     return "укажите узлы из инвентаря; " + "; ".join(parts)
@@ -866,8 +1031,9 @@ def _new_id_hint(op_id: str, index: _Index) -> str:
         if not typed:
             return (f"событие '{op_id}' уже есть в схеме и у него нет определения: "
                     f"поправьте его операцией add_event_definition(id='{op_id}', "
-                    "event_definition=timer|message|error|signal), а id с new_ "
-                    "нужен только для нового элемента")
+                    "event_definition='timer') — определение выбирается по смыслу "
+                    "шага (event_definition=timer|message|error|signal), а id с "
+                    "new_ нужен только для нового элемента")
     return "новые элементы обязаны иметь id, начинающийся с new_"
 
 
@@ -886,6 +1052,62 @@ def _remove_refs(elem: ET.Element, flow_id: str) -> None:
         for ref in list(elem.findall(_q(ref_tag))):
             if (ref.text or "").strip() == flow_id:
                 elem.remove(ref)
+
+
+def _drop_id_ref(elem: ET.Element, gone_id: str) -> None:
+    """Снять ссылки узла, ведущие на id, которого больше нет.
+
+    `incoming`/`outgoing` — IDREF на потоки, но в рукописных схемах встречается
+    ссылка и на id узла (прогон: `delete` шага оставлял у соседа
+    `<incoming>T2</incoming>`). Такая ссылка не разрешается, и bpmn-js
+    разваливает на ней документ — оставлять её после удаления нельзя.
+    """
+    if not gone_id:
+        return
+    for ref_tag in ("incoming", "outgoing"):
+        for ref in list(elem.findall(_q(ref_tag))):
+            if (ref.text or "").strip() == gone_id:
+                elem.remove(ref)
+
+
+def _di_map(index: "_Index") -> Dict[str, List[ET.Element]]:
+    """Записи диаграммы (`BPMNShape`/`BPMNEdge`) по их `bpmnElement`.
+
+    Строится один раз на индекс: обход всего дерева под каждый удалённый id
+    превращал бы пакет удалений в квадратичный проход, а пакет из 25 операций
+    на широкой схеме ограничен бюджетом в полсекунды (tests/test_bpmn_edits.py::
+    TestPerformance).
+    """
+    cache = index.di_of_element
+    if cache is None:
+        cache = {}
+        for node in index.root.iter():
+            if node.tag in DI_ELEMENT_TAGS:
+                key = node.get("bpmnElement") or ""
+                if key:
+                    cache.setdefault(key, []).append(node)
+        index.di_of_element = cache
+    return cache
+
+
+def _drop_di(index: _Index, elem_id: str) -> List[str]:
+    """Убрать графику элемента, которого больше нет.
+
+    `bpmnElement` — IDREF: оставленный `BPMNShape` на несуществующий узел
+    bpmn-js рисует как «фигура без прообраза», а импорт такой схемы через
+    `routers` разваливается. Правка уровня маршрута не имеет права молча
+    портить уровень отображения.
+    """
+    if not elem_id:
+        return []
+    dropped = []
+    for entry in _di_map(index).pop(elem_id, []):
+        parent = index.parents.get(entry)
+        if parent is None:
+            continue
+        parent.remove(entry)
+        dropped.append(entry.get("id") or elem_id)
+    return dropped
 
 
 def _position_after(elem: ET.Element, preceding_tags: set) -> int:
@@ -968,7 +1190,15 @@ def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[st
         )
     process = index.process_of.get(after_id)
     if process is None:
-        raise _Skip(f"не удалось определить пул элемента '{after_id}'")
+        # Операция не вставляет элемент в дерево, у которого нет владельца: без
+        # пула правка физически неисполнима, поэтому подсказка называет operand,
+        # которого не хватает, а не только констатацию.
+        raise _Skip(
+            f"не удалось определить пул элемента '{after_id}'",
+            f"укажите participant именем или id пула из инвентаря: вставка "
+            f"после '{after_id}' не находит его процесс, а молча вставить "
+            "элемент в несуществующий пул нельзя",
+        )
     # Вставляем в непосредственный контейнер узла, а не в процесс: у шага
     # внутри subProcess и новый элемент, и переподвешиваемый поток обязаны
     # остаться того же уровня вложенности. `connect` границу подпроцесса
@@ -1103,16 +1333,7 @@ def _op_add_participant(op: Dict[str, Any], index: _Index) -> List[str]:
 
 def _event_definition_key(op: Dict[str, Any]) -> Optional[str]:
     """Определение события из операции: None — не запрошено, иначе валидируется."""
-    raw = op.get("event_definition")
-    if raw is None or not str(raw).strip():
-        return None
-    key = str(raw).strip().lower()
-    if key not in EVENT_DEFINITIONS:
-        raise _Skip(
-            f"неизвестное определение события '{raw}'",
-            "допустимы: " + ", ".join(sorted(EVENT_DEFINITIONS)),
-        )
-    return key
+    return _event_definition_of(op)
 
 
 def _check_outlet(op: Dict[str, Any], index: _Index, process: ET.Element,
@@ -1316,37 +1537,34 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
                 "определение события задают только событию",
                 "перенесите event_definition в add_event",
             )
-        task_type = op.get("task_type") or "task"
-        if task_type not in ADD_TASK_TAGS:
-            raise _Skip(
-                f"неизвестный тип задачи '{task_type}'",
-                "допустимы: " + ", ".join(sorted(ADD_TASK_TAGS))
-                + " (subProcess и callActivity создать нечем наполнить)",
-            )
+        task_type = _task_type_of(op, tuple(sorted(ADD_TASK_TAGS)),
+                                  " (subProcess и callActivity создать нечем "
+                                  "наполнить)") or "task"
         elem = ET.Element(_q(task_type), {"id": op_id, **name_attr})
         tag = task_type
     elif kind == "gateway":
         if definition:
-            raise _Skip("определение события шлюзу не требуется")
-        gateway_type = (op.get("gateway_type") or "exclusive").lower()
-        tag = {"exclusive": "exclusiveGateway",
-               "parallel": "parallelGateway",
-               "inclusive": "inclusiveGateway"}.get(gateway_type)
-        if not tag:
+            # Операнд здесь назвать нельзя по существу ноты, а не по форме:
+            # у шлюза определения события нет, а `eventBasedGateway` здесь не
+            # создаётся (его ветки — сообщения, а это отдельная правка).
             raise _Skip(
-                f"неизвестный тип шлюза '{gateway_type}'",
-                "допустимы: exclusive, parallel, inclusive",
+                "определение события шлюзу не требуется",
+                "у шлюза ветки разбираются условием потока: определение "
+                "события оставьте за add_event, а шлюз правьте add_condition "
+                "или set_default",
             )
+        tag = _typed_value(op, ("gateway_type", "type"), GATEWAY_TYPE_ALIASES,
+                           GATEWAY_TYPE_TAGS, "тип шлюза") or "exclusiveGateway"
         elem = ET.Element(_q(tag), {"id": op_id, **name_attr})
     else:  # event
-        event_type = (op.get("event_type") or "").strip()
-        tag = EVENT_TYPE_TO_TAG.get(event_type) or EVENT_TYPE_TO_TAG.get(event_type.lower())
-        if not tag and event_type.lower() in EVENT_DEFINITIONS:
+        event_type = str(op.get("event_type") or op.get("type") or "").strip()
+        tag = EVENT_TYPE_ALIASES.get(_alias_key(event_type), "")
+        if not tag and _alias_key(event_type) in EVENT_DEFINITION_ALIASES:
             # Модель просит «таймер» или «ошибку» как тип события. Это
             # определение ловушки, а ловит её промежуточное событие: без
             # такого прочтения ветка обработки откатывалась каскадом пропусков.
             tag = EVENT_TYPE_TO_TAG["intermediatecatch"]
-            definition = definition or event_type.lower()
+            definition = definition or EVENT_DEFINITION_ALIASES[_alias_key(event_type)]
             alias_note = (f"тип события '{event_type}' понят как "
                           f"intermediateCatch с определением '{definition}'")
         if not tag:
@@ -1371,9 +1589,11 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
             # `add_boundary_event` определение требует давно — тот же порядок.
             raise _Skip(
                 "событию нужно определение",
-                "укажите event_definition=timer|message|error|signal (таймеру — "
-                "duration или cycle): без определения bpmn-js рисует пустой "
-                "кружок и скоринг не засчитывает тип события",
+                "укажите одно определение, например event_definition='timer' "
+                "(таймеру — duration или cycle); полный перечень — "
+                "event_definition=timer|message|error|signal, а не одно его "
+                "значение: без определения bpmn-js рисует пустой кружок и "
+                "скоринг не засчитывает тип события",
             )
         timing = _timer_timing(op, definition)
         elem = ET.Element(_q(tag), {"id": op_id, **name_attr})
@@ -1437,7 +1657,11 @@ def _op_rename(op: Dict[str, Any], index: _Index) -> List[str]:
     elem = _require_element(index, op.get("id"))
     name = (op.get("name") or "").strip()
     if not name:
-        raise _Skip("не задано новое имя")
+        # Отказ обязан называть недостающий операнд: без него корректирующий
+        # повтор приносит ровно ту же операцию (`rename` без `name`), и
+        # `improve/op_acceptance` записывает это качеством модели.
+        raise _Skip("не задано новое имя",
+                    "укажите name — новое имя элемента; id правкой не меняется")
     elem.set("name", name)
     return []
 
@@ -1453,16 +1677,14 @@ def _op_set_task_type(op: Dict[str, Any], index: _Index) -> List[str]:
     """
     elem = _require_element(index, op.get("id"))
     elem_id = elem.get("id") or ""
-    kind = (op.get("task_type") or op.get("type") or "").strip()
     # Короткое слово из словаря BPMN — та же правка, что и полное имя тега:
     # отказывать по форме имени значило бы обрезать валидный ответ транспортом.
-    short = {"task": "task", "user": "userTask", "service": "serviceTask",
-             "script": "scriptTask", "manual": "manualTask",
-             "businessrule": "businessRuleTask", "send": "sendTask",
-             "receive": "receiveTask"}
-    kind = short.get(kind.lower().removesuffix("task"), kind)
-    if kind not in TASK_TYPE_TAGS:
-        raise _Skip(f"неизвестный тип шага '{kind}'",
+    # Раз это принималось здесь, то же правило обязан читать и `add_task` —
+    # иначе `"type":"userTask"` писался в схему как `<task>` с отчётом
+    # «применено» (см. `_typed_value`).
+    kind = _task_type_of(op, TASK_TYPE_TAGS)
+    if not kind:
+        raise _Skip("неизвестный тип шага ''",
                     "задайте один из: " + ", ".join(TASK_TYPE_TAGS))
     current = _local(elem.tag)
     if current not in TASK_TYPE_TAGS:
@@ -1565,6 +1787,7 @@ def _op_add_event_definition(op: Dict[str, Any], index: _Index) -> List[str]:
                     "новое с нужным event_definition")
     if definition is None:
         raise _Skip("не задан event_definition",
+                    "укажите одно определение, например event_definition='timer'; "
                     "допустимы: " + ", ".join(sorted(EVENT_DEFINITIONS))
                     + " (таймеру — duration или cycle)")
     _adopt_event_definition(index, elem, definition, elem_id,
@@ -1651,13 +1874,99 @@ def _remove_node(index: _Index, elem: ET.Element) -> Tuple[List[str], List[str]]
         if elem_id in (flow.get("sourceRef"), flow.get("targetRef")):
             index.detach(flow)
             removed_flows.append(flow.get("id", ""))
+            # Графика следует за элементом: BPMNEdge на снятом потоке — тот же
+            # битый IDREF, что и BPMNShape на снятом узле.
+            _drop_di(index, flow.get("id") or "")
     for other in index.elements.values():
         if other is elem:
             continue
         for flow_id in removed_flows:
             _remove_refs(other, flow_id)
+        _drop_id_ref(other, elem_id)
+    # flowNodeRef — IDREF дорожки: снятый узел не обязан быть подписанным,
+    # иначе bpmn-js показывает фигуру, которой нет в процессе, а `move_to_lane`
+    # после этого не находит, откуда её убрать.
+    for lane in index.lanes:
+        for ref in list(lane.findall(_q("flowNodeRef"))):
+            if _text_of(ref) == elem_id:
+                lane.remove(ref)
+    _drop_di(index, elem_id)
     index.detach(elem)
     return removed_flows, removed_boundaries
+
+
+def _route_neighbours(index: _Index, elem_id: str) -> Tuple[List[str], List[str]]:
+    """Живые концы маршрута вокруг узла: (предшественники, преемники).
+
+    messageFlow не считается: это обмен, а не продолжение маршрута. Граничные
+    события самого узла тоже — они уходят вместе с хозяином (`_remove_node`),
+    и замкнуть дугу на снятый кружок нельзя.
+    """
+    leaving = {boundary.get("id") or ""
+               for boundary in _attached_boundaries(index, elem_id)}
+    preds: List[str] = []
+    succs: List[str] = []
+    for flow in index.sequence_flows:
+        src = flow.get("sourceRef") or ""
+        dst = flow.get("targetRef") or ""
+        if dst == elem_id and src and src != elem_id and src not in leaving:
+            if src in index.elements and src not in preds:
+                preds.append(src)
+        elif src == elem_id and dst and dst != elem_id and dst not in leaving:
+            if dst in index.elements and dst not in succs:
+                succs.append(dst)
+    return preds, succs
+
+
+def _legs_of(index: _Index, elem_id: str) -> Tuple[int, int]:
+    """(входящих, исходящих) sequence-потоков узла."""
+    incoming = sum(1 for f in index.sequence_flows if f.get("targetRef") == elem_id)
+    outgoing = sum(1 for f in index.sequence_flows if f.get("sourceRef") == elem_id)
+    return incoming, outgoing
+
+
+def _delete_rewire_plan(index: _Index, elem_id: str
+                        ) -> Tuple[Optional[Tuple[str, str]], List[str], str]:
+    """Что удаление делает с маршрутом: (дуга обхода, соседей без ног, условие).
+
+    Прежний `delete` резал обе дуги среднего узла и молча оставлял дыру при
+    `status=success`: прогон `delete(id="T_ship")` на схеме конструктора
+    оставлял `End_ok` без входящего потока, а скоринг затем ругался на схему,
+    которую «починили». Замыкать обход можно только однозначно — один живой
+    вход и один живой выход, чья пара легальна для sequence-потока. Когда
+    концов несколько, выбор дуги был бы выдуманным маршрутом, и пакет честно
+    отказывает — но лишь тогда, когда соседа это действительно оставляет без
+    ноги (у изолированного узла удаление дыры не создаёт).
+    """
+    preds, succs = _route_neighbours(index, elem_id)
+    stranded = [p for p in preds if _legs_of(index, p)[1] == 1]
+    stranded += [s for s in succs if s not in stranded
+                 and _legs_of(index, s)[0] == 1]
+    if len(preds) != 1 or len(succs) != 1:
+        return None, stranded, ""
+    source_id, target_id = preds[0], succs[0]
+    source = index.elements.get(source_id)
+    target = index.elements.get(target_id)
+    if (source is None or target is None
+            # Условие ветки принадлежит решению предшественника: нога шлюза
+            # остаётся ногой шлюза и после того, как шаг между ними снят. У
+            # задачи условия не бывает, и переносить его на новую дугу нельзя.
+            or _local(source.tag) in SEQUENCE_FORBIDDEN_SOURCES
+            or _local(target.tag) in SEQUENCE_FORBIDDEN_TARGETS
+            or _endpoint_process(index, source) is not _endpoint_process(index, target)
+            or index.has_subprocess_ancestor(source)
+            is not index.has_subprocess_ancestor(target)
+            or any(f.get("sourceRef") == source_id
+                   and f.get("targetRef") == target_id
+                   for f in index.sequence_flows)):
+        return None, stranded, ""
+    condition = ""
+    incoming = [f for f in index.sequence_flows if f.get("targetRef") == elem_id]
+    if len(incoming) == 1 and _local(source.tag) in GATEWAY_TAGS:
+        expression = incoming[0].find(_q("conditionExpression"))
+        if expression is not None:
+            condition = _text_of(expression).strip()
+    return (source_id, target_id), [], condition
 
 
 def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
@@ -1674,6 +1983,17 @@ def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
             "стартовые и конечные события не удаляются",
             "у процесса должен оставаться вход и выход",
         )
+    bridge, stranded, condition = _delete_rewire_plan(index, elem_id)
+    if bridge is None and stranded:
+        listed = ", ".join(f"'{i}'" for i in stranded[:4])
+        raise _Skip(
+            f"удаление '{elem_id}' оставило бы дыру в маршруте: у {listed} "
+            "не осталось бы потока, а замкнуть обход однозначно нельзя",
+            f"сведите маршрут вокруг '{elem_id}' к одному входу и одному "
+            "выходу операциями disconnect и connect, затем удаляйте; либо "
+            f"удалите вместе с ним и его соседей {listed}",
+            needs=tuple(stranded),
+        )
     removed_flows, removed_boundaries = _remove_node(index, elem)
     notes = []
     if removed_boundaries:
@@ -1681,6 +2001,22 @@ def _op_delete(op: Dict[str, Any], index: _Index) -> List[str]:
                      + ", ".join(removed_boundaries))
     if removed_flows:
         notes.append(f"удалены связанные потоки: {', '.join(removed_flows)}")
+    if bridge is not None:
+        source_id, target_id = bridge
+        source = index.elements.get(source_id)
+        process = _endpoint_process(index, source) if source is not None else None
+        if process is not None:
+            flow = _create_sequence_flow(index, source_id, target_id, process,
+                                         condition or None)
+            notes.append(f"маршрут замкнут в обход '{elem_id}': поток "
+                         f"'{flow.get('id')}' ведёт '{source_id}' → "
+                         f"'{target_id}'"
+                         + (f" с условием '{condition}'" if condition else ""))
+        else:
+            # Пул предшественника не читается: выдумывать процесс для дуги
+            # нельзя, поэтому обход остаётся незакрытым и отчёт говорит об этом.
+            notes.append(f"обход '{source_id}' → '{target_id}' не замкнут: "
+                         "у предшественника не определён пул")
     return notes
 
 
@@ -1707,19 +2043,26 @@ def _drop_lane(index: _Index, lane: ET.Element) -> List[str]:
         )
     index.detach(lane)
     name = lane.get("name") or lane.get("id") or ""
+    _drop_di(index, lane.get("id") or "")
     return [f"дорожка «{name}» удалена: в ней не было ни одного шага"]
+
+
+# Булевы слова, которыми модель описывает true/false. Одно перечисление для
+# `_flag` и для `as_lane`: строка «true» обязана читаться флагом везде, а не
+# превращаться в имя дорожки, имя пула или значение поля.
+_BOOL_WORDS = {"true": True, "1": True, "yes": True, "да": True,
+               "": False, "false": False, "0": False, "no": False, "нет": False}
 
 
 def _flag(value: Any, field: str) -> bool:
     """Булево поле операции. Модель нередко присылает «true» строкой, а
     «false» строкой — не то же самое, что False."""
     if isinstance(value, str):
-        text = value.strip().lower()
-        if text in ("true", "1", "yes", "да"):
-            return True
-        if text in ("", "false", "0", "no", "нет"):
-            return False
-        raise _Skip(f"поле {field} должно быть булевым", f'укажите {field}: true либо false')
+        text = _alias_key(value)
+        if text in _BOOL_WORDS:
+            return _BOOL_WORDS[text]
+        raise _Skip(f"поле {field} должно быть булевым",
+                    f"укажите {field}: true либо false")
     return bool(value)
 
 
@@ -1760,9 +2103,8 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
             needs=(source_id if source is None else "",
                    target_id if target is None else ""),
         )
-    flow_type = (op.get("flow_type") or "sequence").lower()
-    if flow_type not in ("sequence", "message"):
-        raise _Skip("flow_type должен быть sequence или message")
+    flow_type = _typed_value(op, ("flow_type", "type"), FLOW_TYPE_ALIASES,
+                             FLOW_TYPES, "тип потока") or "sequence"
     # Выход по умолчанию — атрибут шлюза на sequence-потоке из него: раньше
     # аплайер не умел его ставить, и любая «иначе»-ветка отвергалась.
     default_requested = _flag(op.get("default"), "default")
@@ -1998,6 +2340,9 @@ def _op_disconnect(op: Dict[str, Any], index: _Index) -> List[str]:
     if flow is None:
         raise _Skip("поток не найден", "используйте id потока из инвентаря")
     index.detach(flow)
+    # Графика живёт рядом с маршрутом: снятая дуга без BPMNEdge остаётся
+    # битым IDREF, на котором редактор разваливает документ.
+    _drop_di(index, flow_id)
     for elem in index.elements.values():
         _remove_refs(elem, flow_id)
         # default — тоже ссылка на поток: без неё в пакете нельзя переназначить
@@ -2038,6 +2383,11 @@ def _op_move(op: Dict[str, Any], index: _Index) -> List[str]:
         if index.process_of.get(other) is not target:
             index.detach(flow)
             broken.append(flow.get("id", ""))
+            # Снятая дуга обязана уйти и из графики: `bpmnElement` — IDREF, и
+            # оставленный `BPMNEdge` на несуществующий поток редактор читает как
+            # битый документ (замер: `move_to_participant` на шаге с двумя
+            # межпуловыми дугами оставлял два висячих ребра).
+            _drop_di(index, flow.get("id") or "")
     for other in index.elements.values():
         for flow_id in broken:
             _remove_refs(other, flow_id)
@@ -2086,12 +2436,14 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     name = (op.get("name") or "").strip()
     # Событию имя в BPMN не требуется (то же, что в `_op_add_node`): тип
     # читается из дочернего `*EventDefinition`, а не из подписи кружка.
-    event_type = str(op.get("event_type") or "").strip().lower()
-    if event_type not in ("timer", "error"):
-        raise _Skip(
-            f"неизвестный тип граничного события '{event_type}'",
-            "допустимы: timer, error",
-        )
+    event_type = _typed_value(op, ("event_type", "type"),
+                              EVENT_DEFINITION_ALIASES, BOUNDARY_EVENT_TYPES,
+                              "тип граничного события")
+    if not event_type:
+        # Пустое поле — тот же отказ: без определения событие прицепляется
+        # пустым кружком, а `_adopt_event_definition` ищет по ключу.
+        raise _Skip("неизвестный тип граничного события ''",
+                    "допустимы: " + ", ".join(BOUNDARY_EVENT_TYPES))
     host_id = op.get("attached_to") or ""
     host = index.elements.get(host_id)
     if host is None:
@@ -2107,7 +2459,14 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
         )
     process = index.process_of.get(host_id)
     if process is None:
-        raise _Skip(f"не удалось определить пул элемента '{host_id}'")
+        # Хозяин без процесса — битая схема, а не недостающая деталь операции:
+        # прицеплять событие некуда, поэтому подсказка называет, что проверить.
+        raise _Skip(
+            f"не удалось определить пул элемента '{host_id}'",
+            f"хозяин '{host_id}' не принадлежит ни одному процессу: гранич"
+            "ное событие цепляется к шагу внутри пула — укажите attached_to "
+            "шага из инвентаря либо заведите его процессом раньше",
+        )
     # Одно и то же определение на том же шаге дважды — не два события, а
     # дубль: второй таймер ничего не добавляет и только портит схему.
     for existing in _attached_boundaries(index, host_id):
@@ -2204,6 +2563,16 @@ def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
             raise _Skip("не задано имя дорожки",
                         'as_lane: true — имя дорожки возьмём из имени '
                         "пула-источника, либо укажите имя роли строкой")
+        if _alias_key(lane_name) in _BOOL_WORDS:
+            # «true» строкой — это флаг, а не название роли: прежняя ветка
+            # заводила в схеме дорожку с именем «true» (прогон
+            # `merge_participants(source=…, target=…, as_lane="true")` давал
+            # `<lane name="true">`). Булевы слова читаются так же, как в `_flag`.
+            if not _flag(lane_name, "as_lane"):
+                raise _Skip("сливать пул можно только в дорожку целевого пула",
+                            'as_lane: false — слияния без дорожки не бывает; '
+                            "укажите as_lane: true либо имя дорожки строкой")
+            lane_name = source_name
     elif as_lane is None or _flag(as_lane, "as_lane"):
         lane_name = source_name
     else:
@@ -2266,6 +2635,10 @@ def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
             continue
         if _local(child.tag) == "laneSet":
             # Дорожки источника вместе с его пулом: узлы получат одну общую.
+            # Их графика уходит сразу: `BPMNShape` на снятую дорожку — IDREF в
+            # никуда, а починка дорожки не восстанавливает.
+            for dropped_lane in child.findall(_q("lane")):
+                _drop_di(index, dropped_lane.get("id") or "")
             index.detach(child)
             continue
         if not is_bpmn_tag(child.tag):
@@ -2289,11 +2662,16 @@ def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
     for flow in list(index.message_flows):
         if flow.get("sourceRef") in inside_target and flow.get("targetRef") in inside_target:
             index.detach(flow)
+            _drop_di(index, flow.get("id") or "")
             removed_messages.append(flow.get("id") or "")
             touched.add(flow.get("id") or "")
 
     index.detach(source_process)
     index.detach(source_participant)
+    # Пул снят — снята и его графика: `bpmnElement` процесса и участника
+    # указывает на id, которого в документе больше нет.
+    _drop_di(index, source_process.get("id") or "")
+    _drop_di(index, source_participant.get("id") or "")
     index.touched_by_merge |= {item for item in touched if item}
 
     notes = [f"пул «{source_name}» слит в «{target_name}» дорожкой «{lane_name}», "
@@ -2346,8 +2724,13 @@ def _op_remove_participant(op: Dict[str, Any], index: _Index) -> List[str]:
         )
     for _, elem in nodes:
         _remove_node(index, elem)
+    for lane_set_node in process.findall(_q("laneSet")):
+        for dropped_lane in lane_set_node.findall(_q("lane")):
+            _drop_di(index, dropped_lane.get("id") or "")
     index.detach(process)
     index.detach(participant)
+    _drop_di(index, process.get("id") or "")
+    _drop_di(index, participant.get("id") or "")
     return [f"пустой пул «{label}» удалён вместе с процессом"]
 
 _HANDLERS = {

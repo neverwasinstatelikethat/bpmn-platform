@@ -34,3 +34,23 @@ AI_REQUESTS_PER_HOUR = int(os.getenv("AI_REQUESTS_PER_HOUR", "60"))
 # Флаг только описывает намерение запуска; сам оркестратор создаётся в
 # lifespan приложения (app.ai.init_orchestrator), а не на импорте модуля.
 SKIP_LLM_INIT = os.getenv("SKIP_LLM_INIT") == "1"
+
+# Пул соединений PostgreSQL. ИИ-маршрут держит соединение на всё время вызова
+# модели (см. app/routers/ai.py: зависимость get_db живёт до конца запроса),
+# поэтому дефолтных SQLAlchemy 5+10 не хватает уже на десяток одновременных
+# улучшений: остальные маршруты встают в очередь на pool_timeout. Значения
+# завышены ровно до этого же порядка; ceiling держим под max_connections
+# сервера (PostgreSQL по умолчанию — 100).
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+# SQLite: миллисекунды ожидания блокировки файла перед ошибкой
+# «database is locked» (см. PRAGMA busy_timeout в app/db.py).
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
+
+# Разрешённые источники CORS. Wildcard с allow_credentials браузером не
+# принимался как легитимная пара, поэтому список берётся из окружения, а по
+# умолчанию — адрес локального фронтенда (разработчику нечего задавать).
+# Перечисление через запятую; пустое значение = только FRONTEND_URL.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()] \
+    or [FRONTEND_URL]

@@ -4,6 +4,8 @@
 эндпоинтов (включая предсуществующие 404 в сценариях удаления), поэтому
 случайно изменённый контракт или потерянное при переносе имя видны сразу.
 """
+import contextlib
+import json
 import uuid
 
 import pytest
@@ -20,11 +22,15 @@ from app.models import (  # noqa: E402
     DiagramVersion,
     Folder,
     Improvement,
+    Invitation,
     PasswordResetToken,
+    Role,
     ShareToken,
+    Team,
     TeamMember,
     User,
 )
+from app.startup import PREDEFINED_ROLES  # noqa: E402
 
 XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
@@ -67,6 +73,34 @@ def register(client, label: str) -> dict:
     token = client.post("/api/login", json={"email": email,
                                             "password": "Passw0rd!"}).json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+def account(client, email: str) -> dict:
+    """Регистрация и вход аккаунта с известным адресом.
+
+    Приглашение и доменный набор сопоставляют пользователя по почте, поэтому
+    здесь адрес задаёт тест, а не `register`.
+    """
+    assert client.post("/api/register", json={"name": "Приглашённый", "email": email,
+                                              "password": "Passw0rd!"}).status_code == 200
+    token = client.post("/api/login", json={"email": email,
+                                            "password": "Passw0rd!"}).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+def invite_and_accept(client, owner_headers, team_id: str, role: str, label: str) -> dict:
+    """Заголовок участника команды с сид-ролью `role`.
+
+    Путь ровно продуктовый: приглашение → принятие по POST. Иначе проверка прав
+    сводилась бы к роли, сочинённой в тесте, а не к той, что сидируется.
+    """
+    email = f"{label}-{uuid.uuid4().hex[:8]}@example.com"
+    link = client.post(f"/api/teams/{team_id}/invite", headers=owner_headers,
+                       json={"email": email, "role": role}).json()["accept_link"]
+    headers = account(client, email)
+    assert client.post(f"/api/invitations/accept/{link.rsplit('/', 1)[-1]}",
+                       headers=headers).status_code == 200
+    return headers
 
 
 @pytest.fixture(scope="module")
@@ -252,15 +286,12 @@ class TestTeamRoutes:
 
 
 class TestInvitationAccept:
-    """Приглашение выдаёт доступ адресату, а не тому, у кого оказалась ссылка."""
+    """Приглашение выдаёт доступ адресату, а не тому, у кого оказалась ссылка.
 
-    @staticmethod
-    def _account(client, email: str) -> dict:
-        client.post("/api/register", json={"name": "Inv", "email": email,
-                                           "password": "Passw0rd!"})
-        token = client.post("/api/login", json={"email": email,
-                                                "password": "Passw0rd!"}).json()["access_token"]
-        return {"Authorization": f"Bearer {token}"}
+    Методы расслоены: GET только показывает статус приглашения, POST зачисляет.
+    Прежний GET писал участность, поэтому предвыборка ссылки сканером, повторный
+    заход или prefetch браузера меняли состояние команды.
+    """
 
     def _invite(self, client, headers, email):
         team_id = client.post("/api/teams", headers=headers,
@@ -269,15 +300,21 @@ class TestInvitationAccept:
                            json={"email": email, "role": "admin"}).json()
         return team_id, body["accept_link"].rsplit("/", 1)[-1]
 
-    def test_addressee_joins_and_answer_is_serializable(self, client, auth, db):
+    def test_get_is_safe_and_post_joins(self, client, auth, db):
         """Ответ раньше 500-ился на role (схеме нужна строка, у модели —
         связывание), хотя участник уже был записан."""
         headers, _ = auth
         email = f"inv-{uuid.uuid4().hex[:8]}@example.com"
         team_id, token = self._invite(client, headers, email)
+        member = account(client, email)
 
-        response = client.get(f"/api/invitations/accept/{token}",
-                              headers=self._account(client, email))
+        viewed = client.get(f"/api/invitations/accept/{token}", headers=member)
+        assert viewed.status_code == 200, viewed.text
+        assert viewed.json()["status"] == "pending"
+        db.expire_all()
+        assert db.query(TeamMember).filter_by(team_id=team_id).count() == 1
+
+        response = client.post(f"/api/invitations/accept/{token}", headers=member)
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["role"] == "admin"
@@ -286,6 +323,21 @@ class TestInvitationAccept:
         assert len(members) == 2          # владелец + адресат
         db.expunge_all()
 
+    def test_repeated_post_is_idempotent(self, client, auth, db):
+        """Повтор того же токена — тот же ответ и та же единственная участность,
+        а не 404 и не второй ряд в `team_members`."""
+        headers, _ = auth
+        email = f"twice-{uuid.uuid4().hex[:8]}@example.com"
+        team_id, token = self._invite(client, headers, email)
+        member = account(client, email)
+
+        first = client.post(f"/api/invitations/accept/{token}", headers=member)
+        second = client.post(f"/api/invitations/accept/{token}", headers=member)
+        assert first.status_code == second.status_code == 200
+        assert first.json() == second.json()
+        db.expire_all()
+        assert db.query(TeamMember).filter_by(team_id=team_id).count() == 2
+
     def test_link_forwarded_to_another_account_is_refused(self, client, auth, db):
         headers, _ = auth
         team_id, token = self._invite(client, headers,
@@ -293,10 +345,29 @@ class TestInvitationAccept:
         stranger = register(client, "nosuchuser")
         before = db.query(TeamMember).filter_by(team_id=team_id).count()
 
-        response = client.get(f"/api/invitations/accept/{token}", headers=stranger)
-        assert response.status_code == 403
+        for method in (client.get, client.post):
+            response = method(f"/api/invitations/accept/{token}", headers=stranger)
+            assert response.status_code == 403
         db.expire_all()
         assert db.query(TeamMember).filter_by(team_id=team_id).count() == before
+
+    def test_expired_invitation_is_not_found(self, client, auth, db):
+        """Срок приглашения работает и после перехода на POST: истёкшее не
+        принимается и не показывается как живое."""
+        from app.timeutils import utc_now
+
+        headers, _ = auth
+        email = f"expired-{uuid.uuid4().hex[:8]}@example.com"
+        team_id, token = self._invite(client, headers, email)
+        member = account(client, email)
+        row = db.query(Invitation).filter_by(token=token).first()
+        row.expires_at = utc_now().replace(microsecond=0)  # срок истёк «сейчас»
+        db.commit()
+
+        assert client.post(f"/api/invitations/accept/{token}",
+                           headers=member).status_code == 404
+        db.expire_all()
+        assert db.query(TeamMember).filter_by(team_id=team_id).count() == 1
 
 
 class TestProfileAndMailRoutes:
@@ -827,4 +898,372 @@ class TestVersionSequenceRace:
         assert [v.seq for v in db.query(DiagramVersion).filter(
             DiagramVersion.diagram_id == diagram_id).order_by(DiagramVersion.seq).all()
         ] == [1, 2, 3]
+
+
+@contextlib.contextmanager
+def counting():
+    """SQL, прожитые внутри блока.
+
+    Линейка против по-узловых выборок обязана видеть число запросов, а не
+    тайминг: размер выборки не должен расти с количеством строк.
+    """
+    seen = []
+
+    def count(conn, cursor, statement, parameters, context, executemany):
+        seen.append(statement)
+
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        yield seen
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+
+
+def selects(statements):
+    return [s for s in statements if s.strip().lower().startswith("select")]
+
+
+def _team(client, headers, name="Отдел"):
+    return client.post("/api/teams", headers=headers,
+                       json={"name": name, "color": "#123456"}).json()["id"]
+
+
+def _personal_diagram(client, headers, name="Схема"):
+    diagram_id = str(uuid.uuid4())
+    assert client.post("/api/diagrams", headers=headers, json={
+        "id": diagram_id, "name": name, "xml": XML, "score": 4}).status_code == 200
+    return diagram_id
+
+
+def _share_to_team(client, headers, diagram_id, team_id):
+    """Публикация схемы в команду: перемещение в командную папку требует, чтобы
+    схема уже принадлежала этой команде."""
+    assert client.post("/api/diagrams/share-to-team", headers=headers,
+                       json={"diagram_id": diagram_id, "team_id": team_id}).status_code == 200
+
+
+class TestPermissionsComeFromSeededRoles:
+    """Права роли читаются из разобранного JSON, а не подстрокой в тексте.
+
+    Прежний `Role.permissions.contains(json.dumps({"editRegistry": True}))` не
+    совпадал ни с одной ролью из `PREDEFINED_ROLES` — та хранит четыре ключа в
+    своём порядке, — и правка через роль команды была физически невозможна:
+    все write-маршруты отвечали «только владелец». Роль в тесте берётся строго
+    из сида (участник получает её приглашением), а не сочиняется словарём.
+    """
+
+    def test_seeded_role_text_does_not_contain_the_single_key_predicate(self):
+        """Сам факт дефекта: подстрока-предикат в сид-роли отсутствует, поэтому
+        любой код, который сверяет права текстом, обязан умереть на этом тесте."""
+        from app.services.access import EDIT_PERMISSION, role_grants
+
+        seeded = dict(PREDEFINED_ROLES)
+        admin_text = json.dumps(seeded["admin"])
+        assert json.dumps({EDIT_PERMISSION: True}) not in admin_text
+        assert role_grants(admin_text, EDIT_PERMISSION)
+        assert role_grants(json.dumps({"x": 1, EDIT_PERMISSION: True}, indent=4),
+                           EDIT_PERMISSION)
+        assert not role_grants(json.dumps(seeded["viewer"]), EDIT_PERMISSION)
+        assert not role_grants("{битый текст", EDIT_PERMISSION)
+
+    def test_editor_member_edits_team_diagram_and_viewer_does_not(self, client, auth, db):
+        headers, _ = auth
+        team_id = _team(client, headers, "Склад")
+        diagram_id = _personal_diagram(client, headers)
+        assert client.post("/api/diagrams/share-to-team", headers=headers,
+                           json={"diagram_id": diagram_id, "team_id": team_id}).status_code == 200
+
+        editor = invite_and_accept(client, headers, team_id, "editor", "editor")
+        viewer = invite_and_accept(client, headers, team_id, "viewer", "viewer")
+
+        # Роль — именно сидовая: участник получил её по приглашению, и её права
+        # в базе совпадают с PREDEFINED_ROLES.
+        seeded = dict(PREDEFINED_ROLES)
+        for name in ("editor", "viewer"):
+            row = db.query(Role).filter(Role.name == name).first()
+            assert json.loads(row.permissions) == seeded[name]
+
+        assert client.post(f"/api/diagrams/{diagram_id}/restore/1",
+                           headers=editor).status_code == 200
+        assert client.post(f"/api/diagrams/{diagram_id}/restore/1",
+                           headers=viewer).status_code == 404
+
+    def test_editor_member_creates_team_folder(self, client, auth):
+        """Тот же предикат у папок: создание командной папки участником с
+        editRegistry проходит, без права — 403."""
+        headers, _ = auth
+        team_id = _team(client, headers, "Закупки")
+        editor = invite_and_accept(client, headers, team_id, "editor", "folder-editor")
+        viewer = invite_and_accept(client, headers, team_id, "viewer", "folder-viewer")
+
+        assert client.post("/api/folders", headers=editor,
+                           json={"name": "Правки", "team_id": team_id}).status_code == 200
+        assert client.post("/api/folders", headers=viewer,
+                           json={"name": "Смотрю", "team_id": team_id}).status_code == 403
+
+
+class TestDomainInvite:
+    """Набор по домену: маска адреса, а не шаблон LIKE.
+
+    `re.escape` не экранировал LIKE-джокеры `%` и `_`, зато добавлял экранированную
+    точку — обратный слэш в LIKE без ESCAPE литерален. Домен вида
+    `corp.example.com` не находил никого (фича была мертва), а домен `%`
+    зачислял в команду всю таблицу пользователей.
+    """
+
+    @staticmethod
+    def _members(db, team_id):
+        return {row[0] for row in db.query(TeamMember.user_id).filter(
+            TeamMember.team_id == team_id).all()}
+
+    def test_normal_domain_adds_only_its_own(self, client, auth, db):
+        headers, _ = auth
+        domain = f"corp-{uuid.uuid4().hex[:6]}.example.com"
+        team_id = _team(client, headers, "Домен")
+        mine = [account(client, f"worker{i}@{domain}") for i in range(2)]
+        account(client, f"outsider@other-{uuid.uuid4().hex[:6]}.example.com")
+        before = self._members(db, team_id)
+
+        response = client.post(f"/api/teams/{team_id}/invite-domain", headers=headers,
+                               json={"domain": domain, "role": "viewer"})
+        assert response.status_code == 200, response.text
+        assert response.json()["users_added"] == 2
+
+        db.expire_all()
+        added = self._members(db, team_id) - before
+        ids = {db.query(User.id).filter(User.email == f"worker{i}@{domain}").scalar()
+               for i in range(2)}
+        assert added == ids
+        assert len(mine) == 2
+
+    def test_suffix_lookalike_is_not_matched(self, client, auth, db):
+        """Чужой домен, который заканчивается на тот же хвост, не попадает:
+        маска требует символа `@` ровно перед доменом."""
+        headers, _ = auth
+        tag = uuid.uuid4().hex[:6]
+        domain = f"corp-{tag}.example.com"
+        team_id = _team(client, headers, "Границы")
+        account(client, f"victim@evil-{domain}")
+        before = self._members(db, team_id)
+
+        assert client.post(f"/api/teams/{team_id}/invite-domain", headers=headers,
+                           json={"domain": domain, "role": "viewer"}).json()["users_added"] == 0
+        db.expire_all()
+        assert self._members(db, team_id) == before
+
+    def test_like_wildcards_are_rejected(self, client, auth, db):
+        """`%` и `_` — не домены: джокер внутри маски набрал бы всю таблицу."""
+        headers, _ = auth
+        team_id = _team(client, headers, "Джокер")
+        before = db.query(TeamMember).filter(TeamMember.team_id == team_id).count()
+
+        for bad in ("%", "_", "", "  ", "corp example.com", "a;b"):
+            assert client.post(f"/api/teams/{team_id}/invite-domain",
+                               headers=headers,
+                               json={"domain": bad, "role": "viewer"}).status_code == 400, bad
+        db.expire_all()
+        assert db.query(TeamMember).filter(TeamMember.team_id == team_id).count() == before
+
+
+class TestRoleCreationNeedsManageRoles:
+    """Роли создаёт не «вошедший», а тот, у кого есть `manageRoles`."""
+
+    def test_team_owner_creates_role(self, client, auth):
+        """Владелец команды получает сид-роль admin с `manageRoles: true` при
+        создании команды — этого хватает, чтобы завести новую роль."""
+        headers, _ = auth
+        _team(client, headers, "Право ролей")
+        name = f"auditor-{uuid.uuid4().hex[:6]}"
+        response = client.post("/api/roles", headers=headers,
+                               json={"name": name, "permissions": {"viewRegistry": True}})
+        assert response.status_code == 200, response.text
+        assert response.json()["permissions"] == {"viewRegistry": True}
+
+    def test_viewer_and_stranger_are_refused(self, client, auth):
+        headers, _ = auth
+        team_id = _team(client, headers, "Без ролей")
+        viewer = invite_and_accept(client, headers, team_id, "viewer", "no-roles")
+        payload = {"name": f"evil-{uuid.uuid4().hex[:6]}",
+                   "permissions": {"editRegistry": True, "manageRoles": True}}
+
+        assert client.post("/api/roles", headers=viewer, json=payload).status_code == 403
+        assert client.post("/api/roles", headers=register(client, "lone"),
+                           json=payload).status_code == 403
+        assert all(r["name"] != payload["name"] for r in client.get("/api/roles",
+                                                                    headers=headers).json())
+
+
+class TestTeamFolderOwnership:
+    """Командная папка: право на удаление — у владельца команды, а не только у
+        участника с правом правки."""
+
+    def _team_folder(self, client, headers, team_id, name="Папка"):
+        return client.post("/api/folders", headers=headers,
+                           json={"name": name, "team_id": team_id}).json()["folder_id"]
+
+    def test_owner_deletes_team_folder(self, client, auth, db):
+        headers, _ = auth
+        team_id = _team(client, headers, "Хозяйин")
+        folder_id = self._team_folder(client, headers, team_id)
+
+        assert client.delete(f"/api/folders/{folder_id}", headers=headers).status_code == 200
+        db.expire_all()
+        assert db.query(Folder).filter(Folder.id == folder_id).count() == 0
+
+    def test_owner_without_membership_still_deletes(self, client, auth, db):
+        """Владение командой не зависит от строки участности: с неё снимают
+        роль, а папки команды остаются хозяйскими."""
+        headers, _ = auth
+        team_id = _team(client, headers, "Без участности")
+        folder_id = self._team_folder(client, headers, team_id)
+        db.query(TeamMember).filter(TeamMember.team_id == team_id).delete()
+        db.commit()
+
+        assert client.delete(f"/api/folders/{folder_id}", headers=headers).status_code == 200
+        db.expire_all()
+        assert db.query(Folder).filter(Folder.id == folder_id).count() == 0
+
+    def test_foreign_folder_is_not_found(self, client, auth, db):
+        """Тот же предикат не открывает чужое: личная папка другого человека и
+        папка команды, где пользователя нет, отвечают 404."""
+        headers, _ = auth
+        team_id = _team(client, headers, "Чужая команда")
+        folder_id = self._team_folder(client, headers, team_id)
+        outsider = register(client, "folder-outsider")
+
+        assert client.delete(f"/api/folders/{folder_id}", headers=outsider).status_code == 404
+        assert client.delete(f"/api/folders/{folder_id}",
+                             headers=invite_and_accept(client, headers, _team(
+                                 client, headers, "Своя команда"), "editor",
+                                 "other-team")).status_code == 404
+        db.expire_all()
+        assert db.query(Folder).filter(Folder.id == folder_id).count() == 1
+
+
+class TestTeamDeletionRemovesTeamFolders:
+    """Удаление команды снимает её папки, но оставляет личное.
+
+    Прежний код убирал участников, приглашения и отвязывал диаграммы, но не
+    `folders.team_id`: на PostgreSQL падало по FK, на SQLite оставались сироты.
+    """
+
+    def test_team_folders_go_and_personal_survive(self, fk_enforced, client, auth, db):
+        headers, _ = auth
+        team_id = _team(client, headers, "Уходим")
+        team_root = client.post("/api/folders", headers=headers, json={
+            "name": "Командная", "team_id": team_id}).json()["folder_id"]
+        client.post("/api/folders", headers=headers, json={
+            "name": "Внутри", "team_id": team_id, "parent_id": team_root})
+        personal = client.post("/api/folders", headers=headers,
+                               json={"name": "Личная"}).json()["folder_id"]
+        diagram_id = _personal_diagram(client, headers)
+        _share_to_team(client, headers, diagram_id, team_id)
+        assert client.post("/api/diagrams/move-to-folder", headers=headers, json={
+            "diagram_id": diagram_id, "folder_id": team_root}).status_code == 200
+
+        response = client.delete(f"/api/teams/{team_id}", headers=headers)
+        assert response.status_code == 200, response.text
+
+        db.expire_all()
+        assert db.query(Folder).filter(Folder.team_id == team_id).count() == 0
+        assert db.query(Team).filter(Team.id == team_id).count() == 0
+        assert db.query(TeamMember).filter(TeamMember.team_id == team_id).count() == 0
+        assert db.query(Invitation).filter(Invitation.team_id == team_id).count() == 0
+        kept = db.get(Diagram, diagram_id)
+        assert kept.team_id is None and kept.folder_id is None
+        assert db.query(Folder).filter(Folder.id == personal).count() == 1
+
+    def test_personal_diagram_of_a_member_survives_team_removal(
+            self, fk_enforced, client, auth, db):
+        """Схема участника в командной папке остаётся его: удаление команды не
+        имеет права выбрасывать чужие работы."""
+        headers, _ = auth
+        team_id = _team(client, headers, "Расставание")
+        member = invite_and_accept(client, headers, team_id, "editor", "kept")
+        member_diagram = _personal_diagram(client, member, "Моя")
+        _share_to_team(client, member, member_diagram, team_id)
+        folder_id = client.post("/api/folders", headers=headers, json={
+            "name": "Общая", "team_id": team_id}).json()["folder_id"]
+        assert client.post("/api/diagrams/move-to-folder", headers=member, json={
+            "diagram_id": member_diagram, "folder_id": folder_id}).status_code == 200
+
+        assert client.delete(f"/api/teams/{team_id}", headers=headers).status_code == 200
+        db.expire_all()
+        stored = db.get(Diagram, member_diagram)
+        assert stored is not None and stored.folder_id is None
+
+
+class TestNoRowByRowQueries:
+    """Списки и обходы читаются пакетами: число выборок не растёт с числом строк."""
+
+    def test_team_members_does_not_scale_with_members(self, client, auth):
+        headers, _ = auth
+        small, big = _team(client, headers, "Кадры"), _team(client, headers, "Кадры большие")
+        for i in range(4):
+            invite_and_accept(client, headers, big, "viewer", f"bulk{i}")
+
+        with counting() as seen_small:
+            assert len(client.get(f"/api/teams/{small}/members",
+                                  headers=headers).json()) == 1
+        with counting() as seen_big:
+            assert len(client.get(f"/api/teams/{big}/members", headers=headers).json()) == 5
+        with counting() as seen_big:
+            assert len(client.get(f"/api/teams/{big}/members", headers=headers).json()) == 5
+
+        assert len(selects(seen_big)) == len(selects(seen_small)), (
+            selects(seen_small), selects(seen_big))
+
+    def test_domain_invite_does_not_scale_with_users(self, client, auth):
+        headers, _ = auth
+        tag = uuid.uuid4().hex[:6]
+        small, big = _team(client, headers, "Набор1"), _team(client, headers, "Набор4")
+        account(client, f"solo-{tag}@one-{tag}.example.com")
+        for i in range(4):
+            account(client, f"staff{i}-{tag}@many-{tag}.example.com")
+
+        with counting() as seen_small:
+            assert client.post(f"/api/teams/{small}/invite-domain", headers=headers, json={
+                "domain": f"one-{tag}.example.com", "role": "viewer"}).json()["users_added"] == 1
+        with counting() as seen_big:
+            assert client.post(f"/api/teams/{big}/invite-domain", headers=headers, json={
+                "domain": f"many-{tag}.example.com",
+                "role": "viewer"}).json()["users_added"] == 4
+
+        assert len(selects(seen_big)) == len(selects(seen_small)), (
+            selects(seen_small), selects(seen_big))
+
+    def test_folder_subtree_walk_scales_by_levels_not_nodes(self, client, auth, db):
+        """Обход поддерева: один запрос на уровень, а не на узел."""
+        headers, _ = auth
+
+        def build(width, depth):
+            root = client.post("/api/folders", headers=headers,
+                               json={"name": "Корень"}).json()["folder_id"]
+            frontier, nodes = [root], 0
+            for level in range(depth):
+                nxt = []
+                for parent in frontier:
+                    for i in range(width):
+                        nodes += 1
+                        nxt.append(client.post("/api/folders", headers=headers, json={
+                            "name": f"У{level}-{i}", "parent_id": parent,
+                        }).json()["folder_id"])
+                frontier = nxt
+            return root, nodes
+
+        reads = []
+        for width, depth in ((1, 3), (3, 2)):
+            root, nodes = build(width, depth)
+            with counting() as seen:
+                assert client.delete(f"/api/folders/{root}",
+                                     params={"delete_contents": True},
+                                     headers=headers).status_code == 200
+            db.expire_all()
+            assert db.query(Folder).filter(Folder.id == root).count() == 0
+            # 13 узлов против 3 — а выборок по папкам одинаково (по одной на уровень).
+            reads.append((nodes, len([s for s in selects(seen) if "from folders" in s])))
+
+        assert reads[0][0] < reads[1][0], reads
+        assert reads[0][1] == reads[1][1], reads
+        assert reads[1][1] <= 4, reads
 

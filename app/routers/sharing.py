@@ -1,5 +1,4 @@
 """Доступ по ссылке и публикация диаграмм в команду."""
-import json
 import logging
 import uuid
 from datetime import timedelta
@@ -8,9 +7,9 @@ from sqlalchemy.orm import Session
 from app.config import FRONTEND_URL
 from app.db import get_db
 from app.deps import get_current_user
-from app.models import Diagram, Role, ShareToken, Team, TeamMember, User
+from app.models import Diagram, ShareToken, Team, User
 from app.schemas import ShareRequest, ShareResponse
-from app.services.access import load_diagram
+from app.services.access import EDIT_PERMISSION, can_in_team, load_diagram
 from app.timeutils import utc_now
 
 logger = logging.getLogger(__name__)
@@ -82,16 +81,10 @@ def share_to_team(
     if not team:
         raise HTTPException(404, "Team not found")
     
-    # Проверка прав: владелец команды или участник с editRegistry
-    has_access = (
-        team.owner_id == current_user.id or
-        db.query(TeamMember).filter(
-            TeamMember.team_id == team_id,
-            TeamMember.user_id == current_user.id,
-            TeamMember.role.has(Role.permissions.contains(json.dumps({"editRegistry": True})))
-        ).first() is not None
-    )
-    if not has_access:
+    # Проверка прав: владелец команды или участник с editRegistry. Право берётся
+    # из разобранного JSON роли — подстрокой в сериализованном тексте оно не
+    # находилось ни у одной сид-роли (см. app/services/access.py).
+    if not can_in_team(db, current_user, team_id, EDIT_PERMISSION):
         raise HTTPException(403, "Insufficient permissions in team")
     
     diagram.team_id = team_id

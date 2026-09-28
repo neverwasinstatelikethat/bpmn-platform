@@ -16,8 +16,9 @@ from gigachat.exceptions import (BadRequestError, RequestEntityTooLargeError,
                                  ServerError, UnprocessableEntityError)
 
 from core import llm_client
-from core.llm_client import (LLMError, LLMRequestTooLargeError,
-                             LLMTruncatedError, extract_json, extract_xml)
+from core.llm_client import (LLMBudgetExceededError, LLMError,
+                             LLMRequestTooLargeError, LLMTruncatedError,
+                             extract_json, extract_xml)
 
 CHAT_URL = "https://gigachat-api.sberbank.ru/v1/chat/completions"
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -45,13 +46,17 @@ class FakeProvider:
         return outcome
 
 
-def _response(content):
+def _response(content, usage=None):
     """Ответ, похожий на то, что отдаёт SDK: choices[0].message.content."""
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content),
                                  finish_reason=None)],
-        usage=None,
+        usage=usage,
     )
+
+
+USAGE = SimpleNamespace(prompt_tokens=120, completion_tokens=45,
+                        total_tokens=165)
 
 
 def _provider(monkeypatch, *outcomes) -> FakeProvider:
@@ -413,3 +418,214 @@ class TestModelPool:
             _complete()
         assert "авторизаци" in str(caught.value).lower()
         assert provider.models == ["GigaChat"]
+
+
+class TestContextVsAccessRefusals:
+    """Признак «не влезло в контекст» обязан быть парным: длина/размер + слово
+    про токены/контекст. Голый «token» в теле 400 раньше превращал отказ
+    авторизации и квоты в LLMRequestTooLargeError — неретраируемый, с советом
+    «сократите описание» при нормальном описании."""
+
+    def test_400_token_quota_message_is_not_too_large(self, monkeypatch):
+        provider = _provider(monkeypatch, _response_error(
+            BadRequestError, 400,
+            '{"error": {"message": "Daily token quota exceeded for your plan"}}'))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+        # отказ не размерный и не транспортный: общего ретрая нет
+        assert provider.calls == 1
+
+    def test_400_invalid_token_off_oauth_is_not_too_large(self, monkeypatch):
+        """400 «неверный токен» не на oauth-адресе — не авторизационная ветка,
+        и тем более не размер входа: ретраить его, конечно, тоже не нужно,
+        но классификация обязана быть честной."""
+        _provider(monkeypatch, _response_error(
+            BadRequestError, 400, "Invalid token provided"))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+
+    def test_403_forbidden_about_token_maximum_is_not_too_large(self, monkeypatch):
+        """403 с формулировкой про «maximum tokens» — доступ, а не размер:
+        маркер отказа снимает признак, даже когда оба слова на месте."""
+        _provider(monkeypatch, _response_error(
+            llm_client.ForbiddenError, 403,
+            "access denied: your organization token maximum exceeded"))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+        assert "авторизаци" in str(caught.value).lower()
+
+    def test_401_about_expired_token_is_never_too_large(self, monkeypatch):
+        _provider(monkeypatch, _response_error(
+            llm_client.AuthenticationError, 401,
+            "token expired, request had too many tokens"))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+
+    def test_429_about_token_limit_stays_rate_limit(self, monkeypatch):
+        """429 с токенами в теле — окно провайдера: ему положены дополнительные
+        попытки, а не вечный отказ «уменьшите вход»."""
+        provider = _provider(monkeypatch, _response_error(
+            llm_client.RateLimitError, 429,
+            b'{"message":"Tokens per minute limit exceeded, too many tokens"}'))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+        assert provider.calls == (llm_client.MAX_ATTEMPTS
+                                  + llm_client.RATE_LIMIT_EXTRA_ATTEMPTS)
+
+    def test_400_size_words_without_token_word_is_not_too_large(self, monkeypatch):
+        """«слишком большое» без слова про токены/контекст — общая ошибка
+        запроса: размер тела лечится не «сократите описание», а другим
+        транспортом, и 413 для этого имеет свой класс."""
+        _provider(monkeypatch, _response_error(
+            BadRequestError, 400, '{"message": "payload is too large"}'))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+
+    def test_400_too_many_tokens_is_still_too_large(self, monkeypatch):
+        """Живая формулировка GigaChat про переполненный контекст обязана
+        остаться в классе too-large: повтор здесь правда бесполезен."""
+        provider = _provider(monkeypatch, _response_error(
+            BadRequestError, 400,
+            "This message contains too many tokens for the selected model"))
+        with pytest.raises(LLMRequestTooLargeError):
+            _complete()
+        assert provider.calls == 1
+
+
+def _fake_clock(monkeypatch):
+    """`monotonic` и `sleep` двигают одни часы: wall-clock бюджет проверяется
+    без реального ожидания."""
+    now = {"t": 1000.0}
+    monkeypatch.setattr(llm_client.time, "monotonic", lambda: now["t"])
+    monkeypatch.setattr(llm_client.time, "sleep",
+                        lambda s: now.update(t=now["t"] + s))
+    return now
+
+
+class SteppingProvider(FakeProvider):
+    """Провайдер, каждый вызов к которому сдвигает фейковые часы на `step` с."""
+
+    def __init__(self, *outcomes, step, clock):
+        super().__init__(*outcomes)
+        self.step = step
+        self.clock = clock
+
+    def chat(self, request):
+        self.clock["t"] += self.step
+        return super().chat(request)
+
+
+def _stepping_provider(monkeypatch, clock, step, *outcomes):
+    provider = SteppingProvider(*outcomes, step=step, clock=clock)
+    monkeypatch.setattr(llm_client, "get_llm_client", lambda: provider)
+    monkeypatch.setattr(llm_client, "RETRY_PAUSE_SECONDS", 0)
+    return provider
+
+
+class TestCallBudget:
+    """Общий wall-clock бюджет обращения вместо перемножения попыток, таймаутов
+    и пула моделей: семафор глобальный, и без дедлайна одна медленная схема
+    держит очередь всех остальных пользователей."""
+
+    def test_exhausted_budget_stops_before_the_first_attempt(self, monkeypatch):
+        provider = _provider(monkeypatch, _response('{"ok": true}'))
+        monkeypatch.setattr(llm_client, "CALL_BUDGET_SECONDS", 0)
+        with pytest.raises(LLMBudgetExceededError) as caught:
+            _complete()
+        assert provider.calls == 0
+        # различимая ошибка: не «модель не знает» и не «не влезло»
+        assert not isinstance(caught.value, LLMRequestTooLargeError)
+        assert not isinstance(caught.value, LLMTruncatedError)
+        assert "бюджет" in str(caught.value)
+
+    def test_budget_comes_from_environment(self, monkeypatch):
+        monkeypatch.setenv("GIGACHAT_CALL_BUDGET_SECONDS", "45")
+        assert llm_client._env_int("GIGACHAT_CALL_BUDGET_SECONDS", 600) == 45
+
+    def test_budget_spans_the_repair_round_of_one_call(self, monkeypatch):
+        """Корректирующий разбор — то же обращение, а не новое: вторая попытка
+        обязана влезать в общий бюджет первой, иначе «один вызов» незаметно
+        удваивает ожидание очереди."""
+        clock = _fake_clock(monkeypatch)
+        provider = _stepping_provider(monkeypatch, clock, 160,
+                                      _response("не JSON, извините"))
+        monkeypatch.setattr(llm_client, "CALL_BUDGET_SECONDS", 150)
+        with pytest.raises(LLMBudgetExceededError):
+            llm_client.call_json("система", "запрос")
+        assert provider.calls == 1
+
+    def test_budget_stops_the_pool_walk_after_the_rejected_model(self, monkeypatch):
+        """Семантика пула (404 — спросить следующую) сохраняется, пока есть
+        время; при нуле остатка следующая модель не зовётся, и отказ называет
+        испробованные имена."""
+        clock = _fake_clock(monkeypatch)
+        monkeypatch.setenv("GIGACHAT_MODEL", "GigaChat,GigaChat-2")
+        provider = _stepping_provider(
+            monkeypatch, clock, 120,
+            _response_error(llm_client.NotFoundError, 404,
+                            b'{"message":"No such model"}'))
+        monkeypatch.setattr(llm_client, "CALL_BUDGET_SECONDS", 100)
+        with pytest.raises(LLMBudgetExceededError) as caught:
+            _complete()
+        assert provider.models == ["GigaChat"]
+        assert "GigaChat" in str(caught.value)
+
+    def test_transport_retry_failure_names_the_spent_time(self, monkeypatch):
+        """Время попыток суммируется в одном месте и показывается в отказе:
+        «LLM недоступна» без секунды ожидания неотличимо от быстрого отказа."""
+        clock = _fake_clock(monkeypatch)
+        _stepping_provider(monkeypatch, clock, 30,
+                           _response_error(ServerError, 503, b"upstream down"))
+        with pytest.raises(LLMError) as caught:
+            _complete()
+        assert not isinstance(caught.value, LLMBudgetExceededError)
+        assert "ожидания" in str(caught.value)
+
+
+class TestCallTrace:
+    """Наблюдаемость: имя ответившей модели и usage уходят вызывающей стороне
+    в словаре `trace`, а не только в строку лога."""
+
+    def test_trace_names_the_answered_model_and_sums_usage(self, monkeypatch):
+        monkeypatch.delenv("GIGACHAT_MODEL", raising=False)
+        _provider(monkeypatch, _response('{"ok": true}', usage=USAGE))
+        trace: dict = {}
+        assert llm_client.call_json("система", "запрос", trace=trace) == {"ok": True}
+        assert trace["models"] == list(llm_client.DEFAULT_MODEL_POOL)[:1]
+        assert trace["usage"] == {"prompt_tokens": 120,
+                                  "completion_tokens": 45, "total_tokens": 165}
+        assert trace["attempts"] == 1
+        assert trace["rejected_models"] == []
+
+    def test_trace_records_the_model_switch_after_404(self, monkeypatch):
+        """Mid-run 404: схема дальше собирается другой моделью — журнал обязан
+        нести и отвергнутое имя, и ответившее."""
+        monkeypatch.setenv("GIGACHAT_MODEL", "GigaChat,GigaChat-2")
+        _provider(monkeypatch,
+                  _response_error(llm_client.NotFoundError, 404,
+                                  b'{"message":"No such model"}'),
+                  _response('{"ok": true}', usage=USAGE))
+        trace: dict = {}
+        llm_client.call_json("система", "запрос", trace=trace)
+        assert trace["rejected_models"] == ["GigaChat"]
+        assert trace["models"] == ["GigaChat-2"]
+
+    def test_trace_covers_both_rounds_of_a_repair(self, monkeypatch):
+        provider = _provider(monkeypatch, _response("мусор без JSON", usage=USAGE),
+                             _response('{"ok": true}', usage=USAGE))
+        trace: dict = {}
+        llm_client.call_json("система", "запрос", trace=trace)
+        assert provider.calls == 2
+        assert trace["models"] == [trace["models"][0]] * 2
+        assert trace["usage"]["prompt_tokens"] == 240  # оба вызова
+        assert len(trace["calls"]) == 2
+
+    def test_call_without_trace_does_not_break(self, monkeypatch):
+        _provider(monkeypatch, _response('{"ok": true}', usage=USAGE))
+        assert llm_client.call_json("система", "запрос") == {"ok": True}

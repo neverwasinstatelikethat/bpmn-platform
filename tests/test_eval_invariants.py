@@ -995,6 +995,122 @@ def test_a_pool_with_no_message_flow_at_all_is_still_silent():
     assert not check.ok and check.ids == ("Участник 3",), check.reason
 
 
+# ---------------------------------------------------------------------------
+# dangling_flows: дуга, конец которой не назван узлом схемы
+# ---------------------------------------------------------------------------
+
+DANGLING_GATEWAY_XML_TAIL = ('<endEvent id="E" name="Готово"/>')
+
+
+def gateway_with_a_lost_leg_xml(ghost_target: str = "Ghost") -> str:
+    """Развилка с двумя ногами, одна из которых называет узел, которого нет.
+
+    `ghost_target="X"` — та же схема с существующей второй ногой: сравнение двух
+    видов и есть вопрос «наказывает ли оракул за дефект или наказывает за то,
+    что перестал его видеть».
+    """
+    return _doc(
+        '<startEvent id="S" name="Начало"/>' + _flow("f0", "S", "G")
+        + '<exclusiveGateway id="G" name="Одобрено?"/>'
+        + _flow("f1", "G", "A", condition="да")
+        + '<userTask id="A" name="Выдать деньги"/>' + _flow("f2", "A", "E")
+        + _flow("f3", "G", ghost_target, condition="нет")
+        + ('<userTask id="X" name="Отказать"/>' + _flow("f4", "X", "E")
+           if ghost_target == "X" else "")
+        + DANGLING_GATEWAY_XML_TAIL)
+
+
+def test_a_gateway_leg_into_a_missing_node_fails_the_gate_not_the_denominator():
+    """Провокатор: нога развилки в отсутствующий id была для оракула невидимкой.
+
+    До `dangling_flows` ни одна проверка её не читала: `no_unrouted` считает
+    узлы (у шлюза есть исходящая нога — значит всё в порядке), `flow_ends_legal`
+    и `flows_within_pool` такие ссылки пропускают прямо в коде, а `seq_out`
+    висячую дугу не содержит — развилка становилась одновходовой, и
+    `gateway_split_join` с `gateway_conditions_or_default` уходили в
+    «не применимо». Знаменатель гейта сжимался, и `quality/scheme_checks_share`
+    РАСЛА на битой схеме: штраф превращался в награду.
+
+    Поэтому сверяются оба вида одной и той же схемы: с потерянной ногой доля
+    обязана быть строго ниже, чем с целой."""
+    broken = check_xml(gateway_with_a_lost_leg_xml())
+    fixed = check_xml(gateway_with_a_lost_leg_xml(ghost_target="X"))
+
+    check = broken["dangling_flows"]
+    assert not check.ok and check.applicable, check.reason
+    assert "f3" in check.ids
+    assert "нет узла-цели" in check.reason and "Ghost" in check.reason
+
+    # Ловушка, из-за которой прощался дефект: обе проверки развилки немели.
+    assert broken["gateway_split_join"].applicable is False
+    assert broken["gateway_conditions_or_default"].applicable is False
+
+    def share(results) -> float:
+        deciding = invariants.deciding_checks(results)
+        return sum(1 for c in deciding if c.ok) / len(deciding)
+
+    assert share(fixed) == 1.0, [c.name for c in invariants.failed_checks(fixed)]
+    assert share(broken) < share(fixed)
+    assert not all(c.ok for c in invariants.deciding_checks(broken))
+    # Скоринг такие дуги называл и раньше (`sequence_flows`: 107 дуг в 33 схемах
+    # корпуса): провал заряжен реальным дефектом, а не выдумкой оракула.
+    assert status_of(gateway_with_a_lost_leg_xml(), "sequence_flows") == "failed"
+
+
+def test_a_dangling_flow_is_reported_once_and_by_the_right_check():
+    """Поток сообщения с битым концом — забота `message_flow_ends`: второй отказ
+    на той же дуге читался бы как два разных дефекта в одной схеме."""
+    xml = pools_doc([pool_body(1), pool_body(2)],
+                    '<messageFlow id="M1" sourceRef="A1" targetRef="Ghost"/>')
+    checks = check_xml(xml)
+    assert not checks["message_flow_ends"].ok
+    assert checks["dangling_flows"].ok, checks["dangling_flows"].reason
+
+
+def test_dangling_flows_is_a_notation_invariant_on_both_entry_points():
+    """Инвариант нотации, а не заявленное ожидание: он проверяется всегда, и
+    структура-словарь даёт по нему тот же вердикт, что и XML (иначе «план
+    починен, а в XML не доехало» осталось бы невидимым)."""
+    assert "dangling_flows" in invariants.NOTATION_INVARIANTS
+    assert "dangling_flows" not in invariants.BUSINESS_INVARIANTS
+    plan = {
+        "participants": ["ВкусВилл"],
+        "elements": [
+            {"id": "S", "kind": "startEvent", "name": "Начало",
+             "participant": "ВкусВилл"},
+            {"id": "A", "kind": "userTask", "name": "Собрать",
+             "participant": "ВкусВилл"},
+            {"id": "E", "kind": "endEvent", "name": "Готово",
+             "participant": "ВкусВилл"},
+        ],
+        "flows": [
+            {"id": "f1", "source": "S", "target": "A", "kind": "sequence"},
+            {"id": "f2", "source": "A", "target": "Ghost", "kind": "sequence"},
+            {"id": "f3", "source": "A", "target": "E", "kind": "sequence"},
+        ],
+    }
+    check = check_structure(plan)["dangling_flows"]
+    assert not check.ok and "f2" in check.ids, check.reason
+    # Схема из тех же узлов и целой дугой проходит: провал — именно за дугу.
+    whole = _plan_flows(plan, {})
+    whole["elements"].append({"id": "Ghost", "kind": "userTask",
+                              "name": "Догрузить", "participant": "ВкусВилл"})
+    whole["flows"].append({"id": "f4", "source": "Ghost", "target": "E",
+                           "kind": "sequence"})
+    assert check_structure(whole)["dangling_flows"].ok
+
+
+def test_a_scheme_without_flows_says_not_applicable():
+    """«Нечего проверять» — не прохождение: пустая схема не должна получать
+    кредит за целые потоки."""
+    plan = {"participants": ["ВкусВилл"],
+            "elements": [{"id": "S", "kind": "startEvent", "name": "Начало",
+                          "participant": "ВкусВилл"}],
+            "flows": []}
+    check = check_structure(plan)["dangling_flows"]
+    assert check.applicable is False
+
+
 def test_event_based_fork_is_not_a_split_while_inclusive_fork_is():
     """Решение обоих слоёв о том, у какой развилки обязано быть схождение.
 

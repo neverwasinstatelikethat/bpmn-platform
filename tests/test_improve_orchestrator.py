@@ -8,8 +8,10 @@
 import asyncio
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
+from gigachat.exceptions import NotFoundError
 
 from core import bpmn_edits, llm_client, llm_improve
 from core.bpmn_scoring import BPMNScorer
@@ -744,6 +746,11 @@ def test_report_carries_the_facts_of_the_round(orchestrator, monkeypatch,
     assert report["package_reverted"] == ""
     assert report["rules_regressed"] == {}
     assert report["noop_rows"] == 0
+    # Транспорт подменён выше журнала (`_complete`): ключ есть, он пуст —
+    # отсутствие данных не роняет улучшение и не читается как «отвечала
+    # смоделированная модель».
+    assert report["llm"]["models"] == []
+    assert report["llm"]["mixed_models"] is False
 
 
 # --- промпт как обязательство перед аплайером -------------------------------
@@ -996,3 +1003,83 @@ class TestPromptContract:
         fake = FakeLLM(monkeypatch, '{"analysis": "ок", "operations": []}')
         _improve(orchestrator, single_pool_xml)
         assert "УЗКИЕ МЕСТА ПО СКОРИНГУ" not in fake.prompts[0]
+
+
+# --- кто ответил на этой схеме ----------------------------------------------
+
+
+def _sdk_response(content: str):
+    """Ответ вида SDK: usage обязана быть объектом, иначе журнал токенов пуст."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content),
+                                 finish_reason=None)],
+        usage=SimpleNamespace(prompt_tokens=120, completion_tokens=45,
+                              total_tokens=165),
+    )
+
+
+class FlakyTransport:
+    """Клиент провайдера, где «GigaChat» отвечает 404 ровно один раз.
+
+    Журнал `llm` рождается в настоящем `llm_client`, поэтому транспорт подменён
+    на уровне клиента, а не `_complete`: иначе тест проверял бы подмену, а не
+    учёт ответившей модели."""
+
+    PLAN = ('{"analysis": "план", "operations": ['
+            '{"op": "rename", "id": "T_ship", "name": "Отгрузить"},'
+            '{"op": "rename", "id": "nope", "name": "Призрак"}]}')
+    RETRY = '{"analysis": "повтор", "operations": []}'
+
+    def __init__(self):
+        self.answers = [self.PLAN, self.RETRY]
+        self.rejected_once = False
+        self.models: list = []
+
+    def chat(self, request):
+        self.models.append(request.model)
+        if request.model == "GigaChat" and not self.rejected_once:
+            self.rejected_once = True
+            raise NotFoundError("https://chat", 404,
+                                b'{"message":"No such model"}', None)
+        return _sdk_response(self.answers.pop(0))
+
+
+class TestModelAccounting:
+    def test_report_names_answered_model_and_usage(self, orchestrator,
+                                                   monkeypatch, single_pool_xml):
+        """Имя ответившей модели и usage уходят в отчёт: раньше они жили только
+        в строке лога, и результат нельзя было отдать ни пользователю, ни
+        харнессу."""
+        monkeypatch.delenv("GIGACHAT_MODEL", raising=False)
+        stub = FlakyTransport()
+        stub.rejected_once = True  # перехода по пулу нет: одна модель
+        monkeypatch.setattr(llm_client, "get_llm_client", lambda: stub)
+        monkeypatch.setattr(llm_client, "RETRY_PAUSE_SECONDS", 0)
+        _, improved_xml, report = _improve(orchestrator, single_pool_xml)
+
+        first = llm_client.DEFAULT_MODEL_POOL[0]
+        assert stub.models == [first, first]
+        assert report["llm"]["models"] == [first, first]
+        assert report["llm"]["rejected_models"] == []
+        assert report["llm"]["usage"] == {"prompt_tokens": 240,
+                                          "completion_tokens": 90,
+                                          "total_tokens": 330}
+        assert report["llm"]["mixed_models"] is False
+        assert improved_xml is not None
+
+    def test_model_switch_mid_run_leaves_a_trace(self, orchestrator, monkeypatch,
+                                                 single_pool_xml):
+        """404 посреди прогона: план ответила одна модель пула, переспрос —
+        другую. Смешанная схема обязана нести след, а не выглядеть ответом
+        одной модели."""
+        monkeypatch.setenv("GIGACHAT_MODEL", "GigaChat,GigaChat-2")
+        stub = FlakyTransport()
+        monkeypatch.setattr(llm_client, "get_llm_client", lambda: stub)
+        monkeypatch.setattr(llm_client, "RETRY_PAUSE_SECONDS", 0)
+        _, _, report = _improve(orchestrator, single_pool_xml)
+
+        assert report["llm"]["rejected_models"] == ["GigaChat"]
+        assert report["llm"]["models"] == ["GigaChat-2", "GigaChat"]
+        assert report["llm"]["mixed_models"] is True
+        # usage суммируется по всем обращениям прогона
+        assert report["llm"]["usage"]["total_tokens"] == 2 * 165

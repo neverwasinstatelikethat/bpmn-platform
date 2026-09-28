@@ -8,6 +8,7 @@
 # делает фронтенд (bpmn-auto-layout).
 import asyncio
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -84,6 +85,42 @@ def _process_key(name: str) -> str:
     return re.sub(r"[^0-9a-zа-яё]+", "_", key).strip("_")
 
 
+def _reference_label(name: str) -> str:
+    """Человекочитаемое имя эталона для промпта.
+
+    В именах файлов корпуса живёт 24–64-символьный хеш; дословное имя уводило
+    его в промпт, где модель читала случайный hex как словарный материал.
+    Регистр и слова при этом сохраняются: `_process_key` для рангов нормализует
+    строчным, а метка читателю нужна исходная."""
+    label = re.sub(r"\.bpmn$", "", str(name or ""), flags=re.IGNORECASE)
+    label = _HASH_SUFFIX.sub("", label)
+    return re.sub(r"[_\s]+", " ", label).strip()
+
+
+def corpus_fingerprint(dataset_path: str) -> str:
+    """Содержательный отпечаток корпуса: имена и байты файлов, порядок фиксирован.
+
+    Манифест кэша без него не замечал правку эталона при том же числе файлов:
+    индекс продолжал отдавать практики по старому содержимому. mtime в отпечаток
+    не берём — git-клон обновляет его у всех 367 файлов и гнал бы пересборку
+    эмбеддингов (десятки секунд) при неизменном содержимом; хеш читает те же
+    файлы, что и сборка, — десятки миллисекунд против минуты.
+    """
+    digest = hashlib.sha256()
+    for file_path in sorted(glob.glob(os.path.join(dataset_path, "*.bpmn"))):
+        digest.update(os.path.basename(file_path).encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with open(file_path, "rb") as f:
+                digest.update(f.read())
+        except OSError:
+            # Нечитаемый файл `_load_real_schemas` пропускает — отпечаток обязан
+            # различать «файл пропал» и «файл читается», не падая.
+            digest.update(b"!unreadable")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _vectorizer_manifest(vectorizer: TfidfVectorizer) -> Dict[str, Any]:
     params = dict(_TFIDF_PARAMS)
     params["ngram_range"] = list(vectorizer.ngram_range)
@@ -156,6 +193,10 @@ class BPMNKnowledgeBase:
         self._embeddings: Optional[np.ndarray] = None
         self._vectors = None
         self._vectorizer = TfidfVectorizer(**_TFIDF_PARAMS)
+        # Отпечаток корпуса на момент сборки/загрузки: в манифест пишется он,
+        # а не пересчитанный позже — иначе правка файлов между сборкой и
+        # записью была бы записана как уже учтённая.
+        self._fingerprint = ""
 
     # --- публичное ---
 
@@ -175,7 +216,10 @@ class BPMNKnowledgeBase:
         user_root = self._parse(xml_content) if xml_content else None
         user_keys = ({key for key, _ in self._practice_signals(user_root)}
                      if user_root is not None else None)
-        semantic_text, lexical_text = self._query_texts(query, xml_content)
+        # Разобранный выше корень уходит и в тексты запроса: схема пользователя
+        # за поиск должна парситься один раз, а не по разу на каждую секцию.
+        semantic_text, lexical_text = self._query_texts(query, xml_content,
+                                                        root=user_root)
 
         branches: List[np.ndarray] = []
         if (self._embeddings is not None
@@ -248,6 +292,13 @@ class BPMNKnowledgeBase:
                 logger.info("Кэш RAG устарел (метод %s), пересобираем",
                             manifest.get("method"))
                 return False
+            stored = manifest.get("corpus_fingerprint")
+            current = corpus_fingerprint(self.dataset_path)
+            if stored != current:
+                # Сюда же попадает манифест без ключа: он собран до появления
+                # отпечатка и про правки корпуса ничего не гарантирует.
+                logger.info("Кэш RAG устарел (корпус изменился), пересобираем")
+                return False
             with np.load(npz_path) as arrays:
                 embeddings = (arrays["embeddings"]
                               if "embeddings" in arrays.files else None)
@@ -267,6 +318,7 @@ class BPMNKnowledgeBase:
             self._vectors = vectors
             self._embeddings = embeddings
             self._vectorizer = vectorizer
+            self._fingerprint = current
             logger.info("Кэш RAG загружен: %s эталонов", len(self._metadata))
             return True
         except Exception as e:  # noqa: BLE001 — битый/чужой кэш пересобирается
@@ -300,9 +352,12 @@ class BPMNKnowledgeBase:
                 np.savez(f, **arrays)
             os.replace(data_tmp, npz_path)
             # Полного XML в кэше нет: в промпт уходят name/domain/practices,
-            # а признаки XML считаются один раз на сборке.
+            # а признаки XML считаются один раз на сборке. Отпечаток корпуса —
+            # почему этот индекс ещё актуален: без него правка файла при том
+            # же количестве файлов пересборки не вызывала.
             manifest = {
                 "method": CACHE_METHOD,
+                "corpus_fingerprint": self._fingerprint,
                 "metadata": self._metadata,
                 "vectorizer": _vectorizer_manifest(self._vectorizer),
             }
@@ -317,6 +372,7 @@ class BPMNKnowledgeBase:
     # --- сборка индекса ---
 
     def _build(self) -> None:
+        self._fingerprint = corpus_fingerprint(self.dataset_path)
         schemas = self._load_real_schemas()
         if not schemas:
             logger.warning("Корпус эталонов пуст: RAG работать не будет")
@@ -533,11 +589,18 @@ class BPMNKnowledgeBase:
                             schema.get("complexity", ""), readable, names])
         return semantic, lexical
 
-    def _query_texts(self, query: str,
-                     xml_content: Optional[str]) -> Tuple[str, str]:
+    # Отличает «root не передали» от «схему разобрать не удалось (None)».
+    _UNPARSED = object()
+
+    def _query_texts(self, query: str, xml_content: Optional[str],
+                     root: Any = _UNPARSED) -> Tuple[str, str]:
         """Семантике — запрос и названия элементов, лексике — структура схемы.
         Склеивать их нельзя: признаки вида `tasks_12 low_complexity` живут в
         том же словаре, что и документы корпуса, и тонут в шуме.
+
+        `root` — уже разобранная схема вызывающей стороной (`find_best_practices`
+        парсит её для практик); без него текст разбирается сам, и поведение при
+        битом XML не меняется: `invalid_xml` в лексическую ветку.
 
         Запрос в лексическую ветку дописывали и сняли по замеру: `python -m
         eval.retrieval` дал те же P@3/MRR@3 до и после (0.58/0.88 по эталонным
@@ -549,7 +612,8 @@ class BPMNKnowledgeBase:
         """
         if not xml_content:
             return query, query
-        root = self._parse(xml_content)
+        if root is BPMNKnowledgeBase._UNPARSED:
+            root = self._parse(xml_content)
         names = " ".join(self._element_names(root))
         structural = self._extract_xml_features(root)
         corpus = self._corpus_domains()
@@ -1045,7 +1109,10 @@ def _format_practices(schemas: List[Dict[str, Any]]) -> str:
     """
     grouped: Dict[str, Dict[str, Any]] = {}
     for schema in schemas[:TOP_SCHEMAS]:
-        name = str(schema.get("name") or "без названия")
+        # В промпт уходит человекочитаемое имя эталона, а не имя файла: 24–64-
+        # символьные hex-хэши из имён корпуса модель читала как словарный
+        # материал (правкам они не соответствуют, а контекст занимают).
+        name = _reference_label(str(schema.get("name") or "")) or "без названия"
         for practice in list(schema.get("missing_practices") or [])[:PRACTICES_PER_SCHEMA]:
             entry = grouped.setdefault(practice, {"sources": []})
             if name not in entry["sources"]:
@@ -1068,6 +1135,30 @@ def _format_practices(schemas: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 # Оркестратор
 # ---------------------------------------------------------------------------
+
+def _llm_run_summary(traces: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Итог обращений к модели за прогон улучшения: кто ответил, кого провайдер
+    не знал, сколько ушло токенов.
+
+    `mixed_models` — след mid-run 404: если на схему отвечали разные модели
+    пула, отчёт говорит об этом явно, иначе качество одной модели приписывается
+    другой. Пустые списки — норма для тестовой подмены транспорта: журнал
+    заполняет `llm_client`, а не оркестратор."""
+    models = [m for trace in traces for m in (trace.get("models") or [])]
+    rejected = [m for trace in traces
+                for m in (trace.get("rejected_models") or [])]
+    usage: Dict[str, int] = {}
+    for trace in traces:
+        for field, value in (trace.get("usage") or {}).items():
+            usage[field] = usage.get(field, 0) + int(value)
+    return {
+        "models": models,
+        "rejected_models": rejected,
+        "usage": usage,
+        "attempts": sum(int(t.get("attempts") or 0) for t in traces),
+        "mixed_models": len(set(models)) > 1,
+    }
+
 
 class BPMNImprovementOrchestrator:
     """Планирование изменений схемы через операции и их применение."""
@@ -1098,6 +1189,11 @@ class BPMNImprovementOrchestrator:
         practices_block = await asyncio.to_thread(
             self._practices_block, user_prompt, xml_content)
 
+        # Журнал обращений: имя ответившей модели и usage на каждый вызов.
+        # Схема не имеет права собираться из ответов разных моделей без следа
+        # в отчёте, а наблюдателю нужно знать, кто именно ответил.
+        llm_traces: List[Dict[str, Any]] = []
+
         def _plan_step() -> Dict[str, Any]:
             user_content = _USER_TEMPLATE.format(
                 inventory=json.dumps(inventory, ensure_ascii=False, indent=1),
@@ -1106,9 +1202,13 @@ class BPMNImprovementOrchestrator:
                 practices_block=practices_block,
                 user_prompt=user_prompt,
             )
-            return llm_client.call_json(_SYSTEM_PROMPT, user_content,
-                                        temperature=PLANNING_TEMPERATURE,
-                                        max_tokens=8000)
+            trace: Dict[str, Any] = {}
+            try:
+                return llm_client.call_json(_SYSTEM_PROMPT, user_content,
+                                            temperature=PLANNING_TEMPERATURE,
+                                            max_tokens=8000, trace=trace)
+            finally:
+                llm_traces.append(trace)
 
         try:
             plan = await asyncio.to_thread(_plan_step)
@@ -1155,7 +1255,8 @@ class BPMNImprovementOrchestrator:
         if not operations:
             return analysis, None, {"status": "analysis_only", "applied": [],
                                     "skipped": [],
-                                    "truncated_operations": truncated_operations}
+                                    "truncated_operations": truncated_operations,
+                                    "llm": _llm_run_summary(llm_traces)}
 
         xml_after, report = await asyncio.to_thread(
             bpmn_edits.apply_and_guarantee, xml_content, operations,
@@ -1194,7 +1295,7 @@ class BPMNImprovementOrchestrator:
                 # «повтор был»: попыткой он остаётся и при пустом ответе.
                 xml_after, report, _reapplied = await self._retry_skipped(
                     xml_after, user_prompt, report, unrouted, empty_pools,
-                    undocumented, regressed)
+                    undocumented, regressed, llm_traces=llm_traces)
                 # Пометки второго раунда не заменяют первые: понижение шлюза до
                 # задачи неидемпотентно, и второй `validate_and_repair` его уже
                 # не вернёт — терять факт подмены типа элемента нельзя.
@@ -1233,6 +1334,9 @@ class BPMNImprovementOrchestrator:
         report["noop_rows"] = int(report.get("noop_rows") or 0)
         report["notes"] = repair_notes
         report["repair_notes"] = repair_notes
+        # Кто ответил на этой схеме и сколько это стоило токенов — факт прогона,
+        # его читают и HTTP-слой, и харнесс (атрибуция «модель vs контур»).
+        report["llm"] = _llm_run_summary(llm_traces)
 
         # Висячий шаг — не улучшение: модель не указала, между какими шагами
         # он нужен, и додумывать маршрут за неё нельзя. То же для граничного
@@ -1306,6 +1410,7 @@ class BPMNImprovementOrchestrator:
                              empty_pools: List[str],
                              undocumented: Optional[List[str]] = None,
                              regressed: Optional[Dict[str, str]] = None,
+                             llm_traces: Optional[List[Dict[str, Any]]] = None,
                              ) -> Tuple[str, Dict[str, Any], bool]:
         """Корректирующий раунд: по не применённым операциям и по узлам,
         оставшимся вне маршрута.
@@ -1335,9 +1440,14 @@ class BPMNImprovementOrchestrator:
                 limits_block=_limits_block(inventory),
                 user_prompt=user_prompt,
             )
-            return llm_client.call_json(_SYSTEM_PROMPT, user_content,
-                                        temperature=PLANNING_TEMPERATURE,
-                                        max_tokens=8000)
+            trace: Dict[str, Any] = {}
+            try:
+                return llm_client.call_json(_SYSTEM_PROMPT, user_content,
+                                            temperature=PLANNING_TEMPERATURE,
+                                            max_tokens=8000, trace=trace)
+            finally:
+                if llm_traces is not None:
+                    llm_traces.append(trace)
 
         plan = await asyncio.to_thread(_retry_step)
         retry_planned = plan.get("operations") or []

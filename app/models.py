@@ -26,9 +26,15 @@ class Team(Base):
 
 class TeamMember(Base):
     __tablename__ = "team_members"
+    # Повторное приглашение того же человека в ту же команду — ошибка доступа,
+    # а не вариант нормы: на легаси-базах дубликаты уже копились, пока
+    # ограничение не стало частью схемы (см. миграцию 0003).
+    __table_args__ = (
+        UniqueConstraint("team_id", "user_id", name="uq_team_members_team_user"),
+    )
     id = Column(String(36), primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
-    team_id = Column(String(36), ForeignKey("teams.id"))
-    user_id = Column(Integer, ForeignKey("users.id"))
+    team_id = Column(String(36), ForeignKey("teams.id"), index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     role_id = Column(String(36), ForeignKey("roles.id"))
 
     team = relationship("Team", back_populates="members")
@@ -69,6 +75,12 @@ class User(Base):
     company = Column(String(100), nullable=True)
     website = Column(String(100), nullable=True)
     about = Column(Text, nullable=True)
+    # Клеймо выпуска токенов: смена пароля инкрементит счётчик, и deps.py
+    # отвергает JWT с более старым значением `tv`. В миграции 0003 у колонки
+    # есть server_default — строки, вставленные в обход моделей, не должны
+    # ложиться без клейма; в моделях дефолт питонский, как и в остальных
+    # колонках (см. заметку в ревизии 0002).
+    token_version = Column(Integer, nullable=False, default=0)
 
     diagrams = relationship("Diagram", back_populates="owner")
     folders = relationship("Folder", back_populates="owner")
@@ -83,11 +95,13 @@ class Diagram(Base):
     name = Column(String(100))
     xml_content = Column(Text)
     score = Column(Integer, default=0)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    # Индексы под горячие фильтры реестра: «мои схемы», «схемы команды»,
+    # содержимое папки (миграция 0003 заводит их на существующих базах).
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
-    folder_id = Column(String(36), ForeignKey("folders.id"), nullable=True)
-    team_id = Column(String(36), ForeignKey("teams.id"), nullable=True)
+    folder_id = Column(String(36), ForeignKey("folders.id"), nullable=True, index=True)
+    team_id = Column(String(36), ForeignKey("teams.id"), nullable=True, index=True)
     # Номер последней записанной версии: по нему улучшение понимает, что схема
     # ушла вперёд и предложение пора пересчитать.
     version_seq = Column(Integer, nullable=False, default=0)
@@ -166,12 +180,15 @@ class Improvement(Base):
     """
     __tablename__ = "pending_improvements"
     id = Column(String(36), primary_key=True, index=True)
-    diagram_id = Column(String(36), ForeignKey("diagrams.id"), nullable=True)
+    # diagram_id — поиск открытых предложений по схеме, status — выборка
+    # очереди на рассмотрение; оба без индекса читают таблицу целиком
+    # (миграция 0003).
+    diagram_id = Column(String(36), ForeignKey("diagrams.id"), nullable=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     xml_content = Column(Text)
     recommendations = Column(Text)
     created_at = Column(DateTime, default=utc_now)
-    status = Column(String(20), nullable=False, default="pending")
+    status = Column(String(20), nullable=False, default="pending", index=True)
     # Версия схемы, к которой применимо предложение (см. Diagram.version_seq).
     base_seq = Column(Integer)
     decided_at = Column(DateTime)

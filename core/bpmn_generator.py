@@ -29,8 +29,10 @@ import copy
 import difflib
 import json
 import logging
+import os
 import re
 import time
+from functools import lru_cache
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -69,14 +71,16 @@ TYPED_EVENT_KINDS = {"intermediateCatchEvent", "intermediateThrowEvent",
                      "boundaryEvent"}
 
 MAX_TEXT_CHARS = 10_000
-# Страховка транспорта, а не правило моделирования: размер ответа и так ограничен
-# `MAX_PLAN_TOKENS`, поэтому до этих чисел честная схема дойти не может. Они стоят
-# только для того, чтобы абсурдный ответ не положил генерацию XML, и ничего не
-# отрезают молча — см. `_over_budget`.
+# `MAX_PARTICIPANTS` и `MAX_LANES` — потолок, который починка применяет к себе
+# сама и объясняет заметкой (`_add_pool`, `_resolve_lane`). `MAX_ELEMENTS` — не
+# граница плана модели: маршрут из ~300 элементов модель физически не вернёт
+# (размер ответа держит `MAX_PLAN_TOKENS`), а резать его починке нельзя (см.
+# тест «длинный маршрут не режется контуром»). Это число — основа только для
+# производных лимитов ниже: оно говорит, сколько правок связности контур вправе
+# сделать сам, не превращая схему в решето.
 MAX_PARTICIPANTS = 40
 MAX_LANES = 120
 MAX_ELEMENTS = 300
-MAX_FLOWS = 600
 NAME_LIMIT = 120
 DOCUMENTATION_LIMIT = 400
 # Исправлений достижимости не больше, чем элементов: иначе генератор
@@ -95,6 +99,13 @@ POOL_MATCH_CUTOFF = 0.6
 # каждая лишняя итерация удваивает пользовательскую задержку, а переспрос по
 # нарушениям дешевле, чем принятая пользователем битая схема.
 MAX_RETRY_PLAN_CHARS = 12_000
+# Потолок перечня нарушений в переспросе. Остальные части запроса закейплены
+# уже (`MAX_RETRY_PLAN_CHARS` за план, `MAX_TEXT_CHARS` за описанием), а перечень
+# не был: на схеме из ~300 элементов `plan_gaps` выдаёт десятки пунктов, и этот
+# блок становился крупнейшей частью промпта — то есть источником 413 и обрезки,
+# которые контур честно считал сбоем модели. Отбор идёт по `_gap_priority`,
+# поэтому под сокращение попадает косметика маршрута, а не потерянный участник.
+MAX_RETRY_GAPS_CHARS = 4_000
 # Бюджет ответа на план в токенах. 8000 хватало плану без описаний; теперь
 # модель пишет документацию к каждому шагу, а обрезанный JSON — не «схема без
 # описаний», а отказ всей генерации: `LLMTruncatedError` повторять бессмысленно.
@@ -305,6 +316,30 @@ event_definition="message".
 # своим стартом и финишем, — процесс фрагментировался, и вместе с фрагментацией
 # падали `roles_as_lanes`, `has_branching`, `min_steps`, `expected_participants`.
 MAX_ROSTER_TOKENS = 1_500
+
+# Общий бюджет времени на ОДНУ генерацию. Транспортный `GIGACHAT_CALL_BUDGET_SECONDS`
+# ограничивает один вызов модели, а генерация — это до десяти завершений (состав,
+# маршрут, переспрос, вопрос о принадлежности, repair-повторы) плюс очередь к
+# провайдеру, где `GIGACHAT_MAX_CONCURRENT=1`: без потолка на прогон один запрос
+# законно занимает минуты, а очередь за ним растёт быстрее, чем кто-то получает
+# ответ. Ступор — не тихая деградация: наружу уходит различимая ошибка с
+# предложением повторить, а не недоделанная схема.
+def _budget_seconds(default: int) -> int:
+    # Не-число в окружении — не падение импорта пакета, а дефолт с предупреждением.
+    raw = os.getenv("BPMN_GENERATION_BUDGET_SECONDS", "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "BPMN_GENERATION_BUDGET_SECONDS не число — беру %s", default)
+        return default
+
+
+GENERATION_BUDGET_SECONDS = _budget_seconds(900)
+
+
+class GenerationBudgetExceeded(Exception):
+    """Время на генерацию вышло до того, как собран план."""
 _ROSTER_SYSTEM_PROMPT = """Ты — аналитик бизнес-процессов. По описанию процесса
 определи ЕГО СОСТАВ: кто участвует, что из этого организация, система,
 контрагент, а что — роль или подразделение внутри кого-то. Маршрут, шаги и
@@ -1028,6 +1063,25 @@ class GenerationError(RuntimeError):
     """Сбой генерации с пользовательским сообщением на русском."""
 
 
+# Сбой стадии — не отказ генерации, но обязан быть назван своим словом: «LLM
+# недоступна» и «ответ обрезан» для пользователя означают разную работу (первый
+# зовёт повторить позже, второй — сократить описание). Имена классов наружу не
+# печатаются.
+_ERROR_REASONS = {
+    LLMTruncatedError: "ответ модели обрезан по лимиту токенов",
+    LLMRequestTooLargeError: "запрос не помещается в контекст модели",
+    ValueError: "ответ модели не разбирается в JSON",
+    LLMError: "сервис генерации недоступен",
+}
+
+
+def _error_reason(error: Exception) -> str:
+    for klass in type(error).__mro__:
+        if klass in _ERROR_REASONS:
+            return _ERROR_REASONS[klass]
+    return str(error) or type(error).__name__
+
+
 class BPMNGenerator:
     """Генератор BPMN: один вызов LLM + детерминированная починка структуры."""
 
@@ -1057,20 +1111,36 @@ class BPMNGenerator:
                 "flows": len(structure.get("flows") or []),
                 "состав": "утверждён отдельным вызовом" if meta["frozen"]
                           else "один вызов",
+                # Чем именно стадия состава оказалась: `meta["roster"]` раньше
+                # писался и не читался никем, а без него «схема собрана одним
+                # вызовом» неотличима от «состава нет» и от «состав есть, а
+                # маршрут дописан одним вызовом».
+                "стадия состава": meta.get("roster") or "",
+                # Пустой список — значит двухстадийный путь не ломался. Без
+                # этой строки заплатка неотличима от штатного прогона и в
+                # трейсе, и в отчёте харнесса (тот же класс ошибки, что с
+                # переносом участников в прогонах #58–#62).
+                "деградации": list(meta.get("degradations") or []),
             })
             attempts, retry_note = 1, ""
             # Переспрос переписывает весь план — дорогое и рискованное действие
             # (живые прогоны показывали потерянные шаги). Ради одного лишь
             # расхождения с `actors` его не заводим: там дешевле и надёжнее
             # узкий вопрос о том, чьи это шаги (`_clarify_ownership`).
-            # Нарушения, которые переспрос физически способен закрыть. Требование
+            # Нарушения, которые переспрос физически способен закрыть и которые
+            # влезает в запрос. Требование
             # «заведи пул» под утверждённым составом ему не по зубам
             # (`_merge_skeleton(allow_extra_pools=False)` снимает новый пул), и
             # просить о нём — значит потом читать «повтор не улучшил план» там,
             # где улучшения не могло быть (прогон #53). Такое нарушение не
             # выбрасывается: его закрывает идущий следом узкий вопрос.
-            asked = _askable_gaps(gaps, meta["frozen"])
+            asked = _asked_gaps(gaps, meta["frozen"])
             if asked and plan_gaps(structure, text, with_actors=False):
+                # Переспрос — самый дорогой шаг (он же запрос с перечнем
+                # нарушений), и начинать его «на остатке бюджета» нельзя:
+                # запрос уже оплачен очередью, а ответ всё равно не доживёт до
+                # починки.
+                self._check_budget(meta, "переспрос")
                 attempts = 2
                 patch_trace: Dict[str, Any] = {}
                 retry, patch_notes = self._retry_structure(
@@ -1166,6 +1236,7 @@ class BPMNGenerator:
                 notes.append(retry_note)
             notes.extend(meta["notes"])
             notes.extend(patch_notes)
+            notes.extend(_wait_gap_notes(gaps))
             for note in notes:
                 logger.info("Починка структуры: %s", note)
             bpmn_xml = self._generate_bpmn_xml(repaired)
@@ -1181,6 +1252,19 @@ class BPMNGenerator:
                 "gaps": gaps,
                 "attempts": attempts,
                 "trace": trace,
+                "time_elapsed": time.time() - start_time,
+            }
+        except GenerationBudgetExceeded as e:
+            # Не «модель недоступна» и не обрезанный ответ: прогон длиннее
+            # бюджета. Причина и номер стадии — в тексте, иначе пользователь
+            # читает это как сбой провайдера и нажимает «повторить».
+            logger.error("Генерация прервана по бюджету времени: %s", e)
+            return {
+                "status": "error",
+                "error": "Сборка схемы не уложилась в отведённое время "
+                         f"({GENERATION_BUDGET_SECONDS} с) — повторите запрос "
+                         "или сократите описание процесса.",
+                "step": "llm",
                 "time_elapsed": time.time() - start_time,
             }
         except GenerationError as e:
@@ -1251,11 +1335,20 @@ class BPMNGenerator:
         фрагментацией исчезали развилка, контрагент и число шагов. Состав
         решает маленькая отдельная стадия, а маршрут получает его каркасом и
         новых пулов не заводит.
+
+        Отказ любой из стадий — деградация в одношаговый путь, а не отказ
+        генерации: пригодный план модель обязана отдать и одним вызовом. Что
+        именно не сработало — видно наружу (`meta["degradations"]` уходит в
+        трейс, а строка — в заметки), иначе заплатка читается пользователю и
+        харнессу как двухстадийный прогон.
         """
         meta.setdefault("notes", [])
         meta.setdefault("frozen", False)
+        meta.setdefault("degradations", [])
+        meta.setdefault("_deadline", time.monotonic() + GENERATION_BUDGET_SECONDS)
+        self._check_budget(meta, "начало")
         skeleton: Dict[str, Any] = {}
-        roster = self._extract_roster(text)
+        roster = self._extract_roster(text, meta)
         if roster is not None and any(key in roster
                                       for key in ("elements", "flows", "lanes")):
             # Модель ответила на узкий вопрос планом целиком. Выбрасывать его и
@@ -1269,9 +1362,19 @@ class BPMNGenerator:
         if not skeleton.get("participants"):
             # Состава нет (модель не ответила на этот вызов или состав пуст):
             # генерация обязана остаться одношаговой, а не превратиться в отказ.
+            if roster is not None:
+                # Стадия состава ответила, но состава из ответа не вышло — это
+                # тот же откат в одношаговый путь, и он обязан быть виден.
+                reason = self._note_degradation(meta, "стадия состава",
+                                                "состав не назван")
+                meta["roster"] = f"сбой: {reason}"
+            self._check_budget(meta, "одношаговый план")
             return self._extract_plan(text)
-        plan = self._extract_flow(text, skeleton)
+        self._check_budget(meta, "стадия маршрута")
+        plan = self._extract_flow(text, skeleton, meta)
         if plan is None:
+            meta.setdefault("roster", "состав утверждён, маршрут одним вызовом")
+            self._check_budget(meta, "одношаговый план")
             return self._extract_plan(text)
         merged, merge_notes = _merge_skeleton(skeleton, plan, text)
         meta["notes"].extend(merge_notes)
@@ -1279,19 +1382,57 @@ class BPMNGenerator:
         # Каркас нужен и переспросу: он решает, что из ответа модели про состав
         # остаётся в силе.
         meta["skeleton"] = skeleton
+        meta.setdefault("roster", "утверждён отдельным вызовом")
         return merged
 
-    def _extract_roster(self, text: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _note_degradation(meta: Dict[str, Any], stage: str,
+                          reason: str) -> str:
+        """Запись отката одной стадии в одношаговый путь: трейс, заметка
+        наружу и причина, почему генерация всё-таки состоялась.
+
+        Класс ошибки печатается человеческим словом, а не именем исключения:
+        «LLMTruncatedError» пользователю ничего не говорит, а «ответ обрезан по
+        лимиту токенов» — говорит, и отличает деградацию от сетевого сбоя там,
+        где раньше был только `logger.warning`.
+        """
+        meta.setdefault("degradations", []).append(f"{stage}: {reason}")
+        meta.setdefault("notes", []).append(
+            f"Генерация одним вызовом: {stage} не отработала ({reason})")
+        return reason
+
+    @staticmethod
+    def _check_budget(meta: Dict[str, Any], stage: str) -> None:
+        """Граница стадии — единственное место, где генерацию можно оборвать.
+
+        Транспортный бюджет считает один вызов; между стадиями сумма попыток и
+        ожидания в очереди к провайдеру никем не ограничена. Проверка до вызова,
+        а не после: обрывать начатый запрос смысла нет — он уже оплачен.
+        """
+        deadline = meta.get("_deadline")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise GenerationBudgetExceeded(
+                f"время на генерацию исчерпано до стадии «{stage}» "
+                f"(бюджет {GENERATION_BUDGET_SECONDS} с)")
+
+    def _extract_roster(self, text: str,
+                        meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             data = call_json(_ROSTER_SYSTEM_PROMPT,
                              f"Описание процесса:\n{text}",
                              temperature=0.0, max_tokens=MAX_ROSTER_TOKENS)
-        except (LLMTruncatedError, LLMRequestTooLargeError):
+        except LLMRequestTooLargeError:
+            # Заведомая фатальность: одношаговый запрос с тем же описанием не
+            # меньше, а «попробуйте позже» здесь было бы ложным обещанием.
             raise
-        except LLMError as e:
-            # Только сбой транспорта уводит на одношаговый путь: обрезка и
-            # переполнение контекста — объяснимый пользователю отказ, а
-            # не разобранный JSON — тот же сбой разбора, что и раньше.
+        except (LLMTruncatedError, LLMError, ValueError) as e:
+            # Обрезка этого вызова — не обрезка плана: бюджет состава
+            # (`MAX_ROSTER_TOKENS`) маленький, а одношаговый путь с тем же
+            # описанием годен. Проза вместо JSON — тот же сбой разбора, что и
+            # раньше. Наружу уходит деградация, а не отказ генерации.
+            reason = self._note_degradation(meta, "стадия состава",
+                                            _error_reason(e))
+            meta["roster"] = f"сбой: {reason}"
             logger.warning("Состав процесса не выделен, генерация идёт одним "
                            "вызовом: %s", e)
             return None
@@ -1304,8 +1445,8 @@ class BPMNGenerator:
             raise ValueError("ответ модели не объект")
         return data
 
-    def _extract_flow(self, text: str,
-                      skeleton: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _extract_flow(self, text: str, skeleton: Dict[str, Any],
+                      meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         question = (
             _skeleton_block(skeleton["participants"], skeleton["lanes"])
             + "\n\nКаждому элементу указывай `participant` названием пула из "
@@ -1314,11 +1455,19 @@ class BPMNGenerator:
         try:
             data = call_json(_FLOW_SYSTEM_PROMPT, question, temperature=0.2,
                              max_tokens=MAX_PLAN_TOKENS)
-        except (LLMError, ValueError) as e:
+        except LLMRequestTooLargeError:
+            # Прожевать переполнение контекста и позвать ещё один гигантский
+            # запрос значило бы отдать +2 платных вызова за тот же 413.
+            raise
+        except (LLMTruncatedError, LLMError, ValueError) as e:
+            self._note_degradation(meta, "стадия маршрута", _error_reason(e))
             logger.warning("Маршрут по утверждённому составу не построен, "
                            "идём одним вызовом: %s", e)
             return None
         if not isinstance(data, dict) or not (data.get("elements") or []):
+            # Маршрут пришёл пустым: это не сбой транспорта, но и не
+            # двухстадийный прогон — одношаговый путь отмечается честно.
+            self._note_degradation(meta, "стадия маршрута", "маршрут пуст")
             return None
         return data
 
@@ -1339,18 +1488,37 @@ class BPMNGenerator:
         `trace` — узел трейса прогона: в него пишется отпечаток заплатки, чтобы
         отказ «нарушений меньше не стало» отличался от «заплатка разбилась о
         контракт» без нового живого прогона.
+
+        Причина, по которой повтор не состоялся, возвращается заметкой: про
+        переполнение контекста и про обрезку ответа пользователь обязан читать в
+        результате, а не в логе. Второй попытки с тем же гигантским запросом
+        контур не делает — это те же +2 платных обращения ради того же отказа.
         """
         payload = json.dumps(structure, ensure_ascii=False, default=str)
         if len(payload) > MAX_RETRY_PLAN_CHARS:
             logger.info("Повтор генерации пропущен: план %d символов, лимит %d",
                         len(payload), MAX_RETRY_PLAN_CHARS)
-            return None, []
-        asked = _askable_gaps(gaps, frozen)
+            return None, [f"Повтор не выполнен: запрос с планом в "
+                          f"{len(payload)} символов не влезает в контекст "
+                          f"(лимит {MAX_RETRY_PLAN_CHARS}) — остаётся первый"]
+        askable = _askable_gaps(gaps, frozen)
+        asked = _fit_gaps_into_budget(askable)
         if not asked:
             # Спрашивать не о чем: всё, что нашёл план-гейт, закрытый состав
             # переспросу не по зубам. Узкий вопрос о принадлежности идёт дальше
             # по своему пути и своё нарушение получит.
             return None, []
+        dropped = len(askable) - len(asked)
+        notes: List[str] = []
+        if dropped:
+            # Сокращение перечня — решение контура, и оно обязано быть видно:
+            # иначе «модель не исправила» читается там, где её не просили.
+            # Убираются только хвосты по приоритету, поэтому потерянный
+            # участник и требование к составу в вопросе остаются.
+            notes.append(
+                f"Перечень нарушений для повтора сокращён до {len(asked)} из "
+                f"{len(askable)} (бюджет {MAX_RETRY_GAPS_CHARS} символов): "
+                "опрашиваются главные по важности, косметика маршрута — нет")
         # `str.format` не годится: в шаблоне дословный JSON ответа, и его
         # фигурные скобки format прочёл бы как поля подстановки.
         question = (_RETRY_TEMPLATE
@@ -1361,14 +1529,18 @@ class BPMNGenerator:
             data = call_json(
                 _FLOW_SYSTEM_PROMPT if frozen else _SYSTEM_PROMPT,
                 question, temperature=0.1, max_tokens=MAX_PLAN_TOKENS)
-        except (LLMError, ValueError) as e:
+        except (LLMTruncatedError, LLMRequestTooLargeError, LLMError,
+                ValueError) as e:
+            # Здесь нет развилки «проглотить или уронить генерацию»: годный
+            # первый план остаётся на столе при любом отказе повтора, а
+            # переполнение контекста не зовёт второй вызов с тем же промптом.
             logger.warning("Повтор генерации не удался, остаётся первый план: %s", e)
-            return None, []
+            return None, [f"Повтор не выполнен: {_error_reason(e)} — остаётся "
+                          "первый план"] + notes
         if not isinstance(data, dict):
-            return None, []
+            return None, notes
         if trace is not None:
             trace.update(_patch_digest(data))
-        notes: List[str] = []
         patched = apply_plan_patch(structure, data, gaps, text, notes)
         return patched, notes
 
@@ -1813,7 +1985,10 @@ class BPMNGenerator:
             "bpmnElement": "Collaboration_1",
         })
 
-        return XML_DECLARATION + ET.tostring(definitions, encoding="unicode")
+        # Страховка против структуры, пришедшей мимо починки: управляющий символ
+        # в атрибуте делает XML нечитаемым, а статус ответа остаётся 200.
+        return XML_DECLARATION + _xml_text(
+            ET.tostring(definitions, encoding="unicode"))
 
 
 # --- что в плане модели противоречит методологии ---
@@ -1881,8 +2056,51 @@ def _proper_names(text: str) -> List[str]:
     return out
 
 
-def _text_words(text: str) -> List[str]:
-    return [w for w in (_norm_name(m) for m in re.findall(r"[\w]+", text)) if w]
+class _Words:
+    """Слова описания с индексом основ.
+
+    `_mentioned` вызывается по разу на пул, на роль и на потерянного участника,
+    а прежняя реализация перебирала весь список слов на каждое имя: на схеме с
+    десятками пулов и четырьмя прогонами план-гейта это лишняя секунда процессора
+    при нулевой пользе. Здесь точное совпадение — множество, совпадение по основе
+    — множество префиксов слов. Поведение сравнения не меняется.
+    """
+
+    __slots__ = ("items", "_exact", "_prefixes")
+
+    def __init__(self, items: Any) -> None:
+        self.items = tuple(w for w in items if w)
+        self._exact = set(self.items)
+        prefixes: Set[str] = set()
+        for word in self.items:
+            # Основы короче трёх символов не бывают: `_mentioned` их не ищет.
+            for cut in range(3, len(word)):
+                prefixes.add(word[:cut])
+        self._prefixes = prefixes
+
+    def __iter__(self) -> Any:
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __contains__(self, word: str) -> bool:
+        return word in self._exact
+
+    def has_stem(self, stem: str) -> bool:
+        """Есть ли в описании слово, начинающееся с этой основы."""
+        return stem in self._exact or stem in self._prefixes
+
+
+@lru_cache(maxsize=8)
+def _word_index(text: str) -> _Words:
+    """Индекс слов описания: план-гейт читается за прогон несколько раз, и
+    каждый раз по тому же тексту."""
+    return _Words(_norm_name(match) for match in re.findall(r"[\w]+", text))
+
+
+def _text_words(text: str) -> _Words:
+    return _word_index(text)
 
 
 def _name_parts(name: str) -> List[str]:
@@ -1911,7 +2129,7 @@ def _generic_actor_name(name: Any) -> bool:
     return _norm_name(name) in GENERIC_ACTOR_NAMES
 
 
-def _mentioned(name: str, words: List[str]) -> bool:
+def _mentioned(name: str, words: Any) -> bool:
     """Упомянуто ли имя в описании с любым окончанием.
 
     Точное сравнение ломает русскую морфологию: «Получатель» в тексте живёт как
@@ -1924,13 +2142,14 @@ def _mentioned(name: str, words: List[str]) -> bool:
     parts = _name_parts(name)
     if not parts:
         return False
+    index = words if isinstance(words, _Words) else _Words(words)
     for part in parts:
-        if part in words:
+        if part in index:
             continue
         # У коротких названий основа почти совпадает с самим словом: «банк» в
         # тексте живёт «банком» и «банка», и отбрасывать два символа нечего.
         stem = part[:-1] if len(part) >= 4 else ""
-        if stem and any(word.startswith(stem) for word in words):
+        if stem and index.has_stem(stem):
             continue
         return False
     return True
@@ -2051,6 +2270,78 @@ def _deadline_gaps(elements: List[Dict[str, Any]], text: str) -> List[str]:
             "таймера: добавь boundaryEvent с event_definition=\"timer\" и "
             "attached_to на шаге ожидания (или промежуточное таймерное событие) "
             "и ветку обработки по истечении"]
+
+
+# Глагол ожидания без названного срока: «ждёт подрядчика», «ожидает согласования».
+# `_DEADLINE_RE` требует число, а процесс без числа тоже ждёт — и ждёт его не
+# задача, а событие. Формы перечислены явно: «ожид\w*» ловило бы «ожидаемая
+# цена», и нарушение заводилось бы там, где никто ничего не ждёт.
+_WAIT_VERB_RE = re.compile(
+    r"\b(?:жд[её]т|жд[уё]т|жд[уё]м|жду|ожид(?:ает|ают|ание|ания|ании|ать|"
+    r"ая|ал|аю)|дож[её]д(?:ается|аться|ался))\b", re.I)
+_WAIT_CLAUSE_CLIP = 70
+# Класс нарушения, которое план-гейт видит, но переспросом не проверяет.
+WAIT_GAP_CLASS = "ожидание без срока"
+# По умолчанию — молчание в переспросе. Расширенный список нарушений уже стоил
+# живым прогонам #58–#62 потерянного состава (сводка гейта 0.876 → 0.811,
+# `expected_participants` 0.75 → 0.25), поэтому спрашивать модель про таймер без
+# срока можно только осознанно: `BPMN_GATE_WAIT_GAPS=1` в окружении.
+WAIT_GAPS_ASKABLE = os.getenv("BPMN_GATE_WAIT_GAPS", "").strip() == "1"
+
+
+def _waiting_gaps(elements: List[Dict[str, Any]], text: str) -> List[str]:
+    """Ожидание без срока: нарушение видно контуру, но оно не требование к
+    переспросу.
+
+    Таймер по одному глаголу контур не поставит — какой срок и куда вести ветку
+    знает только описание, а выдуманный хронометраж попал бы в схему молча.
+    Поэтому нарушение живёт в `_GAPS_NEVER_ASKED`: план не переписывается (и не
+    теряет утверждённый состав), но виден в `gaps`, в трейсе и отдельной заметкой
+    в результате.
+    """
+    body = (text or "").strip()
+    if not body or _DEADLINE_RE.search(body):
+        # Названный срок — компетенция `_deadline_gaps`: требовать таймер дважды
+        # значит плодить пункты про один и тот же дефект.
+        return []
+    sentence = next((s for s in re.split(r"(?<=[.!?:;])\s+", body)
+                     if _WAIT_VERB_RE.search(s)), "")
+    if not sentence:
+        return []
+    for elem in elements:
+        if _raw_text(elem.get("kind") or elem.get("type")) not in TYPED_EVENT_KINDS:
+            continue
+        definition = _raw_text(elem.get("event_definition")
+                               or elem.get("event_type")).lower()
+        if definition in ("timer", "message") or _raw_text(
+                elem.get("timer") or elem.get("duration")):
+            # Ожидание уже выражено событием: требовать по тому же слову второй
+            # кружок — учить модель рисовать лишнее.
+            return []
+    clause = re.sub(r"\s+", " ", sentence).strip()[:_WAIT_CLAUSE_CLIP]
+    return [f"в описании есть ожидание без срока («{clause}»), а в плане нет ни "
+            'таймера, ни события ожидания: правка — boundaryEvent с '
+            'event_definition="timer" на шаге ожидания и ветка обработки по '
+            "истечении срока"]
+
+
+def _wait_gap_notes(gaps: List[str]) -> List[str]:
+    """Заметка наружу про каждое ожидание без срока.
+
+    Молчание здесь стоило бы того же, что молчание про перенос участников в
+    прогонах #58–#62: нарушение есть, а отличить «контур не заметил» от
+    «контур заметил и сознательно не стал переписывать план» нечем.
+    """
+    out: List[str] = []
+    for gap in gaps:
+        if _gap_class(gap) != WAIT_GAP_CLASS:
+            continue
+        out.append("план-гейт: " + (gap[:120] + "…" if len(gap) > 120 else gap)
+                   + (" — отправлено в переспрос (флаг ожидания включён)"
+                      if WAIT_GAPS_ASKABLE else
+                      " — в переспрос не отправлено: правка таймером не стоит "
+                      "потери утверждённого состава"))
+    return out
 
 
 def _plan_pool_names(raw: Dict[str, Any]) -> List[str]:
@@ -2308,6 +2599,7 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
     flows = _raw_dicts(raw.get("flows"))
     gaps.extend(_participant_gaps(pools, lanes, text))
     gaps.extend(_deadline_gaps(elements, text))
+    gaps.extend(_waiting_gaps(elements, text))
 
     # `actors` — выписка самой модели из описания, и расхождение с ней ловит
     # потерянного участника там, где коду выдумывать имя нельзя. Эти нарушения
@@ -2626,6 +2918,11 @@ _GAP_CLASS_OF = (("действующим лицом", "лицо без пула
                  ("помечен ролью", "роль без хозяина"),
                  ("без единого шага", "пустой пул"),
                  ("задаёт ожидание", "таймер"),
+                 # Нарушение про срок и нарушение без срока — разные очереди
+                 # работы: у первого переспрос есть, у второго его по умолчанию
+                 # нет (см. `_waiting_gaps`). Иглы у них не пересекаются, поэтому
+                 # порядок чтения роли не играет.
+                 ("ожидание без срока", WAIT_GAP_CLASS),
                  ("ни одного шлюза", "развилка"),
                  ("развилка спрятана", "развилка"),
                  ("ведёт в чужой пул", "развилка"),
@@ -2668,13 +2965,50 @@ def _gap_kinds(gaps: List[str]) -> Dict[str, int]:
 # узкий вопрос о принадлежности, который `missing` принимает и при закрытом
 # составе.
 _GAPS_BEYOND_A_FROZEN_RETRY = ("лицо без пула", "участник вне схемы")
+# Классы, которые переспрос не получает ни при каком составе. Здесь живёт
+# ожидание без срока: спрашивать про него — значит ради таймера рисковать уже
+# утверждённым составом (цена задокументирована в `_waiting_gaps`), а молчать
+# про него контур не вправе: нарушение видно в `gaps` и отдельной заметкой в
+# результате.
+_GAPS_NEVER_ASKED = (WAIT_GAP_CLASS,)
 
 
 def _askable_gaps(gaps: List[str], frozen: bool) -> List[str]:
     """Нарушения, которые переспрос физически способен закрыть."""
-    if not frozen:
-        return list(gaps)
-    return [g for g in gaps if _gap_class(g) not in _GAPS_BEYOND_A_FROZEN_RETRY]
+    never = () if WAIT_GAPS_ASKABLE else _GAPS_NEVER_ASKED
+    asked = [g for g in gaps if _gap_class(g) not in never]
+    if frozen:
+        asked = [g for g in asked if _gap_class(g)
+                 not in _GAPS_BEYOND_A_FROZEN_RETRY]
+    return asked
+
+
+def _fit_gaps_into_budget(gaps: List[str],
+                          budget: Optional[int] = None) -> List[str]:
+    """Перечень нарушений, который влезает в переспрос.
+
+    `plan_gaps` отдаёт список, уже отсортированный по `_gap_priority`, поэтому
+    под сокращение попадает хвост — косметика маршрута, а не потерянный
+    участник. Нарушения нулевого ранга важности не режутся даже сверх бюджета:
+    требование к составу, утверждённому стадией состава, молчаливым обрезанием
+    терять нельзя — иначе повтор отчитается по тому, о чём его не спрашивали.
+    """
+    limit = MAX_RETRY_GAPS_CHARS if budget is None else budget
+    out: List[str] = []
+    used = 0
+    for gap in gaps:
+        if _gap_priority(gap) > 0 and used + len(gap) + 3 > limit:
+            continue
+        out.append(gap)
+        used += len(gap) + 3
+    return out
+
+
+def _asked_gaps(gaps: List[str], frozen: bool) -> List[str]:
+    """То, что контур действительно спрашивает у повтора: можно закрыть и
+    влезает в запрос. Сравнение «улучшил ли повтор» обязано считаться по этому
+    же списку, иначе неотвеченное нарушение засчитывается модели."""
+    return _fit_gaps_into_budget(_askable_gaps(gaps, frozen))
 
 
 def _gap_profile(gaps: List[str]) -> Tuple[int, ...]:
@@ -2715,6 +3049,21 @@ def _valid_timer(value: str) -> bool:
 
 _ID_CLEAN = re.compile(r"[^A-Za-z0-9_]")
 _NOT_IN_NAME = re.compile(r"[^0-9a-zа-яё]+")
+# Управляющие символы в ответе модели: `ET.tostring` отдаёт их как есть, а
+# разобранная обратно схема на них падает — то есть API отвечал 200 битым XML.
+# Табличные переводы строки (`\t`, `\n`, `\r`) остаются: они в атрибуте
+# легальны и экранируются.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _xml_text(value: Any) -> str:
+    """Значение, пригодное для атрибута или текста узла.
+
+    Страховка эмиссии: структура могла прийти в `_generate_bpmn_xml` мимо
+    починки (её вызывают и из харнесса), а `_clip` чистит только те поля,
+    которые починка создаёт сама.
+    """
+    return _CONTROL_CHARS_RE.sub("", str("" if value is None else value))
 
 
 def _sanitize_id(raw: Any, fallback: str) -> str:
@@ -2735,10 +3084,20 @@ def _norm_name(value: Any) -> str:
 
 
 def _clip(text: str, limit: int, notes: List[str], subject: str) -> str:
-    if len(text) <= limit:
-        return text
+    """Текст поля схемы: без непечатаемых символов и не длиннее лимита.
+
+    Очистка идёт до замера длины: иначе лимит считался бы по строке, часть
+    которой выбрасывается, и в XML уезжал бы текст другой длины, чем ждёт
+    подсчёт. Та же очистка повторяется на эмиссии — как страховка для структуры,
+    собранной мимо починки.
+    """
+    clean = _CONTROL_CHARS_RE.sub("", text)
+    if clean != text:
+        notes.append(f"{subject} очищен от непечатаемых символов")
+    if len(clean) <= limit:
+        return clean
     notes.append(f"{subject} укорочен до {limit} символов")
-    return text[:limit]
+    return clean[:limit]
 
 
 def _pool_exact(name: str, participants: List[Dict[str, Any]]) -> Optional[str]:
@@ -2781,7 +3140,7 @@ def _add_pool(name: str, participants: List[Dict[str, Any]], notes: List[str],
     шаги разных участников окажутся одним процессом, а связи между ними
     превратятся в messageFlow. Отдельный пул честнее и виден пользователю.
     """
-    name = name[:NAME_LIMIT]
+    name = _CONTROL_CHARS_RE.sub("", str(name or ""))[:NAME_LIMIT]
     if len(participants) >= MAX_PARTICIPANTS:
         fallback = participants[0]["name"]
         notes.append(f"Пул «{name}» не создан ({subject}): достигнут максимум "
@@ -2936,7 +3295,9 @@ def repair_structure(raw: Dict[str, Any],
     _close(participants, lanes, [], [])
 
     _mark("шаги", participants, lanes, [], [])
-    elements = _repair_elements(raw, participants, lanes, used_ids, notes)
+    renamed: Dict[str, str] = {}
+    elements = _repair_elements(raw, participants, lanes, used_ids, notes,
+                                renamed)
     _close(participants, lanes, elements, [])
     if not elements:
         raise GenerationError(
@@ -2945,7 +3306,7 @@ def repair_structure(raw: Dict[str, Any],
         )
 
     _mark("потоки", participants, lanes, elements, [])
-    flows = _repair_flows(raw, elements, used_ids, notes)
+    flows = _repair_flows(raw, elements, used_ids, notes, renamed)
     _close(participants, lanes, elements, flows)
 
     _mark("хозяева граничных событий", participants, lanes, elements, flows)
@@ -3087,7 +3448,9 @@ def _repair_lanes(raw: Dict[str, Any], participants: List[Dict[str, Any]],
 
 def _repair_elements(raw: Dict[str, Any], participants: List[Dict[str, Any]],
                      lanes: List[Dict[str, Any]], used_ids: Set[str],
-                     notes: List[str]) -> List[Dict[str, Any]]:
+                     notes: List[str],
+                     renamed: Optional[Dict[str, str]] = None,
+                     ) -> List[Dict[str, Any]]:
     elements: List[Dict[str, Any]] = []
     kind_aliases = {k.lower(): k for k in ALL_KINDS}
     raw_elements = raw.get("elements") or []
@@ -3103,6 +3466,16 @@ def _repair_elements(raw: Dict[str, Any], participants: List[Dict[str, Any]],
         declared_id = str(item.get("id") or "").strip()
         if declared_id and declared_id != elem_id:
             notes.append(f"Идентификатор элемента {declared_id} приведён к «{elem_id}»")
+            if renamed is not None:
+                # Ключей два: как id написала модель и как его прочитал бы
+                # `_sanitize_id` на конце потока. Без отображения починка
+                # переименовала бы узел, а дуги, ведущие на прежний id,
+                # удалились бы как висячие — и `_ensure_reachability`
+                # присоединила бы сироту от старта, то есть заменила бы маршрут
+                # модели выдуманными дугами.
+                for key in (declared_id, _sanitize_id(declared_id, declared_id)):
+                    if key and key != elem_id:
+                        renamed[key] = elem_id
         used_ids.add(elem_id)
 
         kind_raw = str(item.get("kind") or item.get("type") or "").strip()
@@ -3142,6 +3515,20 @@ def _repair_elements(raw: Dict[str, Any], participants: List[Dict[str, Any]],
             if declared_host:
                 element["attached_to"] = _sanitize_id(declared_host, declared_host)
         elements.append(element)
+
+    if renamed:
+        # Хозяин граничного события живёт в том же пространстве id, что и шаги:
+        # если починка переименовала узел, на который событие ссылалось, ссылка
+        # обязана уйти за ним, а не догоняться эвристикой `_resolve_boundary_hosts`.
+        ids = {e["id"] for e in elements}
+        for element in elements:
+            host = _raw_text(element.get("attached_to"))
+            new_host = renamed.get(host) if host else None
+            if new_host and host not in ids:
+                element["attached_to"] = new_host
+                notes.append(f"хозяин {element['id']}: событие прикреплено к "
+                             f"«{new_host}» — починка переименовала этот узел, "
+                             f"когда «{host}» был занят")
     return elements
 
 
@@ -3235,9 +3622,29 @@ def _illegal_flow_end(source_kind: str, target_kind: str) -> str:
 
 
 def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
-                  used_ids: Set[str], notes: List[str]) -> List[Dict[str, Any]]:
+                  used_ids: Set[str], notes: List[str],
+                  renamed: Optional[Dict[str, str]] = None,
+                  ) -> List[Dict[str, Any]]:
     element_ids = {e["id"] for e in elements}
     element_by_id = {e["id"]: e for e in elements}
+
+    def rebind(ref: str, role: str) -> str:
+        """Конец потока под переименованный починкой узел.
+
+        Узел, чей id совпал с id дорожки или другого элемента, получает суффикс;
+        дуга, названная прежним id, при этом не «висячая» — она ведёт ровно туда,
+        куда её направила модель. Молча выбросить её и позволить
+        `_ensure_reachability` присоединить узел от старта значило бы подменить
+        маршрут модели выдуманными дугами.
+        """
+        if not ref or ref in element_ids or not renamed:
+            return ref
+        target = renamed.get(ref)
+        if not target or target not in element_ids:
+            return ref
+        notes.append(f"дуга перепривязана: {role} потока «{ref}» починкой "
+                     f"переименован в «{target}»")
+        return target
 
     flows: List[Dict[str, Any]] = []
     seen_pairs: Set[Tuple[str, str, str]] = set()
@@ -3247,8 +3654,10 @@ def _repair_flows(raw: Dict[str, Any], elements: List[Dict[str, Any]],
     for item in raw_flows:
         if not isinstance(item, dict):
             continue
-        source = _sanitize_id(item.get("source") or item.get("sourceRef"), "")
-        target = _sanitize_id(item.get("target") or item.get("targetRef"), "")
+        source = rebind(_sanitize_id(item.get("source") or item.get("sourceRef"),
+                                     ""), "источник")
+        target = rebind(_sanitize_id(item.get("target") or item.get("targetRef"),
+                                     ""), "приёмник")
         if source == target:
             notes.append(f"Поток {source or '?'} → {target or '?'} удалён: шаг не "
                          "может вести сам в себя — повтор моделируется шлюзом "
@@ -3787,7 +4196,10 @@ def _ensure_pool_events(elements: List[Dict[str, Any]],
             })
             if entry:
                 flows.append(_new_flow(used_ids, start_id, entry["id"]))
-            notes.append(f"В пул «{p['name']}» добавлено стартовое событие")
+            notes.append(
+                f"В пул «{p['name']}» добавлено стартовое событие"
+                + (f" и дуга {start_id} → {entry['id']}: её в описании не было, "
+                   "её нарисовал контур" if entry else ""))
 
         if not has_end:
             exit_node = _pick_exit_node(pool, seq)
@@ -3802,7 +4214,10 @@ def _ensure_pool_events(elements: List[Dict[str, Any]],
             })
             if exit_node:
                 flows.append(_new_flow(used_ids, exit_node["id"], end_id))
-            notes.append(f"В пул «{p['name']}» добавлено завершающее событие")
+            notes.append(
+                f"В пул «{p['name']}» добавлено завершающее событие"
+                + (f" и дуга {exit_node['id']} → {end_id}: её в описании не было, "
+                   "её нарисовал контур" if exit_node else ""))
 
 
 def _link_dead_starts(elements: List[Dict[str, Any]],

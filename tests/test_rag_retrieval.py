@@ -19,6 +19,8 @@ from core.llm_improve import (
     BPMNKnowledgeBase,
     _format_practices,
     _process_key,
+    _reference_label,
+    corpus_fingerprint,
 )
 
 BPMN_NS = 'xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"'
@@ -221,6 +223,77 @@ class TestCache:
         assert "Кэш RAG устарел (метод hybrid-v2), пересобираем" in messages
         assert manifest(tmp_path, "stale")["method"] == llm_improve.CACHE_METHOD
 
+    def test_manifest_carries_corpus_fingerprint(self, make_kb, tmp_path):
+        make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]},
+                name="fprint").find_best_practices("эталон")
+        data = manifest(tmp_path, "fprint")
+        stored = data["corpus_fingerprint"]
+        assert re.fullmatch(r"[0-9a-f]{64}", stored), stored
+        dataset = tmp_path / "fprint"
+        assert stored == corpus_fingerprint(str(dataset))
+
+    def test_content_edit_with_same_file_count_rebuilds(self, make_kb, tmp_path,
+                                                        caplog):
+        """Без отпечатка содержимого правка эталона при тех же двух файлах
+        никогда не пересобирала индекс: промпт жил бы практиками старой схемы."""
+        make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]},
+                name="edit").find_best_practices("эталон")
+        old = manifest(tmp_path, "edit")["corpus_fingerprint"]
+        edited = dict(BASE_CORPUS)
+        edited["Эталон_раскладки"] = diagram(
+            flow(SLA_BOUNDARY + NESTED), "P2")
+        assert len(edited) == len(BASE_CORPUS)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="core.llm_improve"):
+            kb = make_kb(edited, table={"эталон": [1.0, 0.0]}, name="edit")
+            names = {s["name"] for s in kb.find_best_practices("эталон")}
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert "Кэш RAG устарел (корпус изменился), пересобираем" in messages
+        assert not [m for m in messages if m.startswith("Кэш RAG загружен")]
+        assert names == set(edited)
+        assert manifest(tmp_path, "edit")["corpus_fingerprint"] != old
+
+    def test_touch_without_content_change_uses_the_cache(self, make_kb, tmp_path,
+                                                         caplog):
+        """mtime в отпечаток не берём: перекодировка файла без изменения байт
+        (git-клон, sync) не должна гнать минутную пересборку эмбеддингов."""
+        make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]},
+                name="touch").find_best_practices("эталон")
+        import os
+        import time
+        for filename in BASE_CORPUS:
+            path = tmp_path / "touch" / f"{filename}.bpmn"
+            future = time.time() + 3600
+            os.utime(path, (future, future))
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="core.llm_improve"):
+            make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]},
+                    name="touch").find_best_practices("эталон")
+        messages = [record.getMessage() for record in caplog.records]
+        assert "Кэш RAG загружен: 2 эталонов" in messages
+        assert not [m for m in messages if "пересобираем" in m]
+
+    def test_manifest_without_fingerprint_rebuilds(self, make_kb, tmp_path, caplog):
+        """Манифест, собранный до появления отпечатка, не допустим: он ничего
+        не гарантирует про содержимое корпуса."""
+        make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]},
+                name="legacy").find_best_practices("эталон")
+        data = manifest(tmp_path, "legacy")
+        del data["corpus_fingerprint"]
+        (tmp_path / "legacy.json").write_text(json.dumps(data, ensure_ascii=False),
+                                              encoding="utf-8")
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="core.llm_improve"):
+            make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]},
+                    name="legacy").find_best_practices("эталон")
+        messages = [record.getMessage() for record in caplog.records]
+        assert "Кэш RAG устарел (корпус изменился), пересобираем" in messages
+        assert "corpus_fingerprint" in manifest(tmp_path, "legacy")
+
     def test_cache_path_defaults_next_to_the_code(self, monkeypatch):
         monkeypatch.delenv("BPMN_RAG_CACHE_FILE", raising=False)
         npz, meta = llm_improve._cache_paths()
@@ -282,6 +355,35 @@ class TestRetrieval:
         assert "найди узкие места" in semantic and "Согласовать договор" in semantic
         assert "tasks_1" in lexical
 
+    def test_user_schema_is_parsed_once_per_query(self, make_kb):
+        """Схема пользователя за один поиск разбирается один раз: практики и
+        тексты запроса берут один и тот же корень, а не два прохода ET по тому
+        же тексту (третий разбор — внутри аплайера, он вне поиска)."""
+        kb = make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]}, name="parse")
+        kb.ensure_ready()  # корпус собран, разбор файлов в счёт не входит
+        user = diagram(flow(SLA_BOUNDARY), "PU")
+        seen: List[str] = []
+        real_parse = kb._parse
+
+        def counting(xml):
+            seen.append(xml)
+            return real_parse(xml)
+
+        kb._parse = counting
+        kb.find_best_practices("что улучшить", user)
+        assert seen == [user]
+
+    def test_broken_user_schema_keeps_the_same_meaning(self, make_kb):
+        """Поведение при битом XML не поехало: признаков нет, в лексику уходит
+        invalid_xml — и когда корень передан, и когда его разбирают сами."""
+        kb = make_kb(BASE_CORPUS, table={"эталон": [1.0, 0.0]}, name="broken")
+        kb.ensure_ready()
+        semantic, lexical = kb._query_texts("улучши", "<definitions><<<")
+        assert "invalid_xml" in lexical
+        semantic2, lexical2 = kb._query_texts("улучши", "<definitions><<<",
+                                              root=None)
+        assert (semantic2, lexical2) == (semantic, lexical)
+
     def test_ranks_are_fused_not_scales_summed(self):
         # Согласованность двух веток важнее пика в одной из них: документ X
         # лучший семантически и худший лексически, Y — вверху обеих.
@@ -311,7 +413,13 @@ class TestPracticesBlock:
         assert TIMER_PRACTICE in item["missing_practices"]
         block = _format_practices([item])
         assert TIMER_PRACTICE in block
-        assert reference in block
+        # В промпт уходит человекочитаемая метка эталона: имя файла с
+        # 24–64-символьным хешем модель читала как словарный материал.
+        label = reference.rsplit("_", 1)[0].replace("_", " ")
+        assert label in block
+        assert reference not in block
+        assert corpus_hash(5) not in block
+        assert not re.search(r"\b[0-9a-f]{24,64}\b", block), block
         # Тег домена из блока выбросили: `[hr]` читается моделью как готовое имя
         # участника, а оракул `employee_onboarding` требует пул «HR» — тег
         # выдавал ответ прямо в промпт (это и мерил eval/provenance.py).
@@ -417,6 +525,17 @@ class TestDomainIsCorpusAware:
         kb = make_kb(files, broken_semantics=True)
         kb.ensure_ready()
         assert kb._detect_domain(INCIDENT_XML, kb._corpus_domains()) == "it"
+
+
+def test_reference_label_hides_the_hash_and_keeps_the_words():
+    """Метка эталона: расширение и hex-хвост (24–64 символа, как `_HASH_SUFFIX`)
+    срезаются, слова и регистр остаются. Короткий хвост — часть имени, а не
+    хеш, и трогать его нельзя."""
+    hashed = "Dispatch_of_goods_" + corpus_hash(7)
+    assert _reference_label(hashed + ".bpmn") == "Dispatch of goods"
+    assert _reference_label("Эталон_согласования") == "Эталон согласования"
+    assert _reference_label("Exercise_ab12cd") == "Exercise ab12cd"
+    assert _reference_label("") == ""
 
 
 def test_identical_gap_from_several_references_becomes_one_line():

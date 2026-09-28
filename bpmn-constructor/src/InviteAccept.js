@@ -22,7 +22,10 @@ const InviteAccept = () => {
         setStatus('pending');
         setError('');
         try {
-            await apiClient.get(`/api/invitations/accept/${token}`);
+            /* Принятие — POST: GET обязан быть безопасным методом, иначе
+               предвыборка ссылки сканером или prefetch браузера зачисляет
+               участника без ведома пользователя. */
+            await apiClient.post(`/api/invitations/accept/${token}`);
             setStatus('accepted');
             /* Подтверждение видно до перехода: таймер нужен ровно для этого
                кадра и снимается при размонтировании. */

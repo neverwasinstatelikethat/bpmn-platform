@@ -18,7 +18,7 @@ MIGRATIONS = ROOT / "migrations"
 TABLES = {
     "users", "roles", "teams", "team_members", "invitations", "folders",
     "diagrams", "diagram_versions", "share_tokens", "deleted_diagrams",
-    "pending_improvements", "password_reset_tokens",
+    "pending_improvements", "password_reset_tokens", "ai_tasks",
 }
 
 

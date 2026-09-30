@@ -21,6 +21,8 @@ USER_TEXT_FIELD_MAX = 100
 # Тот же порог, что у маршрута сброса пароля: правило «минимум 8 символов»
 # не должно зависеть от того, каким из двух маршрутов пользователь меняет пароль.
 MIN_PASSWORD_CHARS = 8
+# Ключ повторной отправки задачи ИИ-контура (см. IdempotentRequest).
+IDEMPOTENCY_KEY_MAX = 120
 
 
 def normalize_email(value: str) -> str:
@@ -173,7 +175,30 @@ class ShareResponse(BaseModel):
     share_link: str
     can_edit: bool
 
-class ImproveRequest(BaseModel):
+class IdempotentRequest(BaseModel):
+    """Запрос, который клиент вправе отправить повторно.
+
+    Долгий вызов модели живёт в очереди, а не в запросе, поэтому «не дождался
+    ответа» больше не значит «ответа нет»: повтор без ключа создал бы вторую
+    задачу и вторую оплату того же вызова. Ключ принадлежит пользователю —
+    уникальность считается парой (user_id, idempotency_key), чужой ключ
+    перехватить нельзя.
+    """
+
+    idempotency_key: Optional[str] = Field(default=None,
+                                           max_length=IDEMPOTENCY_KEY_MAX)
+
+    @field_validator('idempotency_key')
+    @classmethod
+    def key_not_blank(cls, v):
+        # Пустая строка была бы общим ключом всех запросов пользователя: второй
+        # запрос вернул бы результат первого.
+        if v is None:
+            return None
+        return v.strip() or None
+
+
+class ImproveRequest(IdempotentRequest):
     # Лимиты взяты из одного места с генератором и конфигом: раньше роутер
     # держал свою копию лимита длины описания, и правка одного не замечалась
     # в другом.
@@ -188,7 +213,7 @@ class ImproveRequest(BaseModel):
             raise ValueError('Опишите, что нужно улучшить в схеме')
         return v.strip()
 
-class GenerateRequest(BaseModel):
+class GenerateRequest(IdempotentRequest):
     text: str = Field(..., min_length=1, max_length=MAX_TEXT_CHARS)
 
     @field_validator('text')
@@ -198,7 +223,9 @@ class GenerateRequest(BaseModel):
             raise ValueError('Описание процесса не должно быть пустым')
         return v.strip()
 
-class EvaluateRequest(BaseModel):
+class EvaluateRequest(IdempotentRequest):
+    # Скоринг считает по XML из редактора, а не по сохранённой схеме: проверить
+    # нужно то, что на экране, включая несохранённые правки.
     bpmn_xml: str = Field(..., min_length=1, max_length=AI_MAX_XML_CHARS)
 
 class AcceptImprovementRequest(BaseModel):

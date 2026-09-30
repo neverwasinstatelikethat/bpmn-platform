@@ -16,7 +16,7 @@ import re
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import chardet
 import numpy as np
@@ -175,6 +175,15 @@ class ImprovementUnavailable(ImprovementError):
     Отличается от ImprovementError тем, что наружу должен уйти 503, а не 400 —
     иначе клиент решит, что ему ответили «неправильный запрос», и заставит
     пользователя переформулировать то, с чем всё в порядке.
+    """
+
+
+class ImprovementCancelled(RuntimeError):
+    """Задачу отменил пользователь до обращения к модели.
+
+    Не наследник ImprovementError намеренно: это не отказ по содержимому схемы
+    и не сбой провайдера, а решение человека. Смешав их, контур показал бы
+    отмену как ошибку запроса и предложил переформулировать то, что уже не нужно.
     """
 
 
@@ -1172,12 +1181,24 @@ class BPMNImprovementOrchestrator:
         self.knowledge_base.ensure_ready()
 
     async def improve_diagram(self, xml_content: str,
-                              user_prompt: str) -> Tuple[str, Optional[str], Dict[str, Any]]:
+                              user_prompt: str,
+                              cancel_check: Optional[Callable[[], bool]] = None,
+                              ) -> Tuple[str, Optional[str], Dict[str, Any]]:
         """Возвращает (рекомендации, улучшенный XML или None, отчёт операций).
 
         XML равен None для чисто аналитических ответов и при ошибках —
         ошибки сообщаются через ImprovementError.
+
+        `cancel_check` — опрос флага отмены задачи. Проверяется перед каждым
+        обращением к модели, а не во время: прерванный вызов уже оплачен
+        провайдером, а ответа на него нет, то есть отмена mid-flight тратит
+        ровно те деньги, которые должна была сэкономить.
         """
+        def _abort_if_cancelled() -> None:
+            if cancel_check is not None and cancel_check():
+                raise ImprovementCancelled("Улучшение отменено пользователем")
+
+        _abort_if_cancelled()
         try:
             inventory = await asyncio.to_thread(bpmn_edits.build_inventory,
                                                 xml_content)
@@ -1211,6 +1232,7 @@ class BPMNImprovementOrchestrator:
                 llm_traces.append(trace)
 
         try:
+            _abort_if_cancelled()
             plan = await asyncio.to_thread(_plan_step)
         except LLMTruncatedError as e:
             raise ImprovementError(
@@ -1295,7 +1317,8 @@ class BPMNImprovementOrchestrator:
                 # «повтор был»: попыткой он остаётся и при пустом ответе.
                 xml_after, report, _reapplied = await self._retry_skipped(
                     xml_after, user_prompt, report, unrouted, empty_pools,
-                    undocumented, regressed, llm_traces=llm_traces)
+                    undocumented, regressed, llm_traces=llm_traces,
+                    cancel_check=cancel_check)
                 # Пометки второго раунда не заменяют первые: понижение шлюза до
                 # задачи неидемпотентно, и второй `validate_and_repair` его уже
                 # не вернёт — терять факт подмены типа элемента нельзя.
@@ -1411,6 +1434,7 @@ class BPMNImprovementOrchestrator:
                              undocumented: Optional[List[str]] = None,
                              regressed: Optional[Dict[str, str]] = None,
                              llm_traces: Optional[List[Dict[str, Any]]] = None,
+                             cancel_check: Optional[Callable[[], bool]] = None,
                              ) -> Tuple[str, Dict[str, Any], bool]:
         """Корректирующий раунд: по не применённым операциям и по узлам,
         оставшимся вне маршрута.
@@ -1448,6 +1472,9 @@ class BPMNImprovementOrchestrator:
             finally:
                 if llm_traces is not None:
                     llm_traces.append(trace)
+
+        if cancel_check is not None and cancel_check():
+            raise ImprovementCancelled("Улучшение отменено пользователем")
 
         plan = await asyncio.to_thread(_retry_step)
         retry_planned = plan.get("operations") or []

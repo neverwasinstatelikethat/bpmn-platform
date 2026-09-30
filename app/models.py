@@ -196,6 +196,62 @@ class Improvement(Base):
     diagram = relationship("Diagram", back_populates="improvements")
 
 
+class AiTask(Base):
+    """Задача ИИ-контура: источник истины о статусе и результате.
+
+    Redis здесь только транспорт (план
+    docs/plans/redis-cache-and-task-routing.md, раздел 4.3): очередь может быть
+    сброшена или потеряна, а пользовательская история задач и опрос статуса
+    обязаны работать. Поэтому статус, входы и результат живут в базе, а в
+    очередь уходит один идентификатор задачи.
+
+    Статусы: queued → running → done | failed | cancelled. Отмена из queued
+    мгновенная, из running — флагом `cancel_requested`, который воркер смотрит
+    перед каждым обращением к модели: прерывать уже идущий HTTP-вызов значит
+    оставить провайдера с оплаченной работой и без ответа.
+    """
+
+    __tablename__ = "ai_tasks"
+    __table_args__ = (
+        # Повторная отправка с тем же ключом обязана вернуть ту же задачу.
+        # Ограничение в базе, а не `SETNX` в Redis: кэш можно сбросить, а
+        # дубль задачи — это две оплаты одного вызова модели.
+        UniqueConstraint("user_id", "idempotency_key", name="uq_ai_tasks_idempotency"),
+    )
+
+    id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # generate | improve | score
+    kind = Column(String(32), nullable=False)
+    # ai_llm | ai_local: очередь выбирается видом задачи (app/tasks.py)
+    queue = Column(String(32), nullable=False)
+    status = Column(String(16), nullable=False, default="queued", index=True)
+    idempotency_key = Column(String(120), nullable=True)
+    # Привязка к схеме: задача читает XML из базы, а не из аргументов, поэтому
+    # здесь же фиксируется версия схемы на момент постановки — по ней воркер
+    # понимает, что схему изменили, пока задача стояла в очереди.
+    diagram_id = Column(String(36), ForeignKey("diagrams.id"), nullable=True, index=True)
+    base_seq = Column(Integer, nullable=True)
+    # Входы задачи. Для улучшения сохранённой схемы здесь пусто (воркер берёт
+    # XML из `diagrams`); описание процесса и XML без схемы живут здесь, потому
+    # что другого источника у них нет.
+    payload = Column(Text, nullable=True)
+    result = Column(Text, nullable=True)
+    # Ссылка на доменный результат (например, id предложения улучшения): по ней
+    # история задач связывается с историей схем без разбора JSON.
+    result_ref = Column(String(64), nullable=True)
+    error = Column(Text, nullable=True)
+    error_code = Column(String(32), nullable=True)
+    tries = Column(Integer, nullable=False, default=0)
+    cancel_requested = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=utc_now, index=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+
+    owner = relationship("User")
+    diagram = relationship("Diagram")
+
+
 # Таблица для токенов сброса пароля
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"

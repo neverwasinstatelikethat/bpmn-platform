@@ -39,6 +39,31 @@ XML = (
     '<startEvent id="S" name="Start"/><endEvent id="E" name="End"/></process></definitions>'
 )
 
+TERMINAL_STATUSES = ("done", "failed", "cancelled")
+# Коды ошибки задачи, которые честно повторить позже. Всё остальное — свойство
+# входа, и повтор того же запроса даст тот же отказ.
+RETRYABLE_ERROR_CODES = frozenset({"unavailable", "queue_unavailable", "worker_lost"})
+
+
+def run_task(client, path, body, headers):
+    """Постановка задачи ИИ-контура и её итоговый дескриптор.
+
+    Контракт маршрутов асинхронный (202 + task_id), но тесты идут без Redis, то
+    есть в режиме исполнения в процессе: задача завершается до возврата ответа.
+    Опрос при этом остаётся в помощнике честно — если брокер когда-нибудь станет
+    внешним и в тестах, они дождутся результата, а не упадут на первом assert.
+    """
+    response = client.post(path, json=body, headers=headers)
+    assert response.status_code == 202, response.text
+    descriptor = response.json()
+    for _ in range(100):
+        if descriptor["status"] in TERMINAL_STATUSES:
+            return descriptor
+        polled = client.get(f"/api/tasks/{descriptor['task_id']}", headers=headers)
+        assert polled.status_code == 200, polled.text
+        descriptor = polled.json()
+    raise AssertionError(f"задача {path} не завершилась: {descriptor}")
+
 
 @pytest.fixture(scope="module")
 def client():
@@ -527,7 +552,13 @@ class TestBpmnImport:
 class TestAIRoutes:
     def test_evaluate_scores_xml(self, client, auth):
         headers, _ = auth
-        result = client.post("/api/evaluate", json={"bpmn_xml": XML}, headers=headers).json()
+        descriptor = run_task(client, "/api/evaluate", {"bpmn_xml": XML}, headers)
+        # Скоринг детерминированный и внешних вызовов не делает, поэтому идёт в
+        # свою очередь: крупная схема не должна стоять за чужим обращением к
+        # провайдеру и занимать его тарифный слот.
+        assert descriptor["kind"] == "score" and descriptor["queue"] == "ai_local"
+        assert descriptor["status"] == "done", descriptor
+        result = descriptor["result"]
         assert 0 <= result["score"] <= 100
         # Схема не меняется: скоринг только измеряет, «оптимизированный XML»
         # во временных рамках подменял ветки шлюзов на condition=true.
@@ -540,8 +571,7 @@ class TestAIRoutes:
         headers, _ = auth
         from core.bpmn_scoring import BPMNScorer
 
-        result = client.post("/api/evaluate", json={"bpmn_xml": XML},
-                             headers=headers).json()
+        result = run_task(client, "/api/evaluate", {"bpmn_xml": XML}, headers)["result"]
         assert set(result["details"]) == set(BPMNScorer().rules)
         assert set(result["details_meta"]) == set(BPMNScorer().rules)
         for meta in result["details_meta"].values():
@@ -563,54 +593,60 @@ class TestAIRoutes:
     def test_generate_passes_repair_notes(self, client, auth, monkeypatch):
         """notes — единственное, что показывает пользователю починку структуры."""
         headers, _ = auth
-        from app.routers import ai as ai_router
+        from app import ai as ai_module
 
         def fake_generate(text):
             return {"status": "success", "bpmn": XML, "structure": {"elements": []},
                     "notes": ["Элемент T1 перенесён в пул «Клиент»"]}
 
-        monkeypatch.setattr(ai_router.generator, "generate", fake_generate)
-        result = client.post("/api/generate", json={"text": "заявка, счёт"},
-                             headers=headers).json()
-        assert result["notes"] == ["Элемент T1 перенесён в пул «Клиент»"]
+        monkeypatch.setattr(ai_module.generator, "generate", fake_generate)
+        descriptor = run_task(client, "/api/generate", {"text": "заявка, счёт"}, headers)
+        assert descriptor["kind"] == "generate" and descriptor["queue"] == "ai_llm"
+        assert descriptor["result"]["notes"] == ["Элемент T1 перенесён в пул «Клиент»"]
 
-    def test_generate_maps_provider_outage_to_503(self, client, auth, monkeypatch):
-        """Отказ провайдера — не «плохой запрос»: клиент обязан ретраить."""
+    def test_generate_provider_outage_is_retryable(self, client, auth, monkeypatch):
+        """Отказ провайдера — не «плохой запрос»: клиент обязан ретраить.
+
+        В асинхронном контуре это не HTTP-код, а код ошибки задачи: по нему
+        фронтенд отличает «повторите позже» от «сократите описание».
+        """
         headers, _ = auth
-        from app.routers import ai as ai_router
+        from app import ai as ai_module
 
-        monkeypatch.setattr(ai_router.generator, "generate", lambda text: {
+        monkeypatch.setattr(ai_module.generator, "generate", lambda text: {
             "status": "error", "step": "llm", "error": "Сервис временно недоступен"})
-        response = client.post("/api/generate", json={"text": "заявка"}, headers=headers)
-        assert response.status_code == 503
-        assert response.headers.get("retry-after")
+        descriptor = run_task(client, "/api/generate", {"text": "заявка"}, headers)
+        assert descriptor["status"] == "failed"
+        assert descriptor["error_code"] in RETRYABLE_ERROR_CODES
+        assert "недоступен" in descriptor["error"]
 
-    def test_generate_maps_truncation_to_400(self, client, auth, monkeypatch):
+    def test_generate_truncation_is_an_input_failure(self, client, auth, monkeypatch):
         headers, _ = auth
-        from app.routers import ai as ai_router
+        from app import ai as ai_module
 
-        monkeypatch.setattr(ai_router.generator, "generate", lambda text: {
+        monkeypatch.setattr(ai_module.generator, "generate", lambda text: {
             "status": "error", "step": "llm_truncated", "error": "Ответ обрезан"})
-        assert client.post("/api/generate", json={"text": "заявка"},
-                           headers=headers).status_code == 400
+        descriptor = run_task(client, "/api/generate", {"text": "заявка"}, headers)
+        assert descriptor["status"] == "failed"
+        assert descriptor["error_code"] == "llm_truncated"
 
-    def test_generate_maps_oversized_request_to_400(self, client, auth, monkeypatch):
-        """Вход не влезает в контекст: это 400 без Retry-After, иначе клиент
-        будет повторять запрос, который не может получиться."""
+    def test_generate_oversized_request_is_not_retryable(self, client, auth, monkeypatch):
+        """Вход не влезает в контекст: повторить его нельзя, и код ошибки обязан
+        это говорить — иначе клиент будет повторять заведомо мёртвый запрос."""
         headers, _ = auth
-        from app.routers import ai as ai_router
+        from app import ai as ai_module
 
-        monkeypatch.setattr(ai_router.generator, "generate", lambda text: {
+        monkeypatch.setattr(ai_module.generator, "generate", lambda text: {
             "status": "error", "step": "llm_too_large",
             "error": "Описание не помещается в контекст модели"})
-        response = client.post("/api/generate", json={"text": "заявка"},
-                               headers=headers)
-        assert response.status_code == 400
-        assert not response.headers.get("retry-after")
+        descriptor = run_task(client, "/api/generate", {"text": "заявка"}, headers)
+        assert descriptor["status"] == "failed"
+        assert descriptor["error_code"] not in RETRYABLE_ERROR_CODES
 
-    def test_improve_oversized_scheme_is_400_not_503(self, client, auth, monkeypatch):
+    def test_improve_oversized_scheme_is_refused_not_unavailable(self, client, auth,
+                                                                 monkeypatch):
         """Сквозная проверка: отказ провайдера «слишком большой запрос» доходит
-        до клиента как ошибка запроса, а не как «сервис лег»."""
+        до клиента как ошибка входа, а не как «сервис лег»."""
         headers, _ = auth
         from app import ai as ai_module
         from core import llm_client
@@ -629,11 +665,11 @@ class TestAIRoutes:
         monkeypatch.setattr(llm_client, "_complete", refuse)
         monkeypatch.setattr(ai_module, "_orchestrator",
                             BPMNImprovementOrchestrator(knowledge_base=NoKb()))
-        response = client.post("/api/ai/improve",
-                               json={"bpmn_xml": XML, "prompt": "улучши схему"},
-                               headers=headers)
-        assert response.status_code == 400
-        assert "слишком велика" in response.json()["detail"]
+        descriptor = run_task(client, "/api/ai/improve",
+                              {"bpmn_xml": XML, "prompt": "улучши схему"}, headers)
+        assert descriptor["status"] == "failed"
+        assert "слишком велика" in descriptor["error"]
+        assert descriptor["error_code"] not in RETRYABLE_ERROR_CODES
 
     def test_ai_budget_blocks_after_hourly_limit(self, client, auth, monkeypatch):
         from app import deps
@@ -644,7 +680,7 @@ class TestAIRoutes:
         monkeypatch.setattr(deps._ai_window, "limit", 2)
         codes = [client.post("/api/evaluate", json={"bpmn_xml": XML},
                              headers=headers).status_code for _ in range(3)]
-        assert codes[:2] == [200, 200]
+        assert codes[:2] == [202, 202]
         assert codes[2] == 429
 
     def test_improve_reports_disabled_service(self, client, auth):
@@ -662,18 +698,21 @@ class TestAIRoutes:
         from app.models import Improvement
 
         class FakeOrchestrator:
-            async def improve_diagram(self, xml_content, user_prompt):
+            async def improve_diagram(self, xml_content, user_prompt, cancel_check=None):
                 return ("Узкое место — согласование", None,
                         {"status": "analysis_only", "applied": [], "skipped": [],
                          "truncated_operations": 0})
 
         monkeypatch.setattr(ai_module, "_orchestrator", FakeOrchestrator())
-        response = client.post("/api/ai/improve",
-                               json={"bpmn_xml": XML, "prompt": "найди узкие места",
-                                     "diagram_id": diagram}, headers=headers)
-        assert response.status_code == 200
-        body = response.json()
+        descriptor = run_task(client, "/api/ai/improve",
+                              {"bpmn_xml": XML, "prompt": "найди узкие места",
+                               "diagram_id": diagram}, headers)
+        assert descriptor["status"] == "done", descriptor
+        body = descriptor["result"]
         assert body["status"] == "analysis_only" and body["improvement_id"]
+        # Задача обязана оставить ссылку на доменный результат: по ней история
+        # задач сходится с историей схем без разбора JSON.
+        assert descriptor["result_ref"] == body["improvement_id"]
 
         from app.db import SessionLocal
         session = SessionLocal()
@@ -693,15 +732,15 @@ class TestAIRoutes:
         from app import ai as ai_module
 
         class FakeOrchestrator:
-            async def improve_diagram(self, xml_content, user_prompt):
+            async def improve_diagram(self, xml_content, user_prompt, cancel_check=None):
                 return ("Всё хорошо", None, {"status": "analysis_only", "applied": [],
                                              "skipped": [], "truncated_operations": 0})
 
         monkeypatch.setattr(ai_module, "_orchestrator", FakeOrchestrator())
-        improvement_id = client.post(
-            "/api/ai/improve",
-            json={"bpmn_xml": XML, "prompt": "проверь", "diagram_id": diagram},
-            headers=headers).json()["improvement_id"]
+        descriptor = run_task(client, "/api/ai/improve",
+                              {"bpmn_xml": XML, "prompt": "проверь",
+                               "diagram_id": diagram}, headers)
+        improvement_id = descriptor["result"]["improvement_id"]
         assert client.post("/api/ai/accept-improvement",
                            json={"improvement_id": improvement_id},
                            headers=headers).status_code == 404

@@ -1,3 +1,75 @@
+# Один стек: PostgreSQL, веб-процесс, два воркера очереди и Redis.
+#
+# Общий блок окружения вынесен в `x-app-environment` не для краткости: backend и
+# воркеры обязаны читать ОДИНАКОВЫЕ бюджеты, лимиты и очереди. Расхождение —
+# это не «разные настройки сервисов», а задача, поставленная с одним таймаутом и
+# исполненная с другим; анкер делает такое расхождение невозможным по структуре.
+#
+# Сервис `redis` и порт `db` наружу не публикуются: доступ только из внутренней
+# сети стека.
+
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+psycopg2://bpmn:${POSTGRES_PASSWORD:?Задайте POSTGRES_PASSWORD в .env}@db:5432/bpmn
+  SECRET_KEY: ${SECRET_KEY:?Задайте SECRET_KEY в .env}
+  JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+  # Пул соединений под удержание соединений ИИ-маршрутами (app/db.py).
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+  DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+  # Разрешённые источники CORS (app/config.py). По умолчанию — адрес
+  # фронтенда из этого стека; свой список задаётся в .env.
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3456}
+  # Путь к кэшу RAG-индекса внутри контейнера; пусто = рядом с кодом.
+  BPMN_RAG_CACHE_FILE: ${BPMN_RAG_CACHE_FILE:-}
+  MAIL_USERNAME: ${MAIL_USERNAME:-}
+  MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+  # MAIL_FROM обязан быть валидным e-mail: ConnectionConfig валидирует
+  # формат при импорте main.py. Пустое значение ломает запуск, поэтому
+  # даём placeholder по умолчанию.
+  MAIL_FROM: ${MAIL_FROM:-no-reply@vkusvill.ru}
+  MAIL_PORT: ${MAIL_PORT:-465}
+  MAIL_SERVER: ${MAIL_SERVER:-imap.yandex.ru}
+  MAIL_STARTTLS: ${MAIL_STARTTLS:-true}
+  MAIL_SSL_TLS: ${MAIL_SSL_TLS:-false}
+  # Без ключа ИИ-контур недоступен (эндпоинты честно отвечают ошибкой),
+  # поэтому значение опциональное — как и SECRET_KEY для голых миграций.
+  GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
+  GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+  # В контейнере нет корневого сертификата российского УЦ, поэтому проверка
+  # TLS по умолчанию выключена. Для прода: смонтируйте CA-bundle и поставьте true.
+  GIGACHAT_VERIFY_SSL: ${GIGACHAT_VERIFY_SSL:-false}
+  # Имя модели старого API («GigaChat») шлюз api.giga.chat не знает —
+  # отвечает 404. Пусто = пул по умолчанию из core/llm_client.py.
+  GIGACHAT_MODEL: ${GIGACHAT_MODEL:-}
+  # PERS/B2B тариф — один одновременный запрос к модели.
+  GIGACHAT_MAX_CONCURRENT: ${GIGACHAT_MAX_CONCURRENT:-1}
+  # Лимиты ИИ-контура из app/config.py: без проброса настройка из .env
+  # в контейнере молча игнорировалась бы.
+  AI_MAX_XML_CHARS: ${AI_MAX_XML_CHARS:-1000000}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-2000000}
+  AI_REQUESTS_PER_HOUR: ${AI_REQUESTS_PER_HOUR:-60}
+  GIGACHAT_CALL_BUDGET_SECONDS: ${GIGACHAT_CALL_BUDGET_SECONDS:-600}
+  BPMN_GENERATION_BUDGET_SECONDS: ${BPMN_GENERATION_BUDGET_SECONDS:-900}
+  BPMN_GATE_WAIT_GAPS: ${BPMN_GATE_WAIT_GAPS:-0}
+  # Очередь задач и кэш. Первый ключ задает режим: с ним долгие вызовы
+  # исполняет воркер, без него — веб-процесс в запросе (режим одиночного
+  # процесса, см. app/config.py).
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  CACHE_REDIS_URL: ${CACHE_REDIS_URL:-redis://redis:6379/1}
+  LLM_CACHE_TTL: ${LLM_CACHE_TTL:-604800}
+  GENERATION_CACHE_TTL: ${GENERATION_CACHE_TTL:-86400}
+  SCORE_CACHE_TTL: ${SCORE_CACHE_TTL:-2592000}
+  NEGATIVE_CACHE_TTL: ${NEGATIVE_CACHE_TTL:-300}
+  ARQ_MAX_JOBS: ${ARQ_MAX_JOBS:-2}
+  ARQ_LOCAL_MAX_JOBS: ${ARQ_LOCAL_MAX_JOBS:-4}
+  AI_LLM_JOB_TIMEOUT: ${AI_LLM_JOB_TIMEOUT:-1800}
+  AI_LOCAL_JOB_TIMEOUT: ${AI_LOCAL_JOB_TIMEOUT:-120}
+  AI_LLM_JOB_TRIES: ${AI_LLM_JOB_TRIES:-3}
+  AI_LOCAL_JOB_TRIES: ${AI_LOCAL_JOB_TRIES:-2}
+  AI_TASK_STALE_SECONDS: ${AI_TASK_STALE_SECONDS:-2100}
+  TASK_POLL_SECONDS: ${TASK_POLL_SECONDS:-2}
+
 services:
   db:
     image: postgres:16-alpine
@@ -15,65 +87,106 @@ services:
       retries: 10
     # Порт намеренно не публикуется: доступ к БД только из внутренней сети.
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # volatile-lru, а не allkeys-lru: при allkeys сервер имеет право вытеснить
+    # сам ключ очереди arq — и задачи исчезнут молча, что противоречит доводу,
+    # по которому здесь включён AOF. volatile-lru трогает только ключи со сроком
+    # жизни, а у записей кэша срок есть всегда.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb",
+              "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Порт наружу не публикуется: очередь и кэш живут только во внутренней сети,
+    # в них содержатся входы задач и ответы модели.
+
   backend:
     build: .
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg2://bpmn:${POSTGRES_PASSWORD:?}@db:5432/bpmn
-      SECRET_KEY: ${SECRET_KEY:?Задайте SECRET_KEY в .env}
-      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
-      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
-      # Пул соединений под удержание соединений ИИ-маршрутами (app/db.py);
-      # source по умолчанию пустой — SQLAlchemy применит свои разумные числа.
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
-      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-      # Разрешённые источники CORS (app/config.py). По умолчанию — адрес
-      # фронтенда из этого стека; свой список задаётся в .env.
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3456}
-      # Служебный режим без ИИ (перенос данных, прогоны без ключей); в
-      # штатном запуске оставляйте 0.
+      <<: *app-environment
+      # Служебный режим без ИИ (перенос данных) касается только веб-процесса:
+      # у воркера нет другой работы, кроме ИИ, поэтому ему флаг не передаётся.
       SKIP_LLM_INIT: ${SKIP_LLM_INIT:-0}
-      # Путь к кэшу RAG-индекса внутри контейнера; пусто = рядом с кодом.
-      BPMN_RAG_CACHE_FILE: ${BPMN_RAG_CACHE_FILE:-}
-      MAIL_USERNAME: ${MAIL_USERNAME:-}
-      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
-      # MAIL_FROM обязан быть валидным e-mail: ConnectionConfig валидирует
-      # формат при импорте main.py. Пустое значение ломает запуск, поэтому
-      # даём placeholder по умолчанию.
-      MAIL_FROM: ${MAIL_FROM:-no-reply@vkusvill.ru}
-      MAIL_PORT: ${MAIL_PORT:-465}
-      MAIL_SERVER: ${MAIL_SERVER:-imap.yandex.ru}
-      MAIL_STARTTLS: ${MAIL_STARTTLS:-true}
-      MAIL_SSL_TLS: ${MAIL_SSL_TLS:-false}
-      # Без ключа ИИ-контур недоступен (эндпоинты честно отвечают ошибкой),
-      # поэтому значение опциональное — как и SECRET_KEY для голых миграций.
-      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
-      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
-      # В контейнере нет корневого сертификата российского УЦ, поэтому проверка
-      # TLS по умолчанию выключена. Для прода: смонтируйте CA-bundle и поставьте true.
-      GIGACHAT_VERIFY_SSL: ${GIGACHAT_VERIFY_SSL:-false}
-      # Имя модели старого API («GigaChat») шлюз api.giga.chat не знает —
-      # отвечает 404. Пусто = пул по умолчанию из core/llm_client.py; через
-      # запятую можно свой порядок, следующий берётся, когда провайдер не знает
-      # модель.
-      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-}
-      # PERS/B2B тариф — один одновременный запрос к модели.
-      GIGACHAT_MAX_CONCURRENT: ${GIGACHAT_MAX_CONCURRENT:-1}
-      # Лимиты ИИ-контура из app/config.py: без проброса настройка из .env
-      # в контейнере молча игнорировалась бы.
-      AI_MAX_XML_CHARS: ${AI_MAX_XML_CHARS:-1000000}
-      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-2000000}
-      AI_REQUESTS_PER_HOUR: ${AI_REQUESTS_PER_HOUR:-60}
     ports:
       # Хост-порты 8000/3000 заняты сторонними проектами; внутри сети контейнеров остаются 8000/80.
       - "127.0.0.1:8765:8000"
     volumes:
       # Экспортированные файлы и статика живут на хосте.
       - ./static:/app/static
+    # HEALTHCHECK задан в образе (Dockerfile) и бьёт по /health: дублировать
+    # его здесь значило бы иметь два источника истины о том, что живой сервис.
+    # start-period 180 с остаётся нужным для режима без очереди — тогда
+    # веб-процесс поднимает модели эмбеддингов и корпус эталонов.
+
+  # Долгие ИИ-вызовы: генерация и улучшение. Параллелизм держат маленьким —
+  # тариф провайдера разрешает один одновременный запрос, второй слот нужен на
+  # разбор ответа и починку структуры, а не на вторую оплату модели.
+  worker_llm:
+    build: .
+    restart: unless-stopped
+    command: ["arq", "app.tasks.LLMWorkerSettings"]
+    environment: *app-environment
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Миграции применяет веб-процесс (app/startup.py из lifespan). Воркер их
+      # не запускает намеренно: два процесса `alembic upgrade head` одновременно
+      # — это гонка на одной схеме. Поэтому воркер ждёт именно healthy, а не
+      # started.
+      backend:
+        condition: service_healthy
+    # У воркера свой healthcheck: унаследованный из образа проверяет HTTP
+    # `/health`, которого у arq-процесса нет, — контейнер навсегда оставался бы
+    # unhealthy, и `docker compose up --wait`, и мониторинг врали бы. Проверяется
+    # отметка присутствия в Redis: она живёт ровно один интервал, поэтому
+    # отсутствующая отметка означает «процесс умер», а не «задача долгая».
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,redis; r=redis.Redis.from_url(os.environ[\"REDIS_URL\"]); exit(0 if r.get(\"ai_llm:health\") else 1)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Воркер поднимает тяжёлые модели RAG до того, как начинаются отметки.
+      start_period: 240s
+    # general volumes не монтируется: экспортирует файлы фронтенд из bpmn-js,
+    # а эндпоинт отдачи байтов под видом графики из кода убран.
+
+  # Локальные вычисления без сети: скоринг. Своя очередь и свой воркер, потому
+  # что крупная схема обязана считаться параллельно и не иметь права занять
+  # слот, которого ждёт обращение к провайдеру.
+  worker_local:
+    build: .
+    restart: unless-stopped
+    command: ["arq", "app.tasks.LocalWorkerSettings"]
+    environment: *app-environment
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,redis; r=redis.Redis.from_url(os.environ[\"REDIS_URL\"]); exit(0 if r.get(\"ai_local:health\") else 1)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Скоринг не ждёт модели, но оркестратор инициализируется и здесь:
+      # `_worker_startup` один на оба процесса.
+      start_period: 240s
 
   frontend:
     build:
@@ -89,3 +202,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:

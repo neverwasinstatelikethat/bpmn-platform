@@ -18,6 +18,16 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 3s --health-retries 10
+      # Очередь задач и кэш. Отдельный шаг с TEST_REDIS_URL ниже: основной
+      # прогон остаётся герметичным, а Lua-скрипт бюджета, ключи очереди arq и
+      # срок жизни значения проверяются на настоящем сервере — подменой их
+      # проверить нельзя.
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
     env:
       PYTHONIOENCODING: utf-8
       # Целевая СУБД проверяется уже на конвейере: SQLite остаётся легаси-режимом.
@@ -45,6 +55,10 @@ jobs:
           SECRET_KEY: ci-only-secret
       # Дальше схема уже на месте, её только подтверждает фикстура conftest.py.
       - run: python -m pytest tests/ -q
+      - name: Интеграция с Redis (очередь, кэш, общий бюджет)
+        run: python -m pytest tests/test_tasks_redis.py -q
+        env:
+          TEST_REDIS_URL: redis://localhost:6379/0
       # Детерминированный харнесс качества — часть конвейера, а не ручная
       # процедура: README обещает, что деградации промптов ловит именно
       # `--fail-on-regression`. Ключей не нужно: replay не читает `.env` и не

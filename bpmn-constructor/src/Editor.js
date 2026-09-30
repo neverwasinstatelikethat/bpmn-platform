@@ -5,6 +5,7 @@ import { layoutDiagram } from './bpmnLayout';
 import 'bpmn-js/dist/assets/diagram-js.css';
 import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
 import { apiClient, toUserMessage } from './api/client';
+import { runTask, runTaskWithRetry, taskFailureMessage } from './api/tasks';
 import { humanizeBpmnNote } from './i18n/labels';
 import { v4 as uuid } from 'uuid';
 import html2canvas from 'html2canvas';
@@ -387,6 +388,27 @@ const Editor = () => {
     const modelerRef = useRef(null);
     const containerRef = useRef(null);
     const paletteRef = useRef(null);
+    // Незакрытые ИИ-задачи этого экрана. Долгий вызов живёт в очереди воркера,
+    // а не в соединении браузера, поэтому закрытая вкладка его сама по себе не
+    // отменяет — человек ушёл, а оплата модели продолжается. При выходе с
+    // экрана каждый такой запрос снимается явной отменой.
+    const runningTasksRef = useRef(new Set());
+
+    const withTrackedTask = useCallback(async (run) => {
+        const controller = new AbortController();
+        runningTasksRef.current.add(controller);
+        try {
+            return await run(controller.signal);
+        } finally {
+            runningTasksRef.current.delete(controller);
+        }
+    }, []);
+
+    useEffect(() => () => {
+        runningTasksRef.current.forEach((controller) => controller.abort());
+        runningTasksRef.current.clear();
+    }, []);
+
     const [diagramName, setDiagramName] = useState(DEFAULT_DIAGRAM_NAME);
     const [diagramId, setDiagramId] = useState(null);
     const [validationResult, setValidationResult] = useState(null);
@@ -714,12 +736,16 @@ const Editor = () => {
         { sender: 'AI', isLoading: true, id: Date.now() + 1 }
         ]);
         try {
-            const response = await apiClient.post('/api/generate', {
+            const descriptor = await withTrackedTask((signal) => runTask('/api/generate', {
                 text: prompt || 'Создайте стандартную BPMN диаграмму',
                 detail_level: 'Medium',
-            });
-            if (response.data.status === 'success') {
-                const newBpmnXML = response.data.bpmn;
+            }, { signal }));
+            if (descriptor.status !== 'done') {
+                throw new Error(taskFailureMessage(descriptor, 'Не удалось сгенерировать схему.'));
+            }
+            const result = descriptor.result;
+            if (result.status === 'success') {
+                const newBpmnXML = result.bpmn;
                 setCanvasBusy(true);
                 try {
                     if (modelerRef.current) modelerRef.current.clear();
@@ -731,7 +757,7 @@ const Editor = () => {
                     // поток, добавленное событие). Пользователь обязан видеть,
                     // что схему поправили за него, — но служебные id и английские
                     // типы из заметок генератора в чат не идут.
-                    const notes = response.data.notes || [];
+                    const notes = result.notes || [];
                     if (notes.length) console.log('Заметки автоматики:', notes);
                     setMessagesGenerate(prev => [
                         ...prev.slice(0, -1),
@@ -841,23 +867,31 @@ const Editor = () => {
             const namesById = collectElementNames();
             setChatType(null);
             setShowScorePanel(true);
+            // Занятость держится на всём ожидании, а не вокруг одного запроса:
+            // разбор теперь задача очереди, и снять индикатор по возврату
+            // 202 значило бы сказать «готово», когда результата ещё нет.
             setScoreBusy(true);
-            let response;
+            let descriptor;
             try {
-                response = await apiClient.post('/api/evaluate', {
+                descriptor = await withTrackedTask((signal) => runTask('/api/evaluate', {
                     bpmn_xml: layoutedXML,
-                });
+                }, { signal }));
             } finally {
                 setScoreBusy(false);
             }
-            setValidationResult(response.data);
+            if (descriptor.status !== 'done') {
+                throw new Error(taskFailureMessage(descriptor,
+                    'Проверку не удалось выполнить. Попробуйте ещё раз.'));
+            }
+            const result = descriptor.result;
+            setValidationResult(result);
             setElementNames(namesById);
-            setScore(response.data.score);
+            setScore(result.score);
             // В шапке — только балл: разбор рекомендаций живёт в панели,
             // там он читается, а не склеивается в одну строку.
             setMessagesScore([{
                 sender: 'AI',
-                text: `Проверка завершена: ${response.data.score}/100.`,
+                text: `Проверка завершена: ${result.score}/100.`,
                 id: Date.now()
             }]);
         } catch (err) {
@@ -881,23 +915,30 @@ const Editor = () => {
         ]);
         try {
             const { xml } = await modelerRef.current.saveXML({ format: true });
-            const response = await apiClient.post('/api/ai/improve', {
-                bpmn_xml: xml,
-                prompt: prompt,
-                diagram_id: diagramId || null,
-            });
-            const recommendations = Array.isArray(response.data.recommendations)
-                ? response.data.recommendations.join('\n')
-                : (response.data.recommendations || '');
+            // Повтор только по отказу провайдера. Отказ по входу (обрезанный
+            // ответ, схема больше контекста) при повторе дал бы ровно тот же
+            // текст, а пользователь ждал бы второй минуты.
+            const descriptor = await withTrackedTask((signal) => runTaskWithRetry(
+                '/api/ai/improve',
+                { bpmn_xml: xml, prompt, diagram_id: diagramId || null },
+                { signal },
+            ));
+            if (descriptor.status !== 'done') {
+                throw new Error(taskFailureMessage(descriptor, 'Не удалось улучшить схему.'));
+            }
+            const result = descriptor.result;
+            const recommendations = Array.isArray(result.recommendations)
+                ? result.recommendations.join('\n')
+                : (result.recommendations || '');
             setMessagesImprove(prev => [
                 ...prev.slice(0, -1),
                 {
                     sender: 'AI',
                     text: recommendations || 'Изменения подготовлены.',
-                    improvementId: response.data.improvement_id,
+                    improvementId: result.improvement_id,
                     // Без status чат не отличает «предложен XML» от «только анализ»
                     // и показал бы кнопку принятия там, где принимать нечего.
-                    status: response.data.status,
+                    status: result.status,
                     id: Date.now()
                 }
             ]);

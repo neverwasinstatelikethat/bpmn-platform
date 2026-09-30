@@ -13,6 +13,7 @@
 """
 import asyncio
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,12 @@ from app.db import SessionLocal
 from app.main import app
 from app.models import AiTask
 from app.services import tasks as task_store
+
+
+def cached_keys(client):
+    """Ключи ответов в хранилище кэша: счётчики лежат рядом и в проверках
+    «в кэш ничего не легло» участвовать не должны."""
+    return {key for key in client.store if not key.endswith(":stats")}
 
 XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
@@ -150,6 +157,28 @@ class TestRoutingTable:
             assert list(one.functions) == task_module.TASK_FUNCTIONS
             assert one.job_timeout > 0 and one.max_jobs >= 1
             assert one.allow_abort_jobs is False
+
+    def test_worker_liveness_probe_matches_the_settings(self):
+        """Healthcheck контейнера читает тот же ключ, который воркер пишет, и
+        интервал отметки короче, чем срок жизни ключа.
+
+        Проверка сквозная не для красоты: унаследованный из образа пробник
+        стучится в HTTP, которого у arq нет, поэтому воркер висит unhealthy при
+        живой очереди. Если ключ в compose разойдётся с настройками, пробник
+        станет враньём того же рода."""
+        import yaml
+
+        compose = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "docker-compose.yml")
+            .read_text(encoding="utf-8"))["services"]
+        for service, settings in (("worker_llm", task_module.LLMWorkerSettings),
+                                  ("worker_local", task_module.LocalWorkerSettings)):
+            test = compose[service]["healthcheck"]["test"]
+            probe = " ".join(test) if isinstance(test, list) else test
+            assert settings.health_check_key in probe, (
+                f"{service}: проба смотрит не в тот ключ, что пишет воркер")
+            assert 0 < settings.health_check_interval <= 60, (
+                f"{service}: при длинной отметке мёртвый воркер выглядит живым")
 
     def test_arq_cli_accepts_both_settings_classes(self):
         """arq читает атрибуты настроек по именам, которые ожидает `Worker`.
@@ -497,7 +526,7 @@ class TestCacheInContour:
         for _ in range(2):
             client.post("/api/generate", json={"text": "заявка"}, headers=owner[0])
         assert len(calls) == 2
-        assert cache_installed.client.store == {}
+        assert cached_keys(cache_installed.client) == set()
 
     def test_truncation_is_remembered_and_replayed_as_failure(self, client, owner,
                                                              cache_installed,

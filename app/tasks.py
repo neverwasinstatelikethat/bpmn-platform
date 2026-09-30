@@ -33,7 +33,8 @@ from fastapi import HTTPException
 
 from app import ai as ai_components
 from app.config import (AI_LLM_JOB_TIMEOUT, AI_LLM_JOB_TRIES, AI_LOCAL_JOB_TIMEOUT,
-                        AI_LOCAL_JOB_TRIES, AI_TASK_STALE_SECONDS, ARQ_MAX_JOBS,
+                        AI_LOCAL_JOB_TRIES, AI_TASK_STALE_SECONDS,
+                        AI_WORKER_HEALTH_SECONDS, ARQ_MAX_JOBS,
                         ARQ_LOCAL_MAX_JOBS, REDIS_URL)
 from app.db import SessionLocal
 from app.models import AiTask, User
@@ -419,7 +420,10 @@ class LLMWorkerSettings:
     on_startup = _worker_startup
     on_shutdown = _worker_shutdown
     keep_result = 3600
+    # Интервал задаёт окно живости для healthcheck контейнера: ключ живёт
+    # на интервал дольше, и с дефолтным часом мёртвый воркер выглядел бы живым.
     health_check_key = f"{QUEUE_LLM}:health"
+    health_check_interval = AI_WORKER_HEALTH_SECONDS
 
 
 class LocalWorkerSettings:
@@ -437,6 +441,7 @@ class LocalWorkerSettings:
     on_shutdown = _worker_shutdown
     keep_result = 3600
     health_check_key = f"{QUEUE_LOCAL}:health"
+    health_check_interval = AI_WORKER_HEALTH_SECONDS
 
 
 # --- брокер ------------------------------------------------------------------

@@ -77,6 +77,11 @@ AI_LOCAL_JOB_TRIES = int(os.getenv("AI_LOCAL_JOB_TRIES", "2"))
 AI_TASK_STALE_SECONDS = int(os.getenv("AI_TASK_STALE_SECONDS", str(AI_LLM_JOB_TIMEOUT + 300)))
 # Подсказка клиенту, через сколько секунд опрашивать задачу в первый раз.
 TASK_POLL_SECONDS = float(os.getenv("TASK_POLL_SECONDS", "2"))
+# Как часто воркер отмечает своё присутствие в Redis (arq `record_health`).
+# Ключ живёт на один интервал дольше, поэтому интервал и есть окно, за которое
+# healthcheck контейнера замечает мёртвый процесс: при дефолтных 3600 с ключ
+# переживал бы воркера на час, и «нездоровый» процесс выглядел живым.
+AI_WORKER_HEALTH_SECONDS = int(os.getenv("AI_WORKER_HEALTH_SECONDS", "20"))
 
 # Пул соединений PostgreSQL. ИИ-маршрут держит соединение на всё время вызова
 # модели (см. app/routers/ai.py: зависимость get_db живёт до конца запроса),

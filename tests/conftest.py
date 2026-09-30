@@ -1,7 +1,9 @@
 import os
 import sys
 import tempfile
+import time as _time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,6 +40,85 @@ def test_database():
 
     prepare_database()
     yield
+
+
+class FakeRedisClient:
+    """In-process замена синхронного клиента Redis.
+
+    Кэш и бюджет проверяются по контракту слоя (что кладётся, что читается и
+    когда это считается промахом), а не по настоящему серверу: живой Redis с
+    настоящим подключением стоит отдельным тестом, чтобы основной прогон
+    оставался герметичным и не требовал Docker.
+    """
+
+    def __init__(self, fail=False):
+        self.store = {}
+        self.expiry = {}
+        self.fail = fail
+        self.closed = False
+
+    def _alive(self, key):
+        deadline = self.expiry.get(key)
+        return deadline is None or deadline > _time.time()
+
+    def _guard(self):
+        if self.fail:
+            raise ConnectionError("redis не отвечает")
+
+    def get(self, key):
+        self._guard()
+        if key not in self.store or not self._alive(key):
+            return None
+        return self.store[key]
+
+    def set(self, key, value, ex=None):
+        self._guard()
+        self.store[key] = value
+        self.expiry[key] = _time.time() + ex if ex else None
+        return True
+
+    def delete(self, key):
+        self._guard()
+        self.store.pop(key, None)
+        self.expiry.pop(key, None)
+        return 1
+
+    def hincrby(self, key, field, amount=1):
+        self._guard()
+        hash_ = self.store.setdefault(key, {})
+        hash_[field] = int(hash_.get(field, 0)) + amount
+        return hash_[field]
+
+    def hgetall(self, key):
+        self._guard()
+        return dict(self.store.get(key) or {})
+
+    def ping(self):
+        self._guard()
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_cache(monkeypatch):
+    """Настоящий `LLMCache`, но поверх словаря вместо сервера.
+
+    Подменяется `redis.Redis.from_url`, а не приватное поле клиента: проверка
+    идёт ровно тем путём построения, которым он строится в приложении.
+    """
+    from core import llm_cache
+
+    client = FakeRedisClient()
+
+    class _Factory:
+        @staticmethod
+        def from_url(*_args, **_kwargs):
+            return client
+
+    monkeypatch.setattr(llm_cache, "redis", SimpleNamespace(Redis=_Factory))
+    return llm_cache.LLMCache("redis://fake:6379/1", namespace="bpmn"), client
 
 
 XML_DECL = '<?xml version="1.0" encoding="UTF-8"?>\n'

@@ -531,3 +531,133 @@ class TestTouchedScope:
         owner = attribution.attribute_generation(checks, {}, trace)
         assert owner["expected_participants"] == \
             "починка:удаление пустых пулов"
+
+    def test_arc_between_existing_nodes_blames_the_step_on_topology_classes(
+            self):
+        """Дуга `F9: A2 -> A7`, проведённая между двумя узлами плана, — это
+        правка маршрута: отпечаток даёт в `added` только id потока, и без
+        различения классов `loops_have_a_guard` по id [A2, A7] валился бы в
+        «модель:первый ответ (план-гейт про него молчал)» — дважды неправда.
+        Цикл без охраны создал именно шаг «закрытие маршрутов»."""
+        trace = _trace(**{"починка структуры": {"steps": _steps(
+            {"step": "закрытие маршрутов", "added": ["flow:F9:A2->A7"],
+             "removed": []})}})
+        checks = {"loops_have_a_guard": _check("loops_have_a_guard",
+                                               ids=["A2", "A7"])}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["loops_have_a_guard"] == "починка:закрытие маршрутов"
+
+    def test_arc_endpoints_are_touched_only_for_route_shape_classes(self):
+        """Разделение держится на классе нарушения, а не на ширине порога:
+        «узел вне маршрута» — про дуги (их и рисовал шаг), а «таймер без
+        хронометража» — про содержание узла, и проводить его через чужую дугу
+        нельзя."""
+        step = {"step": "достижимость", "added": ["flow:F3:Start_1->A7"],
+                "removed": []}
+        assert {"A7", "Start_1", "F3"} <= attribution._touched(
+            step, arc_topology=True)
+        assert attribution._touched(step) == {"F3"}
+
+    def test_content_defect_is_not_blamed_on_the_arc_that_touched_its_node(
+            self):
+        """Страховка прогона #66: `_ensure_pool_events` рисует «старт →
+        ожидание», и по прежнему правилу этот шаг отвечал бы за отсутствие срока
+        у ожидания при `removed = []` — четыре провала `waits_have_sla` из семи
+        были именно такие. Честный владелец — первый ответ модели, и класс срока
+        в топологические не входит."""
+        trace = _trace(**{"починка структуры": {"steps": _steps(
+            {"step": "события пула",
+             "added": ["StartEvent_1@Склад", "flow:F1:StartEvent_1->A8"],
+             "removed": []})}})
+        checks = {"waits_have_sla": _check("waits_have_sla", ids=["A8"])}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert not owner["waits_have_sla"].startswith(attribution.OWNER_REPAIR)
+        assert owner["waits_have_sla"] == (attribution.OWNER_MODEL_FIRST
+                                           + attribution.OWNER_BLIND)
+
+    def test_topology_classes_are_real_invariants(self):
+        """Опечатка в имени класса не падает и не шумит: такой инвариант просто
+        никогда не совпадёт, и исключение молча вернёт прежнюю ложь."""
+        from eval.invariants import ALL_CHECKS
+
+        assert set(attribution._ARC_TOPOLOGY_CLASSES) <= set(ALL_CHECKS)
+        for content in ("waits_have_sla", "timer_schedule", "event_definitions",
+                        "has_timer", "pool_has_steps", "roles_as_lanes",
+                        "no_overloaded_lane"):
+            assert content not in attribution._ARC_TOPOLOGY_CLASSES, content
+
+
+class TestReaskIdMatch:
+    """Зачёт переспроса идёт по id узла, а не по классу нарушения целиком.
+
+    План-гейт называет ожидание в тексте нарушения (`_deadline_gaps`), и харнесс
+    передаёт эти тексты в атрибуцию: поэтому оба случая идут через ветку
+    «контур видел нарушение в плане», а расходятся они только зачётом повтора.
+    """
+
+    # Так выглядит закрытое нарушение про ДРУГОЕ ожидание (A2), и то же самое
+    # про A8: строки различаются только id узла.
+    _GAP_A2 = ("описание задаёт ожидание («в течение 2 дней»), а у ожидания A2 "
+               "(«Ждать ответа склада», intermediateCatchEvent) нет срока: "
+               'добавь boundaryEvent с event_definition="timer" и '
+               'attached_to="A2" на этом шаге ожидания')
+    _GAP_A8 = _GAP_A2.replace("A2", "A8")
+
+    def test_timer_for_another_wait_does_not_exonerate_the_contour(self):
+        """Три ожидания ждут без срока, повтор принёс таймер одному из них и
+        всё равно не улучшил план. По классу «таймер» контур оправдывался бы и
+        про двух других — а про их срок переспрос молчал, и владелец остаётся у
+        модели."""
+        reask = {"gaps_before": 3, "gaps_after": 3, "kept": "первый ответ",
+                 "fixed_kinds": {"таймер": 1}, "fixed": [self._GAP_A2],
+                 "outcome": "не улучшил"}
+        trace = _trace(**{"переспрос плана": reask})
+        checks = {"waits_have_sla": _check("waits_have_sla", ids=["A8"])}
+        owner = attribution.attribute_generation(checks, {}, trace,
+                                                 gaps=[self._GAP_A8])
+        assert owner["waits_have_sla"] == (attribution.OWNER_REASK_UNTOUCHED
+                                           + attribution.OWNER_SEEN)
+
+    def test_reask_that_named_this_wait_blames_the_contour(self):
+        """Обратная сторона: повтор нёс срок ИМЕННО этому ожиданию, и его
+        отвергли — правка была у контура, а не у модели."""
+        reask = {"gaps_before": 2, "gaps_after": 2, "kept": "первый ответ",
+                 "fixed_kinds": {"таймер": 1}, "fixed": [self._GAP_A8],
+                 "outcome": "не улучшил"}
+        trace = _trace(**{"переспрос плана": reask})
+        checks = {"waits_have_sla": _check("waits_have_sla", ids=["A8"])}
+        owner = attribution.attribute_generation(checks, {}, trace,
+                                                 gaps=[self._GAP_A8])
+        assert owner["waits_have_sla"] == (attribution.OWNER_REASK_REJECTED
+                                           + attribution.OWNER_SEEN)
+
+    def test_the_wait_gap_class_alone_never_closes_a_reask(self):
+        """`ожидание без срока` переспрос не получает (`_GAPS_NEVER_ASKED`),
+        поэтому число по этому классу пустое даже при названном узле: опираться
+        зачёту на класс не на чем, работает только текст закрытого нарушения с
+        id."""
+        from core import bpmn_generator
+
+        assert bpmn_generator.WAIT_GAP_CLASS in attribution._REASK_REPAIRS[
+            "waits_have_sla"]
+        reask = {"gaps_before": 1, "gaps_after": 1, "kept": "первый ответ",
+                 "fixed_kinds": {bpmn_generator.WAIT_GAP_CLASS: 1},
+                 "fixed": [], "outcome": "не улучшил"}
+        trace = _trace(**{"переспрос плана": reask})
+        checks = {"waits_have_sla": _check("waits_have_sla", ids=["A8"])}
+        owner = attribution.attribute_generation(checks, {}, trace,
+                                                 gaps=[self._GAP_A8])
+        assert owner["waits_have_sla"] == (attribution.OWNER_REASK_UNTOUCHED
+                                           + attribution.OWNER_SEEN)
+
+    def test_a_check_without_ids_keeps_the_class_level_count(self):
+        """Оракул не назвал узел — сопоставлять id не с чем, и зачёт остаётся
+        по числу классов: на этом держится разбор прогона #53 (`has_branching`
+        нарушений ids не несёт)."""
+        reask = {"gaps_before": 2, "gaps_after": 2, "kept": "первый ответ",
+                 "fixed_kinds": {"развилка": 1}, "fixed": [],
+                 "outcome": "не улучшил"}
+        trace = _trace(**{"переспрос плана": reask})
+        checks = {"has_branching": _check("has_branching")}
+        owner = attribution.attribute_generation(checks, {}, trace)
+        assert owner["has_branching"] == attribution.OWNER_REASK_REJECTED

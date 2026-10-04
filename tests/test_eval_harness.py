@@ -557,6 +557,40 @@ def test_dump_schemes_pairs_the_improvement_with_its_base(tmp_path):
         assert key in dump, key
 
 
+def test_replay_case_carries_the_package_the_guarantor_saw():
+    """Дамп обязан нести сам пакет операций, а не только пару схем.
+
+    По `_before`/`_after` и строкам отказа неотличим разрыв, снятый стражом дыр
+    маршрута, от дуги, вырезанной починкой, или от переноса между пулами — а это
+    разные очереди работы. Живой прогон #73 оставил один реверт именно без такого
+    файла: «пакет оставил бы дыру» есть, а чья правка её сделала — не сказано, и
+    разбирать класс пришлось бы новым прогоном.
+    """
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery")
+    case = report.improve_cases[0]
+    packages = case.operations_packages
+    assert packages and packages[0], packages
+    assert all(row.get("op") for pkg in packages for row in pkg), packages
+    assert case.as_dict()["operations_packages"] == packages
+
+
+def test_captured_packages_records_the_plan_and_restores_the_guarantor():
+    """Проба на входе гаранта пишет пакет и не оставляет следов: живой контур
+    вызывает его через `asyncio.to_thread`, и утённая замена функции означала бы
+    сломанный прогон у всех, кто пойдёт после."""
+    from core import bpmn_edits
+
+    seen: list = []
+    real = bpmn_edits.apply_and_guarantee
+    with harness._captured_packages(seen):
+        assert bpmn_edits.apply_and_guarantee is not real
+        out, _report = bpmn_edits.apply_and_guarantee(
+            _xml_with(), [{"op": "rename", "id": "A1", "name": "Собрать заказ"}])
+    assert out, "гарант отработал как обычно"
+    assert bpmn_edits.apply_and_guarantee is real
+    assert seen == [[{"op": "rename", "id": "A1", "name": "Собрать заказ"}]], seen
+
+
 def test_dump_schemes_names_the_worst_improvement_outcome():
     """Вердикт в имени файла — не украшение: откатанный пакет и пакет,
     задевший проходившее правило, разбирают первым."""
@@ -1968,3 +2002,105 @@ def test_prompt_sizes_section_says_what_was_not_measured():
         "prompt_note": "числа сняты с настоящих обращений (live)"})
     assert any("состав" in line and "наблюдено" in line for line in filled)
     assert any("4000 симв." in line for line in filled)
+
+
+class TestAbsoluteQualityBar:
+    """`--fail-on-regression` обязан мерить не только «не стало ли хуже».
+
+    Проверка относительно baseline выпускает в master контур, который ровно
+    удержал прошлое плохое число: 0.4 против 0.4 — регрессии нет, а продукта
+    нет. Планка `quality/scheme_checks_share ≥0.8` стоит в AGENTS.md как
+    требование, и до этого она жила только в тексте отчёта.
+    """
+
+    def test_below_the_bar_fails_the_gate(self):
+        from eval import metrics, run
+
+        verdict = run.bar_verdict({metrics.QUALITY_BAR_METRIC: 0.799})
+        assert verdict is not None and "ниже планки" in verdict
+
+    def test_at_the_bar_passes(self):
+        from eval import metrics, run
+
+        assert run.bar_verdict({metrics.QUALITY_BAR_METRIC: 0.8}) is None
+
+    def test_unmeasured_bar_does_not_fail_a_subset_run(self):
+        from eval import run
+
+        assert run.bar_verdict({}) is None
+
+    def test_under_sampled_bar_is_filtered_out_of_the_gate(self):
+        """`--scenarios` одной сценой: `quality/scheme_checks_share` имеет
+        среднее при n=1, и `SuiteResult.flat()` его сохраняет намеренно (иначе
+        метрика исчезла бы и из baseline, и из `unverified`). До этой правки
+        гейт читал только `flat()` и возвращал код 1 по числу, которое таблица в
+        этом же прогоне печатает как «н/д [выборка 1 < 2]», — прямо против
+        docstring'а «неизмеренная метрика — не провал»."""
+        from eval import run
+
+        below = {metrics.QUALITY_BAR_METRIC: 0.4}
+        assert run.bar_verdict(below) is not None
+        assert run.bar_verdict(below, [metrics.QUALITY_BAR_METRIC]) is None
+
+    def test_filtered_bar_is_announced_loudly(self):
+        """Выпадение планки из гейта обязано быть прочитано, а не догадано:
+        «регрессий нет, код 0» иначе неотличимо от «планку не проверяли»."""
+        from eval import run
+
+        below = {metrics.QUALITY_BAR_METRIC: 0.4}
+        note = run.bar_gate_note(below, [metrics.QUALITY_BAR_METRIC])
+        assert note and "не выносилась" in note
+        assert metrics.QUALITY_BAR_METRIC in note
+        # Вердикт состоялся — заметки нет: две ветки читают одно состояние.
+        assert run.bar_gate_note(below, ()) == ""
+        assert run.bar_gate_note({}, ()) and "ни одним кейсом" in \
+            run.bar_gate_note({}, ())
+
+    def test_cli_single_scenario_exit_code_ignores_the_unmeasured_bar(
+            self, monkeypatch, capsys):
+        """То же end-to-end, на настоящих числах прогона: планка по
+        `quality/scheme_checks_share` в прогоне одной сценой не выносится, и CI
+        получает 0 плюс строку в stderr. Подмена одна: долю ставим ниже планки
+        руками, потому что ни одна replay-схема сегодня ниже 0.8 не падает, а
+        проверка ровно на этом и построена."""
+        from eval import run
+
+        real = harness.run
+        prepared = real(mode="replay", scenarios_spec="loan_application",
+                        repeat=1)
+        assert metrics.QUALITY_BAR_METRIC in prepared.under_sampled
+        flat = dict(prepared.metrics_flat())
+        flat[metrics.QUALITY_BAR_METRIC] = 0.4
+        monkeypatch.setattr(harness.RunReport, "metrics_flat",
+                            lambda self: flat)
+        monkeypatch.setattr(harness, "run", lambda **kwargs: prepared)
+        assert prepared.metrics_flat()[metrics.QUALITY_BAR_METRIC] == 0.4
+        code = run.main(["--mode", "replay", "--scenarios", "loan_application",
+                         "--baseline", "", "--fail-on-regression",
+                         "--no-report"])
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "не выносилась" in captured.err
+
+
+class TestQualityBarIsOneNumber:
+    """Планка живёт в одном месте: у неё два читателя, и второй не вправе
+    разойтись с первым молча."""
+
+    def test_harness_and_metrics_read_the_same_bar(self):
+        assert harness.QUALITY_BAR == metrics.QUALITY_BAR
+
+    def test_report_and_gate_share_the_source(self):
+        """`bar_verdict` (код выхода CI) и `manual_review` (список схем,
+        которые автоматика уже пропустила) обязаны называть одно число: поднятая
+        планка в одном месте выдала бы «прошло гейт» и «смотреть руками» для
+        одной и той же схемы."""
+        report = harness.run(mode="replay", scenarios_spec="all", repeat=1)
+        review = report.manual_review()
+        assert review["bar"] == metrics.QUALITY_BAR == harness.QUALITY_BAR
+        from eval import run
+
+        assert run.bar_verdict({metrics.QUALITY_BAR_METRIC:
+                                metrics.QUALITY_BAR - 0.001}) is not None
+        assert run.bar_verdict({metrics.QUALITY_BAR_METRIC:
+                                metrics.QUALITY_BAR}) is None

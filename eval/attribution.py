@@ -79,6 +79,11 @@ _REASK_REPAIRS = {
     "participant_interacts": ("участник вне схемы", "пустой пул"),
     "has_timer": ("таймер",),
     "has_branching": ("развилка",),
+    # Ожидание без срока: план-гейт называет узел своим текстом (`_deadline_gaps`
+    # и `_waiting_gaps`), поэтому провал инварианта отличим от «модель не дала
+    # срок» и от «повтор принёс тот же план». Отличим по id узла, а не по классу
+    # целиком — см. `_reask_closed_this`.
+    "waits_have_sla": ("таймер", "ожидание без срока"),
 }
 # Второе измерение для «дефект пришёл в плане»: видел ли о нём план-гейт.
 # «контур видел» чинят в `repair_structure` и переспросе, «не видел» — только
@@ -108,11 +113,78 @@ def _entry_tokens(entry: str) -> Set[str]:
     return {text.partition("@")[0]}
 
 
-def _touched(step: Mapping[str, Any]) -> Set[str]:
+# Классы инвариантов, которые являются свойством ТОПОЛОГИИ маршрута: они
+# меняются от того, какие дуги проведены между уже существующими узлами, и не
+# меняются от того, что написано внутри узла. Для них концы добавленной или
+# снятой дуги считаются тронутыми элементами (`_touched(arc_topology=True)`).
+# Без этого шагу, который провёл дугу `F9: A2 -> A7` («закрытие маршрутов»,
+# «достижимость», «связь стартов», перешивка ноги при вставке схождений), не
+# чем было отвечать за `loops_have_a_guard` по id [A2, A7]: отпечаток даёт в
+# `added` только id потока, а владельцу приходилось падать в `_plan_owner` и
+# печатать «модель:первый ответ (план-гейт про него молчал)» — ложь и про модель,
+# и про то, что контур молчал.
+# Список сверен с `eval/invariants.py`, а не сформулирован с нуля:
+#  * вошли те, чьи id называют узел, чью связность или роль развилки дуга и
+#    меняет: цикл без охраны, узел вне маршрута, развилка без схождения и без
+#    условий на ногах, граничное событие без ветки обработки, слепой повтор и
+#    цепочка подписей без решения (обе замыкает именно дуга между готовыми
+#    шагами);
+#  * не вошли свойства СОДЕРЖАНИЯ узла — `waits_have_sla` (нет срока у
+#    ожидания), `timer_schedule`, `event_definitions`, `has_timer`,
+#    `roles_as_lanes`, `pool_has_steps`, `no_overloaded_lane`: там действует
+#    запрет прогона #66, и «старт → ожидание» не делает починку виновником
+#    отсутствия срока;
+#  * не вошли классы, чей id уже сам поток (`flow_ends_legal`,
+#    `flows_within_pool`, `dangling_flows`, `message_flow_ends`), и классы про
+#    участников (`participant_interacts`, `expected_participants`): потоку дуга
+#    отвечает и без исключения — его id попадает в тронутые всегда, — а пул
+#    дугой не создаётся.
+_ARC_TOPOLOGY_CLASSES: Tuple[str, ...] = (
+    "loops_have_a_guard",
+    "no_unrouted",
+    "gateway_split_join",
+    "gateway_conditions_or_default",
+    "boundary_handled",
+    "no_blind_rework",
+    "signoffs_need_a_gate",
+)
+
+
+def _touched(step: Mapping[str, Any],
+             arc_topology: bool = False) -> Set[str]:
+    """Что шаг изменил, а не что он увидел.
+
+    Концы дуги сами по себе в тронутые не попадают: `_ensure_pool_events`
+    рисует «старт → ожидание», и по прежнему правилу этот шаг отвечал бы за то,
+    что у ожидания нет срока. Прогон `waits_have_sla`: четыре провала из семи
+    были приписаны «починка:события пула» при `removed = []` — то есть там, где
+    починка ничего не снимала (тот же класс лжи, что и #53 с `roles_as_lanes`,
+    только в другую сторону: тогда контуру приписывалось то, что сделала модель).
+    Узел считается тронутым, только если сам шаг его добавил, снял или перенёс
+    между пулами — то есть на него есть токен `узел@пул`.
+
+    `arc_topology` — обратная сторона того же правила и только для классов из
+    `_ARC_TOPOLOGY_CLASSES`: дуга между двумя УЖЕ существующими узлами меняет
+    именно маршрут, и называть её свидетелем, а не автором, значит отдать
+    провал модели.
+    """
+    entries = [str(entry) for key in ("added", "removed")
+               for entry in (step.get(key) or [])]
+    changed_nodes = {entry.partition("@")[0] for entry in entries
+                     if not entry.startswith(("pool:", "lane:", "flow:"))}
     out: Set[str] = set()
-    for key in ("added", "removed"):
-        for entry in step.get(key) or []:
+    for entry in entries:
+        if not entry.startswith("flow:"):
             out |= _entry_tokens(entry)
+            continue
+        flow_id, _, rest = entry[5:].partition(":")
+        source, _, target = rest.partition("->")
+        out.add(flow_id)
+        if arc_topology:
+            out |= {node for node in (source, target) if node}
+        else:
+            out |= {node for node in (source, target)
+                    if node in changed_nodes}
     return out
 
 
@@ -174,6 +246,41 @@ def _branch_removed_by_repair(steps: Sequence[Mapping[str, Any]]) -> str:
     return ""
 
 
+def _reask_closed_this(reask: Mapping[str, Any], name: str,
+                       ids: Set[str]) -> bool:
+    """Нёс ли переспрос правку ИМЕННО этого провала.
+
+    Числа по классам (`fixed_kinds`) на это не отвечают, и по `waits_have_sla`
+    это ровно тот случай, что оправдывает контур зря: `_askable_gaps` снимает
+    класс `ожидание без срока` (`_GAPS_NEVER_ASKED`), так что в зачёт попадает
+    только класс «таймер» — а его закрывает срок ОДНОГО ожидания. На схеме, где
+    ждут трое, правка одного делала бы владельца «переспрос отвергнут» и для
+    двух других, про которых повтор молчал. Поэтому при названных id сверяется
+    текст закрытого нарушения: план-гейт печатает в нём id узла
+    (`_deadline_gaps`), и стык идёт тем же приёмом, что `_was_in_the_plan`.
+
+    Ограничения. Трейс несёт шесть первых закрытых текстов
+    (`_trace_gaps(closed)[:6]`), и на схеме с десятком снятых нарушений это
+    разворачивается в «повтор не тронул» — то есть вину несёт модель, а не
+    контур; оправдать контур тут может только названный узел. И второе: владелец
+    у строки прогона один на весь инвариант, поэтому провал из нескольких узлов
+    закрывается правкой любого из них — остаток вины тут не делится, он виден по
+    списку id в причине.
+    """
+    kinds = _REASK_REPAIRS.get(name)
+    if not kinds:
+        return False
+    closed = reask.get("fixed_kinds") or {}
+    if not any(closed.get(kind) for kind in kinds):
+        return False
+    if not ids:
+        # Провал без id (`has_branching`) сопоставлять не с чем: остаётся прежнее
+        # число по классам.
+        return True
+    return _was_in_the_plan(ids, [str(text) for text in (reask.get("fixed")
+                                                         or ())])
+
+
 def attribute_generation(
         checks_xml: Mapping[str, Any],
         checks_structure: Mapping[str, Any],
@@ -192,7 +299,7 @@ def attribute_generation(
     reask = _reask(trace)
     from_model = any(n.get("node") == "первый ответ модели" for n in trace)
 
-    def _plan_owner(name: str) -> str:
+    def _plan_owner(name: str, ids: Set[str]) -> str:
         """Кому принадлежит нарушение, пришедшее из плана.
 
         Развилка не в «принят ли повтор», а в том, нёс ли он правку этого
@@ -209,8 +316,7 @@ def attribute_generation(
             return OWNER_MODEL_REASK
         if reask.get("gaps_after") is None:
             return OWNER_MODEL_FIRST
-        closed = reask.get("fixed_kinds") or {}
-        if any(closed.get(kind) for kind in _REASK_REPAIRS.get(name, ())):
+        if _reask_closed_this(reask, name, ids):
             return OWNER_REASK_REJECTED
         return OWNER_REASK_UNTOUCHED
 
@@ -234,11 +340,12 @@ def attribute_generation(
                 out[name] = demoted
                 continue
         if _was_in_the_plan(ids, gaps):
-            out[name] = _plan_owner(name) + OWNER_SEEN
+            out[name] = _plan_owner(name, ids) + OWNER_SEEN
             continue
         owner = ""
+        arc_topology = name in _ARC_TOPOLOGY_CLASSES
         for step in reversed(steps):
-            if ids and (ids & _touched(step)):
+            if ids and (ids & _touched(step, arc_topology)):
                 owner = _step_owner(step)
                 break
         if not owner and ids and any(any(i in n for i in ids) for n in notes):
@@ -246,7 +353,7 @@ def attribute_generation(
         if not owner:
             # Без id стык с нарушениями плана невозможен: утверждать, что
             # план-гейт молчал, харнесс не вправе.
-            owner = _plan_owner(name) + (OWNER_BLIND if ids else "")
+            owner = _plan_owner(name, ids) + (OWNER_BLIND if ids else "")
         out[name] = owner
     return out
 

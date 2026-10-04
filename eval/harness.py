@@ -81,7 +81,10 @@ ADVICE_PROMPT = ("В схеме есть проблемы. Убери то, чт
 # схемой. Числом совпадает с прежним обещанием харнесса («каждый инвариант
 # корректности ≥0.8»), но считается по схеме, а не по конъюнкции: среднее по
 # живому прогону #56 уже 0.853 там, где `pass@1/scenario` даёт 0.062.
-QUALITY_BAR = 0.8
+# Литерала здесь нет: та же планка двигает гейтом `--fail-on-regression`
+# (`eval/run.py:bar_verdict`), и две копии разъехали бы гейт и отчёт молча —
+# держится одно число в `metrics.QUALITY_BAR`.
+QUALITY_BAR = metrics.QUALITY_BAR
 # Что в итоговой схеме решает человек, а не линейка. Формулировки — вопросы, а не
 # критерии с числом: у ответа нет меры, и выдумывать её значило бы подменить
 # ручной вердикт ещё одной самоподтверждающейся метрикой.
@@ -142,6 +145,8 @@ def _resolve_method(class_name: str, *candidates: str) -> Optional[Callable[...,
 
 def repair_structure(plan: Mapping[str, Any],
                      trace: Optional[List[Dict[str, Any]]] = None,
+                     text: str = "",
+                     lost: Optional[List[str]] = None,
                      ) -> Tuple[Dict[str, Any], List[str]]:
     """Починка структуры устойчива к смене сигнатуры: кортеж (структура,
     пометки) или только структура — разбираются оба варианта.
@@ -149,16 +154,28 @@ def repair_structure(plan: Mapping[str, Any],
     `trace` — сборщик отпечатка шагов починки для атрибуции дефектов. Его
     передают ядру только если функция починки действительно принимает такой
     параметр: харнесс не фиксирует под собой сигнатуру, а спрашивает её.
+
+    `text` и `lost` — то же требование к продуктивному пути. Без описания
+    починка не отличает «убрали артефакт» от «сошёл названный участник»
+    (`_drop_vacant_pools`), а без `lost` потеря не попадает в `gaps`: replay
+    мерял бы контур, который физически не способен потерять контрагента, —
+    расхождение с живым прогоном ровно там, где его измеряют отдельно и за него
+    готовы платить.
     """
     fn = _resolve("core.bpmn_generator", "repair_structure", "repair_plan",
                   "normalize_structure")
     if fn is None:
         raise HarnessError("в core/bpmn_generator нет функции починки структуры "
                            "(repair_structure/repair_plan)")
-    args: List[Any] = [dict(plan)]
-    if trace is not None and "trace" in _signature_names(fn):
-        args.append(trace)
-    result = fn(*args)
+    names = _signature_names(fn)
+    kwargs: Dict[str, Any] = {}
+    if trace is not None and "trace" in names:
+        kwargs["trace"] = trace
+    if text and "text" in names:
+        kwargs["text"] = text
+    if lost is not None and "lost" in names:
+        kwargs["lost"] = lost
+    result = fn(dict(plan), **kwargs)
     if isinstance(result, tuple):
         structure = result[0] if len(result) > 0 else {}
         notes = list(result[1]) if len(result) > 1 and result[1] else []
@@ -590,6 +607,13 @@ class ImproveCase:
     rules_regressed: Optional[Dict[str, str]] = None
     noop_rows: Optional[int] = None
     truncated_operations: Optional[int] = None
+    #: пакеты операций, которые контур отдал гаранту, по раундам: первый план и
+    #: корректирующий повтор. По паре `_before`/`_after` и строкам отказа
+    #: неотличим разрыв, снятый стражом дыр маршрута, от дуги, вырезанной
+    #: починкой, или от переноса между пулами, — а это разные очереди работы, и
+    #: без пакета отказ `package_reverted` читается только как факт «откачено».
+    #: `None` — факт не собран (режим, где гарант не вызывался).
+    operations_packages: Optional[List[List[Dict[str, Any]]]] = None
     #: что харнесс не смог померить на этом кейсе (съехавшее имя живого кода,
     #: отсутствующий параметр сигнатуры) — замер неполон, и обязан говорить об
     #: этом, а не молча подменять его локальной копией контура.
@@ -801,6 +825,7 @@ class ImproveCase:
             "rules_regressed": self.rules_regressed,
             "noop_rows": self.noop_rows,
             "truncated_operations": self.truncated_operations,
+            "operations_packages": self.operations_packages,
             "repeat_rejections": self.repeat_rejections,
             "repeat_rejection_share": _repeat_rejection_share(self),
             "defects_introduced": _defects_introduced(self),
@@ -1141,6 +1166,20 @@ def _plan_gaps(plan: Mapping[str, Any], text: str) -> List[str]:
         return []
 
 
+def lost_participant_gap(name: str) -> str:
+    """Строка потери названного участника — та же, что печатает контур.
+
+    Формулировку держит ядро (`core.bpmn_generator.lost_participant_gap`):
+    копия в харнессе разошлась бы, а атрибуция узнаёт потерю именно по тексту,
+    поэтому расхождение выглядело бы как «молчаливый» провал `expected_participants`.
+    """
+    fn = _resolve("core.bpmn_generator", "lost_participant_gap")
+    if fn is None:
+        raise HarnessError("в core/bpmn_generator нет строки потери участника "
+                           "(lost_participant_gap)")
+    return str(fn(name))
+
+
 def _live_plan(text: str) -> Tuple[Dict[str, Any], List[str], str, List[str],
                                    List[Dict[str, Any]]]:
     """План, пометки починки, XML, нарушения плана и трейс узлов живого контура
@@ -1191,7 +1230,14 @@ def run_generation_case(scenario: Scenario, fixture: Optional[Mapping[str, Any]]
                 raise _CaseFailure("у фикстуры нет поля plan")
             gaps = _plan_gaps(fixture["plan"], scenario.text)
             steps: List[Dict[str, Any]] = []
-            structure, notes = repair_structure(fixture["plan"], steps)
+            lost: List[str] = []
+            structure, notes = repair_structure(fixture["plan"], steps,
+                                                text=scenario.text, lost=lost)
+            # Потеря названного участника — решение контура, а не модели: в
+            # продукте она попадает в `gaps` той же строкой, и replay обязан
+            # мерить её там же, иначе `expected_participants` проваливался бы
+            # без владельца.
+            gaps = list(gaps) + [lost_participant_gap(name) for name in lost]
             # Трейс фикстуры честен ровно наполовину: кто прислал план — модель
             # или автор фикстуры — харнесс не знает, поэтому владельцем отсутствия
             # считается сама фикстура (атрибуция решает это по пустому трейсу).
@@ -1419,6 +1465,8 @@ def _replay_improve(base_xml: str,
         "rules_regressed": regressed,
         "noop_rows": noop_rows,
         "truncated_operations": truncated,
+        # сам пакет, отданный гаранту: см. `ImproveCase.operations_packages`.
+        "operations_packages": [operations] + ([retry_ops] if retried else []),
         "unmeasured": unmeasured,
     }
 
@@ -1542,14 +1590,19 @@ def run_improvement_case(scenario: Scenario, fixture: Mapping[str, Any],
             # Свой счётчик: вложенный `llm_call_counter` внутри `_live_improve`
             # видит те же вызовы, но наружу отдаёт только число обращений, а
             # строки с размером входа остаются здесь.
-            with llm_call_counter() as counter:
-                xml_after, report, case.llm_calls = _live_improve(
-                    base.xml, fixture.get("prompt", "") or scenario.improve_prompt)
+            with _captured_packages([]) as packages:
+                with llm_call_counter() as counter:
+                    xml_after, report, case.llm_calls = _live_improve(
+                        base.xml, fixture.get("prompt", "")
+                        or scenario.improve_prompt)
             case.prompt_calls = list(counter.get("prompt_calls") or [])
+            case.operations_packages = packages
         else:
             xml_after, report = _replay_improve(base.xml, fixture)
             case.prompt_calls = rendered_improve_prompt_rows(
                 base.xml, fixture.get("prompt", "") or scenario.improve_prompt)
+            case.operations_packages = list(
+                report.get("operations_packages") or [])
         _absorb_improve_report(case, report)
         # Отчёт приносит СВОИ замечания о недомере; разметка фикстуры,
         # поставленная до вызова, от этого не исчезает.
@@ -1574,13 +1627,42 @@ def run_improvement_case(scenario: Scenario, fixture: Mapping[str, Any],
     return case
 
 
+@contextlib.contextmanager
+def _captured_packages(sink: List[List[Dict[str, Any]]]):
+    """Записать пакеты, которые контур отдаёт гаранту, не трогая продуктовый ответ.
+
+    По паре `_before`/`_after` и строкам отказа неотличим разрыв, снятый стражом
+    дыр маршрута, от дуги, вырезанной починкой, или от переноса между пулами, — а
+    это разные очереди работы: живой прогон #73 оставил один реверт, и по
+    артефактам нельзя было сказать, чья это правка. Оркестратор в отчёте пакета
+    не показывает (пользовательский контракт), поэтому снимается пробою на входе
+    гаранта.
+    """
+    edits = _module("core.bpmn_edits")
+    if edits is None:
+        yield sink
+        return
+    original = edits.apply_and_guarantee
+
+    def _spy(xml_text: str, operations: Any, *args: Any, **kwargs: Any):
+        sink.append([dict(op) for op in (operations or []) if isinstance(op, dict)])
+        return original(xml_text, operations, *args, **kwargs)
+
+    edits.apply_and_guarantee = _spy
+    try:
+        yield sink
+    finally:
+        edits.apply_and_guarantee = original
+
+
 def _live_improve(xml: str,
                   prompt: str) -> Tuple[str, Dict[str, Any], int]:
     """Живое улучшение штатным оркестратором (асинхронным — прогоняем sync).
 
     Отчёт забирается целиком: факты о повторе, об откате пакета и о регрессе
     правил считает оркестратор, и выводить их здесь из стадий отказов значило бы
-    измерять догадку харнесса вместо контура.
+    измерять догадку харнесса вместо контура. Пакеты операций снимаются снаружи —
+    см. `_captured_packages`.
     """
     import asyncio
 
@@ -1627,7 +1709,8 @@ def etalon_business_smells() -> Dict[str, int]:
             continue
         try:
             scenario = scenario_by_id(fixture["scenario"])
-            structure, _notes = repair_structure(fixture["plan"], [])
+            structure, _notes = repair_structure(fixture["plan"], [],
+                                                 text=scenario.text)
             checks = invariants.check_xml(generate_xml(structure),
                                           scenario.expectations())
         except Exception:  # noqa: BLE001 — нечитаемый эталон снимает сверку, не прогон
@@ -1734,7 +1817,10 @@ def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
                  direction=metrics.LOWER, unit="мс")
     suite.metric("llm_retries",
                  lambda case: max(0, case.llm_calls - 1) if case.mode == "live" else 0.0,
-                 description="повторные обращения к модели на задачу",
+                 description="обращений к модели сверх первого: число считает и "
+                             "вторую стадию генерации, и переспросы починки, и "
+                             "повторы транспорта — это глубина прогона, а не "
+                             "сбой провайдера (счётчик ведётся на транспорте)",
                  direction=metrics.LOWER)
     # Размер входа — диагноз стоимости, а не корректности: в гейт
     # `quality/scheme_checks_share` он не входит и не может его ни поднять, ни
@@ -1809,7 +1895,7 @@ def _op_acceptance(case: ImproveCase) -> Optional[float]:
     total = len(case.applied) + len(case.skipped)
     if case.noop_rows is None:
         return None
-    # `noop_rows` считается до откатa (это свойство пакета, а не схемы), поэтому
+    # `noop_rows` считается до отката (это свойство пакета, а не схемы), поэтому
     # после сверки отчёта он может превысить число оставшихся строк.
     return _share(max(0, len(case.applied) - case.noop_rows), total)
 
@@ -2911,7 +2997,9 @@ def dump_schemes(report: "RunReport", out_dir: Path) -> List[Path]:
     выглядит: пригодный BPMN и «правильный по инвариантам, но нечитаемый»
     различаются только взглядом. Имя несёт итог сцены, поэтому разбирают сначала
     провалы. Улучшение выгружается парой `_before`/`_after` плюс `_report.json`:
-    дельта пакета читается только из двух схем рядом.
+    дельта пакета читается только из двух схем рядом, а в отчёте лежит и сам
+    пакет (`operations_packages`) — без него отказ «пакет оставил бы дыру»
+    неотличим от дыры, которую сделала починка или перенос между пулами.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

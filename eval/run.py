@@ -10,7 +10,11 @@
 (`main.py:14`), иначе живой прогон из чистой оболочки падал на отсутствующем
 `GIGACHAT_CREDENTIALS`, хотя ключи лежат в файле рядом с репозиторием.
 Код 1 — по `--fail-on-regression`, если относительно baseline что-то упало: CI
-так и должен отличать «правку промпта, которая ухудшила контур».
+так и должен отличать «правку промпта, которая ухудшила контур». Абсолютная
+планка по коду 1 выносится только измеренным метрикам: доля при одной схеме
+вердикта не даёт (см. `metrics.MIN_GATED_N`), и прогон говорит вслух, что планку
+по такой метрике не выносил, — иначе `--scenarios` одной сценой ловил бы
+красный код по числу, которое таблица уже показала как «н/д».
 Код 2 — харнесс не смог посчитать прогон: нет ключа, нет фикстур, либо упала
 сама метрика (`ОШИБКИ МЕТРИК`): значение такой метрики — None, и пропускать её
 как «данных нет» нельзя, иначе баг харнесса выглядел бы отсутствием регрессий.
@@ -25,7 +29,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
 
@@ -94,6 +98,67 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _bar_state(values: Mapping[str, Any],
+               ungated: Iterable[str]) -> Tuple[Optional[float], str]:
+    """(значение планки, причина, по которой вердикта нет).
+
+    Причина возвращается текстом, а не молчанием: `None` в первом поле означает
+    и «метрики нет вовсе», и «выборка ниже порога», и гейт, и заметка в stderr
+    должны читать одно и то же разделение, иначе строка «планку не выносил»
+    разойдётся с таблицей прогона.
+    """
+    value = values.get(metrics.QUALITY_BAR_METRIC)
+    if value is None:
+        return None, "метрика не померена ни одним кейсом выбранного набора"
+    if metrics.QUALITY_BAR_METRIC in set(ungated or ()):
+        return None, ("выборка ниже порога (`MIN_GATED_N`): среднее по одному "
+                      "кейсу — факт прогона, а не свойство контура")
+    return float(value), ""
+
+
+def bar_verdict(values: Mapping[str, Any],
+                ungated: Iterable[str] = ()) -> Optional[str]:
+    """Вердикт по абсолютной планке качества; None — препятствий нет.
+
+    Относительная регрессия молчит про прогон, который ровно удержал прошлое
+    плохое число: `--fail-on-regression` без этой проверки выпускает в master
+    контур с долей 0.4 как «без регрессий». Планка берётся из AGENTS.md и
+    стоит в `metrics.QUALITY_BAR`.
+
+    Неизмеренная метрика — не провал: прогон по подвыборке `--scenarios` не
+    обязан мерить всю линейку, и фейрить его значило бы сделать гейт
+    непригодным для точечных проверок. Поэтому `ungated` (`RunReport.under_sampled`)
+    обязано доходить сюда: `SuiteResult.flat()` сохраняет средние и метрикам без
+    вердикта, и `quality/scheme_checks_share` при n=1 давала бы код 1 по числу,
+    которое таблица печатает как «н/д». Молчать про снятую планку тоже нельзя —
+    за это отвечает `bar_gate_note`.
+    """
+    value, _reason = _bar_state(values, ungated)
+    if value is None:
+        return None
+    if value >= metrics.QUALITY_BAR:
+        return None
+    return (f"{metrics.QUALITY_BAR_METRIC} = {value:.3f} ниже планки "
+            f"{metrics.QUALITY_BAR:.2f} — прогон годен относительно baseline, "
+            "но не как результат контура")
+
+
+def bar_gate_note(values: Mapping[str, Any],
+                  ungated: Iterable[str] = ()) -> str:
+    """Строка вслух о том, что планка по главной метрике не выносилась.
+
+    Пустая — когда вердикт состоялся. Обе ветки (снятая выборка и «не померено
+    вовсе») читаются тем же `_bar_state`, что и решение гейта, поэтому заметка не
+    вправе разойтись с кодом выхода.
+    """
+    value, reason = _bar_state(values, ungated)
+    if value is not None:
+        return ""
+    return (f"планка {metrics.QUALITY_BAR_METRIC} ≥{metrics.QUALITY_BAR:.2f} по "
+            f"этому прогону не выносилась: {reason}. Число в таблице — «н/д», а "
+            "в baseline и в сверку регрессий оно идёт средним без вердикта.")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     _force_utf8_output()
@@ -140,6 +205,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 3
     if report.regressions and args.fail_on_regression:
         return 1
+    if args.fail_on_regression:
+        flat = report.metrics_flat()
+        ungated = report.under_sampled
+        verdict = bar_verdict(flat, ungated)
+        if verdict:
+            print(f"ХАРНЕСС: {verdict}", file=sys.stderr)
+            return 1
+        note = bar_gate_note(flat, ungated)
+        if note:
+            print(f"ХАРНЕСС: {note}", file=sys.stderr)
     return 0
 
 

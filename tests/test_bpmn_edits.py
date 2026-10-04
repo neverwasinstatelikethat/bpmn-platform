@@ -4017,6 +4017,53 @@ class TestApplyAndGuarantee:
         assert _by_id(out, "L_a").get("name") == "Собрать заказ по описи"
         assert bpmn_edits.new_route_holes(LINEAR_XML, out) == []
 
+    def test_a_hole_from_another_row_does_not_revert_the_whole_package(
+            self, two_pool_xml):
+        """Отказ стража касается только той дыры, которую не залатал снятый разрыв.
+
+        Пакет `[disconnect(MF1), move_to_participant(S_accept)]`: разрыв снят,
+        дыра от переноса осталась — и прежний код разворачивал весь пакет, теряя
+        и сам перенос, и всё, что к дыре не относится. Тот же перенос БЕЗ строки
+        `disconnect` пакета не откатывает (регресс по правилам уходит в
+        корректирующий повтор), значит решение принималось по признаку «в пакете
+        был разрыв», а не «разрыв оставил дыру». Оба случая в этом тесте —
+        иначе проверка превращается в утверждение про один-единственный пакет.
+        """
+        moved = [{"op": "move_to_participant", "id": "S_accept",
+                  "participant": "Клиент"}]
+        _, alone = apply_and_guarantee(two_pool_xml, moved)
+        assert alone["reverted"] == "", alone["reverted"]
+
+        out, report = apply_and_guarantee(
+            two_pool_xml, [{"op": "disconnect", "flow": "MF1"}] + moved)
+        assert report["reverted"] == "", report["reverted"]
+        guards = [row for row in report["skipped"] if row.get("stage") == "guard"]
+        assert [row["flow"] for row in guards] == ["MF1"], report["skipped"]
+        # Снятый разрыв восстановлен, правка переноса осталась в схеме.
+        assert _root(out).find(".//bpmn:messageFlow[@id='MF1']", NS) is not None
+        assert any(a["op"] == "move_to_participant" for a in report["applied"]), (
+            report["applied"], report["skipped"])
+
+    def test_the_guard_still_reverts_a_hole_its_rollback_could_not_heal(
+            self, two_pool_xml):
+        """Обратная сторона предыдущего теста: если снятый разрыв всё равно
+        оставил дыру, пакет откачивается.
+
+        Дугу снял не только `disconnect`, но и вторая строка пакета (здесь —
+        `delete` конца обмена), поэтому частичный откат первой не залечивает
+        дыру: она по-прежнему перечисляет снятый поток в своём `cut`. Без этого
+        теста сужение отказа (дыра чужой правки больше не разворачивает пакет)
+        можно было бы снять незаметно — ветка просто перестала бы срабатывать.
+        """
+        out, report = apply_and_guarantee(two_pool_xml, [
+            {"op": "disconnect", "flow": "MF1"},
+            {"op": "delete", "id": "S_accept"},
+        ])
+        assert out == two_pool_xml, "откат обязан вернуть базу"
+        assert "оставил бы дыру" in report["reverted"], report["reverted"]
+        assert "MF1" in str(report["reverted"]) + str(
+            [s.get("hint") for s in report["skipped"]]), report["skipped"]
+
     def test_merge_notes_keeps_order_and_drops_duplicates(self):
         assert merge_notes(["a", "b"], ["b", "c"]) == ["a", "b", "c"]
         assert merge_notes([], ["x"]) == ["x"]

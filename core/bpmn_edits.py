@@ -4110,14 +4110,20 @@ def apply_and_guarantee(xml_text: str,
     xml_after, report, notes = state["xml"], state["report"], state["notes"]
     report["skipped"].extend(refusals)
     rejection = reject(xml_after) if reject is not None else None
-    if holes and dropped and not _rejection_reason(rejection):
+    # Отказ касается той дыры, которую страж НЕ сумел залатать снятием разрыва:
+    # список снятых дуг обязан входить в `cut` оставшейся записи. Иначе пакет
+    # наказывается за чужую правку — перенос между пулами или дугу, вырезанную
+    # починкой, частичным откатом не снять, и за них отвечает прежний контракт
+    # «регресс по правилам уходит в корректирующий повтор, а не в отказ».
+    # Пакет `[disconnect(MF1), move_to_participant(S_accept)]` на двух пулах
+    # терял из-за этого и перенос, и всё остальное: решение принималось по
+    # признаку «в пакете был разрыв», а не «разрыв оставил дыру».
+    unhealed = [h for h in holes
+                if any(fid in dropped for fid, _ref in h["cut"])]
+    if unhealed and not _rejection_reason(rejection):
         # Дыра осталась после того, как страж уже снял разрыв: пакет обещал
-        # перешивку и не донёс её, и принимать его нельзя. Ни одного снятого
-        # разрыва — значит дыра не от `disconnect` (её сделала починка чужой
-        # дугой или перенос между пулами): тогда работает прежний контракт
-        # «регресс по правилам уходит в корректирующий повтор, а не в отказ»,
-        # и отказ вернул бы базу с той же дырой.
-        rejection = _hole_guard_rejection(holes, dropped)
+        # перешивку и не донёс её, и принимать его нельзя.
+        rejection = _hole_guard_rejection(unhealed, dropped)
     hint = getattr(rejection, "hint", "") or REJECT_HINT
     reverted = _rejection_reason(rejection)
     if reverted:

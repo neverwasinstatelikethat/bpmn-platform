@@ -13,6 +13,11 @@ x-app-environment: &app-environment
   SECRET_KEY: ${SECRET_KEY:?Задайте SECRET_KEY в .env}
   JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
   ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+  # Уровень лога общий для веб-процесса и обоих воркеров: разбирательство
+  # «задача встала в очередь и не вышла» читается по строкам и там, и там, а
+  # настроенный по умолчанию INFO в одном процессе и WARNING в другом — это
+  # половина картины.
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
   # Пул соединений под удержание соединений ИИ-маршрутами (app/db.py).
   DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
   DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
@@ -20,6 +25,19 @@ x-app-environment: &app-environment
   # Разрешённые источники CORS (app/config.py). По умолчанию — адрес
   # фронтенда из этого стека; свой список задаётся в .env.
   CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3456}
+  # Адрес фронтенда уходит в письма (сброс пароля, приглашения в команду): без
+  # проброса контейнер брал бы дефолт кода, и ссылка из письма, открытого не на
+  # этой машине, вела бы в никуда.
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3456}
+  # Троттлинг auth-маршрутов (app/routers/auth.py). Счётчик локален для
+  # процесса, поэтому без проброса в контейнере действовал бы дефолт кода, а
+  # настройка из .env молча игнорировалась.
+  AUTH_LOGIN_PER_IP_EMAIL_MAX: ${AUTH_LOGIN_PER_IP_EMAIL_MAX:-10}
+  AUTH_LOGIN_PER_EMAIL_MAX: ${AUTH_LOGIN_PER_EMAIL_MAX:-30}
+  AUTH_LOGIN_PER_IP_MAX: ${AUTH_LOGIN_PER_IP_MAX:-200}
+  AUTH_REGISTER_PER_IP_MAX: ${AUTH_REGISTER_PER_IP_MAX:-50}
+  AUTH_RESET_PER_EMAIL_MAX: ${AUTH_RESET_PER_EMAIL_MAX:-5}
+  AUTH_RESET_PER_IP_MAX: ${AUTH_RESET_PER_IP_MAX:-100}
   # Путь к кэшу RAG-индекса внутри контейнера; пусто = рядом с кодом.
   BPMN_RAG_CACHE_FILE: ${BPMN_RAG_CACHE_FILE:-}
   MAIL_USERNAME: ${MAIL_USERNAME:-}
@@ -29,16 +47,34 @@ x-app-environment: &app-environment
   # даём placeholder по умолчанию.
   MAIL_FROM: ${MAIL_FROM:-no-reply@vkusvill.ru}
   MAIL_PORT: ${MAIL_PORT:-465}
-  MAIL_SERVER: ${MAIL_SERVER:-imap.yandex.ru}
-  MAIL_STARTTLS: ${MAIL_STARTTLS:-true}
-  MAIL_SSL_TLS: ${MAIL_SSL_TLS:-false}
+  # SMTP (не IMAP) и implicit TLS для 465: в прежнем штампе стоял
+  # `imap.yandex.ru` со STARTTLS, то есть письмо о сбросе пароля не уходило ни
+  # при каких ключах. Для 587 ставьте MAIL_STARTTLS=true, MAIL_SSL_TLS=false.
+  MAIL_SERVER: ${MAIL_SERVER:-smtp.yandex.ru}
+  MAIL_STARTTLS: ${MAIL_STARTTLS:-false}
+  MAIL_SSL_TLS: ${MAIL_SSL_TLS:-true}
   # Без ключа ИИ-контур недоступен (эндпоинты честно отвечают ошибкой),
   # поэтому значение опциональное — как и SECRET_KEY для голых миграций.
   GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
   GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
-  # В контейнере нет корневого сертификата российского УЦ, поэтому проверка
-  # TLS по умолчанию выключена. Для прода: смонтируйте CA-bundle и поставьте true.
-  GIGACHAT_VERIFY_SSL: ${GIGACHAT_VERIFY_SSL:-false}
+  # Проверка TLS включена по умолчанию: под отключённой проверкой base64-пары
+  # `client_id:client_secret` (`GIGACHAT_CREDENTIALS`) уходит соединению, которое
+  # никто не подтвердил, а такой стек лежит в публичном репозитории — человек,
+  # поднявший его без правок, получал бы украденную учётку, а не ошибку.
+  # Обратная сторона: в образе нет корневого сертификата российского УЦ, поэтому
+  # без файла ниже ИИ-контур честно упадёт с `CERTIFICATE_VERIFY_FAILED`.
+  # Второй вариант — явный осознанный `GIGACHAT_VERIFY_SSL=false` в `.env`, и
+  # тогда `core/llm_client.py` печатает предупреждение в журнал.
+  GIGACHAT_VERIFY_SSL: ${GIGACHAT_VERIFY_SSL:-true}
+  # Путь к корневому сертификату российского УЦ ВНУТРИ контейнера. Тома с этим
+  # файлом в стеке нет (у `backend` смонтирован только `./static`, у воркеров —
+  # ничего), поэтому файл кладут в образ или добавляют монтирование самому,
+  # например так:
+  #   volumes:
+  #     - ./certs/gigachat-ca.pem:/etc/ssl/certs/gigachat-ca.pem:ro
+  # Ключ читается (`core/llm_client.py:_ca_bundle_file`) и передаётся в SDK: с
+  # GIGACHAT_VERIFY_SSL=true и этим файлом проверка TLS проходит честно.
+  GIGACHAT_CA_BUNDLE_FILE: ${GIGACHAT_CA_BUNDLE_FILE:-}
   # Имя модели старого API («GigaChat») шлюз api.giga.chat не знает —
   # отвечает 404. Пусто = пул по умолчанию из core/llm_client.py.
   GIGACHAT_MODEL: ${GIGACHAT_MODEL:-}
@@ -67,8 +103,22 @@ x-app-environment: &app-environment
   AI_LOCAL_JOB_TIMEOUT: ${AI_LOCAL_JOB_TIMEOUT:-120}
   AI_LLM_JOB_TRIES: ${AI_LLM_JOB_TRIES:-3}
   AI_LOCAL_JOB_TRIES: ${AI_LOCAL_JOB_TRIES:-2}
-  AI_TASK_STALE_SECONDS: ${AI_TASK_STALE_SECONDS:-2100}
+  # Порог «потерянности» задачи не задаётся числом: он выводится из
+  # AI_LLM_JOB_TIMEOUT (+300 с), а явное значение передаётся только если его
+  # указали в .env. Прежний литерал 2100 переживал рост таймаута очереди и
+  # начинает хоронить живые задачи, а пустое значение означает «не задано»
+  # (app/config.py:_env_int), а не падение импорта.
+  AI_TASK_STALE_SECONDS: ${AI_TASK_STALE_SECONDS:-}
   TASK_POLL_SECONDS: ${TASK_POLL_SECONDS:-2}
+  # Частота, с которой исполнитель задачи смотрит, не сняли ли её. Отдельный
+  # ключ, а не `TASK_POLL_SECONDS`: тот описывает вежливость клиента, и редкий
+  # опрос ради разгруженной очереди иначе означал бы воркера, который не замечает
+  # отмену до десяти минут и платит провайдеру за отказавшегося человека.
+  CANCEL_PROBE_SECONDS: ${CANCEL_PROBE_SECONDS:-2}
+  # Как часто воркер отмечает живость в Redis; окно протухания ключа равно этому
+  # интервалу, поэтому без проброса `healthcheck` контейнера молчал бы час
+  # (дефолт кода — 3600 с), а не замечал мёртвый процесс за 20 секунд.
+  AI_WORKER_HEALTH_SECONDS: ${AI_WORKER_HEALTH_SECONDS:-20}
 
 services:
   db:

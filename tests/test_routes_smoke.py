@@ -152,6 +152,39 @@ class TestPublicRoutes:
     def test_health(self, client):
         assert client.get("/health").json()["status"] == "ok"
 
+    def test_health_names_worker_liveness_only_in_queue_mode(self, client,
+                                                             monkeypatch):
+        """Проба живости нужна только там, где воркер вообще есть.
+
+        В режиме без Redis задачи исполняет сам веб-процесс: поле `dead` было бы
+        неправдой, а `unknown` без пояснения читалось бы как поломка.
+        """
+        from app import main as main_module
+
+        health = client.get("/health").json()
+        assert "ai_workers" not in health["checks"], health["checks"]
+
+        monkeypatch.setattr(main_module, "broker_name", lambda: "arq")
+        monkeypatch.setattr(main_module, "worker_liveness",
+                            lambda queues: {q: "dead" for q in queues})
+        health = client.get("/health").json()
+        # Мёртвый воркер — наблюдение, а не болезнь этого процесса: контейнер
+        # backend нельзя помечать unhealthy из-за соседа.
+        assert health["status"] == "ok"
+        assert health["checks"]["ai_workers"] == {"ai_llm": "dead",
+                                                  "ai_local": "dead"}
+
+    def test_health_admits_a_degraded_budget(self, client, monkeypatch):
+        """`ai_budget: process` при заданном REDIS_URL — лимит на процесс, то
+        есть умноженный на число реплик. Молча это не проходит: поле называет и
+        срок следующей попытки подключения."""
+        from app import main as main_module
+
+        monkeypatch.setattr(main_module, "budget_degraded", lambda: True)
+        monkeypatch.setattr(main_module, "budget_retry_in_seconds", lambda: 42.0)
+        health = client.get("/health").json()
+        assert health["checks"]["ai_budget_retry_in_seconds"] == 42.0
+
     def test_anonymous_cannot_read_registry(self, client):
         assert client.get("/api/diagrams").status_code == 401
 
@@ -595,7 +628,7 @@ class TestAIRoutes:
         headers, _ = auth
         from app import ai as ai_module
 
-        def fake_generate(text):
+        def fake_generate(text, **kwargs):
             return {"status": "success", "bpmn": XML, "structure": {"elements": []},
                     "notes": ["Элемент T1 перенесён в пул «Клиент»"]}
 
@@ -613,7 +646,7 @@ class TestAIRoutes:
         headers, _ = auth
         from app import ai as ai_module
 
-        monkeypatch.setattr(ai_module.generator, "generate", lambda text: {
+        monkeypatch.setattr(ai_module.generator, "generate", lambda text, **kw: {
             "status": "error", "step": "llm", "error": "Сервис временно недоступен"})
         descriptor = run_task(client, "/api/generate", {"text": "заявка"}, headers)
         assert descriptor["status"] == "failed"
@@ -624,7 +657,7 @@ class TestAIRoutes:
         headers, _ = auth
         from app import ai as ai_module
 
-        monkeypatch.setattr(ai_module.generator, "generate", lambda text: {
+        monkeypatch.setattr(ai_module.generator, "generate", lambda text, **kw: {
             "status": "error", "step": "llm_truncated", "error": "Ответ обрезан"})
         descriptor = run_task(client, "/api/generate", {"text": "заявка"}, headers)
         assert descriptor["status"] == "failed"
@@ -636,7 +669,7 @@ class TestAIRoutes:
         headers, _ = auth
         from app import ai as ai_module
 
-        monkeypatch.setattr(ai_module.generator, "generate", lambda text: {
+        monkeypatch.setattr(ai_module.generator, "generate", lambda text, **kw: {
             "status": "error", "step": "llm_too_large",
             "error": "Описание не помещается в контекст модели"})
         descriptor = run_task(client, "/api/generate", {"text": "заявка"}, headers)
@@ -672,13 +705,21 @@ class TestAIRoutes:
         assert descriptor["error_code"] not in RETRYABLE_ERROR_CODES
 
     def test_ai_budget_blocks_after_hourly_limit(self, client, auth, monkeypatch):
+        """Часовая планка считается маршрутом, который платит провайдеру.
+
+        Прежний тест брал для этого `/api/evaluate` — самый дешёвый маршрут, а
+        скоринг схемы бюджет не списывает: `ai_local` не спрашивает модель, и
+        шестьдесят оценок заперли бы пользователю час на генерацию с нулём
+        оплаченных обращений.
+        """
         from app import deps
 
         # Отдельный пользователь: счётчик окна живой, и чужие слоты в этом
         # тесте тратить нельзя.
         headers = register(client, "budget")
         monkeypatch.setattr(deps._ai_window, "limit", 2)
-        codes = [client.post("/api/evaluate", json={"bpmn_xml": XML},
+        codes = [client.post("/api/generate",
+                             json={"text": f"заявка {uuid.uuid4().hex}"},
                              headers=headers).status_code for _ in range(3)]
         assert codes[:2] == [202, 202]
         assert codes[2] == 429
@@ -886,9 +927,50 @@ class TestFolderSubtreeDeletion:
 class TestVersionSequenceRace:
     """seq считается max+1: два параллельных сохранения не должны делить его."""
 
+    def test_sequential_saves_get_distinct_seq(self, client, auth, db):
+        """Два сохранения подряд не делят seq — на этом конец гонки виден и на PostgreSQL.
+
+        Ниже идущий тест воспроизводит переплетение вставкой конкурента внутрь той же
+        транзакции, и на PostgreSQL это невозможно: `record_version` держит
+        `FOR UPDATE` на строке диаграммы, а проверка внешнего ключа вставляемого
+        снимка просит key-share на неё же. Взаимный wait не заканчивается никогда,
+        потому что разблокировать его может только коммит, который и ждёт вставки.
+        Порядок там обеспечивает именно замок, а не ретрай.
+        """
+        from app.services.versions import record_version
+
+        headers, email = auth
+        user_id = db.query(User.id).filter(User.email == email).scalar()
+        diagram_id = str(uuid.uuid4())
+        assert client.post("/api/diagrams", headers=headers, json={
+            "id": diagram_id, "name": "Q", "xml": XML, "score": 1}).status_code == 200
+
+        seqs = []
+        for step in range(2):
+            session = SessionLocal()
+            try:
+                diagram = session.get(Diagram, diagram_id)
+                diagram.xml_content = XML.replace('id="P"', f'id="P{step}"')
+                version = record_version(session, diagram, source="saved",
+                                         author_id=user_id)
+                session.commit()
+                seqs.append(version.seq if version is not None else None)
+            finally:
+                session.close()
+
+        assert all(seq is not None for seq in seqs), seqs
+        assert seqs[1] == seqs[0] + 1, seqs
+
     def test_colliding_seq_is_retried_and_save_survives(self, client, auth, db, monkeypatch):
         from app.services import versions as versions_service
         from app.services.versions import record_version
+
+        if db.get_bind().dialect.name != "sqlite":
+            pytest.skip(
+                "вставка конкурента внутри заблокированной транзакции на PostgreSQL "
+                "неразрешима: `FOR UPDATE` на диаграмме и key-share внешнего ключа "
+                "снимают друг друга навсегда; сериализацию там даёт замок, его "
+                "проверяет `test_sequential_saves_get_distinct_seq`")
 
         headers, email = auth
         user_id = db.query(User.id).filter(User.email == email).scalar()

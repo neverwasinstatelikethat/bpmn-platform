@@ -17,6 +17,7 @@ Redis) задача завершается до возврата ответа, �
 «версия сохранена».
 """
 import asyncio
+import contextlib
 import logging
 import uuid
 from typing import Any, Dict, Optional
@@ -27,7 +28,8 @@ from sqlalchemy.orm import Session
 
 from app import ai as ai_components
 from app.db import SessionLocal, get_db
-from app.deps import consume_ai_budget, get_ai_user, get_current_user
+from app.deps import (RETRY_AFTER_HEADER, consume_ai_budget, get_ai_user,
+                      get_current_user, release_ai_budget)
 from app.models import AiTask, Diagram, Improvement, User
 from app.schemas import (AcceptImprovementRequest, EvaluateRequest,
                          GenerateRequest, ImproveRequest)
@@ -35,7 +37,8 @@ from app.services.access import load_diagram
 from app.services.improvements import APPROVED, PENDING, REJECTED
 from app.services import tasks as task_store
 from app.services.versions import record_version
-from app.tasks import GENERATE, IMPROVE, SCORE, get_broker, queue_of
+from app.tasks import (GENERATE, IMPROVE, QUEUE_LLM, SCORE, get_broker,
+                       queue_of, _refund_if_never_started)
 from app.timeutils import utc_now
 from core.bpmn_scoring import diff_scores
 
@@ -43,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_RETRY_AFTER_UNAVAILABLE = {"Retry-After": "30"}
+_RETRY_AFTER_UNAVAILABLE = {RETRY_AFTER_HEADER: "30"}
 
 
 async def _submit(kind: str, *, user: User, payload: Dict[str, Any],
@@ -73,14 +76,16 @@ async def _submit(kind: str, *, user: User, payload: Dict[str, Any],
             and ai_components.get_orchestrator() is None:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Сервис улучшения отключён (SKIP_LLM_INIT=1)",
+            detail=("Сервис улучшения недоступен: оркестратор не поднят "
+                    "(SKIP_LLM_INIT=1 или сбой его сборки на старте)"),
             headers=_RETRY_AFTER_UNAVAILABLE,
         )
 
     if idempotency_key:
         with SessionLocal() as db:
-            existing = task_store.find_by_idempotency_key(db, user.id,
-                                                          idempotency_key)
+            existing = task_store.find_by_idempotency_key(
+                db, user.id, idempotency_key, kind=kind, payload=payload,
+                diagram_id=diagram_id, base_seq=base_seq)
             if existing is not None:
                 # Повтор отправки не списывает бюджет и не создаёт вторую задачу:
                 # клиент, не дождавшийся ответа, иначе оплатил бы тот же вызов
@@ -91,21 +96,134 @@ async def _submit(kind: str, *, user: User, payload: Dict[str, Any],
                     status_code=status.HTTP_202_ACCEPTED,
                     content={**task_store.describe_task(existing), "replayed": True})
 
-    await consume_ai_budget(user)
-
+    # Тот же запрос под другим ключом: фронтенд выдаёт новый ключ на каждое
+    # действие, поэтому двойное нажатие и повтор после сетевого обрыва приходят
+    # разными ключами и выше не ловятся. Проверка стоит ДО списания бюджета —
+    # иначе дубль снимал бы слот часовой лимита за работу, которую не запускает.
     with SessionLocal() as db:
-        task = task_store.create_task(db, user_id=user.id, kind=kind,
-                                      queue=queue_of(kind), payload=payload,
-                                      diagram_id=diagram_id, base_seq=base_seq,
-                                      idempotency_key=idempotency_key)
-        task_id = task.id
+        live = task_store.find_live_by_inputs(
+            db, user.id, kind=kind, payload=payload, diagram_id=diagram_id,
+            base_seq=base_seq)
+        if live is not None:
+            logger.info("Та же работа уже живёт (%s, kind=%s) — отдаём её",
+                        live.id, kind)
+            return JSONResponse(
+                status_code=status.HTTP_202_ACCEPTED,
+                content={**task_store.describe_task(live), "replayed": True})
+
+    # Идентификатор задачи известен до вставки: слот бюджета списывается здесь,
+    # а возвращается воркером, который видит только `task_id`. Метка слота
+    # выводима из пары «пользователь + задача» (`app/deps.py:budget_slot`), и
+    # только так возврат происходит в другом процессе — без сериализации ручек
+    # в очередь.
+    #
+    # Бюджет меряет обращения к провайдеру (`AI_REQUESTS_PER_HOUR` описан этим
+    # основанием в app/config.py), поэтому очередь `ai_local` его не списывает:
+    # скоринг схемы не спрашивает модель ни при каком раскладе, и шестьдесят
+    # оценок заперли бы пользователю час на генерацию с нулём оплаченных
+    # обращений — ровно тот худший случай, от которого защищает возврат слота.
+    budget_task_id = str(uuid.uuid4())
+    spends_budget = queue_of(kind) == QUEUE_LLM
+    task_id = budget_task_id
+    try:
+        if spends_budget:
+            await consume_ai_budget(user, task_id=budget_task_id)
+        with SessionLocal() as db:
+            task = task_store.create_task(db, user_id=user.id, kind=kind,
+                                          queue=queue_of(kind), payload=payload,
+                                          diagram_id=diagram_id, base_seq=base_seq,
+                                          idempotency_key=idempotency_key,
+                                          task_id=budget_task_id)
+            task_id = task.id
+    except HTTPException:
+        # Отказ по часовому лимиту — не сбой заведения задачи: метка слота
+        # при 429 не добавлялась (её пишут только при успешном списании), так что
+        # возвращать здесь нечего, а строка в ERROR на штатный ответ
+        # `too many requests` превращает журнал оператора в ложную аварию.
+        raise
+    except asyncio.CancelledError:
+        # Обрыв соединения на вставке — не поломка заведения: клиент ушёл, и
+        # читать ответ будет некому. Слот возвращается (провайдера не спрашивали,
+        # и возвращать его больше некому), а в журнал идёт INFO, а не ERROR:
+        # штатные отмены на потоковом журнале выглядели бы аварией заведения и
+        # тонили настоящую поломку — тот же класс, что с ложным ERROR на 429.
+        logger.info("Постановка задачи %s отменена клиентом: слот возвращён",
+                    budget_task_id)
+        if spends_budget:
+            with contextlib.suppress(asyncio.CancelledError):
+                await release_ai_budget(user.id, task_id=budget_task_id)
+        raise
+    except BaseException as error:  # noqa: BLE001 — и отмена клиентом тоже
+        # Задачи нет (или её не успели завести), а бюджет уже списан: без
+        # возврата каждая такая ошибка съедала бы часовой лимит за работу,
+        # которая не начата и не будет. `BaseException`, а не `Exception`,
+        # потому что `CancelledError` таковым не является — обрыв соединения
+        # между списанием и вставкой уходил бы, оставив слот занятым навек.
+        if spends_budget:
+            # Возврат идёт в уже отменяемой задаче, и обычный `await` под
+            # `CancelledError` вспухает вторым `CancelledError` до того, как
+            # Redis что-то увидит.
+            with contextlib.suppress(asyncio.CancelledError):
+                await release_ai_budget(user.id, task_id=budget_task_id)
+        # В лог — тип, а не текст исключения: SQLAlchemy вшивает в сообщение
+        # `[SQL: INSERT INTO ai_tasks ...][parameters: ...]`, где параметры
+        # содержат полный XML схемы (до `AI_MAX_XML_CHARS`). Трейс остаётся на
+        # DEBUG, куда клиентские тела не ходят и без нас.
+        logger.error("Задачу %s не удалось завести (kind=%s): %s",
+                     budget_task_id, kind, type(error).__name__)
+        logger.debug("Причина заведения задачи %s", budget_task_id, exc_info=True)
+        raise
+
+    if task_id != budget_task_id:
+        # Гонка идемпотентности: вставка отдала задачу победителя, а слот был
+        # списан под меткой нашего идентификатора. Он больше ни к чему не
+        # привязан, и держать его списанным значило бы съесть часовой бюджет
+        # за работу, которую заказывает другой запрос.
+        await release_ai_budget(user.id, task_id=budget_task_id)
+        # И здесь же место проигравшему: победителя в очередь поставил его
+        # запрос. Перепоставка отсюда дала бы второй полный прогон за один
+        # заказ (до шести обращений к модели), а ветка отказа ниже закрыла бы
+        # живую строку победителя как `queue_unavailable` — её уже оплаченный
+        # результат некуда записать, потому что `_close` терминальный статус не
+        # трогает. Если у победителя оборвалось соединение до постановки,
+        # строка не потеряна: её поднимает уборка потерянных постановок
+        # (`stale_tasks` читает и `queued`).
+        with SessionLocal() as db:
+            body = task_store.describe_task(db.get(AiTask, task_id))
+        body["replayed"] = True
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
 
     try:
         await broker.submit(kind, task_id)
+    except asyncio.CancelledError:
+        # Та же дыра, что и выше, но на шаге позже: `except Exception` отмену
+        # не видит (`CancelledError` — не `Exception`), и обрыв соединения ровно
+        # во время постановки оставлял строку `queued` со списанным слотом.
+        # Дальше два плохих исхода: job уже лёг в Redis и модель спрашивается для
+        # заказчика, который ушёл, либо строка доживает до уборки потерянных
+        # постановок и перепоставляется оттуда — again с оплатой прогона.
+        # Закрытие условное: если воркер успел заявить задачу, переход не
+        # состоится, и решением остаётся флаг отмены (`_execute` увидит его перед
+        # первым обращением).
+        logger.info("Постановка задачи %s отменена клиентом: строка закрыта, "
+                    "слот — по признаку начала работы", task_id)
+        task_store.mark_cancelled(task_id)
+        with contextlib.suppress(asyncio.CancelledError):
+            # Возврат не безусловный: `InlineBroker.submit` исполняет задачу ЦЕЛИКОМ
+            # внутри этого же `await`, поэтому обрыв соединения после обращения к
+            # модели вернул бы оплаченный прогон — и повторимо, что обнуляет
+            # часовой лимит. `_execute` на той же ветке возврат осознанно
+            # пропускает. `tries` считает заявки на исполнение, поэтому ноль здесь
+            # доказательство, а не догадка.
+            await _refund_if_never_started(task_id)
+        raise
     except Exception as error:  # noqa: BLE001 — очередь могла лечь между ping и постановкой
         logger.error("Задачу %s не удалось поставить в очередь: %s", task_id, error)
         task_store.mark_failed(task_id, error="Очередь задач недоступна",
                                error_code="queue_unavailable")
+        # Та же мера, что и выше: «обращения не было» здесь утверждает не тип
+        # выброса, а отсутствие заявки на исполнение.
+        await _refund_if_never_started(task_id)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Очередь задач недоступна. Попробуйте позже.",

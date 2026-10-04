@@ -365,6 +365,12 @@ class TestMailDeliveryVisibility:
         assert auth_router.password_reset_mail_failures() == before + 1
         assert "SMTP_DELIVERY_FAILED" in caplog.text
         assert "письмо сброса пароля не доставлено" in caplog.text.lower()
+        # Тот же счётчик видит оператор без разбора логов: `/health` печатает его
+        # полем. Сбой почты не условие здоровья — реестр и доступ исправны, и
+        # перезапуск backend SMTP не чинит.
+        checks = client.get("/health").json()["checks"]
+        assert checks["mail_reset_failures"] == before + 1
+        assert checks["database"] == "ok"
 
     def test_successful_delivery_does_not_grow_the_counter(self, client, monkeypatch):
         email = new_email("okmail")

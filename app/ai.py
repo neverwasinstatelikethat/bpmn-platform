@@ -26,17 +26,30 @@ def init_orchestrator() -> None:
 
     Ошибка ключа видна в логе старта, а не через минуту после первого запроса;
     сервис при этом поднимается — реестр, доступ и апрувы работают и без ИИ.
+    Это обещание, и оно должно держаться: сборка оркестратора (тяжёлые модели
+    эмбеддингов, корпус эталонов) и авторизация провайдера — чужая доступность,
+    а не наше состояние, поэтому ни один их сбой не имеет права уносить процесс.
     """
     global _orchestrator
     if _orchestrator is None:
-        _orchestrator = BPMNImprovementOrchestrator()
-        logger.info("LLM-оркестратор инициализирован")
+        try:
+            _orchestrator = BPMNImprovementOrchestrator()
+            logger.info("LLM-оркестратор инициализирован")
+        except Exception as error:  # noqa: BLE001 — ИИ деградирует, сервис жив
+            logger.error("ИИ-улучшение недоступно: оркестратор не собран (%s)",
+                         type(error).__name__)
+            logger.debug("Сборка оркестратора", exc_info=True)
+            return
     try:
         llm_client.ensure_llm_ready()
         logger.info("Авторизация LLM подтверждена (пул моделей: %s)",
                     ", ".join(llm_client.get_model_pool()))
     except llm_client.LLMError as e:
         logger.error("LLM недоступна, ИИ-эндпоинты будут отвечать ошибкой: %s", e)
+    except Exception as error:  # noqa: BLE001 — тот же контракт на старте
+        logger.error("Авторизация LLM не подтверждена (%s), ИИ-эндпоинты будут "
+                     "отвечать ошибкой", type(error).__name__)
+        logger.debug("Проба авторизации LLM", exc_info=True)
     # Корпус эталонов собирается секунды: иначе первый же «найди узкие места»
     # платит warming-of-the-world в пользовательском запросе.
     try:

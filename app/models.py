@@ -3,8 +3,8 @@ import json
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import (Boolean, Column, DateTime, ForeignKey, Integer, String,
-                        Text, UniqueConstraint)
+from sqlalchemy import (Boolean, Column, DateTime, ForeignKey, Index, Integer,
+                        String, Text, UniqueConstraint, text)
 from sqlalchemy.orm import relationship
 
 from app.db import Base
@@ -196,6 +196,13 @@ class Improvement(Base):
     diagram = relationship("Diagram", back_populates="improvements")
 
 
+# «Работа ещё не закрыта»: живой статус и не снята. Миграция 0006 повторяет этот
+# текст дословно (миграции не импортируют приложение), а сверяет их между собой
+# `tests/test_migrations.py`: расхождение сделало бы индекс в базе не тем, что
+# объявлено в модели.
+_LIVE_TASK_PREDICATE = "status in ('queued', 'running') and cancel_requested is false"
+
+
 class AiTask(Base):
     """Задача ИИ-контура: источник истины о статусе и результате.
 
@@ -216,10 +223,38 @@ class AiTask(Base):
         # Повторная отправка с тем же ключом обязана вернуть ту же задачу.
         # Ограничение в базе, а не `SETNX` в Redis: кэш можно сбросить, а
         # дубль задачи — это две оплаты одного вызова модели.
-        UniqueConstraint("user_id", "idempotency_key", name="uq_ai_tasks_idempotency"),
+        #
+        # Ключ привязан и к входам запроса (`inputs_hash`), потому что иначе он
+        # не идемпотентность, а имя пользователя экрана: фронтенд берёт ключ на
+        # действие, и перезатёртый ключ с другим описанием процесса вернул бы
+        # прошлую схему с пометкой `replayed`. Та же задача с теми же входами —
+        # это повтор, и его держит ограничение; та же задача с другими входами —
+        # это другая работа, и она обязана иметь право появиться.
+        UniqueConstraint("user_id", "idempotency_key", "inputs_hash",
+                         name="uq_ai_tasks_idempotency"),
+        # Опрос и история читают «задачи этого пользователя, такого-то статуса,
+        # в порядке постановки»: три одиночных индекса дали бы слияние
+        # фильтров в базе вместо одного поиска по составному ключу.
+        Index("ix_ai_tasks_user_status_created", "user_id", "status", "created_at"),
+        # Обход потерянных задач (app/tasks.py:_recover_stale_tasks) выбирает по
+        # статусу и сроку, поэтому строка находится по обоим признакам сразу.
+        Index("ix_ai_tasks_status_started", "status", "started_at"),
+        # Живой дубликат: одна незавершённая работа на одни входы. Ключ
+        # идемпотентности фронтенд выдаёт на каждое действие, поэтому он от
+        # двойного нажатия не спасает — спасает предикат «ещё не закрыто»
+        # (ревизия 0005 и 0006 в migrations/). Завершённая или снятая задача
+        # дубликатом не считается: переспрос модели и повтор после отказа
+        # остаются законными.
+        Index("uq_ai_tasks_live_inputs", "user_id", "kind", "inputs_hash",
+              unique=True,
+              postgresql_where=text(_LIVE_TASK_PREDICATE),
+              sqlite_where=text(_LIVE_TASK_PREDICATE)),
     )
 
     id = Column(String(36), primary_key=True, index=True)
+    # Пользователя удаляют вместе со всем его хозяйством (маршрута удаления
+    # аккаунта в приложении нет), поэтому здесь достаточно RESTRICT по
+    # умолчанию: задача переживёт схему лишь бы её хозяин был жив.
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     # generate | improve | score
     kind = Column(String(32), nullable=False)
@@ -227,10 +262,21 @@ class AiTask(Base):
     queue = Column(String(32), nullable=False)
     status = Column(String(16), nullable=False, default="queued", index=True)
     idempotency_key = Column(String(120), nullable=True)
+    # Отпечаток входов запроса (см. `uq_ai_tasks_idempotency`): kind, payload и
+    # привязка к схеме. Считается при постановке (app/services/tasks.py),
+    # наружу не отдаётся — это ключ сравнения, а не данные пользователя.
+    inputs_hash = Column(String(64), nullable=False, default="")
     # Привязка к схеме: задача читает XML из базы, а не из аргументов, поэтому
     # здесь же фиксируется версия схемы на момент постановки — по ней воркер
     # понимает, что схему изменили, пока задача стояла в очереди.
-    diagram_id = Column(String(36), ForeignKey("diagrams.id"), nullable=True, index=True)
+    #
+    # `ondelete="SET NULL"` — не косметика: удаления схемы идут через ORM, а
+    # односторонняя связь `diagram` не даёт каскада, поэтому без правила базы
+    # `DELETE FROM diagrams` падал на внешнем ключе и схема становилась
+    # неудаляемой. Задача при этом не чужая: она история этого пользователя, и
+    # её результат (сгенерированный XML) живёт в самой строке, а не в схеме.
+    diagram_id = Column(String(36), ForeignKey("diagrams.id", ondelete="SET NULL"),
+                        nullable=True, index=True)
     base_seq = Column(Integer, nullable=True)
     # Входы задачи. Для улучшения сохранённой схемы здесь пусто (воркер берёт
     # XML из `diagrams`); описание процесса и XML без схемы живут здесь, потому

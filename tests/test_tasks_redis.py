@@ -8,6 +8,7 @@ PostgreSQL включается переменной `TEST_DATABASE_URL`. Отд
 сервера эти тесты подтверждали бы только то, что мы сами себе наврали об API.
 """
 import asyncio
+from datetime import timedelta
 import os
 import time
 import uuid
@@ -18,7 +19,7 @@ from fastapi import HTTPException
 
 from app import tasks as task_module
 from app.db import SessionLocal
-from app.deps import _RedisWindow
+from app.deps import _RedisWindow, budget_slot, release_ai_budget
 from app.models import AiTask, User
 from app.services import tasks as task_store
 from core.llm_cache import LLMCache
@@ -87,10 +88,22 @@ def any_user_id() -> int:
 
 
 def make_task(kind: str, *, payload=None, diagram_id=None) -> str:
+    """Строка задачи со СВОИМИ входами.
+
+    Маркер в payload обязателен: `uq_ai_tasks_live_inputs` (ревизия 0006)
+    считает незакрытые задачи с одинаковым отпечатком входов одной работой, и
+    без маркера второй `make_task` в этом же файле получил бы строку первого —
+    тесты начали бы спорить за один `task_id` (симптом в живом прогоне: воркер
+    дописывает чужую строку, а проверяющий видит `running` вместо `done`).
+    Продуктовое поведение при этом верное: одинаковые входы — это и правда одна
+    и та же работа, а не две оплаты одного обращения.
+    """
+    body = dict(payload or {})
+    body.setdefault("marker", uuid.uuid4().hex)
     with SessionLocal() as session:
         return task_store.create_task(session, user_id=any_user_id(), kind=kind,
                                       queue=task_module.queue_of(kind),
-                                      payload=payload,
+                                      payload=body,
                                       diagram_id=diagram_id).id
 
 
@@ -110,7 +123,6 @@ def run_worker(url: str, queue: str) -> None:
     платформенно-зависимый teardown.
     """
     from arq import Worker
-    from arq.connections import RedisSettings
 
     async def scenario():
         pool = await _pool(url)
@@ -231,6 +243,167 @@ class TestSharedBudgetAgainstRealServer:
         assert asyncio.run(scenario()) == 2
 
 
+def budget_card(url: str, user_id: int | str) -> int:
+    """Сколько слотов часа занято у пользователя — глазами сервера, не окна."""
+    return len(budget_members(url, user_id))
+
+
+def budget_members(url: str, user_id: int | str) -> list:
+    """Метки занятых слотов в порядке займа."""
+    client = redis.Redis.from_url(url, decode_responses=True)
+    try:
+        return client.zrange(f"ai:budget:{user_id}", 0, -1)
+    finally:
+        client.close()
+
+
+class TestSharedBudgetRefundAgainstRealServer:
+    """Возврат слота против живой Redis-строки, а не подменённого окна.
+
+    Веб-процесс занимает бюджет ещё до записи задачи, а отдаёт его воркер:
+    ответ пришёл из кэша, задача отменена или потеряна вместе с процессом.
+    Между этими точками — два разных процесса, поэтому и метка слота
+    выводится из пары «пользователь + задача», а не переезжает в очередь
+    объектом-ручкой. Проверить это подменой нельзя: `ZREM` исполняет сервер.
+    """
+
+    def test_charge_of_the_web_process_is_freed_by_a_second_one(self, queue_url,
+                                                                monkeypatch):
+        """Окно веб-процесса заняло слот до записи задачи, окно воркера его
+        вернуло: два независимых клиента, между ними только пара
+        «пользователь + задача». Дальше повторный возврат не даёт слота."""
+        from app import deps
+
+        user_id = uuid.uuid4().hex[:8]
+        task_id = str(uuid.uuid4())
+        worker = _RedisWindow(queue_url, limit=3)
+        monkeypatch.setattr(deps, "_redis_budget", worker)
+
+        async def scenario():
+            web = _RedisWindow(queue_url, limit=3)
+            try:
+                await web.acquire(user_id, budget_slot(user_id, task_id))
+                assert budget_card(queue_url, user_id) == 1
+                assert await release_ai_budget(user_id, task_id=task_id) is True
+                assert budget_card(queue_url, user_id) == 0
+                # Повторный возврат ничего не освобождает: иначе задача,
+                # отменённая дважды (отмена клиента и восстановление после
+                # потери), вернула бы себе лишний слот.
+                assert await release_ai_budget(user_id, task_id=task_id) is False
+                assert budget_card(queue_url, user_id) == 0
+            finally:
+                await web.close()
+                await worker.close()
+
+        asyncio.run(scenario())
+
+    def test_refund_frees_the_named_slot_and_not_the_oldest_one(self, queue_url):
+        """Слот возвращается по метке, а не «самый старый»: иначе одна отменённая
+        задача вернула бы бюджет живой задачи того же пользователя."""
+        user_id = uuid.uuid4().hex[:8]
+        first = budget_slot(user_id, "task-held")
+        second = budget_slot(user_id, "task-cancelled")
+        window = _RedisWindow(queue_url, limit=5)
+
+        async def scenario():
+            try:
+                await window.acquire(user_id, first)
+                await window.acquire(user_id, second)
+                assert await window.release(user_id, second) is True
+                return budget_members(queue_url, user_id)
+            finally:
+                await window.close()
+
+        assert asyncio.run(scenario()) == [first]
+
+    def test_refund_lets_the_next_request_through(self, queue_url):
+        """Ради этого возврата всё и затевалось: освобождённый слот обязан
+        пустить следующий запрос, а не лежать до конца часа. До возврата шесть
+        повторов одного закешированного ответа выбирали бы окно с нулём
+        обращений к провайдеру."""
+        user_id = uuid.uuid4().hex[:8]
+        charged = budget_slot(user_id, "task-refunded")
+        next_task = budget_slot(user_id, "task-next")
+        window = _RedisWindow(queue_url, limit=1)
+
+        async def scenario():
+            try:
+                await window.acquire(user_id, charged)
+                with pytest.raises(HTTPException):
+                    await window.acquire(user_id, next_task)
+                await window.release(user_id, charged)
+                return await window.acquire(user_id, next_task)
+            finally:
+                await window.close()
+
+        assert asyncio.run(scenario()) == next_task
+
+    def test_foreign_label_is_refused_before_it_reaches_the_server(self, queue_url,
+                                                                  monkeypatch):
+        """Возврат чужого слота отсекается по префиксу метки: в Redis это был бы
+        молчаливый no-op, и ошибка проводки выглядела бы «возврат не сработал»."""
+        from app import deps
+
+        mine = uuid.uuid4().hex[:8]
+        window = _RedisWindow(queue_url, limit=2)
+        monkeypatch.setattr(deps, "_redis_budget", window)
+
+        async def scenario():
+            try:
+                await window.acquire(mine, budget_slot(mine, "task-mine"))
+                assert await release_ai_budget(mine, slot="other:task-mine") is False
+                return budget_card(queue_url, mine)
+            finally:
+                await window.close()
+
+        assert asyncio.run(scenario()) == 1
+
+    def test_worker_refunds_a_slot_it_never_took(self, queue_url, monkeypatch):
+        """Связка целиком: веб списал бюджет постановкой, воркер вернул его по
+        `tries == 0` через продуктовый код, а не вызовом окна в тесте. Это тот
+        случай, когда job сняли с очереди, но заявка на исполнение не
+        состоялась — обращаться к провайдеру не стали."""
+        from app import deps
+
+        task_id = make_task(task_module.SCORE, payload={"bpmn_xml": bpmn()})
+        user_id = read_task(task_id).user_id
+        window = _RedisWindow(queue_url, limit=3)
+        monkeypatch.setattr(deps, "_redis_budget", window)
+
+        async def scenario():
+            try:
+                await window.acquire(user_id, budget_slot(user_id, task_id))
+                assert budget_card(queue_url, user_id) == 1
+                await task_module._refund_if_never_started(task_id)
+                return budget_card(queue_url, user_id)
+            finally:
+                await window.close()
+
+        assert asyncio.run(scenario()) == 0
+
+    def test_started_task_keeps_its_slot(self, queue_url, monkeypatch):
+        """Обратная сторона: задача, которую начинали, слот не возвращает —
+        работа уже оплачена, и возврат открыл бы способ бесплатно перебирать
+        очередь."""
+        from app import deps
+
+        task_id = make_task(task_module.SCORE, payload={"bpmn_xml": bpmn()})
+        user_id = read_task(task_id).user_id
+        task_store.claim_task(task_id)
+        window = _RedisWindow(queue_url, limit=3)
+        monkeypatch.setattr(deps, "_redis_budget", window)
+
+        async def scenario():
+            try:
+                await window.acquire(user_id, budget_slot(user_id, task_id))
+                await task_module._refund_if_never_started(task_id)
+                return budget_card(queue_url, user_id)
+            finally:
+                await window.close()
+
+        assert asyncio.run(scenario()) == 1
+
+
 class TestArqWorkerAgainstRealServer:
     def test_task_travels_through_the_queue_and_completes(self, queue_url):
         """Сквозной прогон настоящего arq: постановка → очередь → воркер →
@@ -254,8 +427,6 @@ class TestArqWorkerAgainstRealServer:
         submit(queue_url, task_module.GENERATE, llm_task)
         submit(queue_url, task_module.SCORE, local_task)
 
-        from arq import create_pool
-        from arq.connections import RedisSettings
 
         async def scenario():
             pool = await _pool(queue_url)
@@ -316,8 +487,20 @@ class TestArqWorkerAgainstRealServer:
             finally:
                 await pool.aclose()
 
+        # Строка обязана быть потерянной по-настоящему: `requeue` держит защёлку
+        # по тому же порогу, по которому уборка признаёт задачу потерянной
+        # (`_stale_thresholds`, а не голый таймаут очереди), и свежая заявка под
+        # неё не попадает.
+        with SessionLocal() as session:
+            session.query(AiTask).filter(AiTask.id == task_id).update(
+                {AiTask.started_at: task_store.utc_now()
+                 - timedelta(
+                     seconds=task_module._stale_thresholds()[
+                         task_module.QUEUE_LOCAL] + 60)})
+            session.commit()
         monkeypatch.setattr(task_module.task_store, "stale_tasks",
-                            lambda _seconds: [(task_id, task_module.QUEUE_LOCAL, 1)])
+                            lambda _seconds: [(task_id, task_module.QUEUE_LOCAL, 1,
+                                               task_store.RUNNING)])
         assert asyncio.run(scenario()) == 1
         assert read_task(task_id).status == task_store.QUEUED
 

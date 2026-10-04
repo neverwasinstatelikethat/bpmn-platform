@@ -23,10 +23,16 @@ TABLES = {
 
 
 def _alembic(*args: str, url: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "DATABASE_URL": url, "SKIP_LLM_INIT": "1"}
+    # UTF-8 в обе стороны: ревизии печатают русские докстринги и сообщения, а
+    # `text=True` без `encoding` декодировал их консольной cp1251 — на Windows
+    # это роняло поток чтения (`UnicodeDecodeError`), то есть тест терял вывод
+    # ровно там, где должен был его показать.
+    env = {**os.environ, "DATABASE_URL": url, "SKIP_LLM_INIT": "1",
+           "PYTHONIOENCODING": "utf-8"}
     return subprocess.run(
         [sys.executable, "-m", "alembic", *args],
         cwd=ROOT, env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
     )
 
 
@@ -60,6 +66,49 @@ def test_migrations_match_models(tmp_path):
     assert _alembic("upgrade", "head", url=url).returncode == 0
     check = _alembic("check", url=url)
     assert check.returncode == 0, check.stdout + check.stderr
+
+
+def test_ai_tasks_revisions_round_trip(tmp_path):
+    """0005 и 0006 идут в обе стороны и не теряют ни данных, ни индексов.
+
+    Обратный ход проверяется не для красоты: обе ревизии на SQLite пересоздают
+    таблицу (`batch_alter_table` с `copy_from`), а это тот путь, на котором
+    теряются индексы, не перечисленные в модели-источнике, и внешние ключи,
+    переданные с неверной сигнатурой. Именно так 0005 лишилась пяти базовых
+    индексов и ключа на `diagrams` — молча, без ошибки. Одинаково молча
+    потерянный индекс обхода превращает уборку потерянных задач в полный обход
+    таблицы, и видно это становится только на живой базе.
+    """
+    url = f"sqlite:///{(tmp_path / 'roundtrip.db').as_posix()}"
+    assert _alembic("upgrade", "head", url=url).returncode == 0
+    engine = create_engine(url)
+
+    def ai_tasks():
+        columns = {c["name"] for c in inspect(engine).get_columns("ai_tasks")}
+        indexes = {i["name"] for i in inspect(engine).get_indexes("ai_tasks")}
+        uniques = [{c for c in u["column_names"]}
+                   for u in inspect(engine).get_unique_constraints("ai_tasks")]
+        return columns, indexes, uniques
+
+    columns, indexes, uniques = ai_tasks()
+    assert "inputs_hash" in columns
+    assert "uq_ai_tasks_live_inputs" in indexes
+    assert {"user_id", "idempotency_key", "inputs_hash"} in uniques
+    for kept in ("ix_ai_tasks_user_id", "ix_ai_tasks_status",
+                 "ix_ai_tasks_created_at", "ix_ai_tasks_diagram_id",
+                 "ix_ai_tasks_id", "ix_ai_tasks_user_status_created",
+                 "ix_ai_tasks_status_started"):
+        assert kept in indexes, f"ревизия сняла индекс {kept}"
+
+    assert _alembic("downgrade", "0004", url=url).returncode == 0
+    columns, indexes, uniques = ai_tasks()
+    assert "inputs_hash" not in columns
+    assert "uq_ai_tasks_live_inputs" not in indexes
+    assert {"user_id", "idempotency_key"} in uniques
+
+    assert _alembic("upgrade", "head", url=url).returncode == 0
+    columns, indexes, _uniques = ai_tasks()
+    assert "inputs_hash" in columns and "uq_ai_tasks_live_inputs" in indexes
 
 
 def test_history_backfilled_for_existing_diagrams(tmp_path):
@@ -134,3 +183,46 @@ def test_pre_alembic_database_is_told_to_stamp_then_upgrade(tmp_path, monkeypatc
     migrated = inspect(legacy_engine)
     assert "diagram_versions" in migrated.get_table_names()
     assert "version_seq" in {c["name"] for c in migrated.get_columns("diagrams")}
+
+
+def _revision_module(name: str):
+    """Ревизия как модуль: миграции не импортируют приложение, поэтому сверку
+    текста предиката приходится делать отсюда, а не из `downgrade/upgrade`."""
+    import importlib.util
+
+    path = MIGRATIONS / "versions" / name
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_live_dedupe_predicate_matches_the_model():
+    """Предикат частичного индекса в миграции обязан совпадать с моделью.
+
+    Обещание стоит в комментарии `app/models.py:_LIVE_TASK_PREDICATE` («миграция
+    0006 повторяет этот текст дословно, а сверяет их `tests/test_migrations.py`»),
+    а проверялось только имя индекса. Расхождение текстов — это индекс, который в
+    живой базе держит не то, что читает `find_live_by_inputs`: либо дубликаты
+    заводятся (вторая оплата того же обращения), либо легальный переспрос после
+    отказа ловит `IntegrityError`, и маршрут отвечает 500.
+    """
+    from app.models import AiTask
+
+    predicate = _revision_module("0006_ai_tasks_live_dedupe.py").PREDICATE
+    indexes = {idx.name: idx for idx in AiTask.__table__.indexes}
+    live = indexes["uq_ai_tasks_live_inputs"]
+    assert str(live.dialect_kwargs["postgresql_where"]) == predicate
+    assert str(live.dialect_kwargs["sqlite_where"]) == predicate
+    assert live.unique is True
+    # И предикат, и запрос дедупликации должны называть ОДИН И ТОТ ЖЕ набор
+    # статусов, а не «оба упоминают queued/running»: новое незакрытое состояние в
+    # `OPEN` без правки ревизии дало бы строке право считаться живой в коде и не
+    # попасть в частичный индекс — то есть дубль и вторую оплату модели молча.
+    import re
+
+    from app.services import tasks as task_store
+
+    assert set(re.findall(r"'([a-z_]+)'", predicate)) == set(task_store.OPEN), (
+        predicate, task_store.OPEN)
+    assert "cancel_requested is false" in predicate

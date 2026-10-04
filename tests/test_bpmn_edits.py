@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
+from core import bpmn_edits
 from core.bpmn_edits import (
     BPMN_NS,
     DEFAULT_TIMER_DURATION,
@@ -715,6 +716,103 @@ class TestPackageOrder:
         assert not [s for s in report["skipped"]
                    if "не создана этим же пакетом" in (s.get("hint") or "")]
 
+    def test_boundary_event_refusal_names_the_host_the_package_failed_to_create(
+            self, two_pool_xml):
+        """Каскад за несозданным хозяином объясняется той же строкой, что и дуга.
+
+        Живой прогон на новой модели: «add_boundary_event: задача 'new_A6' не
+        найдена» при откатанном `add_task(id=new_A6)` читался как выдуманный
+        адрес, хотя именно этот пакет его и создавал. Хозяин события — ссылка из
+        нагрузки правки (`attached_to`): в таблицу опор она не входила и в строку
+        отказа не попадала, поэтому объяснению про причину выше по пакету не было
+        на что сослаться.
+        """
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A6", "name": "Проверить срок"},
+            {"op": "add_boundary_event", "id": "new_T1", "attached_to": "new_A6",
+             "event_type": "timer", "duration": "PT15M", "to": "S_end"},
+        ])
+        rows = [s for s in report["skipped"] if s["op"] == "add_boundary_event"]
+        assert rows, report["skipped"]
+        # Операнд виден и в самой строке отказа: без него ни читатель, ни
+        # объяснение не знают, чем именно правка не сошлась.
+        assert rows[0]["attached_to"] == "new_A6", rows
+        hint = rows[0]["hint"]
+        assert "не создана этим же пакетом" in hint, hint
+        assert "new_A6" in hint and "пул не определён" in hint, hint
+        # Названа операция, в которой правят причину, а не «создание вообще»:
+        # без адреса повтор латал дугу вместо узла (прогон #57).
+        assert "add_task(id='new_A6')" in hint, hint
+        # Строка самого создания не объясняет себя: её причину пишет создатель,
+        # и ссылка на собственный id в заметке читалась бы как «почини это же».
+        creator = [s for s in report["skipped"] if s["op"] == "add_task"][0]
+        assert "не создана этим же пакетом" not in creator["hint"], creator
+
+    def test_edit_of_an_uncreated_node_still_names_its_creator(self, two_pool_xml):
+        """`id` правки, которая адресует существующий узел, остаётся операндом:
+        отказ `rename` по несозданному шагу тоже обязан вести к его созданию.
+        Собственный id исключается из опор только у операций создания — там
+        причина отказа и есть несостоявшееся создание."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A6", "name": "Проверить срок"},
+            {"op": "rename", "id": "new_A6", "name": "Проверить срок ответа"},
+        ])
+        hint = [s for s in report["skipped"] if s["op"] == "rename"][0]["hint"]
+        assert "не создана этим же пакетом" in hint, hint
+        assert "add_task(id='new_A6')" in hint, hint
+
+    def test_existing_host_keeps_a_refusal_of_its_own_kind(self, two_pool_xml):
+        """Хозяин на схеме есть — поведение прежнее: отказа про несозданный узел
+        нет ни когда правка проводится, ни когда она отвергнута по своему основанию."""
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A6", "name": "Проверить срок"},
+            {"op": "add_boundary_event", "id": "new_T1", "attached_to": "S_end",
+             "event_type": "timer", "duration": "PT15M"},
+        ])
+        rows = [s for s in report["skipped"] if s["op"] == "add_boundary_event"]
+        assert rows and rows[0]["reason"] == "'S_end' не является задачей", rows
+        assert "не создана этим же пакетом" not in rows[0]["hint"], rows
+        assert "attached_to=\"S_accept\"" in rows[0]["hint"], rows
+
+        _, report = apply_operations(two_pool_xml, [
+            {"op": "add_task", "id": "new_A6", "name": "Проверить срок"},
+            {"op": "add_boundary_event", "id": "new_T1", "attached_to": "S_accept",
+             "event_type": "timer", "duration": "PT15M", "to": "S_end"},
+        ])
+        assert [a["op"] for a in report["applied"]] == ["add_boundary_event"], report
+        assert not [s for s in report["skipped"]
+                    if "не создана этим же пакетом" in (s.get("hint") or "")], report
+
+    def test_cascade_is_explained_through_every_reference_of_the_package(
+            self, two_pool_xml):
+        """Тот же каскад приходит не только через дугу и не только у хозяина
+        события: узла, которого нет, ждут якорь вставки (`after`), цель исхода
+        (`to`) и приёмник дорожки (`lane`). Поля сидят в нагрузке правки, и
+        таблица опор обязана видеть их все — иначе отказ снова звучит как
+        «модель выдумала id» там, где пакет не досчитался узла, созданием
+        которого сам и занимался."""
+        cases = [
+            ([{"op": "add_task", "id": "new_A6", "name": "Проверить срок"},
+              {"op": "add_task", "id": "new_A7", "name": "Позвонить",
+               "participant": "Магазин", "after": "new_A6", "to": "S_end"}],
+             "add_task(id='new_A6')"),
+            ([{"op": "add_task", "id": "new_A6", "name": "Проверить срок"},
+              {"op": "add_event", "id": "new_E1", "name": "Ожидание ответа",
+               "event_type": "message", "participant": "Магазин",
+               "after": "S_accept", "to": "new_A6"}],
+             "add_task(id='new_A6')"),
+            ([{"op": "add_lane", "id": "new_L1", "name": "Сервис-деск"},
+              {"op": "add_task", "id": "new_A7", "name": "Позвонить",
+               "participant": "Магазин", "after": "S_accept", "lane": "new_L1",
+               "to": "S_end"}],
+             "add_lane(id='new_L1')"),
+        ]
+        for package, creator in cases:
+            _, report = apply_operations(two_pool_xml, package)
+            hints = [s.get("hint") or "" for s in report["skipped"]]
+            assert any("не создана этим же пакетом" in h and creator in h
+                       for h in hints), (package, report["skipped"])
+
     def test_mutual_dependency_does_not_loop(self, two_pool_xml):
         """Шаг А ждёт Б, Б ждёт А: второй проход обязан остановиться, а не
         крутиться до конца жизни процесса."""
@@ -883,18 +981,21 @@ class TestEventDefinitionOnExistingEvent:
             {"op": "add_event", "id": "W_answer", "name": "Ожидание ответа",
              "event_type": "intermediateCatch", "participant": "Process_wait"}])
         skip = report["skipped"][0]
-        assert "без префикса new_" in skip["reason"]
+        assert "уже занят" in skip["reason"]
         assert "add_event_definition(id='W_answer'" in skip["hint"]
 
-    def test_a_task_or_a_typed_event_keeps_the_plain_new_id_hint(self):
+    def test_a_taken_task_id_is_not_pointed_at_the_definition_op(self):
         """Адрес подсказки — только пустой кружок между маршрутами: задачей он не
         правится, и совет «перейдите на add_event_definition» на задаче был бы
-        вторым отказом вместо ответа."""
+        вторым отказом вместо ответа. Свободный id без `new_` к этому времени уже
+        принят, поэтому отказ тут только по занятости адреса."""
         _, report = apply_operations(self.UNTYPED, [
             {"op": "add_event", "id": "T_next", "name": "Обработка",
              "event_type": "intermediateCatch", "participant": "Process_wait"}])
-        assert report["skipped"][0]["hint"] == \
-            "новые элементы обязаны иметь id, начинающийся с new_"
+        skip = report["skipped"][0]
+        assert "уже занят" in skip["reason"]
+        assert "add_event_definition" not in skip["hint"]
+        assert "new_T_next" in skip["hint"]
 
     # --- таймер без хронометража -------------------------------------------
     # `<timerEventDefinition/>` исполнитель не заведёт никогда: ветка «срок
@@ -1236,12 +1337,31 @@ class TestBoundaryEvent:
         assert report["status"] == "partial"
         assert "уже занят" in report["skipped"][0]["reason"]
 
-    def test_id_without_prefix_is_skipped(self, single_pool_xml):
-        _, report = apply_operations(single_pool_xml, [
+    def test_free_id_without_prefix_creates_the_node(self, single_pool_xml):
+        """Свободный id принимается без `new_`: форма не основание для отказа.
+
+        Прогон #71: 33 отказа из 58 — один каскад. `add_lane(id='Lane_X')`
+        отвергался по префиксу, а следом каждая `move_to_lane(lane='Lane_X')`
+        как «дорожка не найдена». Модель называет дорожки и пулы их рабочими
+        именами; намерение «создать» читается из отсутствия id в документе.
+        """
+        out, report = apply_operations(single_pool_xml, [
             {"op": "add_boundary_event", "id": "Boundary_1", "attached_to": "T_collect",
-             "event_type": "timer", "name": "Таймер"},
+             "event_type": "timer", "name": "Таймер", "to": "T_ship"},
         ])
-        assert "без префикса new_" in report["skipped"][0]["reason"]
+        assert report["status"] == "success", report["skipped"]
+        assert _by_id(out, "Boundary_1").get("attachedToRef") == "T_collect"
+
+    def test_taken_id_without_prefix_names_a_usable_id(self, single_pool_xml):
+        """Занятый адрес — единственное, за что отказывают, и подсказка обязана
+        дать свободный id, а не констатировать занятость."""
+        _, report = apply_operations(single_pool_xml, [
+            {"op": "add_boundary_event", "id": "T_collect", "attached_to": "T_collect",
+             "event_type": "timer", "name": "Таймер", "to": "T_ship"},
+        ])
+        skip = report["skipped"][0]
+        assert "уже занят" in skip["reason"]
+        assert "new_T_collect" in skip["hint"]
 
     def test_intermediate_event_can_carry_a_definition(self, single_pool_xml):
         out, report = apply_operations(single_pool_xml, [{
@@ -2013,7 +2133,7 @@ class TestDeleteAndRename:
         assert [a["op"] for a in report["applied"]] == ["rename"]
         reasons = [s["reason"] for s in report["skipped"]]
         assert "неизвестная операция" in reasons
-        assert any("без префикса new_" in r for r in reasons)
+        assert any("уже занят" in r for r in reasons)
         assert any("не задано имя" in r for r in reasons)
         assert "элемент не найден" in reasons
         assert len(report["skipped"]) == 5
@@ -3653,6 +3773,174 @@ LINEAR_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BP
 </definitions>"""
 
 
+CHAIN_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_chain">
+  <process id="P_chain" name="Цепь" isExecutable="true">
+    <startEvent id="CS" name="Заявка"><outgoing>CF1</outgoing></startEvent>
+    <sequenceFlow id="CF1" sourceRef="CS" targetRef="CX"/>
+    <userTask id="CX" name="Собрать комплект"><incoming>CF1</incoming><outgoing>CF2</outgoing></userTask>
+    <sequenceFlow id="CF2" sourceRef="CX" targetRef="CT"/>
+    <userTask id="CT" name="Согласовать"><incoming>CF2</incoming><outgoing>CF3</outgoing></userTask>
+    <sequenceFlow id="CF3" sourceRef="CT" targetRef="CA"/>
+    <userTask id="CA" name="Отгрузить"><incoming>CF3</incoming><outgoing>CF4</outgoing></userTask>
+    <sequenceFlow id="CF4" sourceRef="CA" targetRef="CE"/>
+    <endEvent id="CE" name="Готово"><incoming>CF4</incoming></endEvent>
+  </process>
+</definitions>"""
+
+
+class TestCutArcAdviceIsNotALoop:
+    """Подсказка стража не имеет права звать `connect` на пару, которую только
+    что разорвали, а отказ про готовую дугу — обязан называть её id.
+
+    Живой прогон #68 (`support_ticket`) дал пакет, отвергнутый именно так: отказ
+    по дыре маршрута говорил «разрывай дугу 'F9' в паре с
+    connect(source='T1', target='A1')», где `T1 → A1` и была та самая `F9`;
+    `connect` на готовую пару отвечал «такой поток уже существует» с советом про
+    `set_default`, которого у дуги «ожидание → шаг» нет вовсе; корректирующий
+    повтор принёс то же, а итоговый текст собрал противоречие «разрыв оставил бы
+    дыру» + «уже сняты разрывы: F9». Модель править нечем, и метрика
+    `improve/op_acceptance` записывает это качеством модели.
+    """
+
+    CUTS = {"LF1": ("L_s", "L_a"), "LF2": ("L_a", "L_b"), "LF3": ("L_b", "L_e")}
+
+    def test_duplicate_flow_refusal_names_the_existing_flow(self):
+        """Отказ про существующую дугу называет её id: «придумайте id» повтор
+        приносит тот же пакет, а правка готовой ветки идёт именно по id."""
+        _, report = apply_operations(LINEAR_XML, [
+            {"op": "connect", "source": "L_a", "target": "L_b"}])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "такой поток уже существует", skip
+        assert "'LF2'" in skip["hint"], skip
+        # Источник — задача, а не шлюз: `set_default` к этой дуге не применяется,
+        # и совет про него был бы инструкцией, которую аплайер отвергнет.
+        assert "set_default" not in skip["hint"], skip
+        assert "add_condition" in skip["hint"] or "rename" in skip["hint"], skip
+
+    def test_duplicate_gateway_leg_offers_set_default_by_that_flow_id(self):
+        """Для ветки шлюза подсказка остаётся про выход по умолчанию — но с id
+        этой ветки и именем шлюза, то есть с операндами, а не с названием
+        операции."""
+        xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_g">
+  <process id="P_g" name="Развилка" isExecutable="true">
+    <startEvent id="Gs"><outgoing>GF0</outgoing></startEvent>
+    <sequenceFlow id="GF0" sourceRef="Gs" targetRef="Gw"/>
+    <exclusiveGateway id="Gw"><incoming>GF0</incoming><outgoing>GF1</outgoing><outgoing>GF2</outgoing></exclusiveGateway>
+    <sequenceFlow id="GF1" sourceRef="Gw" targetRef="GA"/>
+    <sequenceFlow id="GF2" sourceRef="Gw" targetRef="GB"/>
+    <userTask id="GA" name="Ветка А"><incoming>GF1</incoming><outgoing>GF3</outgoing></userTask>
+    <userTask id="GB" name="Ветка Б"><incoming>GF2</incoming><outgoing>GF4</outgoing></userTask>
+    <sequenceFlow id="GF3" sourceRef="GA" targetRef="Ge"/>
+    <sequenceFlow id="GF4" sourceRef="GB" targetRef="Ge"/>
+    <endEvent id="Ge"><incoming>GF3</incoming><incoming>GF4</incoming></endEvent>
+  </process>
+</definitions>"""
+        _, report = apply_operations(xml, [
+            {"op": "connect", "source": "Gw", "target": "GA"}])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "такой поток уже существует", skip
+        assert "set_default(gateway='Gw', flow='GF1')" in skip["hint"], skip
+        assert "add_condition(flow='GF1'" in skip["hint"], skip
+
+    def test_guard_hint_never_reconnects_the_arc_it_just_cut(self):
+        """Ни одна подсказка стража не предлагает вернуть снятую дугу.
+
+        Проверяется на цепи `S → X → T → A → E` с двумя разрывами (`F2` и `F3`):
+        записи дыр сгруппированы по узлам, и у первой группы (узел `X`) в списке
+        разрывов есть только `F2`. Прежний поиск концов по `entries[0]` для
+        отказа про `F3` давал `None`, подсказка теряла снятый конец и звала
+        `connect(source='T', target='A1')` на ровно тот поток, который
+        отрабатывался, то есть на `F3`.
+        """
+        flows = {"CF2": ("CX", "CT"), "CF3": ("CT", "CA")}
+        _, report = apply_and_guarantee(CHAIN_XML, [
+            {"op": "disconnect", "flow": "CF2"},
+            {"op": "disconnect", "flow": "CF3"}])
+        rows = [row for row in report["skipped"] if row.get("stage") == "guard"]
+        assert rows, report["skipped"]
+        # Ожидаем отказ по обоим разрывам: иначе тест молча перестанет
+        # покрывать тот случай, где поиск концов промахивается.
+        assert {row["flow"] for row in rows} == {"CF2", "CF3"}, [
+            (row["flow"], row["hint"]) for row in rows]
+        for row in rows:
+            source, target = flows[row["flow"]]
+            forbidden = f"connect(source='{source}', target='{target}')"
+            assert forbidden not in row["hint"], (row["flow"], row["hint"])
+            assert ("connect(" in row["hint"] or "delete(" in row["hint"]
+                    or "разрыв" in row["hint"]), (row["flow"], row["hint"])
+
+    def test_refusal_finds_the_cut_ends_in_any_hole_group(self):
+        """Концы отказываемого разрыва ищутся по всем группам дыр, а не по первой.
+
+        Записи сгруппированы по узлам, и у первой группы может быть свой разрыв:
+        прежний `dict(entries[0]["cut"]).get(cut_id)` давал None, подсказка
+        лишалась исключения снятого конца и получала право назвать парой ровно
+        тот поток, который она же и отказывает. Группы и порядок узлов собраны
+        руками намеренно: через пакет такой расклад не получается, и
+        инвариантный тест выше этой ветки не ловил. `CT` стоит в документе
+        раньше `CS`, потому что перебор кандидатов идёт по порядку схемы, и
+        иначе подсказка успевает назвать другой узел.
+        """
+        two_cuts = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_two">
+  <process id="P_two" name="Два разрыва" isExecutable="true">
+    <userTask id="CT" name="Согласовать"><outgoing>CF3</outgoing></userTask>
+    <startEvent id="CS" name="Заявка"><outgoing>CF9</outgoing></startEvent>
+    <sequenceFlow id="CF9" sourceRef="CS" targetRef="CT"/>
+    <sequenceFlow id="CF3" sourceRef="CT" targetRef="CA"/>
+    <userTask id="CA" name="Отгрузить"><incoming>CF3</incoming></userTask>
+  </process>
+</definitions>"""
+        index = bpmn_edits._Index(ET.fromstring(two_cuts))
+        entries = [
+            {"kind": bpmn_edits.HOLE_NO_OUTGOING, "id": "CX",
+             "label": "шаг «Собрать комплект»",
+             "cut": [("CF2", bpmn_edits._FlowRef("CX", "CT", "sequenceFlow",
+                                                 None, None))]},
+            {"kind": bpmn_edits.HOLE_NO_INCOMING, "id": "CA",
+             "label": "шаг «Отгрузить»",
+             "cut": [("CF3", bpmn_edits._FlowRef("CT", "CA", "sequenceFlow",
+                                                 None, None))]},
+        ]
+        row = bpmn_edits._hole_guard_refusal(entries, "CF3", index)
+        assert "connect(source='CT', target='CA')" not in row["hint"], row["hint"]
+        assert "connect(source='CS', target='CA')" in row["hint"], row["hint"]
+
+    def test_pool_advice_names_its_own_group(self, monkeypatch):
+        """Совет про обмен пула берёт подпись из своей группы, а не из `entries[0]`.
+
+        Тот же класс дефекта, что уже починен в `_hole_guard_refusal`: записи
+        сгруппированы по узлам, и если пустой пул не первая группа, прежний
+        `entries[0]` подставлял в текст метку чужого узла — «верните шаг
+        „Собрать комплект“ обмен в этом же пакете» про пул, к которому этот шаг не
+        относится. Модель читает совет как операнды правки, поэтому чужое имя в
+        нём стоит отвергнутый пакет.
+        """
+        captured = []
+
+        def spy(index, label, process_id):
+            captured.append((label, process_id))
+            return "СОВЕТ"
+
+        two_cuts = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="D_two">
+  <process id="P_two" name="Два разрыва" isExecutable="true">
+    <userTask id="CT" name="Согласовать"><outgoing>CF3</outgoing></userTask>
+    <sequenceFlow id="CF3" sourceRef="CT" targetRef="CA"/>
+    <userTask id="CA" name="Отгрузить"><incoming>CF3</incoming></userTask>
+  </process>
+</definitions>"""
+        index = bpmn_edits._Index(ET.fromstring(two_cuts))
+        entries = [
+            {"kind": bpmn_edits.HOLE_NO_OUTGOING, "id": "CX",
+             "label": "шаг «Собрать комплект»", "cut": []},
+            {"kind": bpmn_edits.HOLE_POOL_WITHOUT_EXCHANGE, "id": "PoolB",
+             "label": "пул «Склад»", "cut": []},
+        ]
+        monkeypatch.setattr(bpmn_edits, "_pool_exchange_hint", spy)
+        text = bpmn_edits._holes_hint(index, entries, None, "CF3")
+        assert captured == [("пул «Склад»", "PoolB")], captured
+        assert "шаг «Собрать комплект»" not in text, text
+
+
 class TestApplyAndGuarantee:
     """Откат имеет право вернуть базу только с пустым `applied`: отчёт не вправе
     утверждать, что правка в схеме, когда схема вернулась к базе."""
@@ -3704,6 +3992,30 @@ class TestApplyAndGuarantee:
         assert [a["op"] for a in report["applied"]] == ["add_task"]
         assert _by_id(out, "new_X") is not None
         assert out != LINEAR_XML
+
+    def test_duplicate_disconnects_are_dropped_together(self):
+        """Страж снимает все строки одного разрыва, иначе пакет откачивается целиком.
+
+        Модель повторяет одну и ту же правку в пакете (для `add_documentation` это
+        замеряется `noop_rows`), и два `disconnect` одной дуги — не выдумка.
+        Снятие первого вхождения оставляло второе рвать ту же дугу, а `dropped`
+        уже держал этот id: следующему снятию нечего противопоставить, и отказ
+        `_hole_guard_rejection` разворачивает весь пакет вместе с правками, к
+        которым дыра не имеет отношения. Заперто тестом, красным на снятии одного
+        вхождения.
+        """
+        out, report = apply_and_guarantee(LINEAR_XML, [
+            {"op": "disconnect", "flow": "LF2"},
+            {"op": "disconnect", "flow": "LF2"},
+            {"op": "rename", "id": "L_a", "name": "Собрать заказ по описи"},
+        ])
+        assert report["reverted"] == "", report["reverted"]
+        guards = [row for row in report["skipped"] if row.get("stage") == "guard"]
+        assert [row["flow"] for row in guards] == ["LF2"], guards
+        assert report["status"] == "partial", report["status"]
+        assert _flow(_root(out), "LF2") is not None
+        assert _by_id(out, "L_a").get("name") == "Собрать заказ по описи"
+        assert bpmn_edits.new_route_holes(LINEAR_XML, out) == []
 
     def test_merge_notes_keeps_order_and_drops_duplicates(self):
         assert merge_notes(["a", "b"], ["b", "c"]) == ["a", "b", "c"]
@@ -4536,3 +4848,116 @@ class TestBootstrapOfAnEmptyProcess:
         assert report["status"] == "partial", report["applied"]
         assert len(self._ids(out)) <= 1, self._ids(out)
         assert report["skipped"], "пакет из трёх несвязанных шагов обязан быть с отказом"
+
+
+class TestBoundaryAnchorAdviceBreaksTheCycle:
+    """Отказ не звать чинить то, что опорой потока быть не может.
+
+    Прогон #70 (live): пакет заводил шаг с `after='new_BT1'` — граничное событие,
+    которое он же создавал другой строкой. Совет «почините сначала создание
+    add_boundary_event(id='new_BT1')» невыполним по нотации: из граничного события
+    поток не выходит, и повтор приносил ровно тот же отказ — 4 строки из 83
+    отказов прогона и `improve/repeat_rejection_share` 0.25 в `warehouse_delivery`.
+    """
+
+    def test_boundary_anchor_names_a_legal_predecessor(self):
+        skipped = [
+            {"op": "add_boundary_event", "id": "new_BT1", "attached_to": "A2",
+             "to": "new_A12", "reason": "цель 'new_A12' не найдена", "hint": ""},
+            {"op": "add_task", "id": "new_A12", "after": "new_BT1", "to": "A3",
+             "reason": "источник не найден", "hint": ""},
+        ]
+        failed = {"new_BT1": "создание откатано", "new_A12": "создание откатано"}
+        bpmn_edits._explain_failed_dependencies(skipped, failed)
+        note = skipped[1]["hint"]
+        assert "почините сначала создание (add_boundary_event" not in note, note
+        assert "потока из него не выходит" in note, note
+        assert "after='A2'" in note, note
+        assert "attached_to='A2'" in note, note
+        assert "существующий узел" not in note and "id шага" not in note, note
+
+    def test_a_missing_host_falls_back_without_an_invented_operand(self):
+        """Хозяина таймера в схеме тоже нет — назвать операнд нечем, и текст
+        возвращается к починке создания вместо плейсхолдера. Модель копирует
+        подсказку дословно: `after='существующий узел'` ловил «элемент не
+        найден», то есть тот же `improve/repeat_rejection_share`, против которого
+        ветка писалась."""
+        skipped = [
+            {"op": "add_boundary_event", "id": "new_BT1", "attached_to": "new_A9",
+             "to": "new_A12", "reason": "хозяин не найден", "hint": ""},
+            {"op": "add_task", "id": "new_A12", "after": "new_BT1", "to": "A3",
+             "reason": "источник не найден", "hint": ""},
+        ]
+        failed = {"new_BT1": "создание откатано", "new_A9": "пул не определён",
+                  "new_A12": "создание откатано"}
+        bpmn_edits._explain_failed_dependencies(skipped, failed)
+        note = skipped[1]["hint"]
+        assert "существующий узел" not in note, note
+        assert "потока из него не выходит" in note, note
+        assert "почините сначала создание" in note, note
+
+    def test_own_anchor_is_not_replaced_for_the_creator_itself(self):
+        """Сам создатель события остаётся со своей причиной: подмена дошла бы до
+        строки, которая ждёт хозяина таймера, а не его конец потока."""
+        skipped = [
+            {"op": "add_boundary_event", "id": "new_BT1", "attached_to": "new_A9",
+             "to": "A3", "reason": "хозяин не найден", "hint": ""},
+        ]
+        failed = {"new_A9": "создание откатано"}
+        bpmn_edits._explain_failed_dependencies(skipped, failed)
+        assert "почините сначала создание (add_task(id='new_A9'))" in skipped[0]["hint"]
+
+    def test_plain_cascade_still_names_the_creator(self):
+        """Обычный каскад не подменился: опора — шаг, и починить его законно."""
+        skipped = [
+            {"op": "add_task", "id": "new_A9", "participant": "Склад",
+             "reason": "пул не определён", "hint": ""},
+            {"op": "connect", "source": "A2", "target": "new_A9",
+             "reason": "цель не найдена", "hint": ""},
+        ]
+        failed = {"new_A9": "создание откатано"}
+        bpmn_edits._explain_failed_dependencies(skipped, failed)
+        assert "почините сначала создание (add_task(id='new_A9'))" in skipped[1]["hint"]
+        assert "потока из него не выходит" not in skipped[1]["hint"]
+
+
+def test_free_id_without_the_prefix_creates_the_lane(two_pool_xml):
+    """Пакет с рабочим именем дорожки проходит за один раунд.
+
+    Прогон #70 дал восемь отказов `add_lane(id='Lane_Engineer')` и тридцать три
+    `move_to_lane(lane='Lane_Engineer')` каскадом за ними, прогон #71 — те же
+    33 отказа из 58. Причина была в форме id, а не в замысле: аплайер требовал
+    префикс `new_`, хотя намерение создать дорожку читается из того, что такого
+    id в документе нет. Отказ по префиксу стоил корректирующего повтора, то есть
+    оплаченного обращения к модели, и занижал `improve/op_acceptance`.
+    """
+    out, report = apply_operations(two_pool_xml, [
+        {"op": "add_lane", "id": "Lane_Engineer", "name": "Инженер",
+         "participant": "Магазин"},
+        {"op": "move_to_lane", "id": "S_accept", "lane": "Lane_Engineer"},
+    ])
+    assert report["status"] == "success", report["skipped"]
+    lane = _root(out).find(".//bpmn:laneSet/bpmn:lane", NS)
+    assert lane.get("id") == "Lane_Engineer"
+    assert "S_accept" in _lane_refs(lane), _lane_refs(lane)
+
+
+def test_taken_lane_id_is_refused_with_a_usable_id(two_pool_xml):
+    """Занятый id по-прежнему отказывает: xml:id обязан быть уникальным.
+
+    Подсказка называет свободный id с той же основой и напоминает подставить его
+    же в зависимых строках пакета — иначе повтор приносит ровно ту же строку.
+    """
+    first, _ = apply_operations(two_pool_xml, [
+        {"op": "add_lane", "id": "Lane_Engineer", "name": "Инженер",
+         "participant": "Магазин"},
+    ])
+    _, report = apply_operations(first, [
+        {"op": "add_lane", "id": "Lane_Engineer", "name": "Инженер на смене",
+         "participant": "Магазин"},
+        {"op": "move_to_lane", "id": "S_accept", "lane": "Lane_Engineer"},
+    ])
+    row = next(row for row in report["skipped"] if row["op"] == "add_lane")
+    assert "уже занят" in row["reason"], row
+    assert "new_Lane_Engineer" in row["hint"], row
+    assert "move_to_lane(lane='new_Lane_Engineer')" in row["hint"], row

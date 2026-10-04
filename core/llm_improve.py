@@ -235,7 +235,9 @@ class BPMNKnowledgeBase:
                 and self._embeddings.shape[0] == len(self._metadata)):
             try:
                 model = self._sentence_model()
-                vector = np.asarray(model.encode([semantic_text]), dtype="float32")
+                with BPMNKnowledgeBase._encode_guard:
+                    vector = np.asarray(model.encode([semantic_text]),
+                                         dtype="float32")
                 norm = float(np.linalg.norm(vector))
                 if norm > 0:
                     vector = vector / norm
@@ -394,7 +396,9 @@ class BPMNKnowledgeBase:
         self._vectors = self._vectorizer.fit_transform(list(lexical_texts))
         try:
             model = self._sentence_model()
-            embeddings = model.encode(list(semantic_texts), show_progress_bar=False)
+            with BPMNKnowledgeBase._encode_guard:
+                embeddings = model.encode(list(semantic_texts),
+                                          show_progress_bar=False)
             embeddings = np.asarray(embeddings, dtype="float32")
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
@@ -405,13 +409,22 @@ class BPMNKnowledgeBase:
             logger.warning("Sentence-transformers недоступен (%s): только TF-IDF", e)
 
     _sentence_model_cache = None
+    # `SentenceTransformer` не потокобезопасен, а экземпляра может быть два: веб-процесс и
+    # воркер очереди, и внутри воркера поиск вызывается из `asyncio.to_thread`
+    # параллельно. Первый же спор загрузки удваивал бы расход памяти и время
+    # старта (модель — сотни мегабайт), а спор `encode` — дал бы испорченные
+    # векторы вместо ошибки.
+    _model_guard = threading.Lock()
+    _encode_guard = threading.Lock()
 
     def _sentence_model(self):
         if BPMNKnowledgeBase._sentence_model_cache is None:
-            from sentence_transformers import SentenceTransformer
-            BPMNKnowledgeBase._sentence_model_cache = SentenceTransformer(
-                "paraphrase-multilingual-MiniLM-L12-v2"
-            )
+            with BPMNKnowledgeBase._model_guard:
+                if BPMNKnowledgeBase._sentence_model_cache is None:
+                    from sentence_transformers import SentenceTransformer
+                    BPMNKnowledgeBase._sentence_model_cache = SentenceTransformer(
+                        "paraphrase-multilingual-MiniLM-L12-v2"
+                    )
         return BPMNKnowledgeBase._sentence_model_cache
 
     # --- загрузка и признаковое описание эталонов ---

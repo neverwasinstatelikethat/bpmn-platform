@@ -145,3 +145,33 @@ def test_repo_root_has_no_scratch_files():
     код проекта, и следующий агент правит их вместо `eval/`."""
     leftovers = sorted(p.name for p in REPO_ROOT.glob("_*.py"))
     assert not leftovers, f"в корне лежат рабочие файлы: {leftovers}"
+
+
+ENV_READ = re.compile(
+    r'(?:_env_(?:int|float|flag)|os\.getenv)\(\s*["\']([A-Z0-9_]+)["\']')
+ENV_ASSIGN = re.compile(r"^#?\s*([A-Z0-9_]+)=", re.M)
+
+
+def test_every_env_key_the_app_reads_is_in_the_template():
+    """Ключ окружения, который код читает, обязан быть назван в `.env.example`.
+
+    Шаблон — единственное место, где оператор узнаёт про настройку. Ключ без
+    строки в шаблоне живёт на дефолте молча: так `AI_TASK_STALE_SECONDS`
+    пережило рост таймаута очереди и начало хоронить живые задачи, а новый
+    `CANCEL_PROBE_SECONDS` чуть не уехал в прод без объяснения, что он делает.
+    Обратное направление не проверяется: в шаблоне законны ключи compose
+    (`POSTGRES_PASSWORD`), сборки фронтенда (`REACT_APP_API_URL`) и тестов
+    (`TEST_DATABASE_URL`), которые приложение не читает.
+    """
+    sources = [REPO_ROOT / "main.py", REPO_ROOT / "migrate_sqlite_to_postgres.py"]
+    sources += [p for d in ("app", "core")
+                for p in (REPO_ROOT / d).rglob("*.py") if "__pycache__" not in str(p)]
+    read = set()
+    for path in sources:
+        if path.exists():
+            read |= set(ENV_READ.findall(path.read_text(encoding="utf-8")))
+    documented = set(ENV_ASSIGN.findall(
+        (REPO_ROOT / ".env.example").read_text(encoding="utf-8")))
+    missing = sorted(read - documented)
+    assert not missing, ("ключи читаются, но не документированы: "
+                         f"{missing} — добавьте строку в .env.example")

@@ -16,9 +16,9 @@ from pathlib import Path
 import pytest
 
 from core import bpmn_generator, llm_client
-from core.bpmn_edits import build_inventory, validate_and_repair
+from core.bpmn_edits import GATEWAY_TAGS, build_inventory, validate_and_repair
 from core.bpmn_generator import BPMNGenerator, repair_structure
-from core.bpmn_scoring import BPMNScorer
+from core.bpmn_scoring import BPMNScorer, NOT_A_WAIT_DEFINITIONS
 
 BPMN = "{http://www.omg.org/spec/BPMN/20100524/MODEL}"
 
@@ -778,6 +778,102 @@ class TestLaneRepair:
         assert len(repaired["lanes"]) == 25
         assert len(repaired["elements"]) == 25
         assert not [n for n in notes if "отброшен" in n], notes
+
+    def test_laneless_events_take_the_lane_of_their_neighbour(self):
+        """Первая дорожка пула — не авторство узла, а порядок перечисления.
+
+        План не подписал дорожку кружку входа и финальному кружку: их ставит
+        сосед по маршруту, а не та роль, что названа первой.
+        """
+        repaired, notes = repair_structure(_plan_dict(
+            lanes=[{"id": "L_w", "name": "Кладовщик", "participant": "ВкусВилл"},
+                   {"id": "L_s", "name": "Сборка", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ поступил", ""),
+                _e("T1", "userTask", "Собрать заказ", "L_s"),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1")],
+        ))
+        lane_of = {e["id"]: e["lane"] for e in repaired["elements"]}
+        assert [lane_of["S1"], lane_of["E1"]] == ["L_s", "L_s"]
+        assert _note(notes, "переставлен в «Сборка» по соседу T1")
+
+    def test_step_without_a_lane_is_not_moved_by_neighbourhood(self):
+        """Шаг — не кружок: его хозяина план уточняет узким вопросом, и молча
+        переселить его «по соседу» значило бы переписать утверждённый состав."""
+        repaired, notes = repair_structure(_plan_dict(
+            lanes=[{"id": "L_w", "name": "Кладовщик", "participant": "ВкусВилл"},
+                   {"id": "L_s", "name": "Сборка", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ", "L_w"),
+                _e("T1", "userTask", "Собрать", "L_s"),
+                _e("T2", "userTask", "Отгрузить", ""),
+                _e("E1", "endEvent", "Готово", "L_w"),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "T2"),
+                   _f("F3", "T2", "E1")],
+        ))
+        lane_of = {e["id"]: e["lane"] for e in repaired["elements"]}
+        assert lane_of["T2"] == "L_w"
+        assert not [n for n in notes if "переставлен" in n and "T2" in n]
+
+    def test_one_note_for_a_repeated_choice(self):
+        """Сводка вместо потока одинаковых строк: заметки читают целиком, и
+        десять одинаковых приговоров — не отчёт, а инвентарная опись."""
+        lanes = [{"id": f"L{i}", "name": f"Роль {i}", "participant": "ВкусВилл"}
+                 for i in range(2)]
+        elements = [_e("S1", "startEvent", "Заявка", "")] + [
+            _e(f"T{i}", "userTask", f"Шаг {i}", "") for i in range(4)] + [
+            _e("E1", "endEvent", "Готово", "")]
+        flows = [_f("F0", "S1", "T0")] + [
+            _f(f"F{i}", f"T{i}", f"T{i + 1}") for i in range(3)] + [
+            _f("F4", "T3", "E1")]
+        _, notes = repair_structure(_plan_dict(lanes=lanes, elements=elements,
+                                               flows=flows))
+        dumped = [n for n in notes if "дорожка не указана" in n]
+        assert len(dumped) == 1, notes
+        assert "S1" in dumped[0] and "T0" in dumped[0] and "E1" in dumped[0]
+
+    def test_participants_of_nameless_elements_are_summarised(self):
+        pools = [{"name": f"Организация {i}"} for i in range(2)]
+        _, notes = repair_structure(_plan_dict(
+            participants=pools,
+            lanes=[],
+            elements=[_e(f"T{i}", "userTask", f"Шаг {i}", "", participant="")
+                      for i in range(3)],
+            flows=[_f("F1", "T0", "T1"), _f("F2", "T1", "T2")],
+        ))
+        dumped = [n for n in notes if "пул не указан" in n]
+        assert len(dumped) == 1, notes
+        assert "T0" in dumped[0] and "T2" in dumped[0]
+
+    def test_boundary_event_moves_to_the_pool_of_its_host(self):
+        """Срок, прицепленный к задаче чужой организации, едет к задаче.
+
+        Перевод в `intermediateCatchEvent` отнимал у ожидания срок: кружок с
+        таймером оставался в маршруте сам по себе, а `receiveTask`, которого
+        ждали, — незакрытым. Хозяин в плане назван, поэтому верная правка —
+        переставить событие в пул его задачи, а не разбирать событие.
+        """
+        repaired, notes = repair_structure(_plan_dict(
+            participants=["ВкусВилл", "Поставщик"],
+            lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заказ", ""),
+                _e("R1", "receiveTask", "Ждать отгрузку", ""),
+                _e("B1", "boundaryEvent", "Срок вышел", "",
+                   participant="Поставщик", attached_to="R1",
+                   event_definition="timer"),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "R1"), _f("F2", "R1", "E1")],
+        ))
+        event = next(e for e in repaired["elements"] if e["id"] == "B1")
+        assert event["kind"] == "boundaryEvent"
+        assert event["participant"] == "ВкусВилл"
+        assert event["attached_to"] == "R1"
+        assert _note(notes, "перенесено из пула «Поставщик»")
 
 
 class TestSingleBranchGateway:
@@ -1712,6 +1808,86 @@ class TestVacantPools:
         assert [p["name"] for p in result["structure"]["participants"]] == \
             ["ВкусВилл"]
 
+    # Описание, где контрагент назван заглавным словом внутри фразы: именно так
+    # его видит `_proper_names`, а значит и нарушение «участник вне схемы».
+    NAMED_TEXT = "Склад собирает груз, Перевозчик сопровождает его в дороге."
+
+    @staticmethod
+    def _named_vacant():
+        """Пустой пул «Перевозчик», названный в описании, и ни одного шага с его
+        именем в названиях: наполнить его починке нечем, и он уходит со схемы."""
+        return _plan(
+            participants=["Склад", "Перевозчик"],
+            lanes=[{"id": "L1", "name": "Кладовщик", "participant": "Склад"}],
+            elements=[
+                _e("S1", "startEvent", "Заявка", "L1", "Склад"),
+                _e("A1", "userTask", "Собрать груз", "L1", "Склад"),
+                _e("E1", "endEvent", "Груз готов", "L1", "Склад"),
+                _e("S2", "startEvent", "Старт", "", "Перевозчик"),
+                _e("E2", "endEvent", "Завершение", "", "Перевозчик"),
+            ],
+            flows=[_f("F1", "S1", "A1"), _f("F2", "A1", "E1"),
+                   _f("F3", "S2", "E2")],
+        )
+
+    def test_dropping_a_named_pool_says_it_lost_the_participant(self, monkeypatch):
+        """Пул, названный в описании, — не артефакт, а контрагент: заметка обязана
+        говорить про потерю, а не про уборку. Нарушение про тот же пул модель
+        читает как «убирать его нельзя», и прежняя формулировка «Пул удалён:
+        только события» перечёркивала её словами контура."""
+        plan = self._named_vacant()
+        FakeLLM(monkeypatch, plan, plan, '{"moves": [], "roles": [], '
+                                         '"missing": []}')
+        result = BPMNGenerator().generate(self.NAMED_TEXT)
+        assert result["status"] == "success"
+        assert "Перевозчик" not in [p["name"] for p in
+                                    result["structure"]["participants"]]
+        lost = [n for n in result["notes"] if "Перевозчик" in n and "сошёл" in n]
+        assert lost, result["notes"]
+        assert "названный в описании" in lost[0]
+        # Уборка артефакта — это про другой пул: здесь так сказать нельзя.
+        assert not [n for n in result["notes"]
+                    if "Пул «Перевозчик» удалён" in n], result["notes"]
+
+    def test_loss_of_a_named_pool_is_visible_in_gaps_not_only_in_notes(
+            self, monkeypatch):
+        """`notes` экран печатает как «автоматика поправила структуру», то есть
+        как благо. Потеря названного участника обязана лежать и в `gaps`: поле
+        «что не удалось починить» читают и человек, и харнесс."""
+        plan = self._named_vacant()
+        FakeLLM(monkeypatch, plan, plan, '{"moves": [], "roles": [], '
+                                         '"missing": []}')
+        result = BPMNGenerator().generate(self.NAMED_TEXT)
+        gaps = [g for g in result["gaps"] if "Перевозчик" in g and "сошёл" in g]
+        assert gaps, result["gaps"]
+        # Служебных id в тексте нет: экран снимает такие строки из `gaps`.
+        assert not re.search(r"[A-Z][a-zA-Z ]*_[0-9a-z]+", gaps[0]), gaps[0]
+
+    def test_the_loss_line_is_added_to_gaps_without_rewriting_the_plan_snapshot(
+            self, monkeypatch):
+        """Снимок нарушений плана в трейсе остаётся снимком ДО починки: на нём
+        атрибуция решает «молчал ли план-гейт», и приписать контуру то, что
+        сказала модель, нельзя. Новой строкой в ответе становится ровно потеря,
+        которую контур допустил сам."""
+        plan = self._named_vacant()
+        FakeLLM(monkeypatch, plan, plan, '{"moves": [], "roles": [], '
+                                         '"missing": []}')
+        result = BPMNGenerator().generate(self.NAMED_TEXT)
+        snapshot = result["trace"][0]["gaps"]
+        assert [g for g in snapshot if "сошёл" in g] == []
+        assert result["gaps"][:len(snapshot)] == snapshot
+        assert len(result["gaps"]) == len(snapshot) + 1
+
+    def test_dropping_an_invented_pool_still_reads_as_housekeeping(
+            self, monkeypatch):
+        """Пул, которого в описании нет, выдуман моделью: тут уборка и есть
+        уборка, а строка про потерю участника была бы ложной тревогой. И `gaps`
+        ответа при этом не пополняется — терять нечего."""
+        result = _generate(monkeypatch, self._vacant())
+        assert _note(result["notes"], "Пул «Кладовщик» удалён")
+        assert not [n for n in result["notes"] if "сошёл" in n], result["notes"]
+        assert [g for g in result["gaps"] if "сошёл" in g] == []
+
 
 class TestRolePoolBecomesLane:
     def test_pool_named_like_a_lane_of_another_pool_is_merged(self, monkeypatch):
@@ -1932,6 +2108,53 @@ class TestGatewayConditionsAndMerge:
         assert gateway.get("default") == next(
             f["id"] for f in result["structure"]["flows"]
             if f["source"] == "G1" and f.get("default"))
+
+    def _default_and_condition(self, monkeypatch, third_branch_condition):
+        """Ветка по умолчанию, у которой ещё и условие: модель пишет «иначе» и
+        проверкой одновременно (живой прогон: 10 таких ног в 8 сценариях, в
+        корпусе из 367 схем — ноль)."""
+        plan = _plan_dict(
+            participants=["ВкусВилл"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заказ", ""),
+                _e("G1", "exclusiveGateway", "Хватает товара?", ""),
+                _e("T2", "userTask", "Собрать", ""),
+                _e("T3", "userTask", "Заказать остаток", ""),
+                _e("T4", "userTask", "Отгрузить", ""),
+                _e("E1", "endEvent", "Отгружено", ""),
+            ],
+            flows=[_f("F1", "S1", "G1"), _f("F2", "G1", "T2", condition="Да"),
+                   _f("F6", "G1", "T3", condition="Нет", default=True),
+                   _f("F7", "G1", "T4", condition=third_branch_condition),
+                   _f("F3", "T2", "T4"), _f("F4", "T3", "T4"),
+                   _f("F5", "T4", "E1")],
+        )
+        return _generate(monkeypatch, _fence(plan))
+
+    @staticmethod
+    def _flow(result, flow_id):
+        return next(f for f in result["structure"]["flows"] if f["id"] == flow_id)
+
+    def test_default_leg_keeps_default_and_loses_condition(self, monkeypatch):
+        """Есть безусловная ветка — «иначе» нужно именно ей, а default остаётся
+        за помеченной ногой: условие с неё снимается, иначе оно не читается."""
+        result = self._default_and_condition(monkeypatch, "")
+        gateway = next(e for e in ET.fromstring(result["bpmn"])
+                       .iter(f"{BPMN}exclusiveGateway"))
+        assert gateway.get("default") == "F6"
+        assert not self._flow(result, "F6").get("condition")
+        assert _note(result["notes"], "Условие снято с потока F6")
+
+    def test_default_is_dropped_when_every_leg_is_conditioned(self, monkeypatch):
+        """Все ноги условные — «иначе» выразить нечем, и лишним является именно
+        default: снимать тогда условие значило бы сломать прочтение маршрута."""
+        result = self._default_and_condition(monkeypatch, "Товара нет")
+        gateway = next(e for e in ET.fromstring(result["bpmn"])
+                       .iter(f"{BPMN}exclusiveGateway"))
+        assert not gateway.get("default")
+        assert self._flow(result, "F6").get("condition") == "Нет"
+        assert not self._flow(result, "F6").get("default")
+        assert _note(result["notes"], "Флаг default у потока F6 снят")
 
     def test_merge_gateway_inserted_before_converging_task(self, monkeypatch):
         result = _generate(monkeypatch, self._branching())
@@ -2282,7 +2505,7 @@ class TestOwnershipClarification:
 
     def test_move_of_an_unknown_element_is_refused(self, monkeypatch):
         plan = _fence(self._plan())
-        fake = FakeLLM(monkeypatch, plan, plan,
+        FakeLLM(monkeypatch, plan, plan,
                        '{"moves": [{"element": "nope", "participant": "Поставщик"}]}')
         result = BPMNGenerator().generate(self.TEXT)
         assert _note(result["notes"], "такого шага в плане нет")
@@ -2309,6 +2532,76 @@ class TestOwnershipClarification:
         # отказ отказом, а шаг без пула не остаётся: «Поставщик» он забирает по
         # своему названию, а не по выдуманному «Экспедитору»
         assert moved["participant"] != "Экспедитор"
+
+    @staticmethod
+    def _refusal_plan():
+        """Три пула: два со своими шагами и пустой «Перевозчик», названный в
+        описании, — он и заводит узкий вопрос, на который модель отвечает
+        пачкой переносов в заполненный пул."""
+        return _fence(_plan_dict(
+            participants=["ВкусВилл", "Склад", "Перевозчик"],
+            lanes=[{"id": "L1", "name": "Менеджер", "participant": "ВкусВилл"},
+                   {"id": "L2", "name": "Кладовщик", "participant": "Склад"}],
+            elements=[
+                _e("S1", "startEvent", "Заявка", "L1", "ВкусВилл"),
+                _e("A1", "userTask", "Проверить заявку", "L1", "ВкусВилл"),
+                _e("G1", "exclusiveGateway", "Согласована?", "L1", "ВкусВилл"),
+                _e("A2", "userTask", "Отгрузить со склада", "L2", "Склад"),
+                _e("S2", "startEvent", "Старт", "", "Перевозчик"),
+                _e("E2", "endEvent", "Завершение", "", "Перевозчик"),
+            ],
+            flows=[_f("F1", "S1", "A1"), _f("F2", "A1", "G1"),
+                   _f("F3", "G1", "A2"), _f("F4", "S2", "E2")]))
+
+    def test_refusals_for_one_pool_collapse_into_one_note(self, monkeypatch):
+        """Причина отказа — про приёмник, а не про шаг, и на четыре переноса в
+        один пул она одна: живой прогон печатал четыре строки подряд («перенос
+        A1 → „Склад“ отклонён…», G1, A2, S2), и человек читал одно и то же
+        четыре раза. Теперь строка одна на пул, а id отвергнутых шагов
+        перечислены списком — они нужны, чтобы понять, что именно не перенесено.
+        """
+        plan = self._refusal_plan()
+        FakeLLM(monkeypatch, plan, plan,
+                '{"moves": ['
+                '{"element": "A1", "participant": "Склад"},'
+                '{"element": "G1", "participant": "Склад"},'
+                '{"element": "A2", "participant": "Склад"},'
+                '{"element": "S2", "participant": "Склад"}],'
+                ' "roles": [], "missing": []}')
+        result = BPMNGenerator().generate(
+            "ВкусВилл заводит заявку, Склад отгружает её, Перевозчик "
+            "сопровождает груз.")
+        refused = [n for n in result["notes"] if "в нём уже есть свои шаги" in n]
+        assert len(refused) == 1, result["notes"]
+        assert "перенос в пул «Склад» отклонён" in refused[0]
+        for elem_id in ("A1", "G1", "A2", "S2"):
+            assert elem_id in refused[0], refused[0]
+        # Ни один шаг при этом не уехал: отказ отказом, а маршрут остаётся.
+        owners = {e["id"]: e["participant"] for e in
+                  result["structure"]["elements"]}
+        assert owners["A1"] == "ВкусВилл"
+
+    def test_two_refused_pools_keep_both_reasons_in_one_line_each(
+            self, monkeypatch):
+        """Обе причины обязаны пережить сведение: «в нём уже есть свои шаги» и
+        «такого пула в плане нет» — это разные ответы модели и разные правки
+        плана, а группы считаются по пулу-приёмнику."""
+        plan = self._refusal_plan()
+        FakeLLM(monkeypatch, plan, plan,
+                '{"moves": ['
+                '{"element": "A1", "participant": "Склад"},'
+                '{"element": "A2", "participant": "Склад"},'
+                '{"element": "A1", "participant": "Экспедитор"},'
+                '{"element": "G1", "participant": "Экспедитор"}],'
+                ' "roles": [], "missing": []}')
+        result = BPMNGenerator().generate(
+            "ВкусВилл заводит заявку, Склад отгружает её, Перевозчик "
+            "сопровождает груз.")
+        full = [n for n in result["notes"] if "в нём уже есть свои шаги" in n]
+        absent = [n for n in result["notes"] if "такого пула в плане нет" in n]
+        assert len(full) == 1 and len(absent) == 1, result["notes"]
+        assert "A1, A2" in full[0], full[0]
+        assert "A1, G1" in absent[0], absent[0]
 
     def test_generic_organization_name_is_not_made_into_a_pool(self, monkeypatch):
         """«Организация» — родовое слово, а не имя: такой пул в живом прогоне
@@ -2596,11 +2889,13 @@ class TestOwnershipClarification:
         плане одна: промер живого прогона поймал обратный случай — «единственной
         организацией с шагами» оказался пул «Руководитель службы поддержки», и
         сама организация уехала к своему сотруднику дорожкой. Роль без `inside`
-        остаётся пулом и нарушением, которое закрывает только модель."""
+        остаётся пулом и нарушением, которое закрывает только модель.
+        (Здесь проверяется ровно это: без `inside` дорожка не появляется.
+        Подстановку «единственной действующей организации» снимает не эта
+        функция, и на её уровне тест ничего не утверждает.)
+        """
         participants = [{"name": "ВкусВилл"},
                         {"name": "Кладовщик", "external": False}]
-        elements = [{"id": "A1", "kind": "userTask", "name": "Принять товар",
-                     "participant": "ВкусВилл"}]
         lanes: list = []
         notes: list = []
         bpmn_generator._declare_role_lanes(participants, lanes, set(), notes)
@@ -2720,6 +3015,32 @@ class TestOwnershipClarification:
         assert next(e for e in result["structure"]["elements"]
                     if e["id"] == "A1")["participant"] == "Банк"
         assert _note(result["notes"], "добавлен на схему")
+
+    def test_the_missing_actor_question_names_its_steps(self, monkeypatch):
+        """Вопрос об отсутствующем лице называет его шаги, а не просит «придумать id».
+
+        Без операнда модель отвечает вымышленным id, аплайер и гейт отвергают, а
+        `improve/op_acceptance`/`expected_participants` записывают это качеством
+        модели. Тот же урок, что и «используйте id из инвентаря» в аплайере.
+        """
+        plan = {"participants": ["ВкусВилл"],
+                "actors": ["ВкусВилл", "Клиент"],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Принять заявку",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask",
+                     "name": "Согласовать условия с клиентом",
+                     "participant": "ВкусВилл"}],
+                "flows": [{"id": "F1", "source": "A1", "target": "A2",
+                           "kind": "sequence"}]}
+        fake = FakeLLM(monkeypatch, '{"missing": []}')
+        text = ("ВкусВилл принимает заявку и согласует условия с клиентом. "
+                "Клиент подписывает договор.")
+        BPMNGenerator()._clarify_ownership(text, plan)
+        assert len(fake.calls) == 1, fake.calls
+        question = fake.calls[0][1]["content"]
+        assert "«Клиент» — шаги с таким именем: A2" in question, question
+        assert "сейчас в «ВкусВилл»" in question
 
     def test_participant_absent_from_the_description_is_refused(self, monkeypatch):
         """Имя участника берётся из описания: дорисовать на схему того, кого в
@@ -3020,7 +3341,7 @@ class TestOwnershipClarification:
 
     def test_role_pointing_at_an_absent_organization_is_refused(self, monkeypatch):
         plan = _fence(self._role_plan())
-        fake = FakeLLM(monkeypatch, plan, plan,
+        FakeLLM(monkeypatch, plan, plan,
                        '{"roles": [{"pool": "Кладовщик", "inside": "Магазин 17"}]}')
         result = BPMNGenerator().generate(self.ROLE_TEXT)
         assert _note(result["notes"], "в описании нет")
@@ -3029,7 +3350,7 @@ class TestOwnershipClarification:
     def test_empty_organization_is_refused_instead_of_folding_somewhere(self,
                                                                        monkeypatch):
         plan = _fence(self._role_plan())
-        fake = FakeLLM(monkeypatch, plan, plan,
+        FakeLLM(monkeypatch, plan, plan,
                        '{"roles": [{"pool": "Кладовщик", "inside": ""}]}')
         result = BPMNGenerator().generate(self.ROLE_TEXT)
         assert _note(result["notes"], "модель не назвала организацию")
@@ -3054,7 +3375,7 @@ class TestOwnershipClarification:
         text = ("ВкусВилл собирает заказ: кладовщик комплектует паллету, "
                 "бухгалтерия сверяет возврат в отчётности.")
         canned = _fence(plan)
-        fake = FakeLLM(monkeypatch, canned, canned,
+        FakeLLM(monkeypatch, canned, canned,
                        '{"roles": [{"pool": "Кладовщик", "inside": "ВкусВилл"},'
                        ' {"pool": "Бухгалтерия", "inside": "ВкусВилл"}]}')
         result = BPMNGenerator().generate(text)
@@ -3661,7 +3982,7 @@ class TestPlanGapsAndRetry:
                 "elements": [{"id": "T1", "kind": "userTask", "name": "Заявка",
                               "participant": "ВкусВилл"}], "flows": []}
         assert bpmn_generator.plan_gaps(rich) and not bpmn_generator.plan_gaps(thin)
-        fake = FakeLLM(monkeypatch, _fence(rich), _fence(thin))
+        FakeLLM(monkeypatch, _fence(rich), _fence(thin))
         result = BPMNGenerator().generate("ВкусВилл: заявка, согласование, "
                                           "отгрузка со склада")
         assert result["attempts"] == 2
@@ -4017,6 +4338,10 @@ class TestReaskAcceptanceByPriority:
                     "шлюза, который раздваивает") == "развилка"
         assert kind("узел B1 ведёт сразу в несколько шагов без шлюза — "
                     "развилка спрятана в подписях потоков") == "развилка"
+        # Одинокая нога шлюза — класс развилки, а не «маршрут»: иначе переспрос,
+        # принёсший вторую ветку, не засчитывался бы правкой `has_branching`.
+        assert kind("шлюз G1 (Сумма покупки больше 5000?) не раздваивает и не "
+                    "сливает маршруты — это обычный шаг") == "развилка"
         assert kind("пул «Кладовщик» объявил дорожку с таким же именем: "
                     "объяви роль или убери дорожку") == "роль-пул"
 
@@ -4526,14 +4851,164 @@ class TestWaitWithoutDeadlineGate:
         assert [g for g in asked if "задаёт ожидание" in g], gaps
         assert not [g for g in gaps if "ожидание без срока" in g]
 
-    def test_a_waiting_event_closes_the_gate(self):
+    def test_a_waiting_event_is_expressed_but_not_bounded(self):
+        """Событие-ожидание выражает «жди», но не назначает срок.
+
+        Прежний гейт молчал, увидев в плане любой кружок с определением
+        `message`: «ожидание уже выражено». И скоринг (`wait_without_sla`), и
+        независимый оракул считают такой узел незакрытым — срок ему всё равно
+        нужен, — поэтому гейт расходился с обеими линейками ровно там, где их
+        согласие измеряется метрикой. Плюс нарушение теперь называет id
+        ожидания: без операнда переспрос приносит тот же план.
+        """
         plan = json.loads(json.dumps(self.PLAN))
         plan["elements"].append(
             {"id": "C1", "kind": "intermediateCatchEvent",
              "name": "Ждём ответ", "participant": "ВкусВилл", "lane": "L1",
              "event_definition": "message"})
+        hit = [g for g in bpmn_generator.plan_gaps(plan, self.WAIT)
+               if "ожидание без срока" in g]
+        assert hit, bpmn_generator.plan_gaps(plan, self.WAIT)
+        assert "C1" in hit[0]
+
+    def test_a_boundary_timer_on_the_wait_closes_the_gate(self):
+        """Граничный таймер на самом ожидании — законная форма срока."""
+        plan = json.loads(json.dumps(self.PLAN))
+        plan["elements"] += [
+            {"id": "C1", "kind": "intermediateCatchEvent",
+             "name": "Ждём ответ", "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "message"},
+            {"id": "B1", "kind": "boundaryEvent", "name": "Просрочка",
+             "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "timer", "attached_to": "C1"}]
         assert not [g for g in bpmn_generator.plan_gaps(plan, self.WAIT)
                     if "ожидание без срока" in g]
+
+    def test_an_event_based_fork_with_a_timer_leg_closes_the_gate(self):
+        """Развилка «ответ или срок»: нога в ожидание и прямая нога в таймер.
+
+        `eventBasedGateway` генератор раньше не знал вовсе и понижал её до
+        задачи, то есть законную форму срока на схеме построить было нечем.
+        """
+        plan = json.loads(json.dumps(self.PLAN))
+        plan["elements"] += [
+            {"id": "C1", "kind": "intermediateCatchEvent",
+             "name": "Ждём ответ", "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "message"},
+            {"id": "G1", "kind": "eventBasedGateway", "name": "",
+             "participant": "ВкусВилл", "lane": "L1"},
+            {"id": "T1x", "kind": "intermediateCatchEvent", "name": "Срок",
+             "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "timer"}]
+        plan["flows"] += [
+            {"id": "FX1", "source": "G1", "target": "C1", "kind": "sequence"},
+            {"id": "FX2", "source": "G1", "target": "T1x", "kind": "sequence"}]
+        gaps = bpmn_generator.plan_gaps(plan, self.WAIT)
+        assert not [g for g in gaps if "ожидание без срока" in g], gaps
+        structure, notes = repair_structure(plan)
+        assert next(e for e in structure["elements"]
+                    if e["id"] == "G1")["kind"] == "eventBasedGateway"
+        assert not [n for n in notes if "Неизвестный тип" in n and "G1" in n]
+        xml = BPMNGenerator()._generate_bpmn_xml(structure)
+        assert 'bpmn:eventBasedGateway id="G1"' in xml
+        _, repair_notes = validate_and_repair(xml)
+        assert not [n for n in repair_notes
+                    if "G1" in n or "T1x" in n], repair_notes
+
+    def test_a_fork_bounds_only_its_own_leg(self):
+        """Развилка «ответ или срок» закрывает то ожидание, чья нога рядом.
+
+        Другое ожидание того же плана остаётся висящим: иначе один таймер в
+        схеме прощал бы все остальные ожидания — ровно та слепота, что стоила
+        живому прогону #66 семи провалов `waits_have_sla`.
+        """
+        plan = json.loads(json.dumps(self.PLAN))
+        plan["elements"] += [
+            {"id": "C1", "kind": "intermediateCatchEvent",
+             "name": "Ждём ответ", "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "message"},
+            {"id": "C2", "kind": "receiveTask", "name": "Ждём курьера",
+             "participant": "ВкусВилл", "lane": "L1"},
+            {"id": "G1", "kind": "eventBasedGateway", "name": "",
+             "participant": "ВкусВилл", "lane": "L1"},
+            {"id": "T1x", "kind": "intermediateCatchEvent", "name": "Срок",
+             "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "timer"}]
+        plan["flows"] += [
+            {"id": "FX1", "source": "G1", "target": "C1", "kind": "sequence"},
+            {"id": "FX2", "source": "G1", "target": "T1x", "kind": "sequence"},
+            {"id": "FX3", "source": "T1x", "target": "C2", "kind": "sequence"}]
+        hit = [g for g in bpmn_generator.plan_gaps(plan, self.WAIT)
+               if "ожидание без срока" in g]
+        assert len(hit) == 1 and "C2" in hit[0], hit
+
+    def test_the_wait_notes_collapse_into_one_summary(self):
+        """Одна сводка про ожидания без срока, а не строка на каждый узел.
+
+        Хвост у этих строк один и тот же, и на схеме с десятком ожиданий человек
+        читал бы десять копий одного решения — тот же поток одинаковых заметок,
+        из-за которого «дорожка не указана» уже свёрнуты в одну строку. Id при
+        этом обязаны перечисляться: сводка без них неотличима от «контур не
+        сказал, какой узел править».
+        """
+        plan = json.loads(json.dumps(self.PLAN))
+        plan["elements"] += [
+            {"id": "C1", "kind": "intermediateCatchEvent",
+             "name": "Ждём ответ", "participant": "ВкусВилл", "lane": "L1",
+             "event_definition": "message"},
+            {"id": "C2", "kind": "receiveTask", "name": "Ждём курьера",
+             "participant": "ВкусВилл", "lane": "L1"}]
+        notes = bpmn_generator._wait_gap_notes(
+            bpmn_generator.plan_gaps(plan, self.WAIT))
+        wait_notes = [n for n in notes if "ожидание без срока" in n]
+        assert len(wait_notes) == 1, notes
+        assert "C1" in wait_notes[0] and "C2" in wait_notes[0], wait_notes
+
+    def test_the_three_layers_agree_on_what_a_wait_is(self):
+        """Гейт, скоринг и оракул судят один и тот же признак ожидания.
+
+        Расхождение трёх списков выглядит как качество модели: план-гейт
+        молчал бы там, где приёмка ругается, и вину за провал харнесс отдавал бы
+        починке.
+        """
+        import eval.invariants as invariants
+
+        assert bpmn_generator.BLOCKING_CATCH_KINDS == set(
+            invariants.BLOCKING_CATCH_KINDS)
+        assert bpmn_generator.NOT_A_WAIT_DEFINITIONS == NOT_A_WAIT_DEFINITIONS
+        assert bpmn_generator.NOT_A_WAIT_DEFINITIONS == frozenset(
+            invariants.NOT_A_WAIT_DEFINITIONS)
+        assert bpmn_generator.SLA_REJECTED_FORKS == {"exclusiveGateway"}
+        assert bpmn_generator.SLA_REJECTED_FORKS <= bpmn_generator.GATEWAY_KINDS
+        assert bpmn_generator.GATEWAY_KINDS <= GATEWAY_TAGS
+
+    def test_the_gate_bounds_a_wait_the_linews_would_accept(self):
+        """Гейт не строже приёмки: `inclusiveGateway` и неявный выбор узла
+        с двумя ногами ограничивают ожидание так же, как их признают скоринг
+        (`_has_parallel_deadline`) и оракул (`_sla_bounds`).
+
+        Гейт, принимающий только `parallelGateway`/`eventBasedGateway`, ругал бы
+        план, который приёмка пропустила бы, — переспрос тратился бы на правку,
+        которую никто не просил, а провал `waits_have_sla` приписывался бы
+        модели там, где схема законна.
+        """
+        for fork_kind in ("inclusiveGateway", "userTask"):
+            plan = json.loads(json.dumps(self.PLAN))
+            plan["elements"] += [
+                {"id": "C1", "kind": "intermediateCatchEvent",
+                 "name": "Ждём ответ", "participant": "ВкусВилл", "lane": "L1",
+                 "event_definition": "message"},
+                {"id": "G1", "kind": fork_kind, "name": "Ответ или срок",
+                 "participant": "ВкусВилл", "lane": "L1"},
+                {"id": "T1x", "kind": "intermediateCatchEvent", "name": "Срок",
+                 "participant": "ВкусВилл", "lane": "L1",
+                 "event_definition": "timer"}]
+            plan["flows"] += [
+                {"id": "FX1", "source": "G1", "target": "C1", "kind": "sequence"},
+                {"id": "FX2", "source": "G1", "target": "T1x", "kind": "sequence"}]
+            gaps = bpmn_generator.plan_gaps(plan, self.WAIT)
+            assert not [g for g in gaps if "ожидание без срока" in g], (
+                fork_kind, gaps)
 
     def test_the_contour_does_not_re_ask_because_of_it(self, monkeypatch):
         fake = FakeLLM(monkeypatch, _fence(self.PLAN))
@@ -4628,6 +5103,114 @@ def test_generation_budget_stops_before_the_next_model_call(monkeypatch):
         "Кладовщик собирает заказ, бухгалтерия выставляет счёт подрядчику.")
 
     assert result["status"] == "error"
-    assert result["step"] == "llm"          # 503 + Retry-After, а не 400
+    # Свой шаг, а не `llm`: под «моделью» отказ неотличим от сбоя провайдера,
+    # и клиент считает его повторяемым — то есть платит второй раз за ту же
+    # слишком длинную схему.
+    assert result["step"] == "budget"
     assert "время" in result["error"]
     assert calls == []
+
+
+def test_generation_cancel_stops_before_the_next_model_call(monkeypatch):
+    """Отказ пользователя обязан остановить прогон до следующего платного вызова.
+
+    Задача стоит в очереди и может быть отменена, пока идёт: без проверки на
+    границе стадий отмена превращалась в «отказ приняли», а оплаченный прогон
+    всё равно доходил до конца и списывался из бюджета пользователя.
+    """
+    from core import bpmn_generator
+
+    calls = []
+    monkeypatch.setattr(
+        bpmn_generator, "call_json",
+        lambda *a, **k: (calls.append(1), {})[1])
+
+    def already_cancelled():
+        return True
+
+    result = bpmn_generator.BPMNGenerator().generate(
+        "Кладовщик собирает заказ, бухгалтерия выставляет счёт подрядчику.",
+        cancel_check=already_cancelled)
+
+    assert result["status"] == "error"
+    # Не `llm` и не `generation`: у отмены собственный шаг, иначе очередь
+    # закрыла бы её как сбой сервиса и предложила повтор.
+    assert result["step"] == "cancelled"
+    assert calls == []
+
+
+def test_generation_cancel_is_not_consulted_after_the_run_started(monkeypatch):
+    """Флаг, выставленный в середине стадии, не прерывает оплаченный вызов.
+
+    Проверка стоит ДО вызова модели: прерывать начатый запрос значит оставить
+    провайдера с оплаченной работой и без ответа, а пользователя — без схемы.
+    """
+    from core import bpmn_generator
+
+    plan = {"participants": ["Кладовщик"],
+            "elements": [{"id": "T1", "kind": "userTask", "name": "Собрать заказ",
+                          "participant": "Кладовщик"}], "flows": []}
+    seen = []
+
+    def fake_call_json(*a, **k):
+        seen.append(1)
+        return plan if len(seen) == 1 else {}
+
+    monkeypatch.setattr(bpmn_generator, "call_json", fake_call_json)
+
+    flips_after_first_call = [False]
+
+    def cancel_only_later():
+        return flips_after_first_call[0]
+
+    monkeypatch.setattr(bpmn_generator, "MAX_TEXT_CHARS", 10_000)
+    gen = bpmn_generator.BPMNGenerator()
+    # Отмена появляется только после того, как первая стадия уже оплачена:
+    # прогон обязан заметить её на следующей границе, а не оборвать текущую.
+    original = bpmn_generator.BPMNGenerator._check_budget
+
+    def spy(meta, stage):
+        if seen:
+            flips_after_first_call[0] = True
+        return original(meta, stage)
+
+    monkeypatch.setattr(bpmn_generator.BPMNGenerator, "_check_budget",
+                        staticmethod(spy))
+
+    result = gen.generate("Кладовщик собирает заказ.",
+                          cancel_check=cancel_only_later)
+
+    assert seen, "оплаченный вызов не должен был прерываться"
+    assert result["step"] == "cancelled"
+
+
+class TestForeignScriptDescription:
+    """Описание латиницей: гейт участников над таким текстом слеп, и заметка
+    обязана это признать.
+
+    `_proper_names` ищет действующих лица русским шаблоном, поэтому на
+    английском описании нарушение «названный контрагент пропал со схемы» не
+    заводится вовсе. Схема при этом выглядела проверенной — тот же класс
+    молчания, из-за которого прогон #47 потерял двух участников из 24 схем.
+    """
+
+    LATIN = ("The clerk registers the order, the warehouse picks it, "
+             "and Finance issues an invoice to the supplier.")
+
+    def test_latin_description_admits_the_blind_check(self, monkeypatch):
+        FakeLLM(monkeypatch, _plan())
+        result = BPMNGenerator().generate(self.LATIN)
+        assert result["status"] == "success"
+        assert [n for n in result["notes"] if "не кириллицей" in n], result["notes"]
+
+    def test_cyrillic_description_keeps_the_note_off(self, monkeypatch):
+        result = _generate(monkeypatch, _plan())
+        assert not [n for n in result["notes"] if "не кириллицей" in n]
+
+    def test_latin_acronyms_inside_russian_text_are_not_foreign(self):
+        from core.bpmn_generator import _foreign_script
+
+        assert not _foreign_script("Кладовщик собирает заказ в WMS, "
+                                   "бухгалтерия выставляет счёт.")
+        assert _foreign_script("The clerk registers the order and finance "
+                               "issues an invoice.")

@@ -25,10 +25,24 @@ logger = logging.getLogger(__name__)
 # Пул моделей по убыванию предпочтения. Имя «GigaChat» принадлежало старому API
 # (gigachat.devices.sberbank.ru); шлюз api.giga.chat, на который переводит SDK
 # 0.2.3, его не знает и отвечает 404 «No such model» — повтор такого не лечит,
-# поэтому спрашиваем следующую модель. `GigaChat-2` — наследник той линии, на
-# которой обкатаны промпты, `GigaChat-3-Lightning` — актуальное поколение.
+# поэтому спрашиваем следующую модель.
+#
+# Состав проверен на живом ключе, а не по названиям из новостей: `GET /models`
+# и по одному обращению. Имен поколения «3» (`GigaChat-3-Ultra`,
+# `GigaChat-3-Max`, `GigaChat-3-Lightning`) этот шлюз не знает — 404, то есть
+# прежний резерв пула был мёртвым именем: при сбое основной модели контур
+# тратил попытку на заведомый 404. Отвечают и измерены: `GigaChat-2`,
+# `GigaChat-2-Max`, `GigaChat-Plus`, `GigaChat-Max-preview`,
+# `GigaChat-Pro-preview`.
+#
+# Выбор головой — `GigaChat-2-Max` по числам харнесса (`--mode live`, 8
+# сценариев, один повтор): `expected_participants` 0.25 → 0.75,
+# `quality/scheme_checks_share` 0.854 → 0.946, `min_steps` 0.875 → 1.0 при
+# неизменном бизнес-слое. `GigaChat-Max-preview` дал те же 0.75 по участникам,
+# но хуже по бизнес-слою (smells 0.375 против 0.302), а preview-статус
+# нестабилен. `GigaChat-2` оставлена резервом: на ней обкатаны промпты.
 # Порядок задаёт GIGACHAT_MODEL: одно имя или список через запятую.
-DEFAULT_MODEL_POOL = ("GigaChat-2", "GigaChat-3-Lightning")
+DEFAULT_MODEL_POOL = ("GigaChat-2-Max", "GigaChat-2")
 DEFAULT_SCOPE = "GIGACHAT_API_PERS"
 MAX_ATTEMPTS = 2
 RETRY_PAUSE_SECONDS = 3
@@ -149,6 +163,72 @@ def _verify_ssl() -> bool:
     )
 
 
+def _ca_bundle_file() -> Optional[str]:
+    """Путь к корневому сертификату УЦ, если он задан и читается.
+
+    Предыстория: текст подсказки при отключённой проверке называет
+    `GIGACHAT_CA_BUNDLE_FILE`, и `.env.example` его документирует, но сам ключ
+    не читался никем. Оператор, который последовал совету и смонтировал bundle,
+    оставался на системном хранилище: проверка падала ровно тем же
+    `CERTIFICATE_VERIFY_FAILED`, из-за которого он её и выключал.
+    """
+    path = _ca_bundle_declared()
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        # Молча принять несуществующий путь значило бы вернуться к той же
+        # иллюзии настройки; ронять процесс из-за опции, которой можно и не быть,
+        # не за чем.
+        logger.warning("GIGACHAT_CA_BUNDLE_FILE=%s: файла нет, проверка TLS идёт "
+                       "по системному хранилищу и сертификат российского УЦ "
+                       "может не принять", path)
+        return None
+    return path
+
+
+def _ca_bundle_declared() -> str:
+    """Задан ли ключ вообще, без проверки читабельности файла.
+
+    При отключённой проверке bundle не участвует в транспорте, и спрашивать про
+    файл незачем: `_ca_bundle_file()` добавил бы в лог «проверка TLS идёт по
+    системному хранилищу» ровно там, где никакой проверки нет.
+    """
+    return (os.getenv("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
+
+
+def _warn_transport(verify: bool) -> None:
+    """Что именно произойдёт с TLS — словами, которые ему соответствуют.
+
+    `gigachat.client._get_kwargs` (и `_get_auth_kwargs` там же) пишет
+    `kwargs["verify"] = settings.ca_bundle_file` ПОСЛЕ `"verify":
+    settings.verify_ssl_certs`: переданный bundle перекрывает отключённую
+    проверку, и связка `GIGACHAT_VERIFY_SSL=false` + `GIGACHAT_CA_BUNDLE_FILE`
+    ходила в сеть с проверкой сертификата, а лог в этот момент утверждал
+    обратное («ключ уходит в незащищённый канал»). Лечится не правкой текста
+    под поведение SDK, а порядком операндов: bundle отдаётся только когда
+    проверка включена, поэтому явный `false` старше bundle и означает именно
+    отключение. Порядок выбран в пользу той опции, которую человек задал явно,
+    а не той, о которой он мог забыть.
+    """
+    if verify:
+        return
+    declared = _ca_bundle_declared()
+    if declared:
+        logger.warning(
+            "GIGACHAT_VERIFY_SSL=false вместе с GIGACHAT_CA_BUNDLE_FILE=%s: "
+            "явный false старше, bundle НЕ подключается — проверка TLS "
+            "отключена целиком (и в OAuth-обмене, и в запросах к модели), ключ "
+            "уходит в незащищённый канал. Чтобы проверка шла против этого "
+            "файла, уберите GIGACHAT_VERIFY_SSL или поставьте true. Допустимо "
+            "только локально.", declared)
+        return
+    logger.warning(
+        "GIGACHAT_VERIFY_SSL=false: проверка TLS отключена, ключ уходит в "
+        "незащищённый канал. Допустимо только локально; для прода — корневой "
+        "сертификат российского УЦ через GIGACHAT_CA_BUNDLE_FILE."
+    )
+
+
 def get_llm_client() -> GigaChat:
     """Клиент провайдера (ленивый синглтон на процесс). Секреты — из окружения.
 
@@ -165,18 +245,17 @@ def get_llm_client() -> GigaChat:
                         "GIGACHAT_CREDENTIALS не задан: заполните переменную "
                         "окружения (см. .env.example)"
                     )
-                if not _verify_ssl():
-                    logger.warning(
-                        "GIGACHAT_VERIFY_SSL=false: проверка TLS отключена, "
-                        "ключ уходит в незащищённый канал. Допустимо только "
-                        "локально; для прода — корневой сертификат российского "
-                        "УЦ через GIGACHAT_CA_BUNDLE_FILE."
-                    )
+                verify = _verify_ssl()
+                _warn_transport(verify)
                 _client = GigaChat(
                     credentials=credentials,
                     scope=os.getenv("GIGACHAT_SCOPE", DEFAULT_SCOPE),
                     timeout=REQUEST_TIMEOUT_SECONDS,
-                    verify_ssl_certs=_verify_ssl(),
+                    verify_ssl_certs=verify,
+                    # Только при включённой проверке: SDK ставит `verify =
+                    # ca_bundle_file` поверх `verify_ssl_certs`, и переданный на
+                    # выключенной проверке bundle включил бы её обратно молча.
+                    ca_bundle_file=_ca_bundle_file() if verify else None,
                 )
     return _client
 
@@ -258,8 +337,18 @@ def ensure_llm_ready() -> None:
 
     Вызывается из lifespan: ошибка ключа должна быть видна на старте сервиса,
     а не через минуту после старта первого пользовательского запроса.
+
+    Сбой транспорта сворачивается в `LLMError`, а не уходит наружу: шлюз
+    провайдера — чужая доступность, и вызывающая сторона фильтрует именно
+    `LLMError`. `httpx.ConnectError` (отбитый TLS-канал, истёкший сертификат,
+    недоступный адрес) этим фильтром не ловился и вешал запуск всего сервиса
+    вместе с реестром, доступом и апрувами.
     """
-    get_llm_client().get_token()
+    try:
+        get_llm_client().get_token()
+    except (ResponseError, *_RETRYABLE) as error:
+        raise LLMError(f"Авторизация LLM не подтверждена ({type(error).__name__}): "
+                       f"{error}") from error
 
 
 def _content_of(response: Any) -> Optional[str]:

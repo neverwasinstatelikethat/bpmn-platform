@@ -1010,18 +1010,21 @@ def _require_element(index: _Index, elem_id: Any) -> ET.Element:
 
 
 def _new_id_hint(op_id: str, index: _Index) -> str:
-    """Подсказка к отказу «id без new_» для события, которое в схеме уже есть.
+    """Подсказка к отказу «id уже занят» для операции, создающей элемент.
 
-    Модель, назвавшая id готового события в `add_event`, хотела поправить его, а
-    не рисовать второй кружок: об этом говорит сам факт, что id взят из схемы и
-    префикса не имеет. Прежняя подсказка предлагала только «придумать id с new_»,
-    и модель в ответ заводила новый пустой кружок, а нарушение `event_types`
-    оставалось. Теперь у отказа есть исполнимый адрес: `add_event_definition`
-    правит тем же id то, чего в схеме не хватало.
+    Модель, назвавшая в `add_event` id готового события, хотела поправить его, а
+    не рисовать второй кружок: об этом говорит сам факт, что id взят из схемы.
+    Прежняя подсказка предлагала только «придумать id с new_», и модель заводила
+    новый пустой кружок, а нарушение `event_types` оставалось. Теперь у отказа
+    есть исполнимый адрес: `add_event_definition` правит тем же id то, чего в
+    схеме не хватало.
 
-    Область подсказки — промежуточные события: `event_types` ругается только на
-    них, поэтому стартовому и конечному событию тип не спрашивают и адрес им не
-    нужен.
+    Область первой ветки — промежуточные события: `event_types` ругается только
+    на них, поэтому стартовому и конечному событию тип не спрашивают и адрес им
+    не нужен. Во второй ветке candidate обязан сверяться со всем пространством
+    имён (`is_taken`), а не только с узлами: дорожки и потоки делят его с
+    элементами, и совет, данные в обход занятого id, заводит второй элемент с
+    тем же `name`.
     """
     elem = index.elements.get(op_id)
     if elem is not None and _local(elem.tag) in ("intermediateCatchEvent",
@@ -1033,18 +1036,34 @@ def _new_id_hint(op_id: str, index: _Index) -> str:
                     f"поправьте его операцией add_event_definition(id='{op_id}', "
                     "event_definition='timer') — определение выбирается по смыслу "
                     "шага (event_definition=timer|message|error|signal), а id с "
-                    "new_ нужен только для нового элемента")
-    return "новые элементы обязаны иметь id, начинающийся с new_"
+                    "new_ берут, когда заводят новый элемент")
+    candidate = f"new_{op_id}"
+    while index.is_taken(candidate):
+        candidate += "X"
+    return (f"элемента с id '{op_id}' не будет: он уже занят в схеме, а xml:id "
+            f"обязан быть уникальным. Лечится двумя путями — править то, что "
+            f"стоит под этим id, либо создать новый '{candidate}' и подставить "
+            "тот же id в строки этого же пакета, которые на него ссылаются "
+            f"(например move_to_lane(lane='{candidate}'))")
 
 
 def _require_new_id(op_id: Optional[str], index: _Index) -> str:
+    """Адрес создаваемого элемента: занятый — отказ, свободный — принят.
+
+    Префикс `new_` отличает намерение «создать» от «править существующий», и
+    отличает его сам факт присутствия id в документе, а не форма имени.
+    Требовать форму значило плодить каскады: живой прогон #71 — 33 отказа из 58,
+    где `add_lane(id='Lane_OnDutyEngineer')` был отвергнут по префиксу, а следом
+    каждая `move_to_lane` к этой дорожке как «дорожка не найдена». Модель называет
+    дорожки и пулы их рабочими именами, а за отказом стоял оплаченный повтор.
+    Соглашение про `new_` остаётся в промпте: оно делает строки пакета читаемыми,
+    но перестало быть основанием для отказа.
+    """
     if not op_id or not isinstance(op_id, str):
         raise _Skip("не задан id нового элемента", "укажите id с префиксом new_")
-    if not op_id.startswith("new_"):
-        raise _Skip(f"id '{op_id}' без префикса new_", _new_id_hint(op_id, index))
-    if index.is_taken(op_id):
-        raise _Skip(f"id '{op_id}' уже занят", "используйте уникальный id")
-    return op_id
+    if not index.is_taken(op_id):
+        return op_id
+    raise _Skip(f"id '{op_id}' уже занят", _new_id_hint(op_id, index))
 
 
 def _remove_refs(elem: ET.Element, flow_id: str) -> None:
@@ -2172,9 +2191,26 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
         if f.get("sourceRef") == source_id and f.get("targetRef") == target_id
     ]
     if existing:
-        raise _Skip("такой поток уже существует",
-                    "существующую ветку помечают выходом по умолчанию "
-                    "операцией set_default")
+        # Причина остаётся дословно той же (её сверяют тесты и разбор отказов), а
+        # подсказка обязана называть операнды: «помечают выходом по умолчанию
+        # операцией set_default» без id потока модель читает как «придумай id»,
+        # и в корректирующем раунде приносит тот же пакет (живой прогон #68 на
+        # схеме support_ticket). Второе расхождение: `set_default` законен только
+        # для ветки шлюза, а дуга «ожидание → шаг» к нему не относится — совет про
+        # default для не-шлюза был бы инструкцией, которую аплайер отвергнет.
+        ids = [str(flow.get("id") or "") for flow in existing if flow.get("id")]
+        named = ", ".join(f"'{flow_id}'" for flow_id in ids) or (
+            f"'{source_id}' → '{target_id}'")
+        if _local(source.tag) in GATEWAY_TAGS and ids:
+            fix = (f"ветку {named} помечают выходом по умолчанию: "
+                   f"set_default(gateway='{source_id}', flow='{ids[0]}'), а условие "
+                   f"дописывают add_condition(flow='{ids[0]}', condition='…'); "
+                   "второй поток между теми же концами не нужен")
+        else:
+            fix = (f"дуга {named} между '{source_id}' и '{target_id}' уже есть: её "
+                   "правят по id (rename, add_condition), а не вторым connect; "
+                   "новую ногу ищите для другого приёмника либо оставляйте эту")
+        raise _Skip("такой поток уже существует", fix)
     notes: List[str] = []
     if flow_type == "sequence":
         condition = (op.get("condition") or "").strip() or None
@@ -2335,6 +2371,16 @@ def _op_add_condition(op: Dict[str, Any], index: _Index) -> List[str]:
 
 
 def _op_disconnect(op: Dict[str, Any], index: _Index) -> List[str]:
+    """Снять дугу. Проверки маршрута здесь нет намеренно.
+
+    `disconnect` — законная самостоятельная правка: его советуют `handoff_pingpong`,
+    `sequence_flows`, `flow_ends_legal`, `message_flow_ends` и `cross_pool_flow`, а
+    перепись `eval.advice` собирает пакет из операндов текста совета и требует
+    «применено == названо». Отказ на уровне одной операции сломал бы и дословный
+    пример из `OP_SPEC`. Дыру, которую разрыв оставил в ИТОГОВОМ маршруте, снимает
+    пакетный страж (`new_route_holes` в `apply_and_guarantee`): он видит, что
+    `[disconnect(F), connect(S, T)]` — перешивка, а `[disconnect(F)]` — тупик.
+    """
     flow_id = op.get("flow") or ""
     flow = index.find_flow(flow_id)
     if flow is None:
@@ -2830,8 +2876,16 @@ def _pool_words(text: Any) -> Set[str]:
 # Поля, по которым правка опознаётся в отчёте. Они же — ключ сравнения
 # «пропуск первого раунда закрыт повтором» в оркестраторе: без них нельзя
 # понять, что исправленная версия той же операции прошла.
+# Операнды-ссылки (`attached_to`, `after`, `to`, `lane`) здесь же: строка отказа
+# обязана показывать, чем именно правка не сошлась. Без них адрес опоры в записи
+# отсутствует — и `_explain_failed_dependencies` не видит каскад за несозданным
+# узлом, и модель читает «задача 'new_A6' не найдена» как выдуманный адрес.
+# Эти поля ждали в строке и `eval/attribution._op_tokens` (пометка «дорожка»), и
+# `_applied_block` оркестратора.
 _OP_IDENTITY_KEYS = ("id", "element_id", "flow", "source", "target", "name",
-                     "participant", "gateway")# Те же поля — публичный словарь идентичности: по ним сверку «отказ первого
+                     "participant", "gateway", "attached_to", "after", "to",
+                     "lane")
+# Те же поля — публичный словарь идентичности: по ним сверку «отказ первого
 # раунда закрыт повтором» ведёт оркестратор. Держать два списка было нельзя:
 # пока он читал только `id`/`source`/`target`, `remove_participant` не получал
 # зачёта никогда, и пользователь читал «не применено» об уже удалённом пуле.
@@ -2843,6 +2897,26 @@ OP_IDENTITY_FIELDS = _OP_IDENTITY_KEYS
 # считать её частью идентичности означало бы никогда не ставить зачёт.
 OP_ELEMENT_FIELDS = ("id", "element_id", "flow", "source", "target",
                      "participant", "gateway")
+# Расширение предыдущего списка — ВСЕ поля, называющие узел или дорожку схемы,
+# на которую правка опирается: к идентичности добавлены ссылки из нагрузки —
+# хозяин граничного события (`attached_to`), якорь вставки (`after`), цель
+# исхода нового узла (`to`) и приёмник дорожки (`lane`). По ним
+# `_explain_failed_dependencies` узнаёт, что отказ «не найдено» — это каскад за
+# узлом, который этот же пакет пытался создать и не создал. В
+# `OP_ELEMENT_FIELDS` этим полям не место: той же таблицей оркестратор сверяет
+# «отказ первого раунда закрыт повтором», а починка как раз и состоит в том,
+# чтобы операнд изменился (пристегнуть событие к существующему шагу, выбрать
+# другой якорь), — поле в идентичности оставляло бы такой повтор без зачёта.
+OP_REFERENCE_FIELDS = OP_ELEMENT_FIELDS + ("attached_to", "after", "to", "lane")
+
+# Как ждущая опору правка называется в хвосте объяснения: «дуга применится
+# после» про connect и «событие» про граничное событие — та же точность, что у
+# советов скоринга, где подсказка называет операнд, а не «правку вообще».
+_WAITING_SUBJECT = {"connect": "дуга", "add_boundary_event": "событие",
+                    "add_task": "шаг", "add_event": "событие",
+                    "add_gateway": "шлюз", "add_lane": "дорожка",
+                    "move_to_lane": "перенос",
+                    "move_to_participant": "перенос"}
 
 
 def _op_identity(op: Dict[str, Any]) -> Dict[str, Any]:
@@ -2861,19 +2935,88 @@ def _explain_failed_dependencies(skipped: List[Dict[str, Any]],
     тот дефект: повтор латал дугу, узел так и не появлялся, а
     `improve/op_acceptance` записывала это как качество модели. Правило то же,
     что у советов скоринга: подсказка без операндов читается как «придумай id».
+
+    Сверка идёт по `OP_REFERENCE_FIELDS`, а не по `OP_ELEMENT_FIELDS`: тот же
+    каскад приходит не только через дугу. Граничное событие ждёт хозяина
+    (`attached_to` — прогон на `GigaChat-2-Max`: «add_boundary_event: задача
+    new_A6 не найдена» при откатанном `add_task(id=new_A6)`), вставляемый узел —
+    якорь (`after`) и цель исхода (`to`), перенос — дорожку (`lane`). Отказ
+    называет и операцию, в которой правят причину: «почините создание» без
+    имени операции повтор снова тратит на латание дуги.
     """
     if not failed:
         return
+    # Кто должен был создать пропавший id: своя таблица для этого не нужна —
+    # строка отказа создания уже несёт и имя операции, и id.
+    creators = {str(entry["id"]): str(entry.get("op") or "")
+                for entry in skipped
+                if entry.get("id") and entry.get("op") in CREATES_ID_OPS}
+    # Хозяин откатанного граничного события: строка отказа несёт `attached_to`
+    # (он в `_OP_IDENTITY_KEYS`), поэтому операнд есть под рукой и выдумывать его
+    # не нужно.
+    boundary_hosts = {str(entry["id"]): str(entry.get("attached_to") or "").strip()
+                      for entry in skipped
+                      if entry.get("op") == "add_boundary_event" and entry.get("id")}
     for entry in skipped:
-        if entry.get("op") in CREATES_ID_OPS:
-            continue  # это сам отказ создания — его причину пишет создатель
+        # Отказ создания не объясняет сам себя: свою причину создатель пишет
+        # сам, и ссылка на собственный id в заметке читалась бы как «почини это
+        # же». Остальные операнды строки — чужие опоры, они и есть каскад.
+        own = (str(entry.get("id") or "").strip()
+               if entry.get("op") in CREATES_ID_OPS else "")
         stuck = sorted({str(value) for key, value in entry.items()
-                        if key in OP_ELEMENT_FIELDS and str(value) in failed})
+                        if key in OP_REFERENCE_FIELDS and str(value) in failed
+                        and str(value) != own})
         if not stuck:
             continue
+        # Поле, в котором сидит пропавшая опора, решает, что советовать: у
+        # дуги и у хозяина таймера разная законная форма. Прогон #70: модель
+        # ставила `add_task(after='new_BT1')` на граничное событие, которое этот
+        # же пакет не создал, и отказ звал «почините создание add_boundary_event»
+        # — тупик, потому что даже созданное граничное событие не может быть
+        # началом потока (оно висит на хозяине). 4 строки из 83 отказов прогона,
+        # и повтор приносил тот же отказ: `improve/repeat_rejection_share` 0.25
+        # на этом кейсе.
+        awaiting = {key: str(value) for key, value in entry.items()
+                    if key in OP_REFERENCE_FIELDS and str(value) in failed
+                    and str(value) != own}
+        flow_ends = {"after", "to"}
+        blocked_by_boundary = sorted({
+            value for key, value in awaiting.items()
+            if key in flow_ends and creators.get(value) == "add_boundary_event"})
         why = "; ".join(f"'{i}' — {failed[i]}" for i in stuck)
-        note = (f"опора не создана этим же пакетом: {why} — почините сначала "
-                f"создание, дуга применится после")
+        subject = _WAITING_SUBJECT.get(str(entry.get("op") or ""), "правка")
+        if blocked_by_boundary:
+            named = ", ".join(f"'{i}'" for i in blocked_by_boundary)
+            # Хозяин таймера — единственный operand, который здесь законен: он
+            # стоит в схеме (иначе сама строка создания отвергнута по другой
+            # причине), и он же узел, после которого вставляют шаг. Плейсхолдер
+            # `after='существующий узел'` корпусный ratchet запрещает — модель
+            # копирует текст дословно и ловит «элемент не найден».
+            hosts = [host for host in
+                     (boundary_hosts.get(i, "") for i in blocked_by_boundary)
+                     if host and host not in failed]
+            if hosts:
+                anchor = hosts[0]
+                note = (
+                    f"опора не создана и не может быть создана как опора: {why} — "
+                    f"{named} это граничное событие, потока из него не выходит, "
+                    f"поэтому в `after` и `to` его ставить нечем; заявите шаг "
+                    f"после узла, к которому таймер и так пристёгнут "
+                    f"(`after='{anchor}'`), а таймер потом пристегните к тому же "
+                    f"шагу (`attached_to='{anchor}'`), {subject} применится после")
+            else:
+                fix = ", ".join(f"{creators.get(i) or 'add_task'}(id='{i}')"
+                                for i in stuck)
+                note = (f"опора не создана этим же пакетом: {why} — "
+                        f"{named} это граничное событие, потока из него не "
+                        f"выходит, поэтому в `after` и `to` его ставить нечем; "
+                        f"почините сначала создание ({fix}), {subject} "
+                        "применится после")
+        else:
+            fix = ", ".join(f"{creators.get(i) or 'add_task'}(id='{i}')"
+                            for i in stuck)
+            note = (f"опора не создана этим же пакетом: {why} — почините сначала "
+                    f"создание ({fix}), {subject} применится после")
         previous = str(entry.get("hint") or "").strip()
         entry["hint"] = f"{note}. {previous}" if previous else note
 
@@ -3222,6 +3365,12 @@ class Rejection(NamedTuple):
     hint: str = REJECT_HINT
 
 
+def _rejection_reason(rejection: Any) -> str:
+    """Причина из `Rejection` или из голой строки: предикаты гаранта возвращают
+    и то, и другое, а молчаливый `None` читается как «пакет принят»."""
+    return str(getattr(rejection, "reason", rejection) or "").strip()
+
+
 def merge_notes(*groups: List[str]) -> List[str]:
     """Пометки починки по раундам с сохранением порядка и дедупликацией.
 
@@ -3272,41 +3421,539 @@ def revert_package(base_xml: str, report: Dict[str, Any], reason: str,
     return base_xml
 
 
-def apply_and_guarantee(xml_text: str,
-                        operations: List[Dict[str, Any]],
-                        reject: Optional[Callable[[str], Optional[str]]] = None,
+# ---------------------------------------------------------------------------
+# Пакетный страж маршрута: дыра, которой не было на базе
+# ---------------------------------------------------------------------------
+
+# Вид дыры — ключ отчёта, теста и подборки текстов ниже, а не строка отказа.
+HOLE_ISOLATED = "isolated"
+HOLE_NO_INCOMING = "no_incoming"
+HOLE_NO_OUTGOING = "no_outgoing"
+HOLE_POOL_WITHOUT_EXCHANGE = "pool_without_exchange"
+
+# Входящий sequence-поток не нужен старту (его запускает процесс) и граничному
+# событию (его запускает хозяин через attachedToRef); исходящий не нужен
+# конечному событию. Списки взяты у `connect` напрямую: два слоя обязаны
+# расходиться в прочтении схемы, а не в перечне тегов.
+HOLE_INCOMING_EXEMPT = SEQUENCE_FORBIDDEN_TARGETS
+HOLE_OUTGOING_EXEMPT = SEQUENCE_FORBIDDEN_SOURCES
+
+# Сколько разрывов страж успевает снять с пакета. Каждый снятый разрыв —
+# повторный прогон аплайера с починкой, а пакет из `MAX_OPERATIONS` правок
+# приносит и десять дыр; за потолком отказ всему пакету дешевле перебора, и
+# он же отличает «одна лишняя дуга» от «пакет перешивает маршрут целиком».
+MAX_HOLE_ROLLBACKS = 3
+
+# Короткое имя дыры для текста отказа всему пакету: там нет места разбирать
+# ноги по видам, а называть узел без пояснения — диагноз без лечения.
+HOLE_TEXT = {
+    HOLE_ISOLATED: "без единого потока",
+    HOLE_NO_INCOMING: "без входящего sequence-потока",
+    HOLE_NO_OUTGOING: "без исходящего sequence-потока",
+    HOLE_POOL_WITHOUT_EXCHANGE: "без единого потока-сообщения",
+}
+
+
+class _FlowRef(NamedTuple):
+    """Дуга снимка: концы, её тип и пулы концов — по последним отказ называется
+    у пуловых дыр и у межпуловых разрывов, где законная форма другая."""
+
+    source: str
+    target: str
+    tag: str
+    source_pool: Optional[str]
+    target_pool: Optional[str]
+
+
+class _RouteSnapshot(NamedTuple):
+    """Считается один раз на схему и сравнивается с базой.
+
+    `holes` — {(вид, id): подпись}, `ids` — узлы и процессы, которые в схеме
+    есть (по ним отсекаются дыры у узлов, созданных этим же пакетом), `flows` —
+    дуги по id (по ним находится разрыв, оставивший дыру).
+    """
+
+    holes: Dict[Tuple[str, str], str]
+    ids: Set[str]
+    flows: Dict[str, _FlowRef]
+
+
+def _pool_of_ref(index: _Index, ref: str) -> Optional[str]:
+    """Процесс, которому принадлежит конец потока: узел, пул или процесс целиком."""
+    if not ref:
+        return None
+    process = index.process_of.get(ref)
+    if process is not None:
+        return process.get("id") or None
+    for candidate in index.processes:
+        if candidate.get("id") == ref:
+            return ref
+    for participant in index.participants:
+        if participant.get("id") == ref:
+            return participant.get("processRef") or None
+    return None
+
+
+def _sequence_legs(index: _Index) -> Tuple[Set[str], Set[str]]:
+    """Узлы с входящим и с исходящим sequence-потоком.
+
+    Дуга с концом, которого в схеме нет, в пары не идёт: её так же не считает
+    скоринг (`_Schema`), и пакет, снявший битую дугу, не должен выглядеть
+    создателем тупика там, где тупик был и до правки.
+    """
+    incoming: Set[str] = set()
+    outgoing: Set[str] = set()
+    for flow in index.sequence_flows:
+        src, dst = flow.get("sourceRef") or "", flow.get("targetRef") or ""
+        if src in index.elements and dst in index.elements:
+            outgoing.add(src)
+            incoming.add(dst)
+    return incoming, outgoing
+
+
+def _flow_signature(index: _Index, flow: ET.Element) -> _FlowRef:
+    src = flow.get("sourceRef") or ""
+    dst = flow.get("targetRef") or ""
+    return _FlowRef(src, dst, _local(flow.tag), _pool_of_ref(index, src),
+                    _pool_of_ref(index, dst))
+
+
+def _node_signature(elem: ET.Element) -> str:
+    name = str(elem.get("name") or "").strip()
+    ident = elem.get("id") or ""
+    return f"узел «{name}» ({ident})" if name else f"узел ({ident})"
+
+
+def _message_legs(index: _Index) -> Tuple[Set[str], Set[str]]:
+    """Узлы, которых касается поток-сообщение: связанный обмен узел не одинок.
+
+    Концом `messageFlow` по BPMN бывает и участник целиком, поэтому множество
+    известных концов шире, чем у sequence-дуги.
+    """
+    incoming: Set[str] = set()
+    outgoing: Set[str] = set()
+    known = set(index.elements) | {p.get("id") or "" for p in index.participants}
+    for flow in index.message_flows:
+        src, dst = flow.get("sourceRef") or "", flow.get("targetRef") or ""
+        if src in known and dst in known:
+            outgoing.add(src)
+            incoming.add(dst)
+    return incoming, outgoing
+
+
+def _pool_holes(index: _Index) -> Dict[Tuple[str, str], str]:
+    """Процессы-пулы, у которых не осталось ни одного обмена.
+
+    Пул без обмена — не «узел вне маршрута»: его нога живёт в другом пуле, и
+    дыра здесь в участии, а не в связности (`participant_interacts`). Считается
+    по процессу, а не по участнику: два участника одного процесса — один пул.
+    """
+    exchanging: Set[str] = set()
+    known = set(index.elements) | {p.get("id") or "" for p in index.participants}
+    for flow in index.message_flows:
+        for ref in (flow.get("sourceRef") or "", flow.get("targetRef") or ""):
+            # Битый конец считает `message_flow_ends`, а не это правило: дуга в
+            # никуда обмена пулу не добавляет.
+            if ref in known:
+                pool = _pool_of_ref(index, ref)
+                if pool:
+                    exchanging.add(pool)
+    holes: Dict[Tuple[str, str], str] = {}
+    for process in index.processes:
+        pid = process.get("id") or ""
+        if not pid or pid in exchanging:
+            continue
+        if (index.participant_by_process_id.get(pid) is None
+                and not str(process.get("name") or "").strip()):
+            continue  # безымянный процесс без участника — не пул, а черновик
+        holes[(HOLE_POOL_WITHOUT_EXCHANGE, pid)] = (
+            f"пул «{index.participant_name(process)}»")
+    return holes
+
+
+def _route_snapshot(xml_text: str) -> _RouteSnapshot:
+    """Дыры схемы, её узлы и процессы, и все её дуги — одним проходом."""
+    root = parse_xml(xml_text)
+    index = _Index(root)
+    seq_in, seq_out = _sequence_legs(index)
+    msg_in, msg_out = _message_legs(index)
+    holes: Dict[Tuple[str, str], str] = {}
+    for node_id, elem in index.elements.items():
+        tag = _local(elem.tag)
+        connected = (node_id in seq_in or node_id in seq_out
+                     or node_id in msg_in or node_id in msg_out
+                     or bool(elem.get("attachedToRef")))
+        if not connected:
+            holes[(HOLE_ISOLATED, node_id)] = _node_signature(elem)
+        if tag not in HOLE_OUTGOING_EXEMPT and node_id not in seq_out:
+            holes[(HOLE_NO_OUTGOING, node_id)] = _node_signature(elem)
+        if tag not in HOLE_INCOMING_EXEMPT and node_id not in seq_in:
+            holes[(HOLE_NO_INCOMING, node_id)] = _node_signature(elem)
+    holes.update(_pool_holes(index))
+    flows = {flow.get("id"): _flow_signature(index, flow)
+             for flow in index.sequence_flows + index.message_flows
+             if flow.get("id")}
+    ids = set(index.elements) | {p.get("id") or "" for p in index.processes}
+    return _RouteSnapshot(holes, ids, flows)
+
+
+def new_route_holes(base_xml: str, candidate_xml: str) -> List[Dict[str, Any]]:
+    """Дыры маршрута, которых не было на базе.
+
+    Уровень — ПАКЕТ, а не операция. Отказ в самом `_op_disconnect` ломает шесть
+    запертых контрактов: `disconnect` остаётся законной самостоятельной правкой
+    (его советуют `handoff_pingpong`, `sequence_flows`, `flow_ends_legal`,
+    `message_flow_ends`, `cross_pool_flow`, и перепись `eval.advice` собирает из
+    текста совета пакет и требует «применено == названо»). Дыра при этом
+    свойство пакета: `[disconnect(F), connect(S, T)]` — перешивка, а
+    `[disconnect(F)]` — тупик, и различает их только состояние схемы после
+    всех правок.
+
+    Частичный откат (снимаются только разрывы, оставившие дыру) дороже целого
+    пакета — он перезапускает аплайер с починкой на каждый снятый разрыв, — но
+    он не выбрасывает хорошие правки и не обнуляет `improve/defects_repaired`
+    из-за одной лишней дуги.
+
+    Запись: {"kind", "id", "label", "cut": [(flow_id, _FlowRef)]}, где `cut` —
+    дуги, которые пакет снял и которые держали этот узел: по ним отказ называет
+    операнда, а не «найдите дугу словами». Узлы и пулы, которых на базе не было,
+    не считаются: их одностороннюю связь снимает `prune`, а требовать маршрут от
+    пакета для узла, созданного им же, — тот же неисполнимый отказ, что уже
+    запрещён для текстов подсказок скоринга.
+    """
+    try:
+        base = _route_snapshot(base_xml)
+        cand = _route_snapshot(candidate_xml)
+    except Exception:  # noqa: BLE001 — страж не имеет права ронять улучшение
+        logger.exception("Схема не читается для проверки маршрута")
+        return []
+    fresh: List[Dict[str, Any]] = []
+    for (kind, ident), label in sorted(cand.holes.items()):
+        if ident not in base.ids or (kind, ident) in base.holes:
+            continue
+        cut = [(fid, ref) for fid, ref in sorted(base.flows.items())
+               if fid not in cand.flows
+               and (ident in (ref.source, ref.target)
+                    or ident in (ref.source_pool, ref.target_pool))]
+        fresh.append({"kind": kind, "id": ident, "label": label, "cut": cut})
+    return fresh
+
+
+def _same_level(index: _Index, a: str, b: str) -> bool:
+    """Узлы на одном уровне вложенности: поток не пересекает границу subProcess,
+    и кандидат из-под подпроцесса был бы советом, который `connect` отвергнет."""
+    if a not in index.elements or b not in index.elements:
+        return False
+    return (index.has_subprocess_ancestor(index.elements[a])
+            is index.has_subprocess_ancestor(index.elements[b]))
+
+
+def _reach(index: _Index, elem_id: str, direction: str) -> Set[str]:
+    """Узлы, достижимые по sequence-дугам: нога обратно в них — цикл.
+
+    Подсказка, ведущая шаг в его же предка, формально закрывает дыру, но
+    заряжает `loops_have_a_guard` и `no_blind_rework` — то есть отказ,
+    лечением которого сам и является дефектом.
+    """
+    seen: Set[str] = set()
+    stack = [elem_id]
+    while stack:
+        current = stack.pop()
+        if direction == "down":
+            nxt = [f.get("targetRef") for f in index.sequence_flows
+                   if f.get("sourceRef") == current]
+        else:
+            nxt = [f.get("sourceRef") for f in index.sequence_flows
+                   if f.get("targetRef") == current]
+        for nid in nxt:
+            if nid and nid not in seen:
+                seen.add(nid)
+                stack.append(nid)
+    return seen
+
+
+def _connect_candidates(index: _Index, elem_id: str, role: str,
+                        exclude: Tuple[str, ...] = ()) -> List[str]:
+    """Узлы того же пула, которыми законно закрывается недостающая нога.
+
+    `role="source"` — кто ведёт в элемент (у конечного события исхода не бывает),
+    `role="target"` — куда элемент ведёт (в старт и в граничное событие поток
+    не входит). Те же два списка, по которым отказывает `connect`: подсказка не
+    вправе звать к дуге, которую аплайер тут же отвергнет.
+    """
+    elem = index.elements.get(elem_id)
+    if elem is None:
+        return []
+    process = index.process_of.get(elem_id)
+    blocked = _reach(index, elem_id, "down" if role == "source" else "up")
+    out: List[str] = []
+    for nid, other in index.elements.items():
+        if (nid == elem_id or nid in exclude or nid in blocked
+                or index.process_of.get(nid) is not process):
+            continue
+        tag = _local(other.tag)
+        if role == "source" and tag in SEQUENCE_FORBIDDEN_SOURCES:
+            continue
+        if role == "target" and tag in SEQUENCE_FORBIDDEN_TARGETS:
+            continue
+        if not _same_level(index, elem_id, nid):
+            continue
+        out.append(nid)
+    # Шаг пула — самый частый операнд продолжения, конечное событие идёт сразу
+    # за ним («довести маршрут до финиша»), развилка — последней.
+    def rank(nid: str) -> int:
+        node_tag = _local(index.elements[nid].tag)
+        if node_tag in TASK_TAGS:
+            return 0
+        return 1 if node_tag == "endEvent" else 2
+
+    out.sort(key=rank)
+    return out[:3]
+
+
+def _pool_processes(index: _Index) -> Dict[str, ET.Element]:
+    return {p.get("id") or "": p for p in index.processes}
+
+
+def _pool_node_ids(index: _Index, process_id: str) -> List[str]:
+    """Узлы, лежащие в процессе (пуле), в порядке дерева."""
+    return [nid for nid, process in index.process_of.items()
+            if (process.get("id") or "") == process_id]
+
+
+def _leg_operand(index: _Index, elem_id: str, role: str,
+                 exclude: Tuple[str, ...], placeholder: str) -> str:
+    """Операнд пары: любой законный узел пула, а если их нет — честная вилка.
+
+    Снятый конец (`peer`) пробуется последним: возвращать его — значит советовать
+    соединить ровно то, что модель только что разорвала, и это ответ «не рви эту
+    дугу», а не перешивка.
+    """
+    ordered = _connect_candidates(index, elem_id, role, exclude=exclude)
+    if not ordered:
+        ordered = _connect_candidates(index, elem_id, role,
+                                      exclude=tuple(n for n in exclude if n != ""))
+    return ordered[0] if ordered else placeholder
+
+
+def _hole_pairs(index: _Index, ident: str, kinds: Set[str],
+                cut: Optional[_FlowRef]) -> List[str]:
+    """Законная форма правки: вызовы `connect` с операндами этой же схемы.
+
+    «Разорви и соедините что-нибудь» повтор приносит ровно тот же пакет — тем
+    же правилом, что держит отказы `merge_participants` (называет оба пула и id
+    спорной дорожки) и совет `move_to_lane` (12 пропусков в живых прогонах
+    25–26 сентября). Поэтому операнд называется дословно, а когда назвать его
+    нечем — честно сказано, чьё это решение.
+
+    Направление, которого нотация не допускает, в подсказке не появляется:
+    `connect` в стартовое событие не входит, из конечного не выходит, и совет
+    «верни вход старту» аплайер отверг бы на следующем шаге того же пакета.
+
+    Снятый конец (`peer`) исключается из операндов: предложить его — значит
+    позвать `connect` на ровно ту дугу, которую пакет снял, и получить
+    «такой поток уже существует» вместо правки. Работает это только когда `cut`
+    известен, то есть когда вызывающий нашёл концы разрыва (`_hole_guard_refusal`
+    ищет их по всем группам дыр, а не по первой).
+    """
+    elem = index.elements.get(ident)
+    tag = _local(elem.tag) if elem is not None else ""
+    peer = "" if cut is None else (cut.source if cut.target == ident else cut.target)
+    process = index.process_of.get(ident)
+    pool_name = index.participant_name(process) if process is not None else ""
+    needs_in = ((HOLE_NO_INCOMING in kinds or HOLE_ISOLATED in kinds)
+                and tag not in SEQUENCE_FORBIDDEN_TARGETS)
+    needs_out = ((HOLE_NO_OUTGOING in kinds or HOLE_ISOLATED in kinds)
+                 and tag not in SEQUENCE_FORBIDDEN_SOURCES)
+    pairs: List[str] = []
+    source_operand = ""
+    if needs_in:
+        source_operand = _leg_operand(index, ident, "source", (peer,),
+                                      f"<шаг пула «{pool_name}»>")
+        pairs.append(f"connect(source='{source_operand}', target='{ident}')")
+    if needs_out:
+        # Приёмник второй ноги не берётся тем же узлом, что и предшественник
+        # первой: «S_audit → S_check → S_audit» закрыло бы дыру циклом без
+        # выхода, то есть тем дефектом, за который аплайер откатывает пакет.
+        operand = _leg_operand(index, ident, "target",
+                               tuple(n for n in (peer, source_operand) if n),
+                               "<следующий шаг его пула>")
+        pairs.append(f"connect(source='{ident}', target='{operand}')")
+    return pairs
+
+
+def _hole_phrase(kinds: Set[str]) -> str:
+    """Три вида дыры одного узла сворачиваются в одну фразу: перечислять
+    «без единого потока; без входящего; без исходящего» — шум вместо диагноза."""
+    if HOLE_POOL_WITHOUT_EXCHANGE in kinds:
+        return HOLE_TEXT[HOLE_POOL_WITHOUT_EXCHANGE]
+    if HOLE_ISOLATED in kinds:
+        return "без единого потока"
+    if {HOLE_NO_INCOMING, HOLE_NO_OUTGOING} <= kinds:
+        return "без входа и без выхода"
+    if not kinds:
+        return ""
+    return HOLE_TEXT[next(iter(kinds))]
+
+
+def _group_holes(entries: List[Dict[str, Any]]
+                 ) -> List[Tuple[str, str, Set[str]]]:
+    """(id, подпись, виды дыр) по одному узлу или пулу, в порядке упоминания.
+
+    Три вида дыры одного узла — это один дефект, а не три: без сведения к
+    записи отказа печатают «без единого потока; без входящего; без исходящего»
+    и три пары connect на тот же узел.
+    """
+    grouped: Dict[str, List[Any]] = {}
+    for entry in entries:
+        slot = grouped.setdefault(entry["id"], [entry["label"], set()])
+        slot[1].add(entry["kind"])
+    return [(ident, slot[0], slot[1]) for ident, slot in grouped.items()]
+
+
+def _holes_reason(entries: List[Dict[str, Any]], cut_id: str) -> str:
+    """Причина отказа: какие узлы остались без ноги из-за этого разрыва."""
+    groups = _group_holes(entries)
+    listed = "; ".join(f"{label} {_hole_phrase(kinds)}"
+                       for _ident, label, kinds in groups[:2])
+    more = f"; и ещё {len(groups) - 2} — той же дырой" if len(groups) > 2 else ""
+    kinds = {kind for _ident, _label, kk in groups for kind in kk}
+    rule = ("`participant_interacts` ведёт список участвующих, и молчавший пул "
+            "из него выпадает" if kinds == {HOLE_POOL_WITHOUT_EXCHANGE}
+            else "`sequence_flows` и `no_isolated` заряжают такой тупик "
+            "нарушением")
+    return (f"разрыв '{cut_id}' оставил бы в маршруте дыру: {listed}{more} — "
+            f"на базе потоки были, а {rule}")
+
+
+def _holes_hint(index: _Index, entries: List[Dict[str, Any]],
+                cut: Optional[_FlowRef], cut_id: str) -> str:
+    """Отказ называет пару и её операндов: «разрывай дугу 'F' в паре с
+    connect(source='…', target='…')» с id этой же схемы."""
+    pairs: List[str] = []
+    deletions: List[str] = []
+    pool_parts: List[str] = []
+    for ident, label, kinds in _group_holes(entries):
+        if kinds == {HOLE_POOL_WITHOUT_EXCHANGE}:
+            # Подпись обязана принадлежать этому же узлу: `entries[0]` дал бы
+            # метку чужого узла, когда пустой пул не первый, и совет звал бы
+            # «верните обмен» про узел, к которому пул не относится.
+            pool_parts.append(_pool_exchange_hint(index, label, ident))
+            continue
+        pairs.extend(_hole_pairs(index, ident, kinds, cut))
+        if HOLE_ISOLATED in kinds:
+            deletions.append(ident)
+    pairs = list(dict.fromkeys(pairs))
+    if not pairs:
+        if pool_parts:
+            return pool_parts[0]
+        # Узлу нельзя вернуть ногу потоком по нотации: остаётся удалить его
+        # самого — `_delete_rewire_plan` у узла без ног дыры не видит.
+        return (f"в '{ident}' поток по нотации не входит и не выходит: "
+                f"delete(id='{ident}') снимет узел вместе с его дугой либо "
+                f"оставьте дугу '{cut_id}' на месте")
+    text = (f"разрывай дугу '{cut_id}' в паре с {' и '.join(pairs)} — операнды "
+            "взяты из пула по структуре, какой сосед нужен по смыслу, решает "
+            "модель")
+    if deletions:
+        text += ("; осиротевший узел снимается целиком: delete(id='"
+                 + deletions[0] + "')")
+    if pool_parts:
+        text += "; " + pool_parts[0]
+    return text
+
+
+def _hole_guard_refusal(entries: List[Dict[str, Any]], cut_id: str,
+                        index: _Index) -> Dict[str, Any]:
+    """Отказ по снятому разрыву — строка `skipped` с идентичностью операции.
+
+    Идентичность (`op` + `flow`) нужна сверке «повтор добил ту же правку»: без
+    неё корректирующий раунд, вернувший `disconnect` в паре с `connect`, остался
+    бы в отчёте невыполненной работой.
+    """
+    # Концы снятой дуги ищутся по ВСЕМ записям дыр, а не по первой: `entries`
+    # сгруппированы по узлам, и у первой группы может быть свой разрыв, тогда как
+    # отказывается этот `cut_id`. Прежний `dict(entries[0]["cut"]).get(cut_id)`
+    # в таком случае давал None, подсказка теряла снятый конец и звала
+    # `connect` ровно на ту пару, которую пакет только что разорвал (живой прогон
+    # #68, `support_ticket`: «разрывай дугу F9 в паре с connect(source='T1',
+    # target='A1')», где T1→A1 и есть F9). Аплайер отвечал «такой поток уже
+    # существует», корректирующий повтор приносил тот же пакет, а отказ
+    # складывался в противоречие «разрыв оставил бы дыру» плюс «уже сняты
+    # разрывы: F9».
+    cut = next((ref for entry in entries
+                for fid, ref in entry["cut"] if fid == cut_id), None)
+    return {"op": "disconnect", "flow": cut_id, "stage": "guard",
+            "reapplied": False, "reason": _holes_reason(entries, cut_id),
+            "hint": _holes_hint(index, entries, cut, cut_id)}
+
+
+def _pool_message_operand(index: _Index, process_id: str, role: str) -> str:
+    """Шаг пула, годящийся в концы обмена: работа предпочтительнее события.
+
+    Событие-кандидат (старт чужого пула, бросющее событие своего) аплайер
+    примет, но подсказка про шаг читается моделью как про маршрут, а про кружок
+    — как про деталь нотации.
+    """
+    allowed = MESSAGE_SOURCE_TAGS if role == "source" else MESSAGE_TARGET_TAGS
+    nodes = _pool_node_ids(index, process_id)
+    ranked = sorted(nodes, key=lambda nid: 0 if _local(index.elements[nid].tag)
+                    in TASK_TAGS else 1)
+    for nid in ranked:
+        if _local(index.elements[nid].tag) in allowed:
+            return nid
+    return ""
+
+
+def _pool_exchange_hint(index: _Index, label: str,
+                        process_id: str) -> str:
+    """Обмен пула: операнды — шаг этого пула и принимающий шаг чужого."""
+    processes = _pool_processes(index)
+    own = _pool_message_operand(index, process_id, "source")
+    other = ""
+    for pid in processes:
+        if pid == process_id:
+            continue
+        other = _pool_message_operand(index, pid, "target")
+        if other:
+            break
+    process = processes.get(process_id)
+    name = index.participant_name(process) if process is not None else ""
+    own_operand = own or f"<шаг пула «{name}»>"
+    other_operand = other or "<шаг чужого пула>"
+    back = (f"; в {label} нет ни одного узла — снимайте его вместе "
+            f"с потоками: remove_participant(participant='{name}')") \
+        if not _pool_node_ids(index, process_id) else ""
+    return (f"верните {label} обмен в этом же пакете: connect("
+            f"source='{own_operand}', target='{other_operand}', "
+            f"flow_type='message'){back} — какой шаг пула говорит с кем, решает "
+            "автор процесса")
+
+
+def _hole_guard_rejection(entries: List[Dict[str, Any]],
+                          dropped: List[str]) -> Rejection:
+    """Дыры остались, а разрывов, которые за них отвечают, в пакете нет."""
+    groups = _group_holes(entries)
+    listed = "; ".join(f"{label} {_hole_phrase(kinds)}"
+                       for _ident, label, kinds in groups[:3])
+    tail = f" Уже сняты разрывы: {', '.join(dropped)}." if dropped else ""
+    return Rejection(
+        f"пакет оставил бы дыру в маршруте: {listed} — изменение откачено",
+        "правку, после которой у узла не осталось входа или выхода, закрывайте "
+        "connect в том же пакете, а сам узел снимайте delete" + tail)
+
+
+def _apply_repair_prune(xml_text: str, operations: List[Dict[str, Any]],
                         prune: Optional[Callable[
                             [str, Dict[str, str]],
-                            Tuple[str, List[Dict[str, Any]]]]] = None
-                        ) -> Tuple[str, Dict[str, Any]]:
-    """Пакет операций + починка до состояния покоя + гарант «не хуже исходной».
+                            Tuple[str, List[Dict[str, Any]]]]]
+                        ) -> Dict[str, Any]:
+    """Один прогон «пакет → починка до покоя → снятие осиротевших новых узлов».
 
-    `reject(candidate_xml) -> str | None` — причина откатить ВЕСЬ пакет.
-    Вызывается на уже отпочиненной схеме, поэтому предикат видит дерево в том
-    виде, в каком оно ушло бы пользователю.
-
-    Отчёт = отчёт `apply_operations` плюс "notes" (пометки всех прогонов
-    починки), "reverted" ("" | причина отката), "noop_rows" (сколько
-    «применённых» строк ничего не изменили), "repair_rounds".
-
-    При откате каждая applied-строка переезжает в skipped с причиной отката, а
-    `applied` очищается: отчёт не вправе утверждать, что правка в схеме, когда
-    схема вернулась к базе. Тот же порядок, что с откатом слияния пулов в
-    `apply_operations` и с `_drop_stranded` оркестратора; раньше он писался
-    руками дважды в `llm_improve.py` и один раз короче — в харнессе, и откат
-    по циклу без выхода возвращал базу с полным `applied`. Корректирующий
-    повтор после этого запрещал модели пересоздавать элемент, которого в
-    показанном ей инвентаре уже не было.
-
-    Частичный откат узлов вне маршрута задаёт `prune`: `prune(candidate_xml,
-    created) -> (candidate_xml, [dropped])`, где `created` — «id → операция» для
-    узлов, которые этот пакет добавил, а `dropped` — строки
-    `{"id", "op", "gap", "hint"}`. Он звонится ДО `reject`, потому что снятый
-    односторонний шаг перестаёт быть ухудшением, и иначе гарант отвергал бы
-    пакет из-за узла, который сам же и уберёт. Отчёт по снятию ведётся здесь, а
-    не у вызывающего кода: `applied` теряет строки, ссылающиеся на снятый узел,
-    в `skipped` уходит отказ со стадией «починка», а пометка починки про уже
-    удалённый элемент не остаётся.
+    Вынесен из `apply_and_guarantee` потому, что страж маршрута перезапускает
+    его со снятым разрывом: частичный откат обязан давать тот же отчёт, что и
+    полный прогон (строки `applied`/`skipped` по фактическому XML), а не латать
+    уже применённую правку на живом дереве.
     """
     xml_after, report = apply_operations(xml_text, operations)
     rows = report["applied"]
@@ -3352,9 +3999,127 @@ def apply_and_guarantee(xml_text: str,
             # Замечание починки про уже удалённый узел: чинить там нечего,
             # правка откатана, и показывать её нельзя.
             notes = [n for n in notes if gone not in n]
+    return {"xml": xml_after, "report": report, "notes": notes, "rounds": rounds,
+            "noop_rows": noop_rows}
+
+
+def _cut_disconnect(ops: List[Any], holes: List[Dict[str, Any]],
+                    dropped: List[str]) -> Tuple[List[int], str, List[Dict[str, Any]]]:
+    """Разрыв, который отвечает за дыру: (позиции его строк в пакете, id дуги, дыры).
+
+    Виновником считается тот `disconnect`, чей поток входил в список снятых дуг
+    этой дыры; из нескольких выбирается тот, который объясняет больше дыр за
+    один шаг — прогон аплайера с починкой на каждое снятие недешёв. Возвращаются
+    ВСЕ строки этого разрыва: модель повторяет одну и ту же правку в пакете, а
+    снятая только первая из них оставляет вторую рвать ту же дугу при том, что
+    `dropped` уже держит этот id — следующему снятию нечего противопоставить, и
+    `_hole_guard_rejection` разворачивает пакет целиком. Разрыв, который пакет не
+    проводил сам (дугу вырезала починка, её унёс `delete` узла или перенос между
+    пулами), частичным откатом не снять — и вызывающий код отказывает пакету
+    целиком.
+    """
+    wanted = {fid for entry in holes for fid, _ref in entry["cut"]}
+    cuts: Dict[str, Dict[str, Any]] = {}
+    for position, op in enumerate(ops):
+        if not isinstance(op, dict) or str(op.get("flow") or "") not in wanted:
+            continue
+        if _canonical_op_name(op) != "disconnect":
+            continue
+        flow = str(op["flow"])
+        if flow in dropped:
+            continue
+        entries = [e for e in holes if flow in dict(e["cut"])]
+        if not entries:
+            continue
+        cut = cuts.setdefault(flow, {"positions": [], "entries": entries})
+        cut["positions"].append(position)
+    if not cuts:
+        return [], "", []
+    flow = max(cuts, key=lambda f: len(cuts[f]["entries"]))
+    return cuts[flow]["positions"], flow, cuts[flow]["entries"]
+
+
+def _canonical_op_name(op: Dict[str, Any]) -> str:
+    """Имя операции так, как его увидит `_HANDLERS`: с учётом синонимов."""
+    name = str(op.get("op") or "")
+    return name if name in _HANDLERS else OP_ALIASES.get(name, name)
+
+
+def apply_and_guarantee(xml_text: str,
+                        operations: List[Dict[str, Any]],
+                        reject: Optional[Callable[[str], Optional[str]]] = None,
+                        prune: Optional[Callable[
+                            [str, Dict[str, str]],
+                            Tuple[str, List[Dict[str, Any]]]]] = None
+                        ) -> Tuple[str, Dict[str, Any]]:
+    """Пакет операций + починка до состояния покоя + гарант «не хуже исходной».
+
+    `reject(candidate_xml) -> str | None` — причина откатить ВЕСЬ пакет.
+    Вызывается на уже отпочиненной схеме, поэтому предикат видит дерево в том
+    виде, в каком оно ушло бы пользователю.
+
+    Отчёт = отчёт `apply_operations` плюс "notes" (пометки всех прогонов
+    починки), "reverted" ("" | причина отката), "noop_rows" (сколько
+    «применённых» строк ничего не изменили), "repair_rounds".
+
+    При откате каждая applied-строка переезжает в skipped с причиной отката, а
+    `applied` очищается: отчёт не вправе утверждать, что правка в схеме, когда
+    схема вернулась к базе. Тот же порядок, что с откатом слияния пулов в
+    `apply_operations` и с `_drop_stranded` оркестратора; раньше он писался
+    руками дважды в `llm_improve.py` и один раз короче — в харнессе, и откат
+    по циклу без выхода возвращал базу с полным `applied`. Корректирующий
+    повтор после этого запрещал модели пересоздавать элемент, которого в
+    показанном ей инвентаре уже не было.
+
+    Частичный откат узлов вне маршрута задаёт `prune`: `prune(candidate_xml,
+    created) -> (candidate_xml, [dropped])`, где `created` — «id → операция» для
+    узлов, которые этот пакет добавил, а `dropped` — строки
+    `{"id", "op", "gap", "hint"}`. Он звонится ДО `reject`, потому что снятый
+    односторонний шаг перестаёт быть ухудшением, и иначе гарант отвергал бы
+    пакет из-за узла, который сам же и уберёт. Отчёт по снятию ведётся здесь, а
+    не у вызывающего кода: `applied` теряет строки, ссылающиеся на снятый узел,
+    в `skipped` уходит отказ со стадией «починка», а пометка починки про уже
+    удалённый элемент не остаётся.
+
+    Третий слой гарантии — страж дыр маршрута (`new_route_holes`): пакет, после
+    которого у узла, бывшего на базе, не осталось входа или выхода, а у пула —
+    ни одного обмена, не принимается. Живой прогон #67 дал
+    `improve/rules_regressed_share` 0.200, и четыре регрессии из пяти принёс
+    одинокий `disconnect`: он рвёт дугу без единой проверки, а симметричный по
+    последствиям `delete` такую дыру отвергает сам.
+    """
+    ops = list(operations or [])
+    state = _apply_repair_prune(xml_text, ops, prune)
+    holes = new_route_holes(xml_text, state["xml"])
+    refusals: List[Dict[str, Any]] = []
+    dropped: List[str] = []
+    while holes and len(dropped) < MAX_HOLE_ROLLBACKS:
+        positions, flow, entries = _cut_disconnect(ops, holes, dropped)
+        if not positions:
+            # Дыру сделал не разрыв: снимать в частичном откате нечего.
+            break
+        # Подсказка строится по схеме ДО отката: операнды берутся из того же
+        # дерева, которое видел инвентарь модели, а не из уже залатанного.
+        index = _Index(parse_xml(state["xml"]))
+        refusals.append(_hole_guard_refusal(entries, flow, index))
+        for position in reversed(positions):
+            del ops[position]
+        dropped.append(flow)
+        state = _apply_repair_prune(xml_text, ops, prune)
+        holes = new_route_holes(xml_text, state["xml"])
+    xml_after, report, notes = state["xml"], state["report"], state["notes"]
+    report["skipped"].extend(refusals)
     rejection = reject(xml_after) if reject is not None else None
+    if holes and dropped and not _rejection_reason(rejection):
+        # Дыра осталась после того, как страж уже снял разрыв: пакет обещал
+        # перешивку и не донёс её, и принимать его нельзя. Ни одного снятого
+        # разрыва — значит дыра не от `disconnect` (её сделала починка чужой
+        # дугой или перенос между пулами): тогда работает прежний контракт
+        # «регресс по правилам уходит в корректирующий повтор, а не в отказ»,
+        # и отказ вернул бы базу с той же дырой.
+        rejection = _hole_guard_rejection(holes, dropped)
     hint = getattr(rejection, "hint", "") or REJECT_HINT
-    reverted = str(getattr(rejection, "reason", rejection) or "").strip()
+    reverted = _rejection_reason(rejection)
     if reverted:
         xml_after = revert_package(xml_text, report, reverted, hint)
     open_skips = [s for s in report["skipped"] if not s.get("reapplied")]
@@ -3362,8 +4127,8 @@ def apply_and_guarantee(xml_text: str,
                         ("success" if not open_skips else "partial"))
     report["notes"] = notes
     report["reverted"] = reverted
-    report["noop_rows"] = noop_rows
-    report["repair_rounds"] = rounds
+    report["noop_rows"] = state["noop_rows"]
+    report["repair_rounds"] = state["rounds"]
     return xml_after, report
 
 

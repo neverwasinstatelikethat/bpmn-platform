@@ -406,6 +406,15 @@ class TestContract:
         assert set(result["details"]) == set(scorer.rules)
         assert set(result["details_meta"]) == set(scorer.rules)
         assert "BPMN" in result["recommendations"][0]
+        # Ошибка разбора — не нарушение. Держать все правила «упавшими»
+        # значило бы отчитаться, что схема нарушила 26 правил, хотя ни одно не
+        # исполнялось: ни экран, ни дельта, ни улучшающий пакет не могли бы
+        # отличить «плохо» от «не проверяли».
+        assert result["parse_error"] is True
+        statuses = {meta["status"] for meta in result["details_meta"].values()}
+        assert statuses == {NOT_APPLICABLE}, statuses
+        assert not [r for r in result["recommendations_by_rule"]], \
+            "правил не исполнялось — подсказывать не по чему"
 
     def test_direction_and_no_loops_rules_removed(self):
         assert "direction" not in scorer.rules
@@ -989,8 +998,8 @@ class TestRolePools:
 
     @staticmethod
     def _doc(pool_name="Кладовщик", lane_owner="Proc_1"):
-        lanes = (f'<laneSet id="LS"><lane id="L1" name="Кладовщик">'
-                 f'<flowNodeRef>A2</flowNodeRef></lane></laneSet>')
+        lanes = ('<laneSet id="LS"><lane id="L1" name="Кладовщик">'
+                 '<flowNodeRef>A2</flowNodeRef></lane></laneSet>')
         head = ('<startEvent id="S1" name="Старт"/>' + _flow("f1", "S1", "A1")
                 + '<userTask id="A1" name="Собрать заявку"/>'
                 + _flow("f2", "A1", "E1") + '<endEvent id="E1" name="Финиш"/>')
@@ -1287,6 +1296,43 @@ class TestApprovalChain:
             + '<task id="U4" name="Виза 4"/>' + _flow("f4", "U4", "E")
             + '<endEvent id="E" name="Готово"/>')
         assert status(scorer.evaluate(xml), "approval_chain") == FAILED
+
+    def test_laneless_recipe_is_executable_by_the_applier(self):
+        """Рецепт без дорожек называет операнды, которые аплайер принимает по этому
+        же документу.
+
+        Модель копирует текст совета дословно, поэтому отказ «элемент с id … уже
+        занят» или «не назван пул» — брак текста правила, а не ответ модели, и
+        `improve/op_acceptance` записывает его не на того виновника. Пакет
+        собирается ИСКЛЮЧИТЕЛЬНО из вызовов подсказки (`eval.advice.parse_recipes`)
+        и проводится гарантом: `participant=` обязан называть пул по имени, а id
+        дорожки — быть свободным.
+        """
+        from core import bpmn_edits
+        from eval.advice import parse_recipes
+
+        body = ('<startEvent id="S" name="Заявка"/>' + _flow("f0", "S", "U1")
+                + "".join(f'<userTask id="U{i}" name="Согласовать {i}"/>'
+                          + _flow(f"f{i}", f"U{i}", f"U{i + 1}")
+                          for i in range(1, 4))
+                + '<userTask id="U4" name="Согласовать 4"/>' + _flow("f4", "U4", "E")
+                + '<endEvent id="E" name="Готово"/>')
+        xml = pools_doc([body])
+        rec = scorer.evaluate(xml)["recommendations_by_rule"]["approval_chain"]
+        assert "participant='Участник 1'" in rec, rec
+        assert "participant='Proc_1'" not in rec, rec
+        ops = parse_recipes(rec)
+        assert [op["op"] for op in ops] == ["add_lane", "move_to_lane"], rec
+        # Литерал `new_lane` рецепт печатать не вправе: второй круг того же
+        # контура ловит «уже занят» и нарушение не снимается ни одним кругом.
+        assert ops[0]["id"] != "new_lane", rec
+
+        out, report = bpmn_edits.apply_and_guarantee(xml, ops)
+        assert report["reverted"] == "", report["reverted"]
+        assert report["status"] == "success", report["skipped"]
+        lane = re.search(r'<(?:\w+:)?lane id="([^"]+)"', out)
+        assert lane and lane.group(1) == ops[0]["id"], (lane and lane.group(1), ops)
+        assert ops[1]["lane"] == ops[0]["id"], ops
 
     def test_three_in_a_row_is_not_a_chain(self):
         """Три согласования — не цепочка, и правило обязано сказать «нечего
@@ -2157,3 +2203,48 @@ class TestTaskTypesAreRepairable:
         xml = pools_doc([pool_body(1).replace('userTask', 'serviceTask'),
                          pool_body(2).replace('userTask', 'serviceTask')])
         assert status(scorer.evaluate(xml), "task_types") == FAILED
+
+
+def test_rule_and_check_tables_cannot_drift_apart():
+    """Новое правило, внесённое в один из двух словарей, видно на старте.
+
+    Без проверки правило ругает схему, которой не видело; без описания проверка
+    молча выпадает из балла. Оба случая выглядят как работающий скоринг, и
+    третий случай — KeyError в первом же /api/evaluate — их и лечит.
+    """
+    from core.bpmn_scoring import BPMNScorer, _assert_rule_tables
+
+    scorer = BPMNScorer()
+    _assert_rule_tables(scorer.rules, scorer._checks)   # живые таблицы согласны
+
+    with pytest.raises(ValueError, match="без проверки"):
+        _assert_rule_tables({"новое_правило": {"weight": 1}}, {})
+    with pytest.raises(ValueError, match="без описания"):
+        _assert_rule_tables({}, {"новое_правило": lambda schema: True})
+
+
+def test_every_rule_has_a_text_in_the_score_panel():
+    """Панель оценки печатает только те правила, чей ключ есть в словаре
+    `bpmn-constructor/src/scoreRules.js`, — пропущенное нарушение исчезает из
+    «Найденных ошибок» молча.
+
+    Оно остаётся в знаменателе и в балле, поэтому человек читает «2 из 26» там,
+    где на схеме висит третье нарушение, а редактор дельты после принятия
+    улучшения не называет исправленное и сломанное правило. Так было для девяти
+    правил подряд (`wait_without_sla`, `lane_overload`, `approval_chain` и
+    других), и лечится этот разрыв только списком: словарь обязан покрывать
+    `self.rules` ни раньше, ни позже.
+    """
+    source = (Path(__file__).parents[1] / "bpmn-constructor" / "src"
+              / "scoreRules.js").read_text(encoding="utf-8")
+    block = source.split("export const RULE_MESSAGES", 1)[1]
+    described = dict(re.findall(r"'([a-z_]+)':\s*\{([^}]*)\}", block))
+    rules = set(BPMNScorer().rules)
+
+    assert set(described) == rules, (
+        f"нет текста в панели: {sorted(rules - set(described))}; "
+        f"лишние ключи: {sorted(set(described) - rules)}")
+    empty = [name for name, body in described.items()
+             if not re.search(r"title:\s*'[^']+'", body)
+             or not re.search(r"fix:\s*'[^']+", body)]
+    assert not empty, f"правила без заголовка или починки: {empty}"

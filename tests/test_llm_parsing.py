@@ -351,6 +351,17 @@ class TestModelPool:
     """
 
     POOL = "GigaChat,GigaChat-2"
+    # Имена, на которые шлюз отвечал при замере живым ключом (первичная
+    # проверка 2026-10-02, перепроверка `GET /models` 2026-10-04): список тот же,
+    # `GigaChat` в нём живёт на нынешнем шлюзе — рассказ про 404 ниже относится к
+    # дефолтному хосту библиотеки `gigachat` 0.2.3 (api.giga.chat), а не к этому.
+    # Поколения «3» в выдаче нет до сих пор: `GigaChat-3-Ultra`, `GigaChat-3-Max`,
+    # `GigaChat-3-Lightning` — 404 «No such model», свежее доступное — семейство «2».
+    ANSWERING = frozenset({
+        "GigaChat", "GigaChat-2", "GigaChat-2-Max", "GigaChat-2-Pro",
+        "GigaChat-Plus", "GigaChat-Pro", "GigaChat-Max",
+        "GigaChat-Pro-preview", "GigaChat-Max-preview",
+    })
 
     def test_empty_env_falls_back_to_the_default_pool(self, monkeypatch):
         """Пустая переменная — не «модель с пустым именем», а пул из кода:
@@ -359,9 +370,21 @@ class TestModelPool:
         assert llm_client.get_model_pool() == list(llm_client.DEFAULT_MODEL_POOL)
         assert all(llm_client.DEFAULT_MODEL_POOL), "в пуле не может быть пустых имён"
 
+    def test_default_pool_names_only_models_the_gateway_answers(self):
+        """В пуле по умолчанию не может быть имени, которого шлюз не знает:
+        резерв из такого имени — не резерв, а снятая попытка на заведомом 404
+        (так и жил `GigaChat-3-Lightning`). Имя добавляется в пул только после
+        проверки живым ключом — список ниже от неё и остался."""
+        unknown = [name for name in llm_client.DEFAULT_MODEL_POOL
+                   if name not in self.ANSWERING]
+        assert not unknown, ("пул называет модели, которых нет на шлюзе: "
+                             f"{unknown} — сверьтесь с `GET /models`")
+        assert len(set(llm_client.DEFAULT_MODEL_POOL)) == len(
+            llm_client.DEFAULT_MODEL_POOL), "повтор имени тратит попытку впустую"
+
     def test_env_pool_is_comma_separated_and_trimmed(self, monkeypatch):
-        monkeypatch.setenv("GIGACHAT_MODEL", " GigaChat-2 , GigaChat-3-Lightning,")
-        assert llm_client.get_model_pool() == ["GigaChat-2", "GigaChat-3-Lightning"]
+        monkeypatch.setenv("GIGACHAT_MODEL", " GigaChat-2-Max , GigaChat-2,")
+        assert llm_client.get_model_pool() == ["GigaChat-2-Max", "GigaChat-2"]
 
     def test_unknown_model_name_asks_the_next_one(self, monkeypatch):
         monkeypatch.setenv("GIGACHAT_MODEL", self.POOL)
@@ -629,3 +652,235 @@ class TestCallTrace:
     def test_call_without_trace_does_not_break(self, monkeypatch):
         _provider(monkeypatch, _response('{"ok": true}', usage=USAGE))
         assert llm_client.call_json("система", "запрос") == {"ok": True}
+
+
+class TestTlsTrust:
+    """`GIGACHAT_CA_BUNDLE_FILE` обязан доходить до SDK.
+
+    Текст подсказки при выключенной проверке TLS советует положить корневой
+    сертификат российского УЦ в этот ключ, `.env.example` его документирует — а
+    читал его никто. Оператор, последовавший совету, оставался на системном
+    хранилище и получал ровно ту же `CERTIFICATE_VERIFY_FAILED`, из-за которой
+    проверку и выключил.
+    """
+
+    @staticmethod
+    def _build(monkeypatch, **env):
+        seen = {}
+
+        class Recorder:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+        monkeypatch.setattr(llm_client, "GigaChat", Recorder)
+        monkeypatch.setenv("GIGACHAT_CREDENTIALS", "client:secret")
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        llm_client._reset_client()
+        try:
+            llm_client.get_llm_client()
+        finally:
+            llm_client._reset_client()
+        return seen
+
+    def test_readable_bundle_goes_to_the_client(self, monkeypatch, tmp_path):
+        bundle = tmp_path / "rus-trust-ca.pem"
+        bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+        seen = self._build(monkeypatch, GIGACHAT_CA_BUNDLE_FILE=str(bundle),
+                           GIGACHAT_VERIFY_SSL="true")
+        assert seen["ca_bundle_file"] == str(bundle)
+        assert seen["verify_ssl_certs"] is True
+
+    def test_missing_bundle_is_not_silently_accepted(self, monkeypatch, tmp_path,
+                                                    caplog):
+        seen = self._build(monkeypatch,
+                           GIGACHAT_CA_BUNDLE_FILE=str(tmp_path / "нет.pem"))
+        assert seen["ca_bundle_file"] is None
+        assert "файла нет" in caplog.text
+
+    def test_unset_bundle_leaves_the_system_store(self, monkeypatch):
+        monkeypatch.delenv("GIGACHAT_CA_BUNDLE_FILE", raising=False)
+        assert llm_client._ca_bundle_file() is None
+
+    def test_sdk_puts_the_bundle_over_the_verification_flag(self, tmp_path):
+        """Поведение установленного пакета, из-за которого прежний лог врал.
+
+        `gigachat.client._get_kwargs` пишет `kwargs["verify"] =
+        settings.ca_bundle_file` ПОСЛЕ `"verify": settings.verify_ssl_certs`:
+        переданный bundle перекрывает отключённую проверку. Сверка с настоящим
+        SDK, а не с нашим ожиданием: правку порядка строк в `_get_kwargs` надо
+        заметить здесь, а не в проде.
+        """
+        from gigachat import client as gc_client
+
+        class _Settings:
+            base_url = "https://example"
+            timeout = 10
+            verify_ssl_certs = False
+            ca_bundle_file = str(tmp_path / "rus-trust-ca.pem")
+            ssl_context = None
+            cert_file = None
+            key_file = None
+            key_file_password = None
+            max_connections = None
+
+        kwargs = gc_client._get_kwargs(_Settings())
+        assert kwargs["verify"] == _Settings.ca_bundle_file
+
+    def test_disabled_verification_does_not_receive_the_bundle(
+            self, monkeypatch, tmp_path):
+        """Явный `GIGACHAT_VERIFY_SSL=false` старше bundle: bundle не уезжает в
+        SDK, иначе отключение проверки молча оборачивалось проверкой против
+        этого файла — и лог про «незащищённый канал» был бы ложью.
+        """
+        bundle = tmp_path / "rus-trust-ca.pem"
+        bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+        seen = self._build(monkeypatch, GIGACHAT_CA_BUNDLE_FILE=str(bundle),
+                           GIGACHAT_VERIFY_SSL="false")
+        assert seen["verify_ssl_certs"] is False
+        assert seen["ca_bundle_file"] is None
+
+    def test_both_switches_are_explained_loudly(self, monkeypatch, tmp_path,
+                                                caplog):
+        """Комбинация двух ключей обязана быть названа: оператор, поставивший
+        bundle «для прода» и оставивший false, обязан увидеть, что bundle не
+        работает, а не читать общую фразу про незащищённый канал."""
+        bundle = tmp_path / "rus-trust-ca.pem"
+        bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+        with caplog.at_level("WARNING"):
+            self._build(monkeypatch, GIGACHAT_CA_BUNDLE_FILE=str(bundle),
+                        GIGACHAT_VERIFY_SSL="false")
+        assert "старше" in caplog.text
+        assert "НЕ подключается" in caplog.text
+
+    def test_plain_off_switch_keeps_the_plain_warning(self, monkeypatch, caplog):
+        """Без bundle фраза остаётся прежней: совет про `GIGACHAT_CA_BUNDLE_FILE`
+        адресован тому, у кого его ещё нет."""
+        monkeypatch.delenv("GIGACHAT_CA_BUNDLE_FILE", raising=False)
+        with caplog.at_level("WARNING"):
+            seen = self._build(monkeypatch, GIGACHAT_VERIFY_SSL="false")
+        assert seen["verify_ssl_certs"] is False
+        assert "незащищённый канал" in caplog.text
+        assert "старше" not in caplog.text
+
+    def test_missing_bundle_file_is_still_reported_when_verification_is_on(
+            self, monkeypatch, tmp_path, caplog):
+        """Порядок операндов не съел прежнюю диагностику: при включённой
+        проверке битый путь виден как и был."""
+        monkeypatch.setenv("GIGACHAT_VERIFY_SSL", "true")
+        seen = self._build(monkeypatch,
+                           GIGACHAT_CA_BUNDLE_FILE=str(tmp_path / "нет.pem"))
+        assert seen["ca_bundle_file"] is None
+        assert "файла нет" in caplog.text
+
+
+class TestStartupSurvivesProviderOutage:
+    """Старт сервиса не зависит от доступности провайдера.
+
+    `ensure_llm_ready` зовёт lifespan, а тот фильтрует `LLMError`. Транспортный
+    сбой (`httpx.ConnectError`: отбитый TLS-канал, истёкший сертификат,
+    недоступный адрес шлюза) этому фильтру не подчинялся и долетал до
+    `Application startup failed` — реестр, доступ и апрувы падали вместе с ИИ
+    из-за чужой недоступности. Увидено живым запуском на битых учётных данных.
+    """
+
+    @staticmethod
+    def _probe(monkeypatch, error):
+        monkeypatch.setattr(llm_client, "get_llm_client",
+                            lambda: SimpleNamespace(get_token=lambda: (_ for _ in ()).throw(error)))
+        llm_client.ensure_llm_ready()
+
+    def test_tls_failure_becomes_an_llm_error(self, monkeypatch):
+        import httpx
+
+        with pytest.raises(LLMError) as caught:
+            self._probe(monkeypatch, httpx.ConnectError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"))
+        assert "CERTIFICATE_VERIFY_FAILED" in str(caught.value)
+        assert "ConnectError" in str(caught.value)
+
+    def test_refused_connection_becomes_an_llm_error(self, monkeypatch):
+        with pytest.raises(LLMError):
+            self._probe(monkeypatch, ConnectionRefusedError(
+                "не удалось соединиться с адресом"))
+
+    def test_oauth_rejection_becomes_an_llm_error(self, monkeypatch):
+        with pytest.raises(LLMError) as caught:
+            self._probe(monkeypatch, _response_error(
+                BadRequestError, 400, "invalid_credentials", url=OAUTH_URL))
+        assert "не подтверждена" in str(caught.value)
+
+    def test_absent_credentials_keep_their_own_wording(self, monkeypatch):
+        """Сообщение не перематывается второй обёрткой: «не задан» — другой
+        диагноз, чем «шлюз недоступен», и оператору нужен именно он."""
+        monkeypatch.delenv("GIGACHAT_CREDENTIALS", raising=False)
+        llm_client._reset_client()
+        try:
+            with pytest.raises(LLMError) as caught:
+                llm_client.ensure_llm_ready()
+        finally:
+            llm_client._reset_client()
+        assert "GIGACHAT_CREDENTIALS не задан" in str(caught.value)
+        assert "не подтверждена" not in str(caught.value)
+
+
+class TestOrchestratorInitIsNotFatal:
+    """`init_orchestrator` обязан возвращать управление живому процессу.
+
+    Обещание слоя: при сбое ИИ сервис поднимается, и `/health` показывает
+    `llm_orchestrator: disabled`. Держалось оно только для `LLMError` — сборка
+    оркестратора (тяжёлые модели эмбеддингов, чтение корпуса) и проба
+    авторизации могли бросить что угодно.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_orchestrator(self):
+        from app import ai as ai_module
+
+        saved = ai_module._orchestrator
+        yield
+        ai_module._orchestrator = saved
+
+    def test_unknown_transport_error_does_not_abort_startup(self, monkeypatch, caplog):
+        import httpx
+        from app import ai as ai_module
+
+        monkeypatch.setattr(ai_module, "BPMNImprovementOrchestrator",
+                            lambda: SimpleNamespace(warmup=lambda: None))
+        monkeypatch.setattr(ai_module.llm_client, "ensure_llm_ready",
+                            lambda: (_ for _ in ()).throw(
+                                httpx.RemoteProtocolError("странный ответ шлюза")))
+        with caplog.at_level("ERROR", logger="app.ai"):
+            ai_module.init_orchestrator()
+        assert ai_module.get_orchestrator() is not None
+        assert "Авторизация LLM не подтверждена" in caplog.text
+
+    def test_orchestrator_build_failure_degrades_instead_of_dying(self, monkeypatch,
+                                                                   caplog):
+        from app import ai as ai_module
+
+        def boom():
+            raise RuntimeError("моделей эмбеддингов нет на диске")
+
+        monkeypatch.setattr(ai_module, "BPMNImprovementOrchestrator", boom)
+        with caplog.at_level("ERROR", logger="app.ai"):
+            ai_module.init_orchestrator()
+        assert ai_module.get_orchestrator() is None
+        assert "оркестратор не собран" in caplog.text
+
+    def test_warmup_failure_still_leaves_the_orchestrator_usable(self, monkeypatch,
+                                                                 caplog):
+        """Прогретый индекс — ускорение, а не условие: без него улучшение
+        работает, просто первый запрос дольше."""
+        from app import ai as ai_module
+
+        class NoCorpus:
+            def warmup(self):
+                raise OSError("корпус эталонов не читается")
+
+        monkeypatch.setattr(ai_module, "BPMNImprovementOrchestrator", NoCorpus)
+        monkeypatch.setattr(ai_module.llm_client, "ensure_llm_ready", lambda: None)
+        with caplog.at_level("WARNING", logger="app.ai"):
+            ai_module.init_orchestrator()
+        assert isinstance(ai_module.get_orchestrator(), NoCorpus)
+        assert "первый запрос будет долгим" in caplog.text

@@ -3,7 +3,7 @@
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
-from typing import Dict, List, NamedTuple, Set, Tuple
+from typing import Callable, Dict, List, NamedTuple, Set, Tuple
 
 from .bpmn_edits import (
     DEFAULT_TIMER_DURATION,
@@ -364,6 +364,22 @@ def _participant_label(participant: ET.Element) -> str:
     return (participant.get("name") or participant.get("id") or "?").strip()
 
 
+def _lane_host_operand(s: _Schema, node_id: str) -> str:
+    """Адрес пула для `add_lane(participant=…)` — тот, который аплайер примет.
+
+    Имя участника, а где коллаборации нет — id процесса (`resolve_process`
+    принимает и то и другое). Пустой операнд рецепт печатать не вправе: его
+    запрещает корпусный `test_no_advice_prints_an_empty_operand`, и вызывающий
+    код опускает `participant=` там, где адреса нет, — однопроцессному документу
+    аплайер заводит дорожку и без него.
+    """
+    for participant in s.participants_of_node(node_id):
+        label = _participant_label(participant)
+        if label != "?":
+            return label
+    return s.owner_of_node.get(node_id) or ""
+
+
 def _free_new_id(s: _Schema, base: str) -> str:
     """Id нового узла, которого на этой схеме ещё нет.
 
@@ -371,8 +387,9 @@ def _free_new_id(s: _Schema, base: str) -> str:
     теряется. Опаснее всего литерал на втором круге того же контура: первый
     круг создал `new_sla_fork_1`, подсказка второго зовёт его же — перепись
     `eval/advice.py` стопорилась на этом в `approval_chain` и `wait_without_sla`,
-    и нарушение не снималось ни одним кругом. Префикс `new_` сохраняется: без
-    него аплайер отвечает «новый id без префикса new_».
+    и нарушение не снималось ни одним кругом. Префикс `new_` сохраняется, хотя
+    аплайер его больше не требует: без него строка пакета не отличалась бы от
+    правки существующего узла, а это читают и повтор модели, и отчёт.
     """
     taken = {elem.get("id") for elems in s.by_tag.values() for elem in elems
              if elem.get("id")}
@@ -734,38 +751,49 @@ def _check_cross_pool_flow(s: _Schema) -> _Check:
         src_label = _participant_label_of(s, flow.source)
         dst_label = _participant_label_of(s, flow.target)
         legs = "; ".join(n for n in (src_note, dst_note) if n)
-        # Концы обмена оба известны — рецепт полный; если хотя бы один назван
-        # словами, правка пакета начинается с `disconnect`, а второй шаг
-        # подсказки модель обязана выбрать сама.
+        # Рецепт печатывается только целиком исполнимым. Концы обмена оба
+        # известны и ни один из них разрыв не обнажает — права полная; иначе
+        # второй шаг модель обязана выбрать сама, а половинчатый рецепт из
+        # одного `disconnect` пакетный страж (`bpmn_edits.new_route_holes`)
+        # снимает как дыру в маршруте, и перепись `eval.advice` показала бы
+        # «названо, но неприменимо» там, где предела текста нет, а есть предел
+        # структуры.
+        stranded = _cut_strands(s, flow)
         recipe = (f"disconnect(flow='{ident}') + connect(source='{src}', "
                   f"target='{dst}', flow_type='message')"
-                  if src and dst else f"disconnect(flow='{ident}')")
+                  if src and dst and not stranded else "")
         notes.append(
-            f"'{ident}': {recipe} — шаг '{flow.source}' ({src_label}) и шаг "
+            f"'{ident}': " + (f"{recipe} — " if recipe else "")
+            + f"шаг '{flow.source}' ({src_label}) и шаг "
             f"'{flow.target}' ({dst_label}) принадлежат разным процессам, "
             "сообщением между ними становится нога, а не поток управления"
             + (f" — {legs}" if legs else "")
-            + _stranded_tail(s, flow))
+            + _stranded_tail(stranded))
     if len(crossing) > RECIPES_IN_MESSAGE:
         notes.append(f"и ещё {len(crossing) - RECIPES_IN_MESSAGE} дуг той же формой")
     return _Check(FAILED, tuple(f.id or f"{f.source}->{f.target}"
                                 for f, _, _ in crossing), "; ".join(notes))
 
 
-def _stranded_tail(s: _Schema, flow: _Flow) -> str:
-    """Предупреждение о том, что обнажит правка.
+def _cut_strands(s: _Schema, flow: _Flow) -> List[str]:
+    """Что обнажит разрыв этой дуги: узлы, у которых не останется ноги в своём пуле.
 
-    Межпуловая дуга часто бывает единственным «управленческим» продолжением
-    шага: после её перевода в сообщение у активности внутри своего процесса не
-    остаётся ни входа, ни выхода, и `no_isolated` заряжает её следом. Для
-    оркестратора это хуже косметики: `_rules_regressed` отклоняет весь пакет, и
-    дуга переживает улучшение. Поэтому предупреждение в тексте — часть рецепта,
-    а не сноска: продолжение внутри пула знает только модель по описанию
-    процесса, и спросить его нужно в этом же пакете."""
+    Считаются ВСЕ узлы маршрута, а не только активности: пакетный страж аплайера
+    заряжает тупик и шлюзу, и событию, и совет, который аплайер отвергнет,
+    напечатан быть не может (тот же запрет, что держит `sequence_flows` со
+    своим «половинчатый disconnect не советуем»). Исключения по нотации — те же
+    константы аплайера: у финиша исходящего потока не бывает, в старт и в
+    граничное событие поток не входит, и требовать от них ногу смысла нет.
+    """
     stranded = []
     for node_id, direction in ((flow.source, "выхода"), (flow.target, "входа")):
         elem = s.node_by_id.get(node_id)
-        if elem is None or _local(elem.tag) not in ACTIVITY_TAGS:
+        if elem is None:
+            continue
+        tag = _local(elem.tag)
+        if direction == "выхода" and tag in SEQUENCE_FORBIDDEN_SOURCES:
+            continue
+        if direction == "входа" and tag in SEQUENCE_FORBIDDEN_TARGETS:
             continue
         own = s.owner_of_node.get(node_id, "")
         if direction == "выхода":
@@ -776,6 +804,19 @@ def _stranded_tail(s: _Schema, flow: _Flow) -> str:
                     if f is not flow and s.owner_of_node.get(f.source, "") == own]
         if not rest:
             stranded.append(f"'{node_id}' без {direction} внутри своего процесса")
+    return stranded
+
+
+def _stranded_tail(stranded: List[str]) -> str:
+    """Предупреждение о том, что обнажит правка.
+
+    Межпуловая дуга часто бывает единственным «управленческим» продолжением
+    шага: после её перевода в сообщение у активности внутри своего процесса не
+    остаётся ни входа, ни выхода, и `no_isolated` заряжает её следом. Для
+    оркестратора это хуже косметики: `_rules_regressed` отклоняет весь пакет, и
+    дуга переживает улучшение. Поэтому предупреждение в тексте — часть рецепта,
+    а не сноска: продолжение внутри пула знает только модель по описанию
+    процесса, и спросить его нужно в этом же пакете."""
     if not stranded:
         return ""
     return ("; после правки " + ", ".join(stranded)
@@ -1669,12 +1710,19 @@ def _check_approval_chain(s: _Schema) -> _Check:
             line = _longest_user_task_line(s, users)
             if len(line) >= APPROVAL_CHAIN_MIN:
                 offenders.extend(line)
+                # Литерал `new_lane` здесь был второй копией того же дефекта, из-за
+                # которого `wait_without_sla` стопорил перепись: первый круг создал
+                # дорожку с этим id, подсказка второго круга зовёт его же, а
+                # `_require_new_id` отвечает «уже занят» — и нарушение не снимается
+                # ни одним кругом.
+                lane_new = _free_new_id(s, "new_lane")
+                host = _lane_host_operand(s, line[0])
                 notes.append(f"дорожек в процессе нет, четыре подписи идут одной "
                              f"линией: {_join_ids(tuple(line))} — заведите "
-                             f"add_lane(id='new_lane', name='Второй согласующий', "
-                             f"participant='{s.owner_of_node.get(line[0]) or ''}')"
+                             f"add_lane(id='{lane_new}', name='Второй согласующий'"
+                             f"{f', participant={host!r}' if host else ''})"
                              f" и перенесите move_to_lane(id='{line[0]}', "
-                             "lane='new_lane')")
+                             f"lane='{lane_new}')")
     if not tracked:
         return _Check(NOT_APPLICABLE, note="дорожек с четырьмя задачами нет")
     if not notes:
@@ -2046,6 +2094,24 @@ def has_unguarded_cycle(bpmn_xml: str) -> bool:
     return any(not _is_guarded(schema, cycle) for cycle in _find_cycles(schema))
 
 
+def _assert_rule_tables(rules: Dict[str, Dict], checks: Dict[str, Callable]) -> None:
+    """Правило и его проверка не вправе разъехаться по словарям.
+
+    Новое имя, внесённое в `rules` без проверки, ругает схему, которой не
+    виделось, и советует правку, которую никто не проверяет; имя в `checks` без
+    описания не входит ни в вес, ни в знаменатель балла — линейка молча
+    теряет проверку. Оба случая читаются как «скоринг работает», поэтому
+    проверяются здесь, при подъёме процесса.
+    """
+    without_check = sorted(set(rules) - set(checks))
+    without_rule = sorted(set(checks) - set(rules))
+    if without_check or without_rule:
+        raise ValueError(
+            "Правила скоринга и их проверки разошлись: "
+            f"без проверки {without_check or '—'}, "
+            f"без описания {without_rule or '—'}")
+
+
 class BPMNScorer:
     """Скоринг схемы: нормированный балл, рекомендации и статус по каждому
     правилу.
@@ -2117,6 +2183,13 @@ class BPMNScorer:
             'lane_overload': _check_lane_overload,
             'wait_without_sla': _check_wait_without_sla,
         }
+        # Одно правило живёт в двух словарях: `rules` несёт его вес, текст и
+        # совет, `_checks` — проверку. Расхождение ключей означает, что новое
+        # имя внесли в один из них, и дальше возможно только плохое: без
+        # проверки правило ругается на схему, которую не видело, а без описания
+        # проверка молча не входит в знаменатель балла. Ошибку лучше увидеть на
+        # старте процесса, чем в первом же /api/evaluate.
+        _assert_rule_tables(self.rules, self._checks)
 
     def evaluate(self, bpmn_xml: str) -> Dict:
         try:
@@ -2126,10 +2199,18 @@ class BPMNScorer:
                 'score': 0,
                 'recommendations': [f'Ошибка валидации BPMN: {e}'],
                 'details': {name: False for name in self.rules},
+                # Статус — «не исполнялось», а не «нарушено»: ниже сказано, что
+                # ошибка разбора не нарушение, и держать при этом все правила
+                # упавшими значит врать и экрану, и любой, кто считает дельту:
+                # «схема нарушала 26 правил» неотличимо от «схему не проверяли».
                 'details_meta': {
-                    name: {'status': FAILED, 'weight': rule['weight'], 'elements': []}
+                    name: {'status': NOT_APPLICABLE, 'weight': rule['weight'],
+                           'elements': []}
                     for name, rule in self.rules.items()
                 },
+                # Признак, по которому слой может отличить «не разобрано» от
+                # «разобрано и плохо»: балл 0 даёт и то, и другое.
+                'parse_error': True,
                 # Правила не исполнялись — индекса схемы нет, поэтому и
                 # рекомендации по правилам нет: ошибка разбора не нарушение.
                 'recommendations_by_rule': {},

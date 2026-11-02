@@ -31,8 +31,9 @@ scorer = BPMNScorer()
 HEADER = ('<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" '
           'id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn">')
 
-# Артефакт живого прогона (см. reports/warehouse-delivery/recommendations.md):
-# он и есть та схема, которую скоринг пропускал с 85 баллами.
+# Архивная схема живого прогона: она и есть та схема, которую скоринг
+# пропускал с 85 баллами. В индексе держат именно её — остальная `reports/`
+# пересобирается прогоном и игнорируется.
 WAREHOUSE = Path(__file__).parents[1] / "reports" / "warehouse-delivery" / "process.bpmn"
 
 
@@ -890,7 +891,7 @@ class TestScoreDiff:
 
 
 class TestRealGeneratedSchema:
-    """Артефакт живого прогона (`reports/warehouse-delivery/`): четыре пула, где
+    """Архивная схема живого прогона: четыре пула, где
     из содержания только `startEvent → endEvent`, и ни одного messageFlow на них.
     Прежний скоринг выдавал за такую схему 85/100."""
 

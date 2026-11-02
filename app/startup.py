@@ -67,7 +67,7 @@ def run_migrations() -> None:
             "В базе есть таблицы, но alembic_version отсутствует — она создана до "
             f"перехода на Alembic. Выполните один раз: alembic stamp {base} "
             f"&& alembic upgrade head.{extras} Если база старше базовой ревизии, "
-            "вместо stamp перенесите данные в чистую (migrate_sqlite_to_postgres.py)."
+            "вместо stamp перенесите данные в чистую базу."
         )
 
     command.upgrade(config, "head")

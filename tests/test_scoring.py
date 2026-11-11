@@ -724,6 +724,153 @@ class TestParticipantInteracts:
         assert status(result, "pool_has_steps") == PASSED
 
 
+class TestBlackBoxParticipant:
+    """Чёрная коробка коллаборации: `participant` без `processRef`.
+
+    Так рисуют внешнего контрагента («Поставщик», «Клиент», «Система
+    мониторинга»): его внутреннюю работу автор не описывает, а обмен ведут
+    потоком сообщения с концом на самого участника. Правила «у пула есть старт»,
+    «у пула есть финиш» и «в пуле есть шаг» проверяют СОДЕРЖИМОЕ процесса, и для
+    пула без процесса содержимое неопределимо — не «пусто», а «негде». По
+    корпусу 367 рукописных схем таких участников 31 из 346 (9,0%), и до этой
+    правки именно они составляли 31 нарушителя из 37 у `pool_has_steps`, 31 из
+    49 у `start_event` и 31 из 69 у `end_event`, а совет звал модель наполнять
+    контрагента выдуманной работой.
+
+    Белый пул с процессом и без шагов нарушение не отменяет: по корпусу таких 8
+    (2,3%), а по живым дампам #74 починка дорисовывала им старт и финиш — этот
+    ряд обязан оставаться красным.
+    """
+
+    @staticmethod
+    def _doc(white_body: str, black_attrs: str = 'id="P2" name="Поставщик"',
+             extra_processes: str = "", message_flows: str = "") -> str:
+        """Пул `P1` с процессом + участник без процесса + их обмены."""
+        return (f'<?xml version="1.0" encoding="UTF-8"?>\n{HEADER}'
+                f'<collaboration id="C1">'
+                f'<participant id="P1" name="ВкусВилл" processRef="Proc_1"/>'
+                f'<participant {black_attrs}/>'
+                f'{message_flows}</collaboration>'
+                f'<process id="Proc_1" name="ВкусВилл">{white_body}</process>'
+                f'{extra_processes}</definitions>')
+
+    def test_black_box_is_not_charged_for_steps_or_events(self):
+        xml = self._doc(pool_body(1),
+                        message_flows='<messageFlow id="M1" sourceRef="A1" '
+                                      'targetRef="P2"/>')
+        result = scorer.evaluate(xml)
+        for rule in ("pool_has_steps", "start_event", "end_event",
+                     "participant_interacts", "message_flow_ends"):
+            assert status(result, rule) == PASSED, rule
+            assert elements(result, rule) == [], rule
+
+    def test_three_rules_go_not_applicable_when_every_pool_is_a_black_box(self):
+        xml = (f'<?xml version="1.0" encoding="UTF-8"?>\n{HEADER}'
+               '<collaboration id="C1">'
+               '<participant id="P2" name="Поставщик"/>'
+               '<participant id="P3" name="Клиент"/>'
+               '<messageFlow id="M1" sourceRef="P2" targetRef="P3"/>'
+               '</collaboration></definitions>')
+        result = scorer.evaluate(xml)
+        for rule in ("pool_has_steps", "start_event", "end_event"):
+            assert status(result, rule) == NOT_APPLICABLE, rule
+        # обмен между двумя коробками законен, а «немой» пул по-прежнему виден
+        assert status(result, "message_flow_ends") == PASSED
+        assert status(result, "participant_interacts") == PASSED
+
+    def test_white_pool_without_steps_still_fails_next_to_a_black_box(self):
+        """Отличить пустоту от неопределимости — весь смысл правки."""
+        xml = self._doc(pool_body(1, with_task=False),
+                        message_flows='<messageFlow id="M1" sourceRef="S1" '
+                                      'targetRef="P2"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "pool_has_steps") == FAILED
+        assert elements(result, "pool_has_steps") == ["P1"]
+        rec = result["recommendations_by_rule"]["pool_has_steps"]
+        assert "без шагов 1 из 1 участников" in rec
+        assert "'P2'" in rec, "чёрная коробка не названа снятой с проверки"
+        assert "не проверяет" in rec
+
+    def test_advice_never_offers_to_fill_a_black_box(self):
+        """Ни `add_task`, ни `add_event` с адресом контрагента: наполнять чёрную
+        коробку нечем и незачем, а совет уходит в промпт улучшения дословно.
+
+        Схема держит белый пул без старта и без финиша — нарушение есть, рецепт
+        есть, и он обязан назвать белого участника, а не соседнюю коробку."""
+        xml = self._doc('<userTask id="A1" name="Собрать заказ"/>',
+                        message_flows='<messageFlow id="M1" sourceRef="A1" '
+                                      'targetRef="P2"/>')
+        result = scorer.evaluate(xml)
+        for rule in ("start_event", "end_event"):
+            assert status(result, rule) == FAILED, rule
+            assert elements(result, rule) == ["P1"], rule
+            rec = result["recommendations_by_rule"][rule]
+            assert "participant='Поставщик'" not in rec, rule
+            assert "'P2': add_" not in rec, rule
+            assert "не проверяет" in rec, rule
+        assert status(result, "pool_has_steps") == PASSED
+
+    def test_broken_process_ref_is_not_a_black_box(self):
+        """Ссылка есть и ведёт в никуда — это битая ссылка, а не контрагент:
+        ряд держится отдельно, иначе правка пропустит schemas без процесса."""
+        xml = self._doc(pool_body(1), black_attrs='id="P2" name="Поставщик" '
+                                                  'processRef="Proc_missing"',
+                        message_flows='<messageFlow id="M1" sourceRef="A1" '
+                                      'targetRef="P2"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "pool_has_steps") == FAILED
+        assert elements(result, "pool_has_steps") == ["P2"]
+
+    def test_empty_process_ref_counts_as_a_black_box(self):
+        """Пустой атрибут — то же «процесса нет»: `get` вернёт '', и отличать
+        его от отсутствующего оснований нет."""
+        xml = self._doc(pool_body(1), black_attrs='id="P2" name="Поставщик" '
+                                                  'processRef=""',
+                        message_flows='<messageFlow id="M1" sourceRef="A1" '
+                                      'targetRef="P2"/>')
+        assert status(scorer.evaluate(xml), "pool_has_steps") == PASSED
+
+    def test_message_flow_end_is_named_by_id_not_by_name(self):
+        """Единый адрес конца обмена — id участника: им меряет
+        `validate_and_repair`, им же инвентарь показывает `participants`.
+        Отказ обязан назвать настоящий id, иначе повтор приносит то же слово."""
+        xml = self._doc(pool_body(1),
+                        message_flows='<messageFlow id="M1" sourceRef="A1" '
+                                      'targetRef="Поставщик"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "message_flow_ends") == FAILED
+        assert elements(result, "message_flow_ends") == ["M1"]
+        rec = result["recommendations_by_rule"]["message_flow_ends"]
+        assert "назван именем участника, а не его id 'P2'" in rec, rec
+
+    def test_message_flow_to_the_same_participant_is_a_violation(self):
+        """Обмен сам с собой: концы существуют, но обмена нет. Правка аплайера
+        этот ряд тоже отвергает — отказ обязан называть второго контрагента."""
+        xml = self._doc(pool_body(1),
+                        message_flows='<messageFlow id="M1" sourceRef="A1" '
+                                      'targetRef="P2"/>'
+                                      '<messageFlow id="M2" sourceRef="P2" '
+                                      'targetRef="P2"/>')
+        result = scorer.evaluate(xml)
+        assert status(result, "message_flow_ends") == FAILED
+        assert elements(result, "message_flow_ends") == ["M2"]
+        rec = result["recommendations_by_rule"]["message_flow_ends"]
+        assert "сам с собой обмен не ведётся" in rec, rec
+
+    def test_message_flow_between_two_black_boxes_passes(self):
+        xml = (f'<?xml version="1.0" encoding="UTF-8"?>\n{HEADER}'
+               '<collaboration id="C1">'
+               '<participant id="P2" name="Поставщик"/>'
+               '<participant id="P3" name="Клиент"/>'
+               '<participant id="P4" name="Система мониторинга"/>'
+               '<messageFlow id="M1" sourceRef="P2" targetRef="P3"/>'
+               '<messageFlow id="M2" sourceRef="P3" targetRef="P4"/>'
+               '</collaboration></definitions>')
+        result = scorer.evaluate(xml)
+        assert status(result, "message_flow_ends") == PASSED
+        assert status(result, "participant_interacts") == PASSED
+
+
 class TestGatewaySplitJoin:
     def test_branches_that_merge_pass(self):
         assert status(scorer.evaluate(split_join_xml()), "gateway_split_join") == PASSED
@@ -1271,7 +1418,9 @@ class TestApprovalChain:
         дорожек молчало (`not_applicable`), хотя именно там разделения
         согласующих нет вовсе: на всём реальном корпусе (367 схем) правило не
         сработало ни разу. Отсутствие дорожек — худший случай, а не «нечего
-        проверять», и совет обязан сказать, что разводить надо созданием дорожек."""
+        проверять», и совет обязан рвать линию развилкой: `move_to_lane` концы
+        потока не трогает, и цепочка из четырёх подписей остаётся ровно такой же
+        длины (перепись `eval/advice.py`: 8/8 рецептов применено, 0 снято)."""
         xml = _doc(
             '<startEvent id="S" name="Заявка"/>' + _flow("f0", "S", "U1")
             + "".join(f'<userTask id="U{i}" name="Согласовать {i}"/>'
@@ -1282,7 +1431,9 @@ class TestApprovalChain:
         result = scorer.evaluate(xml)
         assert status(result, "approval_chain") == FAILED, result["details_meta"]["approval_chain"]
         assert elements(result, "approval_chain") == ["U1", "U2", "U3", "U4"]
-        assert "add_lane" in result["recommendations_by_rule"]["approval_chain"]
+        rec = result["recommendations_by_rule"]["approval_chain"]
+        assert "add_gateway(" in rec and "connect(source=" in rec, rec
+        assert "add_lane" not in rec, rec
 
     def test_generic_tasks_count_as_the_chain_too(self):
         """`task` — шаг без типа, именно так в bpmn-js рисуют человеческое
@@ -1320,20 +1471,31 @@ class TestApprovalChain:
                 + '<endEvent id="E" name="Готово"/>')
         xml = pools_doc([body])
         rec = scorer.evaluate(xml)["recommendations_by_rule"]["approval_chain"]
-        assert "participant='Участник 1'" in rec, rec
         assert "participant='Proc_1'" not in rec, rec
         ops = parse_recipes(rec)
-        assert [op["op"] for op in ops] == ["add_lane", "move_to_lane"], rec
-        # Литерал `new_lane` рецепт печатать не вправе: второй круг того же
+        assert [op["op"] for op in ops] == ["add_gateway", "connect",
+                                            "set_default"], rec
+        # Литерал `new_gate` рецепт печатать не вправе: второй круг того же
         # контура ловит «уже занят» и нарушение не снимается ни одним кругом.
-        assert ops[0]["id"] != "new_lane", rec
+        gate = ops[0]["id"]
+        assert gate != "new_gate" and gate.startswith("new_gate_"), rec
+        # Оба адреса второй ноги взяты из документа, а не выдуманы: конец
+        # маршрута существует, а `default` помечает поток, который вставка
+        # `after` отдаёт шлюзу (тот же id, что у дуги X → Y до правки).
+        ends = re.findall(r'<(?:\w+:)?endEvent id="([^"]+)"', xml)
+        flows = re.findall(r'<(?:\w+:)?sequenceFlow id="([^"]+)"', xml)
+        assert ops[1]["target"] in ends, (ops[1], ends)
+        assert ops[1]["source"] == gate and ops[2]["gateway"] == gate, ops
+        assert ops[2]["flow"] in flows and ops[2]["flow"] != "f0", ops
 
         out, report = bpmn_edits.apply_and_guarantee(xml, ops)
         assert report["reverted"] == "", report["reverted"]
         assert report["status"] == "success", report["skipped"]
-        lane = re.search(r'<(?:\w+:)?lane id="([^"]+)"', out)
-        assert lane and lane.group(1) == ops[0]["id"], (lane and lane.group(1), ops)
-        assert ops[1]["lane"] == ops[0]["id"], ops
+        # Пакет обязан оставить именно шлюз: если гарант понизил его до задачи,
+        # значит нога у развилки одна и нарушение не снято.
+        assert "exclusiveGateway" in out, out
+        assert status(scorer.evaluate(out), "approval_chain") != FAILED, (
+            scorer.evaluate(out)["details_meta"]["approval_chain"])
 
     def test_three_in_a_row_is_not_a_chain(self):
         """Три согласования — не цепочка, и правило обязано сказать «нечего
@@ -2061,18 +2223,36 @@ class TestAdviceIsExecutable:
         assert "disconnect(flow=" not in text, text
 
     def test_approval_chain_names_a_repair_it_can_apply(self):
-        """Разнесение по дорожкам требует вторую дорожку и пул, а шлюз — две
-        соседние задачи. В тексте обязаны быть те id, которыми правка
-        заполняется без выдумывания."""
+        """Линию согласований рвёт только развилка с ДВУМЯ ногами. `add_gateway`
+        с одним исходом гарант понижает до задачи (`_demote_single_branch_gateways`),
+        а задача — ещё одна ручная подпись: линия не рвётся, а удлиняется. Прежний
+        одноногий рецепт перепись `eval/advice.py` меряла именно так: 8/8 названо,
+        8/8 применено, 0 снято. Пакет собирается ИЗ ТЕКСТА подсказки, а не пишется
+        руками: правка текста правила обязана красить этот тест."""
+        from eval.advice import parse_recipes
+
         xml = approval_lane_xml()
         text = scorer.evaluate(xml)["recommendations_by_rule"]["approval_chain"]
         named = self._named_ids(text, xml)
         assert len(named) >= 2, f"одного id для правки мало: {text}"
-        self._assert_fixed(xml, "approval_chain",
-                           [{"op": "add_gateway", "id": "new_g",
-                             "name": "Нужен второй согласующий?",
-                             "gateway_type": "exclusive", "after": "U2",
-                             "to": "U3"}])
+        ops = parse_recipes(text)
+        assert [o["op"] for o in ops] == ["add_gateway", "connect", "set_default"], ops
+        self._assert_fixed(xml, "approval_chain", ops)
+
+    def test_single_leg_gateway_does_not_clear_the_chain(self):
+        """Отрицание: развилка с ОДНОЙ ногой нарушения не снимает — гарант
+        понижает её до задачи, и ручных подписей в линии становится больше.
+        Тест держит причину двухногого рецепта: если понижение одновходовых
+        шлюзов когда-нибудь снимут, пакет из одной операции снова начнёт
+        «чинить», и покраснеет первым именно он."""
+        from eval.advice import parse_recipes
+
+        xml = approval_lane_xml()
+        text = scorer.evaluate(xml)["recommendations_by_rule"]["approval_chain"]
+        one_leg = parse_recipes(text)[:1]
+        assert [o["op"] for o in one_leg] == ["add_gateway"], one_leg
+        assert status(scorer.evaluate(self._repair(xml, one_leg)),
+                      "approval_chain") == FAILED
 
     def test_lane_overload_names_the_work_and_the_receiving_lane(self):
         """«Перенеси в другую дорожку» без перечня работ перегруженной дорожки и

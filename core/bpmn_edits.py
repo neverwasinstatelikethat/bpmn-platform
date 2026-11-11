@@ -67,6 +67,26 @@ def is_bpmn_tag(tag: Any) -> bool:
     return tag[1:].split("}", 1)[0].startswith("http://www.omg.org/spec/BPMN/")
 
 
+def is_black_box(participant: ET.Element) -> bool:
+    """Участник без ссылки на процесс — «чёрная коробка» коллаборации.
+
+    Так рисуют внешнего контрагента (Поставщик, Клиент, Система мониторинга):
+    его внутреннюю работу модельер не описывает, а обмен ведёт пулом целиком, и
+    конец `messageFlow` указывает на самого участника. Признак — «атрибута
+    `processRef` нет», а не «процесса не нашлось»: участник со ссылкой на
+    отсутствующий процесс остаётся битой ссылкой и наказывается как раньше
+    (этот ряд держит `test_participant_without_process_fails`).
+
+    Предикат живёт в аплайере, а не в каждом слое по-своему: им меряют и
+    инвентарь (пул обязан быть виден модели), и скоринг (правила про шаги, старт
+    и финиш для такой коробки неприменимы), и оракул харнесса. Замер по корпусу
+    367 рукописных схем: 31 чёрная коробка из 346 участников (9,0%), пустых белых
+    пулов при этом 8 (2,3%), а белых пулов ровно с одной активностью — 14 (4,0%).
+    Различить «контрагента» и «раздутую роль» по XML нечем: это решение стадии
+    состава, и оно в генераторе."""
+    return not (participant.get("processRef") or "").strip()
+
+
 TASK_TAGS = {
     "task", "userTask", "serviceTask", "scriptTask", "manualTask",
     "businessRuleTask", "sendTask", "receiveTask", "callActivity", "subProcess",
@@ -367,7 +387,17 @@ OP_SPEC: Dict[str, str] = {
                  ' задаётся duration (ISO-8601) либо циклом "cycle":"R3/PT10M",'
                  " но не обоими сразу; поля after, to и lane опциональны, а у end"
                  " исход не бывает",
-    "add_participant": '{"op":"add_participant","id":"new_...","name":"..."}',
+    # Чёрная коробка — участник без процесса: так показывают внешнего
+    # контрагента, чью внутреннюю работу автор не описывает, а обмен ведут пулом
+    # целиком (конец `messageFlow` тогда ссылается на id этого участника). Флаг
+    # читается так же, как `as_lane` и `default`, то есть и строкой «true».
+    "add_participant": '{"op":"add_participant","id":"new_...","name":"...",'
+                       '"black_box":true}'
+                       " — black_box: true создаёт пул без процесса (чёрная "
+                       "коробка внешнего контрагента: шагов, старта и финиша в "
+                       "нём не заводят, а обмен ведут потоком сообщения с id "
+                       "этого пула на конце); без флага пул создаётся со своим "
+                       "процессом",
     "add_documentation": '{"op":"add_documentation","id":"id элемента","text":"..."}',
     "add_event_definition": '{"op":"add_event_definition","id":"id события",'
                             '"event_definition":"timer","duration":"PT2H"}'
@@ -393,7 +423,11 @@ OP_SPEC: Dict[str, str] = {
     "connect": '{"op":"connect","source":"...","target":"...",'
                '"flow_type":"sequence","condition":"текст условия","default":true}'
                " — flow_type: sequence либо message; поля condition и default"
-               " опциональны, default ставят только одной ветке шлюза",
+               " опциональны, default ставят только одной ветке шлюза; у"
+               " messageFlow концом бывает и пул целиком — его id из"
+               " participants (чёрная коробка внешнего контрагента), именем"
+               " такой конец не разрешается; sequenceFlow внутри одного пула"
+               " участником целым не бывает",
     # Ветка, которая на схеме уже есть, через `connect` условия не получит: он
     # создаёт поток и на готовую пару отвечает «такой поток уже существует».
     "add_condition": '{"op":"add_condition","flow":"id потока шлюза",'
@@ -681,6 +715,34 @@ class _Index:
                  for process in self.fuzzy_matches(str(key or ""))}
         return sorted(name for name in names if name)
 
+    def participant_by_id(self, ref: Any) -> Optional[ET.Element]:
+        """Участник по его id — адрес пула целиком в конце потока-сообщения.
+
+        Participants не входят в `elements` (они не узлы маршрута), поэтому
+        конец `messageFlow`, названный участником, раньше читался как «источник
+        или цель не найдены» и отвергался, хотя BPMN 2.0 рисует так обмен с
+        внешним контрагентом, у которого внутренней работы нет (чёрная
+        коробка). Ищется строго по id, а не по имени: тем же адресом меряет
+        `validate_and_repair` (`pool_ids`), им же инвентарь показывает пул.
+        """
+        key = str(ref or "")
+        if not key:
+            return None
+        for participant in self.participants:
+            if participant.get("id") == key:
+                return participant
+        return None
+
+    def participant_process(self, participant: ET.Element) -> Optional[ET.Element]:
+        """Процесс участника; None — чёрная коробка (ссылки на процесс нет)."""
+        ref = (participant.get("processRef") or "").strip()
+        if not ref:
+            return None
+        for process in self.processes:
+            if process.get("id") == ref:
+                return process
+        return None
+
     def resolve_process(self, key: Optional[str]) -> Optional[ET.Element]:
         """Участник по id, имени или id процесса → элемент процесса.
 
@@ -807,16 +869,44 @@ def build_inventory(xml_text: str) -> Dict[str, Any]:
     события, определения таймера и факта документации планировщик работает
     вслепую — предлагает перенос в ту же дорожку, второй таймер на тот же шаг
     и описание там, где оно уже есть.
+
+    Список участников идёт от участников, а не от процессов: дуга, чей конец —
+    адрес из `participants`, не считается обрезанной (`shown_ids`), и обмен с
+    чёрной коробкой остается виден модели. Пока обход шёл от процессов, пул без
+    `processRef` выпадал и из `participants`, и из `flows` — планировщик видел
+    схему, где контрагента нет вовсе, а `limits.flows_omitted` молча рос.
     """
     root = parse_xml(xml_text)
     index = _Index(root)
     participants = []
+    # Пул показывается дважды разными дорожками: белый — со своим процессом
+    # (одна запись на процесс, как и раньше), чёрная коробка — прямо по
+    # участнику. Прежний обход шёл ОТ процессов, поэтому участник без
+    # `processRef` в инвентаре отсутствовал вовсе: модель не видела контрагента,
+    # не могла назвать его адресом и в ответ заводила ему пустой процесс с
+    # выдуманным шагом. По корпусу таких пулов 31 из 346 (9,0%).
+    seen_participants: Set[int] = set()
     for process in index.processes:
         participant = index.participant_by_process_id.get(process.get("id", ""))
+        if participant is not None:
+            seen_participants.add(id(participant))
         participants.append({
             "id": participant.get("id") if participant is not None else process.get("id"),
             "name": index.participant_name(process),
         })
+    for participant in index.participants:
+        if id(participant) in seen_participants or not is_black_box(participant):
+            continue
+        entry = {
+            "id": participant.get("id") or "",
+            "name": participant.get("name") or participant.get("id") or "",
+            # Пометка читается и моделью, и человеком: без неё чёрная коробка
+            # неотличима от пустого белого пула, а правки у них противоположные
+            # (первой шагов не нужно вовсе, второй их не поручили).
+            "black_box": True,
+            "process": "без процесса",
+        }
+        participants.append(entry)
 
     # Узел принадлежит ровно одной дорожке: разворачиваем flowNodeRef в
     # обратную ссылку, иначе «в какой дорожке шаг» пришлось бы искать перебором
@@ -984,6 +1074,17 @@ def _connect_endpoints_hint(index: _Index, source_id: str, target_id: str) -> st
             # скоринга: «цель '': нет в схеме» читается как указание на
             # несуществующий адрес, а не как «операнд не назван».
             parts.append(f"{role} не назван — укажите id узла из инвентаря")
+            continue
+        # Конец назван ИМЕНЕМ участника: пул в схеме есть, адресован неверно.
+        # Правило одно на весь контур — id (им же меряет `validate_and_repair`,
+        # им же инвентарь показывает `participants`), и отказ обязан дать его
+        # готовые, иначе корректирующий повтор приносит то же слово.
+        named = [p.get("id") or "" for p in index.participants
+                 if str(p.get("name") or "").strip() == str(value).strip()
+                 and p.get("id")]
+        if named:
+            parts.append(f"{role} '{value}' — имя участника, а не его id "
+                         f"({', '.join(repr(x) for x in named)})")
             continue
         parts.append(f"{role} '{value}': " + _missing_id_hint(index, value))
     if not parts:
@@ -1191,6 +1292,52 @@ def _adopt_event_definition(index: _Index, owner: ET.Element, key: str,
     return index.adopt(owner, definition)
 
 
+def _lane_for_new_node(index: _Index, elem: ET.Element,
+                       anchor_id: str = "") -> Optional[ET.Element]:
+    """Дорожка, которой подписать только что вставленный узел.
+
+    `flowNodeRef` — это подпись исполнителя, а не украшение: узел процесса с
+    дорожками, в дорожку не подписанный, bpmn-js кладёт ПОВЕРХ всех дорожек, и
+    улучшенная схема выглядит сломанной при верно применённой правке
+    (прогон #75: `new_report_task` и `new_timer_postmortem` доехали до схемы без
+    ссылок, оракул `nodes_have_a_lane` считает это нарушением нотации).
+
+    Приёмник — дорожка якоря: вставленный шаг продолжает работу того же
+    исполнителя. Якоря нет (или он сам без подписи) и дорожка в пуле одна —
+    берём её. Несколько дорожек и якорь без подписи — берём наименее загруженную
+    и пишем об этом в отчёте: узел без `flowNodeRef` — это не «нейтральный»
+    вариант, а сломанная отрисовка, а генератор (`_lanes_cover_nodes`) решает ту
+    же задачу тем же признаком, и две линейки одного свойства разъезжаться не
+    должны.
+    """
+    parent = index.parents.get(elem)
+    if parent is None or _local(parent.tag) != "process":
+        # Внутри subProcess дорожек нет, и ссылка на узел нижнего уровня в
+        # laneSet была бы битой IDREF-ссылкой.
+        return None
+    lanes = [lane for lane in index.lanes
+             if index.parents.get(index.parents.get(lane)) is parent]
+    if not lanes:
+        return None
+    anchor = (anchor_id or "").strip()
+    if anchor:
+        for lane in lanes:
+            if any(_text_of(ref) == anchor
+                   for ref in lane.findall(_q("flowNodeRef"))):
+                return lane
+    if len(lanes) == 1:
+        return lanes[0]
+    return min(lanes, key=lambda lane: (
+        len(list(lane.findall(_q("flowNodeRef")))), lane.get("id") or ""))
+
+
+def _sign_lane(lane: ET.Element, elem_id: str) -> str:
+    """Подписать узел дорожкой и вернуть текст для отчёта."""
+    ET.SubElement(lane, _q("flowNodeRef")).text = elem_id
+    return (f"подписан дорожкой «{lane.get('name') or lane.get('id')}» — "
+            "иначе bpmn-js рисует узел вне всех дорожек")
+
+
 def _insert_after(new_elem: ET.Element, after_id: str, index: _Index) -> List[str]:
     """Вставка элемента после существующего с переподвеской потоков.
     Возвращает пояснения для отчёта."""
@@ -1339,6 +1486,20 @@ def _op_add_participant(op: Dict[str, Any], index: _Index) -> List[str]:
     if not name:
         raise _Skip("не задано имя нового пула", "укажите name")
     collaboration = _ensure_collaboration(index)
+    # `black_box: true` — участник без процесса: внешнего контрагента, чью
+    # внутреннюю работу автор не описывает, рисуют чёрной коробкой
+    # коллаборации, а обмен ведут пулом целиком. Заводить ему процесс «на всякий
+    # случай» значило бы заряжать схему выдуманным маршрутом: починка
+    # `validate_and_repair` кладёт в каждый процесс старт и финиш, и пустой
+    # процесс контрагента наполняется работой, которой в описании нет. По живым
+    # дампам #74 так выросло 9 белых пулов из 21 ровно с одной активностью, а
+    # корпус читает обратное: 31 участник из 346 (9,0 %) держатся без процесса
+    # вовсе.
+    if _flag(op.get("black_box"), "black_box"):
+        participant = ET.Element(_q("participant"), {"id": op_id, "name": name})
+        index.adopt(collaboration, participant)
+        return [f"создана чёрная коробка '{name}' ({op_id}): процесса у неё нет, "
+                "сообщение в неё идёт концом на этот id"]
     process = ET.Element(_q("process"), {
         "id": f"{op_id}_proc", "isExecutable": "true",
     })
@@ -1664,11 +1825,18 @@ def _op_add_node(op: Dict[str, Any], index: _Index, kind: str) -> List[str]:
         index.adopt(process, elem)
     if outlet_id:
         notes.append(_link_outlet(index, op_id, outlet_id, process))
+    if lane is None:
+        # Операция дорожку не называла — это не право оставлять узел без
+        # подписи: см. `_lane_for_new_node`.
+        lane = _lane_for_new_node(index, elem, str(after_id or "").strip())
     if lane is not None:
-        # Новый узел становится ребёнком процесса, а дорожка только ссылается
-        # на него — ровно так пишет bpmn-js (см. _op_move_to_lane).
-        ET.SubElement(lane, _q("flowNodeRef")).text = op_id
-        notes.append(f"помещён в дорожку '{lane.get('name') or lane_key}'")
+        if lane_key:
+            # Узел назван операцией: новый ребёнок процесса, а дорожка только
+            # ссылается на него — ровно так пишет bpmn-js (см. _op_move_to_lane).
+            ET.SubElement(lane, _q("flowNodeRef")).text = op_id
+            notes.append(f"помещён в дорожку '{lane.get('name') or lane_key}'")
+        else:
+            notes.append(_sign_lane(lane, op_id))
     return notes or [f"добавлен элемент '{name}'"]
 
 
@@ -2110,20 +2278,61 @@ def _endpoint_process(index: "_Index", elem: ET.Element) -> Optional[ET.Element]
     return index.enclosing_process(elem)
 
 
+def _endpoint_home(index: _Index, elem: Optional[ET.Element],
+                   pool: Optional[ET.Element]) -> Optional[ET.Element]:
+    """Дом конца дуги: процесс узла, а для участника целиком — его процесс, если
+    он есть, иначе сам участник.
+
+    Сравнение домов по идентичности элемента — то, на чём держатся оба запрета:
+    `sequenceFlow` не пересекает границу пула, а `messageFlow` не живёт внутри
+    одного. Чёрную коробку нельзя было мерить процессом: его нет, и два разных
+    контрагента давали пару `None is None` — аплайер отвергал законный обмен
+    между ними формулировкой «messageFlow внутри одного пула»."""
+    if elem is not None:
+        return _endpoint_process(index, elem)
+    if pool is not None:
+        home = index.participant_process(pool)
+        return pool if home is None else home
+    return None
+
+
 def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     source_id = op.get("source") or ""
     target_id = op.get("target") or ""
     source = index.elements.get(source_id)
     target = index.elements.get(target_id)
-    if source is None or target is None:
+    # Конец потока-сообщения по BPMN 2.0 — и узел, и участник целиком; так рисуют
+    # обмен с внешним контрагентом, у которого нет внутреннего процесса (чёрная
+    # коробка: 31 участник из 346 на корпусе рукописных схем, 9,0%). Для
+    # sequence-потока пул целым концом не бывает — тот ряд остаётся отказом и
+    # здесь, и в скоринге (`cross_pool_flow`), и в оракуле (`flows_within_pool`).
+    flow_type = _typed_value(op, ("flow_type", "type"), FLOW_TYPE_ALIASES,
+                             FLOW_TYPES, "тип потока") or "sequence"
+    source_pool = (index.participant_by_id(source_id)
+                   if source is None and flow_type == "message" else None)
+    target_pool = (index.participant_by_id(target_id)
+                   if target is None and flow_type == "message" else None)
+    if flow_type == "sequence":
+        # Пул целым участником концом потока управления не бывает: sequenceFlow
+        # живёт внутри одного процесса, и принятие такой дуги означало бы дыру,
+        # которую не закрывает ни `cross_pool_flow` скоринга, ни
+        # `flows_within_pool` оракула. Отказ отдельный, а не общее «не найдены»:
+        # адрес существует, неверно выбран род потока.
+        as_pool = [ref for ref, elem in ((source_id, source), (target_id, target))
+                   if elem is None and index.participant_by_id(ref) is not None]
+        if as_pool:
+            raise _Skip(
+                f"пул ({', '.join(as_pool)}) концом sequenceFlow не бывает",
+                "потоком управления соединяют узлы одного процесса, а связь двух "
+                "пулов выражается flow_type=message",
+            )
+    if (source is None and source_pool is None) or (target is None and target_pool is None):
         raise _Skip(
             "источник или цель не найдены",
             _connect_endpoints_hint(index, source_id, target_id),
-            needs=(source_id if source is None else "",
-                   target_id if target is None else ""),
+            needs=(source_id if (source is None and source_pool is None) else "",
+                   target_id if (target is None and target_pool is None) else ""),
         )
-    flow_type = _typed_value(op, ("flow_type", "type"), FLOW_TYPE_ALIASES,
-                             FLOW_TYPES, "тип потока") or "sequence"
     # Выход по умолчанию — атрибут шлюза на sequence-потоке из него: раньше
     # аплайер не умел его ставить, и любая «иначе»-ветка отвергалась.
     default_requested = _flag(op.get("default"), "default")
@@ -2131,17 +2340,27 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
         if flow_type != "sequence":
             raise _Skip("выходом по умолчанию назначают sequence-поток",
                         "уберите default у messageFlow")
-        if _local(source.tag) not in GATEWAY_TAGS:
+        if source is None or _local(source.tag) not in GATEWAY_TAGS:
             raise _Skip(f"'{source_id}' не является шлюзом",
                         "default ставят только шлюзу, у задачи ветки по умолчанию нет")
-    source_process = _endpoint_process(index, source)
-    target_process = _endpoint_process(index, target)
+    source_process = _endpoint_home(index, source, source_pool)
+    target_process = _endpoint_home(index, target, target_pool)
     if flow_type == "sequence" and source_process is not target_process:
         raise _Skip(
             "sequenceFlow между разными пулами недопустим",
             "используйте flow_type=message",
         )
     if flow_type == "message" and source_process is target_process:
+        if source_id == target_id:
+            # Оба конца — один и тот же участник: «обмен» никуда не идёт. Это
+            # не «внутри одного пула» (там подсказка про sequence законна), и
+            # отдельный отказ потому, что правка у него другая — выбрать второго
+            # контрагента, а не сменить род потока.
+            raise _Skip(
+                f"оба конца обмена названы одним участником ('{source_id}')",
+                "сообщение ведут между двумя пулами: вторым концом поставьте id "
+                "другого участника из инвентаря (participants)",
+            )
         raise _Skip(
             "messageFlow внутри одного пула не имеет смысла",
             "используйте flow_type=sequence",
@@ -2153,7 +2372,7 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     # `connect(source='<шлюз>', …, flow_type='message')`.
     if flow_type == "message":
         on_gateway = [ref for ref, elem in ((source_id, source), (target_id, target))
-                      if _local(elem.tag) in GATEWAY_TAGS]
+                      if elem is not None and _local(elem.tag) in GATEWAY_TAGS]
         if on_gateway:
             raise _Skip(
                 f"развилка ({', '.join(on_gateway)}) концом messageFlow не бывает",
@@ -2161,8 +2380,11 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
                 "поставьте шаг, ведущий в развилку, а не саму развилку",
             )
     # Поток не должен пересекать границу subProcess: узел внутри подпроцесса
-    # принадлежит ему, и bpmn-js такую конструкцию не отрисует.
-    if index.has_subprocess_ancestor(source) is not index.has_subprocess_ancestor(target):
+    # принадлежит ему, и bpmn-js такую конструкцию не отрисует. Участник целиком
+    # в подпроцесс не вкладывается (он живёт в коллаборации), поэтому проверка
+    # смотрит только на пару узлов.
+    if (source is not None and target is not None
+            and index.has_subprocess_ancestor(source) is not index.has_subprocess_ancestor(target)):
         raise _Skip(
             "элементы лежат на разной вложенности",
             "поток не может выходить из subProcess: соединяйте узлы одного уровня",
@@ -2171,8 +2393,8 @@ def _op_connect(op: Dict[str, Any], index: _Index) -> List[str]:
     # из конечного не выходят, а у граничного события вход — хозяин через
     # attachedToRef, не поток. Ни скоринг, ни оракул такого дефекта не видят,
     # поэтому проверка обязана быть здесь.
-    source_tag = _local(source.tag)
-    target_tag = _local(target.tag)
+    source_tag = _local(source.tag) if source is not None else ""
+    target_tag = _local(target.tag) if target is not None else ""
     if flow_type == "sequence":
         if target_tag in SEQUENCE_FORBIDDEN_TARGETS:
             raise _Skip(
@@ -2534,6 +2756,9 @@ def _op_add_boundary_event(op: Dict[str, Any], index: _Index) -> List[str]:
     _adopt_event_definition(index, elem, event_type, op_id, timing)
     index.adopt(process, elem)
     note = f"граничное событие '{name or op_id}' прицеплено к '{host_id}'"
+    host_lane = _lane_for_new_node(index, elem, host_id)
+    if host_lane is not None:
+        note += f"; {_sign_lane(host_lane, op_id)} хозяина"
     if not name:
         note += "; имя не задано — событию в BPMN оно не требуется, тип читается " \
                 "из определения"
@@ -2590,9 +2815,27 @@ def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
         if not key:
             raise _Skip(f"не задан пул ({role})",
                         "укажите source и target именами или id пулов из инвентаря")
-        if process is None:
+        if process is None and participant is None:
             raise _Skip(f"пул '{key}' не найден ({role})",
                         _merge_operand_hint(index, key, role))
+        if process is None:
+            # Чёрная коробка: участник найден, процесса у него нет. Отказ по
+            # существу, а не «пул не найден» — адрес в схеме есть, и подсказка
+            # обязана называть операцию, которая с ним законна.
+            label = participant.get("name") or participant.get("id") or key
+            if role == "источник":
+                raise _Skip(
+                    f"пул «{label}» — чёрная коробка без процесса ({role}): "
+                    "переносить в дорожку нечего",
+                    "снимите её операцией remove_participant (её обмены сначала "
+                    "disconnect), а роль заведите дорожкой приёмника операцией "
+                    "add_lane",
+                )
+            raise _Skip(
+                f"пул «{label}» — чёрная коробка без процесса ({role}): в него "
+                "нельзя положить дорожку",
+                "приёмником ставьте пул с процессом из инвентаря (participants)",
+            )
         if participant is None:
             raise _Skip(f"'{key}' не является пулом ({role}): процесс не заявлен "
                         "участником в коллаборации",
@@ -2735,13 +2978,36 @@ def _op_merge_participants(op: Dict[str, Any], index: _Index) -> List[str]:
 
 
 def _op_remove_participant(op: Dict[str, Any], index: _Index) -> List[str]:
-    """Удалить пул, в котором нет ни одной активности: только старт и финал."""
+    """Удалить пул, в котором нет ни одной активности: только старт и финал.
+
+    Чёрная коробка (участник без `processRef`) — тот же случай, только
+    тривиальный: активности в ней быть не может, а прежний отказ «пул не найден»
+    делал её недоступной правке, хотя инвентарь её как раз показывал. Первыми
+    снимаются проверки, а не дерево: обмены, чей конец — сам участник, надо
+    разорвать явно, иначе удаление оставит висячую дугу, которую и скоринг, и
+    оракул (`message_flow_ends`) меряют нарушением.
+    """
     participant, process, key = index.resolve_participant(
         op.get("participant") or op.get("id"))
     if not key:
         raise _Skip("не задан пул", "укажите participant именем или id пула из инвентаря")
-    if process is None:
+    if participant is None and process is None:
         raise _Skip(f"пул '{key}' не найден", "используйте имена участников из инвентаря")
+    if process is None:
+        # Чёрная коробка: удаляется сам участник, процесса в схеме нет.
+        label = participant.get("name") or participant.get("id") or key
+        holder = str(participant.get("id") or "")
+        attached = sorted(flow.get("id") or "" for flow in index.message_flows
+                          if holder in (flow.get("sourceRef"), flow.get("targetRef")))
+        if attached:
+            raise _Skip(
+                f"чёрная коробка «{label}» держит обмены {', '.join(attached[:5])}",
+                "сначала снимите их операцией disconnect, иначе дуга повиснет "
+                "концом в несуществующий пул",
+            )
+        index.detach(participant)
+        _drop_di(index, holder)
+        return [f"чёрная коробка «{label}» удалена: процесса у неё не было"]
     if participant is None:
         raise _Skip(f"'{key}' не является пулом: процесс не заявлен участником "
                     "в коллаборации",
@@ -4161,6 +4427,11 @@ def _ensure_process_event(index: _Index, process: ET.Element, tag: str,
             f"не найден — {label} событие не добавлено"
         )
         return counter
+    # Дорожка подписывается уже после связи: снятый ниже по потоку узел оставил
+    # бы в laneSet висячий flowNodeRef, а это битая IDREF-ссылка.
+    lane = _lane_for_new_node(index, event)
+    if lane is not None:
+        _sign_lane(lane, event_id)
     notes.append(f"добавлено {label} событие {event_id}")
     return counter + 1
 
@@ -4545,4 +4816,12 @@ def validate_and_repair(xml_text: str) -> Tuple[str, List[str]]:
                              f"ссылка убрана из дорожки "
                              f"«{lane.get('name') or lane.get('id')}»")
 
+    # Графика следует за семантикой: узел или дуга, которые создал пакет либо
+    # эта починка, без `BPMNShape`/`BPMNEdge` редактор читает как дыру в
+    # раскладке и перерисовывает всю схему авто-layout'ом — вместе с дорожками,
+    # которых касалась принятая правка. Импорт внутри функции: `bpmn_layout`
+    # знает `bpmn_edits`, обратное направление было бы циклом.
+    from .bpmn_layout import supplement_di
+
+    notes.extend(supplement_di(root))
     return _serialize(root), notes

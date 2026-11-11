@@ -30,7 +30,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from app.config import (CACHE_REDIS_URL, GENERATION_CACHE_TTL, LLM_CACHE_TTL,
                         NEGATIVE_CACHE_TTL, SCORE_CACHE_TTL)
-from core import bpmn_edits, bpmn_generator, bpmn_scoring, llm_client, llm_improve
+from core import (bpmn_edits, bpmn_generator, bpmn_layout, bpmn_scoring,
+                  llm_client, llm_improve)
 from core.llm_cache import CachedAnswer, LLMCache, sha256_of, source_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -45,13 +46,18 @@ logger = logging.getLogger(__name__)
 # именно из этих строк, то есть текст правила входит в контракт ответа.
 # `llm_client` — температура и `max_tokens` по умолчанию (`:538-540`) и
 # `DEFAULT_MODEL_POOL` (`:31`): правка транспорта меняет ответ, не меняя ни
-# описания, ни схемы. Скоринг — детерминированный код, поэтому транспорт и
-# тексты промптов к его версии относятся ровно постольку, поскольку правила
-# ссылаются на теги аплайера.
+# описания, ни схемы. `bpmn_layout` не участвует в тексте промпта, но входит в
+# кэшированный результат: у генерации — как BPMN DI схемы, у улучшения — как
+# графика узлов и дуг, которые дорисовывает починка (`validate_and_repair` зовёт
+# `supplement_di`). Скоринг — детерминированный код, поэтому транспорт и тексты
+# промптов к его версии относятся ровно постольку, поскольку правила ссылаются
+# на теги аплайера; `bpmn_layout` он держит потому же: теги читает аплайер, а
+# аплайер зовёт раскладку. Пересчёт оценки — локальная работа без обращений к
+# модели, поэтому лишняя инвалидация здесь стоит миллисекунды, а не деньги.
 _PROMPT_SOURCES: Dict[str, Tuple[ModuleType, ...]] = {
-    "generate": (bpmn_generator, bpmn_edits, llm_client),
-    "improve": (llm_improve, bpmn_edits, bpmn_scoring, llm_client),
-    "score": (bpmn_scoring, bpmn_edits),
+    "generate": (bpmn_generator, bpmn_layout, bpmn_edits, llm_client),
+    "improve": (llm_improve, bpmn_edits, bpmn_layout, bpmn_scoring, llm_client),
+    "score": (bpmn_scoring, bpmn_edits, bpmn_layout),
 }
 
 

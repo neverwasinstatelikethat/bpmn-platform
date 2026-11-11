@@ -16,11 +16,15 @@ from pathlib import Path
 import pytest
 
 from core import bpmn_generator, llm_client
-from core.bpmn_edits import GATEWAY_TAGS, build_inventory, validate_and_repair
+from core.bpmn_edits import (BPMNDI_NS, DC_NS, DI_NS, GATEWAY_TAGS,
+                             build_inventory, validate_and_repair)
 from core.bpmn_generator import BPMNGenerator, repair_structure
 from core.bpmn_scoring import BPMNScorer, NOT_A_WAIT_DEFINITIONS
 
 BPMN = "{http://www.omg.org/spec/BPMN/20100524/MODEL}"
+BPMNDI = f"{{{BPMNDI_NS}}}"
+DC = f"{{{DC_NS}}}"
+DI = f"{{{DI_NS}}}"
 
 
 class FakeLLM:
@@ -207,7 +211,10 @@ class TestRolesAreLanesNotPools:
         prompt = fake.plan_prompt
         assert '"lanes"' in prompt and '"lane"' in prompt
         assert "ДОРОЖКИ" in prompt
-        assert "РАЗНЫХ пулов" in prompt
+        # Сообщение бывает только между пулами — раньше это проверялось словом
+        # «РАЗНЫХ», теперь правило живёт в выводе рода потока (`_flow_kind`), а
+        # в промпте оно названо словами «между разными пулами».
+        assert "между разными пулами" in prompt
         # Живые прогоны разводили по пулам кладовщика, водителя и экспедитора, а
         # организации в схеме не оставалось: должность обязана названа запрещена.
         assert "пулом быть не может" in prompt
@@ -462,14 +469,14 @@ class TestTwoStageGeneration:
         assert "«Склад»" in fake.calls[1][1]["content"]
 
     def test_the_flow_prompt_forbids_an_idle_pool(self):
-        """Утверждённый состав обязывает маршрут наполнить каждый пул: без
-        этого правила модель записывает действие контрагента в пул ждущей
-        организации («ждёт подтверждения от перевозчика» → шаг диспетчера),
-        пул контрагента остаётся пустым, и починка удаляет названного в
-        описании участника со схемы."""
+        """Пул с описанной работой наполняется её шагами, а внешний участник
+        без такой работы не получает выдуманный процесс ради заполнения."""
         rule = " ".join(bpmn_generator._FLOW_SYSTEM_PROMPT.split())
-        assert "Ни один утверждённый пул не остаётся без своего шага" in rule
+        assert ("Ни один утверждённый пул с описанной внутренней работой "
+                "не остаётся без своего шага") in rule
         assert "ждать — не значит делать" in rule
+        assert ("Если внутренняя работа внешнего участника не описана, "
+                "он остаётся чёрным ящиком без элементов") in rule
 
     def test_the_prompt_forbids_an_incoming_flow_into_a_boundary_event(self):
         """Правило таймера объясняло, чем граничное событие является, и требовало
@@ -1344,6 +1351,38 @@ class TestIllegalFlowEnds:
         assert not _illegal_xml_edges(BPMNGenerator()._generate_bpmn_xml(repaired))
 
 
+class TestOutputHasDiagramInterchange:
+    """Хранимый XML обязан открываться без повторной раскладки фронтендом."""
+
+    def test_every_node_lane_and_pool_has_real_bounds(self):
+        structure, _ = repair_structure(_plan_dict())
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(structure))
+        shapes = list(root.iter(f"{BPMNDI}BPMNShape"))
+        refs = {shape.get("bpmnElement") for shape in shapes}
+        expected = ({item["id"] for item in structure["elements"]}
+                    | {lane["id"] for lane in structure["lanes"]}
+                    | {"Participant_1"})
+        assert refs == expected
+        for shape in shapes:
+            bounds = shape.find(f"{DC}Bounds")
+            assert bounds is not None
+            assert int(bounds.get("width")) > 0
+            assert int(bounds.get("height")) > 0
+
+    def test_every_flow_has_an_edge_with_distinct_waypoints(self):
+        structure, _ = repair_structure(_plan_dict())
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(structure))
+        edges = list(root.iter(f"{BPMNDI}BPMNEdge"))
+        assert {edge.get("bpmnElement") for edge in edges} == {
+            flow["id"] for flow in structure["flows"]}
+        for edge in edges:
+            points = [(int(point.get("x")), int(point.get("y")))
+                      for point in edge.findall(f"{DI}waypoint")]
+            assert len(points) >= 2
+            assert all(first != second
+                       for first, second in zip(points, points[1:]))
+
+
 class TestOutputIsApplierClean:
     """Схема генератора не должна хотеть починки: `validate_and_repair` — тот
     же фильтр, через который в БД попадает пользовательский XML. Если после
@@ -1917,6 +1956,452 @@ class TestRolePoolBecomesLane:
         moved = next(e for e in result["structure"]["elements"]
                      if e["id"] == "T2")
         assert moved["lane"] == "L_k"
+
+
+class TestDeclaredCounterpartyIsNotFoldedIntoALane:
+    """Названный контрагент — не дорожка.
+
+    Сворачивать «роль-пул» в дорожку можно, потому что роль живёт внутри
+    организации. Сворачивать нельзя участника, которого стадия состава
+    классифицировала контрагентом или внешней системой: дорожка — это
+    подразделение одного участника, а «Поставщик» с «ВкусВиллом» не в одном
+    процессе. Тот же знак отличает и обратный выбор: у названного контрагента
+    внутреннего процесса может не быть вовсе (чёрная коробка коллаборации), а
+    у нашей роли его не бывает.
+    """
+
+    TEXT = ("ВкусВилл оформляет контракт в WMS и передаёт его поставщику, "
+            "поставщик подтверждает отгрузку")
+
+    @staticmethod
+    def _plan_with_counterparty_lane():
+        return _plan_dict(
+            participants=["ВкусВилл", "Поставщик"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"},
+                   {"id": "L_p", "name": "Поставщик", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Контракт готов", "L_m"),
+                _e("T1", "userTask", "Оформить контракт", "L_m"),
+                _e("T2", "userTask", "Подтвердить отгрузку", "L_p", "Поставщик"),
+                _e("E1", "endEvent", "Отгрузка подтверждена", "L_m"),
+            ],
+            flows=[_f("F1", "S1", "T1"),
+                   _f("M1", "T1", "T2", kind="message"),
+                   _f("F2", "T2", "E1")])
+
+    def test_parse_roster_carries_the_external_bucket(self):
+        """Корзина стадии состава доходит до плана: `organizations` — куда роль
+        ложится дорожкой, `external_pools` — кого дорожкой делать нельзя. Без
+        этого починка различает «Поставщика» и «Кладовщика» только по размеру
+        пула, то есть по трюку, а не по смыслу."""
+        skeleton, _notes = bpmn_generator.parse_roster(
+            {"organizations": ["ВкусВилл"], "counterparties": ["Поставщик"],
+             "systems": ["WMS"], "roles": []}, self.TEXT)
+        assert skeleton["organizations"] == ["ВкусВилл"]
+        assert set(skeleton["external_pools"]) == {"Поставщик", "WMS"}
+
+    def test_counterparty_named_like_a_lane_stays_a_participant(self):
+        plan = self._plan_with_counterparty_lane()
+        plan["external_pools"] = ["Поставщик"]
+
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        assert "Поставщик" in [p["name"] for p in repaired["participants"]], notes
+        assert _note(notes, "не свёрнута"), notes
+        moved = next(e for e in repaired["elements"] if e["id"] == "T2")
+        assert moved["participant"] == "Поставщик", moved
+
+    def test_the_same_name_without_the_bucket_still_merges(self):
+        """Контроль мутации: без знака внешности прежняя ветка обязана работать
+        — иначе запрет превращается в «никогда не сливать», и роль-пул снова
+        начнёт жить отдельным участником."""
+        repaired, notes = repair_structure(
+            self._plan_with_counterparty_lane(), text=self.TEXT)
+        assert "Поставщик" not in [p["name"] for p in repaired["participants"]]
+        assert _note(notes, "слит в «ВкусВилл»")
+
+
+class TestMessageEndsAreLiftedToTheParticipant:
+    """Конец обмена, которого нотация не терпит, поднимается до участника целым.
+
+    Замер по 367 рукописным схемам корпуса (625 обменов): приёмниками бывают
+    `intermediateCatchEvent` (213), `startEvent` (160), шаг (160) и участник
+    целиком (88) — конечного события и броска ожидания среди них нет;
+    источниками бывают шаг, `intermediateThrowEvent`, `endEvent` и участник —
+    стартового события нет ни одного. Починка потоков концы сообщения не
+    проверяла вовсе (законность конца мерилась только для sequence), и в
+    выпущенный XML уходил обмен «шаг → чужое событие завершения»: скоринг и
+    оракул его не видят, а аплайер за такую же дугу отвечает отказом, то есть
+    улучшать такую схему пакетом невозможно.
+
+    Подъём до пула — не выдуманное содержание: сам конец «участник целиком» и
+    есть законная форма «доставлено в этот процесс», её кампания только что
+    сделала поддержанной (чёрная коробка и белый пул). Хозяина берём у узла,
+    каким его видит план: если участника в списке ещё нет, починка объявляет
+    его по шагам, и поднимется тот же адрес, что окажется в XML.
+    """
+
+    @staticmethod
+    def _plan(*, source, target, target_pool):
+        return _plan_dict(
+            participants=["ВкусВилл", "Покупатель"], lanes=[],
+            elements=[
+                _e("S1", "startEvent", "Заявление получено", "", "ВкусВилл"),
+                _e("A1", "userTask", "Направить мотивированный отказ", "",
+                   "ВкусВилл"),
+                _e("E1", "endEvent", "Возврат оформлен", "", "ВкусВилл"),
+                _e("PS", "startEvent", "Отказ получен", "", target_pool),
+                _e("P3", "userTask", "Оспорить отказ", "", target_pool),
+                _e("PE", "endEvent", "Ответ получен", "", target_pool),
+            ],
+            flows=[{"id": "F1", "source": "S1", "target": "A1"},
+                   {"id": "F2", "source": "A1", "target": "E1"},
+                   {"id": "F3", "source": "PS", "target": "P3"},
+                   {"id": "F4", "source": "P3", "target": "PE"},
+                   {"id": "M1", "source": source, "target": target,
+                    "kind": "message", "condition": "мотивированный отказ"}])
+
+    def _xml(self, plan):
+        repaired, notes = repair_structure(
+            plan, text="ВкусВилл рассматривает заявление Покупателя и "
+                       "направляет ему мотивированный отказ.")
+        return ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired)), repaired, notes
+
+    def test_a_message_into_a_foreign_end_event_lands_on_the_pool(self):
+        root, repaired, notes = self._xml(
+            self._plan(source="A1", target="PE", target_pool="Покупатель"))
+
+        message = next(f for f in repaired["flows"] if f["kind"] == "message")
+        assert message["target"] == "Покупатель", (message, notes)
+        xml_message = next(f for f in root.iter(f"{BPMN}messageFlow"))
+        assert xml_message.get("targetRef") == "Participant_2"
+        assert len([f for f in repaired["flows"] if f["kind"] == "message"]) == 1
+
+    def test_a_message_from_a_foreign_start_event_lands_on_the_pool(self):
+        root, repaired, notes = self._xml(
+            self._plan(source="PS", target="A1", target_pool="Покупатель"))
+
+        message = next(f for f in repaired["flows"] if f["kind"] == "message")
+        assert message["source"] == "Покупатель", (message, notes)
+        xml_message = next(f for f in root.iter(f"{BPMN}messageFlow"))
+        assert xml_message.get("sourceRef") == "Participant_2"
+
+    def test_the_lift_follows_the_owner_the_plan_declared_for_the_node(self):
+        """Узла объявленного пула нет, но починка объявляет хозяина по шагам —
+        и подъём идёт к нему, а не к выдуманному адресату.
+
+        Проверка держит форму заметки: без неё читатель схемы видит, что конец
+        обмена поднят, а не молча переставлен.
+        """
+        plan = self._plan(source="A1", target="PE", target_pool="Курьер")
+
+        repaired, notes = repair_structure(
+            plan, text="ВкусВилл рассматривает заявление и направляет отказ "
+                       "курьеру.")
+
+        message = next(f for f in repaired["flows"] if f["kind"] == "message")
+        assert message["target"] != "PE", (message, notes)
+        assert message["target"] in [p["name"] if isinstance(p, dict) else p
+                                     for p in repaired["participants"]], message
+        assert _note(notes, "поднят до участника"), notes
+
+
+class TestPoolRemovalKeepsEveryFlowEndpointAnchored:
+    """Сняв пул, починка обязана снять и дугу, чей конец был назван его именем.
+
+    `_repair_flows` принимает адрес участника как законный конец `messageFlow`
+    (белый пул — тоже конец, а не только чёрная коробка), а `messageFlow` и в
+    XML выходит именем, а не `Participant_N`: адрес разворачивается при эмиссии.
+    Отсюда дыра: два шага, идущих *после* починки потоков, пулы удаляют —
+    слияние ролей-пулов и вычистка пустых, — а дугу с выселенным адресом не
+    трогают. Эмиссия печатает `targetRef="Кладовщик"`, ссылки на такой элемент
+    в документе нет, раскладка не находит фигуру и роняет `BPMNEdge`, а
+    редактор, видя меньше рёбер, чем потоков, считает DI неполным и перерисовывает
+    всю схему сам. То есть одна потерянная ссылка обнуляла бы раскладку всей
+    схемы — ровно тот дефект, из-за которого пользователи видели «кривой
+    layout».
+
+    Правка не переписывает адрес: перевести обмен на «тот же шаг, что был у
+    роли» значит выдумать маршрут. Дуга снимается с явной заметкой.
+    """
+
+    ROLE_TEXT = ("ВкусВилл оформляет заказ, Кладовщик его собирает, "
+                 "после чего заказ закрывается.")
+    VACANT_TEXT = ("ВкусВилл оформляет заказ и передаёт его Складу, "
+                   "который только принимает заявку без описанных действий.")
+
+    @staticmethod
+    def _plan(*, extra_pool, target_id, message_target, element_lanes):
+        return _plan_dict(
+            participants=["ВкусВилл", extra_pool],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"},
+                   *element_lanes],
+            elements=[
+                _e("S1", "startEvent", "Заказ создан", "L_m", "ВкусВилл"),
+                _e("T1", "userTask", "Оформить заказ", "L_m", "ВкусВилл"),
+                _e(target_id, "userTask", "Собрать заказ", "L_x", extra_pool)
+                if element_lanes else
+                _e(target_id, "startEvent", "Заявка принята", "", extra_pool),
+                _e("E1", "endEvent", "Заказ собран", "", extra_pool),
+            ],
+            flows=[_f("F1", "S1", "T1"),
+                   _f("M1", "T1", message_target, kind="message"),
+                   _f("F2", target_id, "E1")])
+
+    def test_role_merge_drops_the_exchange_addressed_to_the_vanished_pool(self):
+        plan = self._plan(extra_pool="Кладовщик", target_id="T2",
+                          message_target="Кладовщик",
+                          element_lanes=[{"id": "L_x", "name": "Кладовщик",
+                                          "participant": "ВкусВилл"}])
+
+        repaired, notes = repair_structure(plan, text=self.ROLE_TEXT)
+
+        assert "Кладовщик" not in [p["name"] for p in repaired["participants"]], notes
+        assert not [f for f in repaired["flows"]
+                    if "Кладовщик" in (f["source"], f["target"])], repaired["flows"]
+        assert _note(notes, "Кладовщик") and _note(notes, "слит в «ВкусВилл»"), notes
+
+    def test_vacant_pool_drop_drops_the_exchange_addressed_to_it(self):
+        plan = self._plan(extra_pool="Склад", target_id="S2",
+                          message_target="Склад", element_lanes=[])
+
+        repaired, notes = repair_structure(plan, text=self.VACANT_TEXT)
+
+        assert "Склад" not in [p["name"] for p in repaired["participants"]], notes
+        assert not [f for f in repaired["flows"]
+                    if "Склад" in (f["source"], f["target"])], repaired["flows"]
+
+    @pytest.mark.parametrize("plan,text", [
+        (_plan_dict(
+            participants=["ВкусВилл", "Кладовщик"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"},
+                   {"id": "L_x", "name": "Кладовщик", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ создан", "L_m", "ВкусВилл"),
+                _e("T1", "userTask", "Оформить заказ", "L_m", "ВкусВилл"),
+                _e("T2", "userTask", "Собрать заказ", "L_x", "Кладовщик"),
+                _e("E1", "endEvent", "Заказ собран", "L_x", "Кладовщик"),
+            ],
+            flows=[_f("F1", "S1", "T1"),
+                   _f("M1", "T1", "Кладовщик", kind="message"),
+                   _f("F2", "T2", "E1")]),
+         "ВкусВилл оформляет заказ, Кладовщик его собирает."),
+        (_plan_dict(
+            participants=["ВкусВилл", "Склад"],
+            lanes=[{"id": "L_m", "name": "Менеджер", "participant": "ВкусВилл"}],
+            elements=[
+                _e("S1", "startEvent", "Заказ создан", "L_m", "ВкусВилл"),
+                _e("T1", "userTask", "Оформить заказ", "L_m", "ВкусВилл"),
+                _e("S2", "startEvent", "Заявка принята", "", "Склад"),
+                _e("E2", "endEvent", "Заказ принят", "", "Склад"),
+            ],
+            flows=[_f("F1", "S1", "T1"),
+                   _f("M1", "T1", "Склад", kind="message"),
+                   _f("F2", "S2", "E2")]),
+         "ВкусВилл оформляет заказ и передаёт его Складу.")])
+    def test_emitted_xml_never_addresses_a_removed_pool(self, plan, text):
+        """Сквозная инвариантность эмиссии: каждый конец потока называет узел или
+        участника этого же документа, а каждое ребро DI соответствует потоку.
+
+        Проверка идёт по XML, а не по плану: `sourceRef`/`targetRef` разворачиваются
+        из имени в `Participant_N` здесь, и именно здесь висячий адрес
+        превращается в потерянное ребро.
+        """
+        repaired, _ = repair_structure(plan, text=text)
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired))
+
+        known = {node.get("id") for node in root.iter()
+                 if node.get("id") and node.tag in
+                 (f"{BPMN}participant", f"{BPMN}process")}
+        for process in root.iter(f"{BPMN}process"):
+            known.add(process.get("id"))
+            known.update(child.get("id") for child in process
+                         if child.get("id"))
+        dangling = [(flow.tag.split("}")[1], flow.get("id"), key, flow.get(key))
+                    for flow in list(root.iter(f"{BPMN}sequenceFlow"))
+                    + list(root.iter(f"{BPMN}messageFlow"))
+                    for key in ("sourceRef", "targetRef")
+                    if flow.get(key) not in known]
+        assert not dangling, dangling
+
+        flows = len(list(root.iter(f"{BPMN}sequenceFlow"))) \
+            + len(list(root.iter(f"{BPMN}messageFlow")))
+        edges = len(list(root.iter(f"{BPMNDI}BPMNEdge")))
+        assert edges == flows, f"рёбер DI {edges}, потоков {flows}"
+
+
+class TestDeclaredExternalBlackBox:
+    """Внешний участник без описанной работы — пул без процесса, а не пустой
+    процесс и не повод удалить контрагента. Признак внешности берётся из состава,
+    число шагов самостоятельным основанием для чёрного ящика не является."""
+
+    TEXT = "ВкусВилл оформляет заказ и передаёт его Поставщику."
+
+    @staticmethod
+    def _plan(*external_elements, target="Поставщик"):
+        return _plan_dict(
+            participants=["ВкусВилл", "Поставщик"], lanes=[],
+            external_pools=["Поставщик"],
+            elements=[
+                _e("S1", "startEvent", "Заказ создан", ""),
+                _e("T1", "userTask", "Оформить заказ", ""),
+                _e("E1", "endEvent", "Заказ передан", ""),
+                *external_elements,
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1"),
+                   _f("M1", "T1", target, kind="message")])
+
+    def test_black_box_survives_repair_and_gets_xml_and_di(self):
+        repaired, notes = repair_structure(self._plan(), text=self.TEXT)
+
+        supplier = next(p for p in repaired["participants"]
+                        if p["name"] == "Поставщик")
+        assert supplier["black_box"] is True, notes
+        message = next(f for f in repaired["flows"] if f["id"] == "M1")
+        assert message["target"] == "Поставщик"
+        assert not any(e["participant"] == "Поставщик"
+                       for e in repaired["elements"])
+
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired))
+        processes = list(root.iter(f"{BPMN}process"))
+        assert [p.get("id") for p in processes] == ["Process_1"]
+        participant = next(p for p in root.iter(f"{BPMN}participant")
+                           if p.get("id") == "Participant_2")
+        assert participant.get("processRef") is None
+        message_xml = next(f for f in root.iter(f"{BPMN}messageFlow")
+                           if f.get("id") == "M1")
+        assert message_xml.get("sourceRef") == "T1"
+        assert message_xml.get("targetRef") == "Participant_2"
+        assert any(edge.get("bpmnElement") == "M1"
+                   for edge in root.iter(f"{BPMNDI}BPMNEdge"))
+
+    def test_event_only_external_pool_is_canonicalized_without_losing_exchange(self):
+        plan = self._plan(
+            _e("S2", "startEvent", "Заказ получен", "", "Поставщик"),
+            _e("E2", "endEvent", "Заказ принят", "", "Поставщик"),
+            target="S2")
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        assert "S2" not in _kinds(repaired), notes
+        assert "E2" not in _kinds(repaired), notes
+        message = next(f for f in repaired["flows"] if f["id"] == "M1")
+        assert (message["kind"], message["target"]) == ("message", "Поставщик")
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired))
+        assert len(list(root.iter(f"{BPMN}process"))) == 1
+
+    def test_external_pool_with_a_described_step_stays_a_process(self):
+        plan = self._plan(
+            _e("T2", "userTask", "Подтвердить получение", "", "Поставщик"),
+            target="T2")
+        repaired, _ = repair_structure(plan, text=self.TEXT)
+
+        supplier = next(p for p in repaired["participants"]
+                        if p["name"] == "Поставщик")
+        assert not supplier.get("black_box")
+        assert "T2" in _kinds(repaired)
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired))
+        assert len(list(root.iter(f"{BPMN}process"))) == 2
+
+    def test_message_flow_may_end_at_a_declared_white_participant(self):
+        """Белый пул остаётся законченным концом messageFlow: адрес участника
+        означает весь процесс, а не только чёрный ящик. Иначе перенос потерянного
+        действия в его пул молча съедал уже согласованный обмен."""
+        plan = self._plan(
+            _e("T2", "userTask", "Подтвердить получение", "", "Поставщик"),
+            target="Поставщик")
+
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        message = next(f for f in repaired["flows"] if f["id"] == "M1")
+        assert (message["kind"], message["target"]) == ("message", "Поставщик"), notes
+        supplier = next(p for p in repaired["participants"]
+                        if p["name"] == "Поставщик")
+        assert not supplier.get("black_box"), notes
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired))
+        xml_message = next(f for f in root.iter(f"{BPMN}messageFlow")
+                           if f.get("id") == "M1")
+        assert xml_message.get("targetRef") == "Participant_2"
+        assert len(list(root.iter(f"{BPMN}process"))) == 2
+
+    def test_internal_role_does_not_gain_black_box_immunity(self):
+        plan = self._plan()
+        plan["external_pools"] = []
+        repaired, _ = repair_structure(plan, text=self.TEXT)
+
+        assert [p["name"] for p in repaired["participants"]] == ["ВкусВилл"]
+
+    def test_external_origin_survives_the_route_skeleton_merge(self):
+        skeleton = {"participants": ["ВкусВилл", "Поставщик"], "lanes": [],
+                    "organizations": ["ВкусВилл"],
+                    "external_pools": ["Поставщик"]}
+        route = self._plan()
+        route.pop("external_pools")
+        merged, _ = bpmn_generator._merge_skeleton(
+            skeleton, route, self.TEXT)
+        assert merged["external_pools"] == ["Поставщик"]
+
+    def test_event_only_external_gap_asks_to_remove_the_events(self):
+        """Контур не имеет права выдумывать работу внешнему участнику: если в
+        его пуле остались только старт и финиш, правка — снять их и оставить
+        чёрную коробку."""
+        plan = self._plan(
+            _e("S2", "startEvent", "Заказ получен", "", "Поставщик"),
+            _e("E2", "endEvent", "Заказ принят", "", "Поставщик"),
+            target="S2")
+
+        gaps = bpmn_generator.plan_gaps(plan, self.TEXT)
+
+        assert any("Поставщик" in gap and "без единого шага" in gap
+                   and "сними" in gap and "чёрным ящиком" in gap
+                   for gap in gaps), gaps
+
+    def test_plan_gate_accepts_only_the_declared_external_black_box(self):
+        assert not any("Поставщик" in gap and "без единого шага" in gap
+                       for gap in bpmn_generator.plan_gaps(self._plan(), self.TEXT))
+        internal = self._plan()
+        internal["external_pools"] = []
+        assert any("Поставщик" in gap and "без единого шага" in gap
+                   for gap in bpmn_generator.plan_gaps(internal, self.TEXT))
+
+    def test_misassigned_action_named_for_the_external_pool_keeps_the_gap(self):
+        """Чёрный ящик допустим только там, где внутренней работы нет. Если
+        действие контрагента описано его именем, но записано чужим пулом,
+        план-гейт обязан звать переспрос, а починка — сохранять претендента."""
+        plan = self._plan()
+        plan["elements"].append(
+            _e("A9", "userTask", "Подтвердить отгрузку от поставщика", ""))
+
+        gaps = bpmn_generator.plan_gaps(plan, self.TEXT)
+
+        assert any("Поставщик" in gap and "без единого шага" in gap
+                   and "A9" in gap for gap in gaps), gaps
+
+    def test_participant_endpoint_keeps_a_message_and_rejects_a_sequence(self):
+        """Участник может быть концом messageFlow, но не sequenceFlow. Починка
+        обязана отличить адрес пула от узла, иначе уже оплаченная генерация
+        упадёт KeyError'ем при разборе легального обмена."""
+        plan = self._plan(
+            _e("S2", "startEvent", "Заказ получен", "", "Поставщик"),
+            target="S2")
+        plan["flows"].extend([
+            _f("M2", "Поставщик", "S2", kind="message"),
+            _f("F9", "Поставщик", "S2", kind="sequence"),
+        ])
+
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        message = next(f for f in repaired["flows"] if f["id"] == "M1")
+        assert message["target"] == "Поставщик", notes
+        assert "F9" not in {f["id"] for f in repaired["flows"]}, notes
+        assert _note(notes, "sequence-потоком участником быть не может")
+
+    def test_prompt_draws_events_only_for_a_pool_with_a_process(self):
+        """Чёрный ящик не получает фиктивные старт и финиш: правило концов
+        относится к белому процессу, а не ко всякому утверждённому участнику."""
+        rule = " ".join(bpmn_generator._SYSTEM_PROMPT.split())
+        assert "У каждого пула с внутренним процессом должны быть" in rule
+        assert "чёрный ящик событий не получает" in rule
+        assert "У каждого пула должны быть хотя бы один startEvent" not in rule
 
 
 class TestEventLogic:
@@ -3589,6 +4074,31 @@ class TestPlanPatch:
         assert [f["id"] for f in patched["flows"]] == ["F1", "F2", "F9"]
         assert any("добавлен элемент B1" in n for n in notes)
 
+    def test_a_new_flow_without_an_id_is_numbered_not_lost(self):
+        """Переспрос отвечает тем же промптом, где `id` потока не пишут: дуга
+        без адреса обязана дожить до починки и получить номер, а не быть
+        отвергнутой как «узла с таким id в плане нет»."""
+        patched, notes = self._patch({"add_flows": [{"source": "S1",
+                                                     "target": "E1"}]})
+        added = [f for f in patched["flows"]
+                 if f.get("source") == "S1" and f.get("target") == "E1"]
+        assert len(added) == 1, notes
+        assert not added[0].get("id"), "патч не додумывает адрес"
+
+        from core.bpmn_generator import _prepare_flows
+        _prepare_flows(patched)
+        assert added[0]["id"] == "F3", patched["flows"]
+
+    def test_an_empty_flow_id_does_not_become_a_known_node(self):
+        """Пустой адрес нового потока не имеет права попасть в известные узлы
+        плана: тогда следующая дуга с пустым `source` прошла бы проверку и
+        починка получила бы поток в никуда."""
+        patched, _notes = self._patch({"add_flows": [
+            {"source": "S1", "target": "E1"},
+            {"source": "", "target": "A1"}]})
+        arcs = [(f.get("source"), f.get("target")) for f in patched["flows"]]
+        assert ("", "A1") not in arcs, arcs
+
     def test_the_retry_prompt_forbids_rewriting_a_step_into_an_event(self):
         """Живые отказы #48: на нарушение «в плане нет таймера» модель отвечает
         `fixes` с `event_definition`/`timer`/`attached_to` поверх существующего
@@ -5214,3 +5724,605 @@ class TestForeignScriptDescription:
                                    "бухгалтерия выставляет счёт.")
         assert _foreign_script("The clerk registers the order and finance "
                                "issues an invoice.")
+
+
+class TestAnswerCarriesOnlyDecisions:
+    """Ответ модели обязан нести только решения, а не то, что контур выводит сам.
+
+    Замер живого контура: локальная работа генерации — 5,7 мс на всю схему, а
+    53,6 с уходят внутри ответов модели (~44 токена/с при фиксированном оверхеде
+    обращения ~0,2 с). Значит каждое поле, которое план мог бы не писать, — это
+    оплаченные секунды пользователя, а не косметика промпта.
+    """
+
+    TEXT = ("ВкусВилл принимает заявку клиента, клиент её подтверждает, "
+            "заявка завершается.")
+
+    def _two_pool_plan(self, flows_override=None):
+        return {
+            "participants": ["ВкусВилл", "Клиент"],
+            "lanes": [],
+            "actors": ["ВкусВилл", "Клиент"],
+            "elements": [
+                {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                 "participant": "ВкусВилл", "lane": ""},
+                {"id": "A1", "kind": "userTask", "name": "Принять заявку",
+                 "participant": "ВкусВилл", "lane": ""},
+                {"id": "A2", "kind": "userTask", "name": "Подтвердить заявку",
+                 "participant": "Клиент", "lane": ""},
+                {"id": "E1", "kind": "endEvent", "name": "Заявка закрыта",
+                 "participant": "ВкусВилл", "lane": ""},
+            ],
+            "flows": [
+                {"source": "S1", "target": "A1"},
+                {"source": "A1", "target": "A2"},
+                {"source": "A2", "target": "E1"},
+            ] if flows_override is None else flows_override,
+        }
+
+    def test_flows_get_contour_ids_and_derived_kinds(self):
+        """Номер и род потока выводимы: `id` контур даёт по порядку, а `message`
+        следует из разных пулов на концах — тот же признак, что у
+        `_repair_flows`."""
+        from core.bpmn_generator import _prepare_flows
+
+        plan = self._two_pool_plan()
+        _prepare_flows(plan)
+        assert [f["id"] for f in plan["flows"]] == ["F1", "F2", "F3"]
+        assert plan["flows"][1]["kind"] == "message"
+        assert plan["flows"][0]["kind"] == "sequence"
+
+    def test_the_gate_names_a_flow_it_can_point_at(self):
+        """Без id в тексте нарушения модели нечем править: «поток ?» переспрос
+        читает как разрешение придумать адрес."""
+        from core.bpmn_generator import _prepare_flows
+
+        plan = self._two_pool_plan(flows_override=[
+            {"source": "S1", "target": "A1"},
+            {"source": "A1", "target": "A2"},
+            {"source": "E1", "target": "A1"},
+        ])
+        before = bpmn_generator.plan_gaps(plan, self.TEXT)
+        assert any("поток ?" in g for g in before), before
+
+        _prepare_flows(plan)
+        after = bpmn_generator.plan_gaps(plan, self.TEXT)
+        assert any("поток F3" in g for g in after), after
+        assert not any("поток ?" in g for g in after)
+
+    def test_model_written_ids_survive_and_the_kind_follows_the_pools(self):
+        """Номер — адрес, его контур не трогает. Род — выводимое: `message`
+        между шагами одного пула нотой не допускается, поэтому он пересчитывается
+        по фактическим пулам (см. `TestFlowKindFollowsTheRoute`)."""
+        from core.bpmn_generator import _prepare_flows
+
+        plan = self._two_pool_plan(flows_override=[
+            {"id": "MF1", "source": "A1", "target": "A2", "kind": "message"},
+            {"id": "F7", "source": "S1", "target": "A1", "kind": "sequence"},
+            {"id": "F8", "source": "A1", "target": "E1", "kind": "message"},
+        ])
+        _prepare_flows(plan)
+        assert [(f["id"], f["kind"]) for f in plan["flows"]] == [
+            ("MF1", "message"), ("F7", "sequence"), ("F8", "sequence")]
+
+    def test_a_lean_plan_repairs_into_the_same_route(self):
+        """Тонкий и подробный планы описывают один маршрут: починка обязана
+        дать одинаковые дуги, иначе «не писать выводимое» значит терять потоки,
+        а не секунды."""
+        verbose = self._two_pool_plan(flows_override=[
+            {"id": "F1", "source": "S1", "target": "A1", "kind": "sequence",
+             "condition": "", "default": False},
+            {"id": "F2", "source": "A1", "target": "A2", "kind": "sequence",
+             "condition": ""},
+            {"id": "F3", "source": "A2", "target": "E1", "kind": "sequence",
+             "condition": ""},
+        ])
+        full, _ = bpmn_generator.repair_structure(verbose, text=self.TEXT)
+        slim, _ = bpmn_generator.repair_structure(self._two_pool_plan(),
+                                                  text=self.TEXT)
+        key = lambda s: sorted((f["source"], f["target"], f["kind"],
+                                f["condition"]) for f in s["flows"])
+        assert key(full) == key(slim)
+
+    def test_the_prompt_does_not_bill_derivable_flow_fields(self):
+        """Пример промпта модель копирует дословно: если в нём у каждого потока
+        лежит `"kind": "sequence"` и пустое `condition`, договорённость «пиши
+        только решения» не работает, даже когда текст правила её требует."""
+        prompt = bpmn_generator._SYSTEM_PROMPT
+        assert '"kind": "sequence"' not in prompt
+        assert '"condition": ""' not in prompt
+        assert '"id": "F1"' not in prompt
+        rule = " ".join(prompt.split())
+        assert "Поток описывается концами" in rule
+
+    def test_the_route_stage_is_not_asked_to_echo_lanes(self):
+        """Дорожки маршруту присланы каркасом, а `_merge_skeleton` берёт
+        каркасные: эхо — ~100 токенов выдачи (~2,3 с) в никуда."""
+        rule = " ".join(bpmn_generator._FLOW_SYSTEM_PROMPT.split())
+        assert "`lanes` возвращать не нужно" in rule
+        assert "`participants` и `lanes` верни ровно этим списком" not in rule
+
+    def test_a_route_answer_without_lanes_keeps_the_composition(self, monkeypatch):
+        """Тот же контракт со стороны ответа: маршрут без ключа `lanes` не
+        остаётся без дорожек — состав берётся из каркаса."""
+        roster = json.dumps({"organizations": ["ВкусВилл"], "systems": [],
+                             "counterparties": ["Клиент"],
+                             "roles": [{"name": "Диспетчер",
+                                        "host": "ВкусВилл"}]},
+                            ensure_ascii=False)
+        route = {"actors": ["ВкусВилл", "Клиент"],
+                 "participants": ["ВкусВилл", "Клиент"],
+                 "elements": [
+                     {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                      "participant": "ВкусВилл", "lane": ""},
+                     {"id": "A1", "kind": "userTask", "name": "Принять заявку",
+                      "participant": "ВкусВилл", "lane": ""},
+                     {"id": "A2", "kind": "userTask", "name": "Подтвердить",
+                      "participant": "Клиент", "lane": ""},
+                     {"id": "E1", "kind": "endEvent", "name": "Готово",
+                      "participant": "ВкусВилл", "lane": ""}],
+                 "flows": [{"source": "S1", "target": "A1"},
+                           {"source": "A1", "target": "A2"},
+                           {"source": "A2", "target": "E1"}]}
+        FakeLLM(monkeypatch, roster, json.dumps(route, ensure_ascii=False),
+                json.dumps({"moves": [], "roles": [], "missing": []}))
+        result = BPMNGenerator().generate(self.TEXT)
+
+        assert result["status"] == "success", result
+        lanes = result["structure"]["lanes"]
+        assert [l["name"] for l in lanes] == ["Диспетчер"], lanes
+        assert [f["id"] for f in result["structure"]["flows"]][:3] == [
+            "F1", "F2", "F3"]
+
+    def test_ownership_answers_by_pool_handle(self):
+        """Имя пула в ответе о принадлежности — самая дорогая строка: 12
+        переносов полным именем это ~3/4 байтов ответа. Ручка `P2` стоит
+        столько же, сколько любое другое значение, и разрешается тем же
+        пулом."""
+        from core.bpmn_generator import _resolve_pool_ref
+
+        handles = {"P1": "ВкусВилл", "P2": "Клиент"}
+        assert _resolve_pool_ref("P2", handles) == "Клиент"
+        assert _resolve_pool_ref("p1", handles) == "ВкусВилл"
+        assert _resolve_pool_ref("ВкусВилл", handles) == "ВкусВилл"
+        assert _resolve_pool_ref("", handles) == ""
+
+
+class TestFlowKindFollowsTheRoute:
+    """Род потока пересчитывается по пулам, а дуга из-за него не исчезает.
+
+    Ответ маршрута тонкий: `id` и род потока модель не пишет, их выводит контур
+    (`_prepare_flows`). Но выводит он их по пулам ПЕРВОГО ответа, а вопрос о
+    принадлежности переселяет шаги между пулами позже — замороженный `message`
+    `_repair_flows` читал как слово самой модели, классифицировал дугу как
+    «сообщение внутри пула» и выбрасывал её; обрыв заделывала
+    `_close_pool_paths`, и в `gaps` не значилось ничего. Проверено по заметкам
+    живого прогона #74: ветка удаления не сработала там ни разу, то есть потеря
+    шагов идёт не от неё. Класс закрывает механизм, а не число: молчаливая
+    правка рода, которая рвёт маршрут, опаснее уже измеренного шума модели.
+    """
+
+    TEXT = ("ВкусВилл заводит заявку, менеджер запрашивает подтверждение у "
+            "клиента, WMS отгружает товар и списывает остаток; заявка "
+            "закрыта.")
+
+    @staticmethod
+    def _plan():
+        return {"participants": ["ВкусВилл", "WMS"],
+                "lanes": [],
+                "actors": ["ВкусВилл", "Клиент"],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                     "participant": "ВкусВилл"},
+                    {"id": "A1", "kind": "userTask", "name": "Завести заявку",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask",
+                     "name": "Запросить подтверждение у клиента",
+                     "participant": "ВкусВилл"},
+                    {"id": "A3", "kind": "userTask", "name": "Отгрузить товар",
+                     "participant": "WMS"},
+                    {"id": "E1", "kind": "endEvent", "name": "Заявка закрыта",
+                     "participant": "ВкусВилл"},
+                ],
+                "flows": [{"source": "S1", "target": "A1"},
+                          {"source": "A1", "target": "A2"},
+                          {"source": "A2", "target": "A3"},
+                          {"source": "A3", "target": "E1"}]}
+
+    def test_a_move_between_revisions_retypes_the_flow(self):
+        """Вторая ревизия видит уже переселённый шаг: дуга внутри пула становится
+        sequence, а номер остаётся — по нему нарушение и переспрос обращаются к
+        потоку, и менять его нельзя."""
+        from core.bpmn_generator import _prepare_flows
+
+        plan = self._plan()
+        _prepare_flows(plan)
+        assert [f["kind"] for f in plan["flows"]] == [
+            "sequence", "sequence", "message", "message"]
+        ids = [f["id"] for f in plan["flows"]]
+
+        plan["elements"][3]["participant"] = "ВкусВилл"
+        _prepare_flows(plan)
+        assert [f["id"] for f in plan["flows"]] == ids
+        assert [f["kind"] for f in plan["flows"]] == ["sequence"] * 4
+
+    def test_pool_identity_is_compared_by_name_not_by_spelling(self):
+        """Дуга между двумя шагами одного пула — sequence, даже если состав
+        написал имя пула с заглавной, а модель — тому же шагу в нижнем регистре.
+
+        Пересечение границы процесса выводится по строке `participant`, и
+        посимвольное сравнение видело две разные организации там, где план
+        объявлял одну. Итог — `messageFlow` внутри одного `participant`:
+        нотационное нарушение, которое не ловит ни скоринг (`message_flow_ends`
+        сверяет id концов, а они разные), ни оракул, ни аплайер — тот за такой
+        же дугу отвечает отказом «messageFlow внутри одного пула». Три слоя
+        начинают расходиться ровно там, где знание о «том же самом пуле» хранят
+        две строки разного регистра.
+        """
+        from core.bpmn_generator import _prepare_flows
+
+        plan = self._plan()
+        plan["elements"][2]["participant"] = "вкусвилл"
+        _prepare_flows(plan)
+
+        assert [f["kind"] for f in plan["flows"]] == [
+            "sequence", "sequence", "message", "message"], plan["flows"]
+
+    def test_a_self_exchange_does_not_become_a_message_flow_in_the_xml(self):
+        """Конец дуги с именем того же пула, что и шаг, не оставляет в XML
+        обмена внутри участника: правка — снять дугу, а не переименовывать пул.
+
+        Сквозная пара к предыдущему тесту: род выводится в `_prepare_flows`, а
+        в XML его проверяет уже эмиссия, и именно здесь видно, что нарушение
+        доходит до схемы.
+        """
+        plan = {"participants": ["Поставщик"], "lanes": [],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                     "participant": "поставщик"},
+                    {"id": "T1", "kind": "userTask", "name": "Собрать заказ",
+                     "participant": "поставщик"},
+                    {"id": "E1", "kind": "endEvent", "name": "Готово",
+                     "participant": "поставщик"},
+                ],
+                "flows": [{"id": "F1", "source": "S1", "target": "T1"},
+                          {"id": "F2", "source": "T1", "target": "E1"},
+                          {"id": "M1", "source": "T1", "target": "Поставщик",
+                           "kind": "message"}]}
+
+        repaired, notes = repair_structure(plan,
+                                           text="Поставщик собирает заказ.")
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired))
+        home = {}
+        for process in root.iter(f"{BPMN}process"):
+            for child in process:
+                if child.get("id"):
+                    home[child.get("id")] = process.get("id")
+        own = {p.get("id"): p.get("processRef")
+               for p in root.iter(f"{BPMN}participant")}
+        inside = [(f.get("id"), f.get("sourceRef"), f.get("targetRef"))
+                  for f in root.iter(f"{BPMN}messageFlow")
+                  if own.get(f.get("targetRef"))
+                  and home.get(f.get("sourceRef"))
+                  == own[f.get("targetRef")]]
+        assert not inside, (f"обмен внутри одного участника: {inside}", notes)
+
+    def test_the_contour_keeps_the_arc_after_a_new_actor_claims_two_steps(
+            self, monkeypatch):
+        """Тот же переезд сквозняком через контур: участник, названный в
+        описании, забирает себе соседние шаги из ДВУХ пулов — дуга между ними
+        была межпуловой и получила `message`, а после переноса стала внутренней.
+        Маршрут обязан остаться, а не «обрыв, заделанный починкой»."""
+        roster = ('{"organizations": ["ВкусВилл"], "systems": ["WMS"], '
+                  '"counterparties": [], "roles": []}')
+        plan = self._plan()
+        # Донор обязан остаться с действиями, поэтому у каждого пула по два
+        # шага: иначе отказ «пул остался без действий» затмил бы проверяемый
+        # механизм.
+        plan["elements"].append({"id": "A4", "kind": "userTask",
+                                 "name": "Списать остаток",
+                                 "participant": "WMS"})
+        plan["flows"] = [{"source": "S1", "target": "A1"},
+                         {"source": "A1", "target": "A2"},
+                         {"source": "A2", "target": "A3"},
+                         {"source": "A3", "target": "A4"},
+                         {"source": "A4", "target": "E1"}]
+        answer = _fence(plan)
+        ownership = ('{"missing": [{"pool": "Клиент", "external": true, '
+                     '"steps": ["A2", "A3"]}]}')
+        # Запасаемся четвёртым ответом: нарушение плана вправе вызвать переспрос
+        # до вопроса о принадлежности, и порядок вызовов здесь не предмет
+        # проверки.
+        fake = FakeLLM(monkeypatch, roster, answer, ownership, ownership)
+        result = BPMNGenerator().generate(self.TEXT)
+
+        assert result["status"] == "success", result
+        owner = {e["id"]: e["participant"] for e in result["structure"]["elements"]}
+        assert owner["A2"] == owner["A3"] == "Клиент", (owner, result["notes"])
+        kinds = {(f["source"], f["target"]): f["kind"]
+                 for f in result["structure"]["flows"]}
+        assert ("A2", "A3") in kinds, (kinds, result["notes"])
+        assert kinds[("A2", "A3")] == "sequence"
+        assert len(fake.calls) >= 3
+
+    def test_a_stale_message_is_retyped_and_not_deleted(self):
+        """Починка получает род из плана: «сообщение» между шагами одного пула
+        переписывается в sequence, а не выбрасывается — удаление рвало бы
+        маршрут и не оставляло бы в нарушениях ни строки."""
+        plan = self._plan()
+        plan["elements"][3]["participant"] = "ВкусВилл"
+        plan["flows"] = [{"id": "F1", "source": "A2", "target": "A3",
+                          "kind": "message"},
+                         {"id": "F2", "source": "A3", "target": "E1",
+                          "kind": "message"}]
+
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        kinds = {(f["source"], f["target"]): f["kind"] for f in repaired["flows"]}
+        assert kinds[("A2", "A3")] == "sequence"
+        assert _note(notes, "переписан в sequence"), notes
+
+    def test_an_illegal_end_still_fails_and_names_the_real_reason(self):
+        """Переписывание не вправе пропустить то, что раньше отсекал признак
+        «внутри пула»: входящий поток в старт недопустим и внутри пула, а отказ
+        обязан называть настоящую причину, а не «сообщение внутри пула»."""
+        plan = self._plan()
+        plan["elements"][3]["participant"] = "ВкусВилл"
+        plan["flows"] = [{"id": "F1", "source": "A3", "target": "S1",
+                          "kind": "message"}]
+
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        assert not [f for f in repaired["flows"]
+                    if (f["source"], f["target"]) == ("A3", "S1")]
+        assert _note(notes, "у стартового события входящих"), notes
+
+
+class TestRoleWithoutAHostFoldsIntoTheOnlyOrganization:
+    """Пул с одной задачей и без хозяина — дорожка, когда организация в плане
+    одна и назвала её организацией сама модель.
+
+    Прогон #74, `production_incident`: 4 участника, из них «Дежурный инженер» и
+    «Руководитель дежурства» — роли, помеченные `external: false`, но не
+    назвавшие `inside`. Каждый такой пул держал по одной задаче плюс
+    автоматически дорисованные «Старт» и «Завершение»: читается как «миллион
+    участников при горстке задач». Раньше контур не подставлял хозяина НИКОГДА
+    (откат `_sole_role_host`, прогон #37: по списку пулов «единственная
+    организация» оказывалась должностью). Подстановка разрешена по другому
+    свидетельству — корзине `organizations` стадии состава.
+    """
+
+    TEXT = ("Сервис-деск регистрирует алерт, дежурный инженер оценивает "
+            "инцидент, система мониторинга присылает алерты.")
+
+    ROSTER = ('{"organizations": ["Сервис-деск"], '
+              '"systems": ["Система мониторинга"], "counterparties": [], '
+              '"roles": [{"name": "Дежурный инженер"}]}')
+
+    def _plan(self):
+        return {"participants": ["Сервис-деск", {"name": "Дежурный инженер",
+                                                 "external": False},
+                                 "Система мониторинга"],
+                "lanes": [], "actors": ["Сервис-деск", "Дежурный инженер"],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Алерт",
+                     "participant": "Система мониторинга"},
+                    {"id": "A1", "kind": "userTask", "name": "Прислать алерт",
+                     "participant": "Система мониторинга"},
+                    {"id": "A2", "kind": "userTask", "name": "Зарегистрировать",
+                     "participant": "Сервис-деск"},
+                    {"id": "A3", "kind": "userTask", "name": "Оценить инцидент",
+                     "participant": "Дежурный инженер"},
+                    {"id": "E1", "kind": "endEvent", "name": "Оценён",
+                     "participant": "Сервис-деск"},
+                ],
+                "flows": [{"source": "S1", "target": "A1"},
+                          {"source": "A1", "target": "A2"},
+                          {"source": "A2", "target": "A3"},
+                          {"source": "A3", "target": "E1"}]}
+
+    def test_the_plan_carries_the_organizations_bucket(self):
+        """Классификация стадии состава обязана дожить до починки: без неё
+        приёмник роли нечем определить, а угадывать по списку пулов запрещено."""
+        skeleton, _notes = bpmn_generator.parse_roster(
+            {"organizations": ["Сервис-деск"],
+             "systems": ["Система мониторинга"], "counterparties": [],
+             "roles": [{"name": "Дежурный инженер"}]}, self.TEXT)
+        assert skeleton["organizations"] == ["Сервис-деск"]
+        assert {"name": "Дежурный инженер", "external": False} in \
+            skeleton["participants"]
+
+    def test_the_lone_role_pool_becomes_a_lane(self, monkeypatch):
+        fenced = _fence(self._plan())
+        FakeLLM(monkeypatch, self.ROSTER, fenced, fenced,
+                '{"moves": [], "roles": [], "missing": []}')
+        result = BPMNGenerator().generate(self.TEXT)
+
+        assert result["status"] == "success", result
+        names = sorted(p["name"] for p in result["structure"]["participants"])
+        assert names == sorted(["Сервис-деск", "Система мониторинга"]), names
+        lanes = {l["name"]: l["participant"]
+                 for l in result["structure"]["lanes"]}
+        assert lanes.get("Дежурный инженер") == "Сервис-деск", lanes
+        assert _note(result["notes"], "в составе одна организация"), \
+            result["notes"]
+        owner = {e["id"]: e["participant"]
+                 for e in result["structure"]["elements"]}
+        assert owner["A3"] == "Сервис-деск", owner
+
+    def test_two_organizations_leave_the_role_a_pool(self, monkeypatch):
+        """Обратная ветка: когда организаций две, приёмник роли не определён —
+        и контур не угадывает, а нарушение остаётся нарушением (тот же пропуск
+        стоил прогону #37 организацию, уехавшую дорожкой к своему сотруднику)."""
+        roster = ('{"organizations": ["Сервис-деск", "Цупис"], '
+                  '"systems": [], "counterparties": [], '
+                  '"roles": [{"name": "Дежурный инженер"}]}')
+        plan = self._plan()
+        plan["participants"] = ["Сервис-деск", "Цупис",
+                                {"name": "Дежурный инженер",
+                                 "external": False}]
+        plan["elements"] = [e for e in plan["elements"]
+                            if e["participant"] != "Система мониторинга"]
+        plan["flows"] = [{"source": "A2", "target": "A3"},
+                         {"source": "A3", "target": "E1"}]
+        plan["actors"] = ["Сервис-деск", "Цупис", "Дежурный инженер"]
+        fenced = _fence(plan)
+        FakeLLM(monkeypatch, roster, fenced, fenced,
+                '{"moves": [], "roles": [], "missing": []}')
+        result = BPMNGenerator().generate(
+            "Сервис-деск регистрирует инцидент, Цупис проверяет звонки, "
+            "дежурный инженер оценивает инцидент.")
+
+        names = sorted(p["name"] for p in result["structure"]["participants"])
+        assert "Дежурный инженер" in names, names
+        assert not _note(result["notes"], "в составе одна организация")
+
+
+class TestLanesCoverEveryNode:
+    """В процессе с дорожками каждый узел лежит в дорожке — финальным шагом."""
+
+    TEXT = ("ВкусВилл заводит заявку, кладовщик отгружает товар, заявка "
+            "закрыта.")
+
+    def test_nodes_added_after_lane_declaration_stay_inside_a_lane(self):
+        """Дорожка у пула появляется ПОЗЖЕ разбора элементов: шаг A3 назвал
+        дорожку словом, и `_resolve_lane` завёл её для себя, а A2, у которого
+        дорожки не было, остался висеть на пуле. `placed`, собранный при разборе,
+        его не видит, `_retarget_fallback_lanes` шагов не касается, и bpmn-js
+        кладёт такой узел поверх всех дорожек (прогон #74: `loan_application` —
+        9 узлов вне дорожек, id `R1`, `B1`, `I2`)."""
+        plan = {"participants": ["ВкусВилл", "WMS"],
+                "organizations": ["ВкусВилл", "WMS"],
+                "lanes": [{"id": "L_m", "name": "Менеджер",
+                           "participant": "ВкусВилл"}],
+                "actors": ["ВкусВилл", "WMS"],
+                "elements": [
+                    {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                     "participant": "ВкусВилл", "lane": "L_m"},
+                    {"id": "A1", "kind": "userTask", "name": "Завести заявку",
+                     "participant": "ВкусВилл", "lane": "L_m"},
+                    {"id": "A2", "kind": "userTask", "name": "Собрать заказ",
+                     "participant": "WMS"},
+                    {"id": "A3", "kind": "userTask", "name": "Отгрузить",
+                     "participant": "WMS", "lane": "Складская обработка"},
+                    {"id": "E1", "kind": "endEvent", "name": "Закрыта",
+                     "participant": "ВкусВилл"},
+                ],
+                "flows": [{"source": "S1", "target": "A1"},
+                          {"source": "A1", "target": "A2"},
+                          {"source": "A2", "target": "A3"},
+                          {"source": "A3", "target": "E1"}]}
+
+        repaired, notes = bpmn_generator.repair_structure(plan, text=self.TEXT)
+
+        by_pool: Dict[str, Set[str]] = {}
+        for lane in repaired["lanes"]:
+            by_pool.setdefault(lane["participant"], set()).add(lane["id"])
+        stray = [e["id"] for e in repaired["elements"]
+                 if by_pool.get(e["participant"])
+                 and e.get("lane") not in by_pool[e["participant"]]]
+        assert not stray, (stray, repaired["lanes"],
+                           [(e["id"], e.get("lane"))
+                            for e in repaired["elements"]])
+        assert _note(notes, "без дорожки в процессе с дорожками"), notes
+
+
+class TestApprovedRosterIsNotDefeated:
+    """Запрет заводить пул не оставляет на схеме шагов, которые его называют.
+
+    Прогон #74: `loan_application` — 2 участника в утверждённом составе против 4
+    на схеме, `product_return` — 1 против 2. `_merge_skeleton` честно отвечал
+    «такого пула нет, состав утверждён» и НЕ трогал поле `participant` у шагов,
+    а `_repair_elements` этому полю доверяет и заводит пул сам (`_add_pool`):
+    решение стадии состава отменялось следующим слоем. Тот же разрыв у
+    `roles.inside` и у имён, дополненных падежной фразой.
+    """
+
+    TEXT = "Магазин ВкусВилл оформляет возврат и возвращает деньги."
+
+    def _plan(self):
+        return {"participants": ["Магазин ВкусВилл", "Покупатель"],
+                "lanes": [],
+                "actors": ["Магазин ВкусВилл"],
+                "elements": [
+                    _e("S1", "startEvent", "Возврат", "",
+                       participant="Магазин ВкусВилл"),
+                    _e("A1", "userTask", "Оформить заявку", "",
+                       participant="Магазин ВкусВилл"),
+                    _e("A2", "userTask", "Принести товар в магазин", "",
+                       participant="Покупатель"),
+                    _e("E1", "endEvent", "Возврат закрыт", "",
+                       participant="Магазин ВкусВилл"),
+                ],
+                "flows": [_f("F1", "S1", "A1"), _f("F2", "A1", "A2"),
+                          _f("F3", "A2", "E1")]}
+
+    def test_a_refused_pool_is_not_resurrected_by_its_own_steps(self):
+        """Совесть контура проверяется в двух слоях: отказ прозвучал — и
+        починка не восстанавливает пула."""
+        skeleton = {"participants": ["Магазин ВкусВилл"], "lanes": [],
+                    "actors": ["Магазин ВкусВилл"]}
+        merged, notes = bpmn_generator._merge_skeleton(
+            skeleton, self._plan(), self.TEXT, allow_extra_pools=False)
+
+        assert [bpmn_generator._pool_name(p)
+                for p in merged["participants"]] == ["Магазин ВкусВилл"]
+        assert _note(notes, "шаги отказного пула перенесены"), notes
+        owner = {e["id"]: e["participant"] for e in merged["elements"]}
+        assert owner["A2"] == "Магазин ВкусВилл"
+
+        repaired, _notes = bpmn_generator.repair_structure(merged, text=self.TEXT)
+        assert [p["name"] for p in repaired["participants"]] == [
+            "Магазин ВкусВилл"], repaired["participants"]
+
+    def test_a_padded_actor_name_folds_onto_the_approved_pool(self):
+        """«Клиент интернет-магазина» — тот же утверждённый «Клиент»: `difflib`
+        даёт 0.43 при планке 0.6, и `_add_pool` завёл бы второго участника,
+        уведя к нему часть маршрута (прогон #74, `production_incident` —
+        «Дежурный инженер платёжного шлюза» рядом с «Дежурный инженер»).
+        Обратная сторона ровно та же: «Склад» не вправе проглотить «Складской
+        учёт» — совпадение ищется по началу СПИСКА слов, а не подстрокой."""
+        participants = [{"name": "Клиент"}, {"name": "Склад"}]
+        assert bpmn_generator._pool_close(
+            "Клиент интернет-магазина", participants) == "Клиент"
+        assert bpmn_generator._pool_close(
+            "Складской учёт", participants) is None
+
+        plan = {"participants": ["ВкусВилл", "Клиент"],
+                "lanes": [], "actors": [],
+                "elements": [
+                    _e("A1", "userTask", "Оформить возврат", "",
+                       participant="ВкусВилл"),
+                    _e("A2", "userTask", "Принести товар", "",
+                       participant="Клиент интернет-магазина")],
+                "flows": [_f("F1", "A1", "A2")]}
+        repaired, notes = bpmn_generator.repair_structure(plan, text=self.TEXT)
+
+        assert sorted(p["name"] for p in repaired["participants"]) == \
+            ["ВкусВилл", "Клиент"], repaired["participants"]
+        assert _note(notes, "сопоставлен с близким"), notes
+
+    def test_the_host_of_a_role_is_resolved_from_a_handle_too(
+            self, monkeypatch):
+        """Вопрос о принадлежности печатает пулы ручками (`P1 «ВкусВилл»`), и
+        ответ ручкой приходит в ЛЮБОЕ поле, где назван пул, — не только в
+        `moves.participant`. Без разрешения ручек `inside` становился именем
+        нового участника «P1», а роль оставалась нерешённой."""
+        plan = {"participants": ["ВкусВилл", "Кладовщик"],
+                "lanes": [],
+                "elements": [
+                    {"id": "A1", "kind": "userTask", "name": "Завести заявку",
+                     "participant": "ВкусВилл"},
+                    {"id": "A2", "kind": "userTask",
+                     "name": "Принять товар по накладной",
+                     "participant": "ВкусВилл"}], "flows": []}
+        fenced = _fence(plan)
+        FakeLLM(monkeypatch, fenced, fenced,
+                '{"roles": [{"pool": "P2", "inside": "P1"}]}')
+        result = BPMNGenerator().generate(
+            "ВкусВилл заводит заявку, кладовщик принимает товар по накладной.")
+
+        names = [p["name"] for p in result["structure"]["participants"]]
+        assert "P1" not in names and "P2" not in names, names
+        lanes = {l["name"]: l["participant"] for l in result["structure"]["lanes"]}
+        assert lanes.get("Кладовщик") == "ВкусВилл", (lanes, result["notes"])

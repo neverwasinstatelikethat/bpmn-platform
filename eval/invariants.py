@@ -64,6 +64,7 @@ EVENT_DEFINITION_NAMES = {"timer", "message", "error", "signal", "escalation",
 # quality=good). Именно они входят в гейт `scenario_pass`.
 NOTATION_INVARIANTS: Tuple[str, ...] = (
     "pool_has_steps",
+    "nodes_have_a_lane",
     "participant_interacts",
     "roles_as_lanes",
     "gateway_split_join",
@@ -188,6 +189,16 @@ class _Graph:
     # потому, что конец messageFlow по BPMN 2.0 имеет право быть участником
     # целиком, и «кто затронут» тогда не читается из узлов.
     pool_aliases: Dict[str, str] = field(default_factory=dict)
+    # Id самих участников (`<participant id=…>`), а не их процессов и не имена:
+    # нужен проверке «оба конца обмена названы одним участником», чтобы она
+    # меряла ровно тот же адрес, что и скоринг (`_Schema.self_messages`).
+    pool_ids: Set[str] = field(default_factory=set)
+    # Имена участников без процесса — «чёрные коробки» коллаборации: внешний
+    # контрагент, у которого внутренней работы не описывают, а обмен ведут пулом
+    # целиком. Отдельное поле, а не вывод из «у пула нет узлов»: пустой белый
+    # процесс (работу не поручили никому) и чёрная коробка (работы там и не
+    # должно быть) — два разных вердикта, и различать их больше негде.
+    black_boxes: Set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.by_id: Dict[str, _Node] = {n.id: n for n in self.nodes}
@@ -261,6 +272,32 @@ def _pool_name(item: Any) -> str:
     return _text(item)
 
 
+# Слова, которыми план говорит «этот участник — чёрная коробка». Те же формы,
+# что принимает аплайер (`_flag` в `core/bpmn_edits.py`), в том числе «true»
+# строкой: модель пишет флаг как попало, а оракул не имеет права на её счете
+# терять класс только из-за кавычек.
+_BLACK_BOX_TRUE_WORDS = {"true", "1", "yes", "да", "black_box", "blackbox"}
+
+
+def _is_black_box_flag(item: Any) -> bool:
+    """Явный флаг «пул без процесса» в записи плана (`black_box`, `is_black_box`).
+
+    Оракул не импортирует словари аплайера намеренно (тот же порядок, что со
+    словарями типов выше), поэтому перечисление локальное и только на чтение:
+    план без флага даёт False, и чёрной коробкой в плане считается ровно то, что
+    названо им самим."""
+    if not isinstance(item, Mapping):
+        return False
+    for key in ("black_box", "is_black_box", "blackbox"):
+        value = item.get(key)
+        if isinstance(value, str):
+            if value.strip().lower() in _BLACK_BOX_TRUE_WORDS:
+                return True
+        elif value:
+            return True
+    return False
+
+
 def _graph_from_structure(structure: Mapping[str, Any]) -> _Graph:
     """План/починенная структура -> граф. Неизвестные поля плана игнорируются:
     генератор меняется прямо сейчас, и харнесс не имеет права на них падать."""
@@ -318,6 +355,9 @@ def _graph_from_structure(structure: Mapping[str, Any]) -> _Graph:
              for lane in raw_lanes if isinstance(lane, Mapping)]
     pools = [_pool_name(p) for p in (structure.get("participants") or [])]
     aliases: Dict[str, str] = {}
+    pool_ids: Set[str] = set()
+    black: Set[str] = set()
+    named: Set[str] = set()
     for p in (structure.get("participants") or []):
         name = _pool_name(p)
         if not name:
@@ -325,9 +365,22 @@ def _graph_from_structure(structure: Mapping[str, Any]) -> _Graph:
         aliases[name] = name
         if isinstance(p, Mapping) and _text(p.get("id")):
             aliases[_text(p.get("id"))] = name
+            pool_ids.add(_text(p.get("id")))
+        # Чёрную коробку в плане объявляет только явный флаг: `external` у
+        # контрагента процесс не отменяет (внешняя система вправе вести свой
+        # маршрут), а «нет узлов» в плане — свойство ответа модели, а не замысла.
+        if _is_black_box_flag(p):
+            black.add(name)
+        else:
+            named.add(name)
     return _Graph(nodes=nodes, edges=edges,
                   pools=[p for p in pools if p], lanes=lanes,
                   pool_aliases=aliases,
+                  pool_ids=pool_ids,
+                  # Имя, под которым стоит и белый, и чёрный участник, спорное:
+                  # проверять надо строго, иначе пропуск одного закрывал бы
+                  # нарушение другому.
+                  black_boxes=black - named,
                   defaults={k: v for k, v in defaults.items() if v})
 
 
@@ -346,7 +399,13 @@ def _graph_from_xml(xml: str) -> _Graph:
     root = parse_xml(xml)
     pools: List[str] = []
     aliases: Dict[str, str] = {}
+    pool_ids: Set[str] = set()
     pool_by_process: Dict[str, str] = {}
+    # Чёрные коробки (участник без `processRef`) и имена участников, у которых
+    # процесс есть, — два множества, а не одно: по корпусу 31 чёрная коробка из
+    # 346 участников (9,0%), и до этой правки оракул считал их пулами без шагов.
+    black: Set[str] = set()
+    named: Set[str] = set()
     edges: List[_Edge] = []
     defaults: Dict[str, str] = {}
 
@@ -360,8 +419,13 @@ def _graph_from_xml(xml: str) -> _Graph:
                 pools.append(name)
                 if child.get("id"):
                     aliases[child.get("id")] = name
-                if child.get("processRef"):
-                    pool_by_process[child.get("processRef")] = name
+                    pool_ids.add(child.get("id"))
+                if _text(child.get("processRef")):
+                    pool_by_process[_text(child.get("processRef"))] = name
+                    if name:
+                        named.add(name)
+                elif name:
+                    black.add(name)
             elif tag == "messageFlow":
                 # Концы messageFlow — узлы разных процессов: участнику этого
                 # достаточно, а в local-маршрут своего пула он не входит.
@@ -443,6 +507,11 @@ def _graph_from_xml(xml: str) -> _Graph:
             edge.is_default = True
     return _Graph(nodes=nodes, edges=edges, pools=pools, lanes=lanes,
                   pool_aliases={**aliases, **pool_by_process},
+                  pool_ids=pool_ids,
+                  # Спорное имя (под ним стоит и белый, и чёрный участник)
+                  # проверяется строго: пропуск одного не закрывает нарушение
+                  # другого.
+                  black_boxes=black - named,
                   defaults=defaults)
 
 
@@ -465,14 +534,92 @@ def _fail(name: str, reason: str, ids: Sequence[str] = ()) -> Check:
 
 
 def _check_pool_has_steps(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """В каждом пуле с процессом обязан быть хотя бы один шаг.
+
+    Различение двух пустот — весь смысл проверки, и путать их нельзя:
+    • белый пул (ссылка на процесс есть, шагов нет) — работа не поручена
+      никому: «Старт → Завершение» как декорация. По корпусу 8 таких участников
+      из 346 (2,3%), а по живым дампам #74 к девяти белым пулам из 21 починка
+      дорисовала выдуманные старт и финиш — это нарушение и остаётся;
+    • чёрная коробка (участник без `processRef`) — внешний контрагент, у которого
+      внутренней работы не описывают, а обмен ведут пулом целиком. По корпусу
+      31 такой из 346 (9,0%): падать на них значило требовать шага там, где
+      процесса нет, а `add_task` в такой пул аплайер отвергает («пул не
+      определён»), то есть совет был неисполним по построению. Пул из одной
+      активности (4,0% корпуса) это правило не наказывает — легальны и
+      контрагент, и короткая роль, а различает их состав действующих лиц на
+      стадии генерации.
+
+    Узлы в чёрной коробке появиться не могут (процесса нет), поэтому пропуск
+    ничего не прячет: если имя белого пула совпал с именем чёрного, спорное имя
+    из `black_boxes` снято и проверка остаётся строгой."""
     if not g.pools:
         return _na("pool_has_steps", "пулов нет — проверять нечего")
-    empty = [p for p in g.pools if not g.steps(p)]
+    checked = [p for p in g.pools if p not in g.black_boxes]
+    if not checked:
+        return _na("pool_has_steps",
+                   f"пулов {len(g.pools)}: все они — чёрные коробки без процесса, "
+                   "шагов внутри них не бывает")
+    empty = [p for p in checked if not g.steps(p)]
     if not empty:
-        return _pass("pool_has_steps")
+        skipped = len(g.pools) - len(checked)
+        return _pass("pool_has_steps",
+                     (f"пустых белых пулов нет; снято с проверки чёрных коробок "
+                      f"без процесса: {skipped}") if skipped
+                     else "пустых белых пулов нет")
     return _fail("pool_has_steps",
                  "пулы без единого шага: только «Старт → Завершение» — "
-                 + ", ".join(f"«{p}»" for p in empty), empty)
+                 + ", ".join(f"«{p}»" for p in empty)
+                 + (" (чёрные коробки без процесса из проверки сняты)"
+                    if g.black_boxes else ""),
+                 empty)
+
+
+def _check_nodes_have_a_lane(g: _Graph, _exp: Mapping[str, Any]) -> Check:
+    """Каждый узел пула, у которого есть дорожки, лежит в одной из них.
+
+    Дорожка в BPMN — не украшение: `flowNodeRef` в `laneSet` и есть подпись
+    исполнителя, а узел без неё bpmn-js рисует ПОВЕРХ всех дорожек. Человеческое
+    «кривой layout» — это ровно оно. Перепись корпуса (367 рукописных схем): в
+    305 процессах с дорожками узлов вне дорожек — ноль; единственное, что там
+    висит, это `dataObject`/`dataStoreReference` (10 штук), которые дорожки не
+    имеют по нотации. Значит требование выполнимо по построению и живёт в гейте.
+
+    Хозяин дорожки и пул узла сверяются по каноническому имени (`pool_aliases`):
+    дорожка вправе назвать владельца id процесса, а узел — именем пула, и
+    посимвольное сравнение множество «пулов с дорожками» не совпал бы с пулами
+    узлов. Тогда проверка молча рапортовала бы «узлов вне их 0» ровно на той
+    схеме, где узел не подписан ничем, — то есть врала бы в тексте нарушения.
+
+    Живой прогон #74: `loan_application` — 9 узлов вне дорожек (`R1`, `R2`,
+    `B1`, `B2`, `I2`, `StartEvent_2/3`, `EndEvent_2/3`), `product_return` и
+    `employee_onboarding` — по 3. Ни одна проверка линейки этого не видела:
+    `_check_no_overloaded_lane` берёт только размеченные дорожки, а `flows_within_pool`
+    смотрит на пул, а не на дорожку.
+
+    Парную проверку «пул с работой обязан объявить дорожку» я измерил и снял:
+    эталоны quality=good держат такие пулы осознанно — «Клиент», «Бюро
+    кредитных историй», «Платёжный шлюз», «Система опросов», по одной ответной
+    активности, и это легальная чёрная коробка коллаборации, а не раздутая роль.
+    Роль от контрагента отличает только корзина стадии состава (`external` /
+    `inside`), которой у линейки по XML нет: случай заперт в генераторе
+    (`_declare_role_lanes` с единственным хозяином из `organizations`), а не тут.
+    """
+    def canonical(value: str) -> str:
+        return g.pool_aliases.get(value, value)
+
+    laned = {canonical(_text(lane.get("pool"))) for lane in g.lanes
+             if _text(lane.get("pool"))}
+    if not laned:
+        return _na("nodes_have_a_lane", "ни у одного пула нет дорожек — нечего сверять")
+    stray = [node.id for node in g.nodes
+             if canonical(node.pool) in laned and not node.lane]
+    if not stray:
+        return _pass("nodes_have_a_lane",
+                     f"пулов с дорожками {len(laned)}, узлов вне их 0")
+    return _fail("nodes_have_a_lane",
+                 f"узел пула с дорожками не подписан ни одной из них ({len(stray)}): "
+                 + ", ".join(stray), stray)
 
 
 def _check_participant_interacts(g: _Graph, _exp: Mapping[str, Any]) -> Check:
@@ -756,12 +903,20 @@ def _check_flows_within_pool(g: _Graph, _exp: Mapping[str, Any]) -> Check:
 
 def _check_message_flow_ends(g: _Graph, _exp: Mapping[str, Any]) -> Check:
     """Концы сообщения обязаны быть названы в схеме и способны обмен принять:
-    участником или узлом, но не развилкой.
+    участником или узлом, но не развилкой и не самим собой.
 
     `participant_interacts` про неё молчит правильно: он считает, кого обмен
     затронул, а сломанный конец ни кого не затрагивает — и схема выглядит
     «мало участников», а не «битый обмен».
-    """
+
+    Адрес конца — id, а не имя: `pool_aliases` в XML-вью не содержит ключей-имён
+    именно поэтому, и тем же адресом оперируют `validate_and_repair` и `connect`
+    аплайера. В плане имя держится адресом легально (у плана пул живёт именем), и
+    это расхождение двух точек входа, а не двух читателей схемы.
+
+    Класс «оба конца — один участник» взят тем же признаком, что и у скоринга
+    (`s.self_messages`): в корпусе таких дуг 0 из 625, заносят их правки контура,
+    и без него пакет из одного `disconnect` считался бы снятием нарушения."""
     if not g.message_edges:
         return _na("message_flow_ends", "потоков сообщения нет")
     bad: List[str] = []
@@ -780,6 +935,13 @@ def _check_message_flow_ends(g: _Graph, _exp: Mapping[str, Any]) -> Check:
                 # шлюзовых концов ноль), а собственный совет линейки.
                 problems.append(f"{side} — развилка '{g.by_id[ref].kind}', "
                                 "концом обмена она не бывает")
+        if (edge.source and edge.source == edge.target
+                and edge.source in g.pool_ids):
+            # Оба конца названы одним участником: обмен сам с собой. Проверка
+            # идёт после «которого в схеме нет», чтобы не удвоить отказ на дуге,
+            # у которой адрес и так битый.
+            problems.append(f"оба конца названы участником '{edge.source}' — "
+                            "сам с собой обмен не ведётся")
         if not problems:
             continue
         ident = edge.id or f"{edge.source}->{edge.target}"
@@ -1504,6 +1666,7 @@ _SCENARIO_CHECKS = {
 def _run_checks(g: _Graph, expectations: Mapping[str, Any]) -> Dict[str, Check]:
     results: Dict[str, Check] = {
         "pool_has_steps": _check_pool_has_steps(g, expectations),
+        "nodes_have_a_lane": _check_nodes_have_a_lane(g, expectations),
         "participant_interacts": _check_participant_interacts(g, expectations),
         "roles_as_lanes": _check_roles_as_lanes(g, expectations),
         "gateway_split_join": _check_gateway_split_join(g, expectations),

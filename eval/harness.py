@@ -21,6 +21,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping,
@@ -85,6 +86,14 @@ ADVICE_PROMPT = ("В схеме есть проблемы. Убери то, чт
 # (`eval/run.py:bar_verdict`), и две копии разъехали бы гейт и отчёт молча —
 # держится одно число в `metrics.QUALITY_BAR`.
 QUALITY_BAR = metrics.QUALITY_BAR
+
+# Классы узлов, которые считаются РАБОТОЙ: только задачи. Словарь берётся у
+# оракала (`invariants.TASK_KINDS`) одним источником, а не переписывается:
+# `STEP_KINDS`, с которыми живёт `pass@1/min_steps`, добавляет к ним шлюзы и
+# промежуточные события, и расхождение двух списков должно быть видно как
+# разница метрик, а не как два разных прочтения одного плана.
+ACTIVITY_KINDS = frozenset(invariants.TASK_KINDS)
+
 # Что в итоговой схеме решает человек, а не линейка. Формулировки — вопросы, а не
 # критерии с числом: у ответа нет меры, и выдумывать её значило бы подменить
 # ручной вердикт ещё одной самоподтверждающейся метрикой.
@@ -361,6 +370,110 @@ def fixture_by_id(fixture_id: str,
 
 
 # ---------------------------------------------------------------------------
+# структурные факты схемы
+# ---------------------------------------------------------------------------
+
+
+def structure_facts(structure: Mapping[str, Any]) -> Dict[str, int]:
+    """Сколько в схеме узлов каждого класса: пулы, дорожки, задачи, шлюзы,
+    события, потоки.
+
+    Считается по тому же `structure`, из которого берутся `pools` и `elements`
+    для остальных строк кейса, — иначе «сколько задач» и «сколько элементов»
+    мерили бы разные прочтения одной схемы. Активности — только задачи
+    (`ACTIVITY_KINDS`): в живом прогоне #73→#74 схема `purchase_approval`
+    потеряла 3 элемента из 18, `vehicle_reservation` — 6 из 20, а сводная доля
+    гейт-проверок выросла (0.937 → 0.953), потому что у меньшей схемы просто
+    меньше применимых проверок. Отличить «схема сжалась» от «схема стала чище»
+    этим числом нельзя, а глазами читатель видит «мало тасков».
+
+    `single_activity_pools` и `pools_without_work` — ответ на «миллион
+    участников, в каждом одна задача». По живым дампам #74 из 21 пула девять
+    держали ровно одну активность и заодно выдуманные старт/финиш
+    («Покупатель», «Поставщик», «Клиент», «Скоринговый сервис», «Руководитель
+    дежурства»), а по корпусу 367 рукописных схем 4.0% пулов с одной активностью
+    и 11.3% без работы вовсе (чёрные коробки коллаборации — 9.0%, пустые белые —
+    2.3%). Число намеренно НЕ вердикт: пул из одной активности легален, когда это
+    контрагент, и недопустим, когда это наша роль, а различие знает только
+    корзина стадии состава. Здесь виден масштаб класса, лечит его генератор.
+    """
+    elements = [e for e in (structure.get("elements") or []) if isinstance(e, Mapping)]
+    kinds = [str(e.get("kind") or e.get("type") or "") for e in elements]
+    flows = [f for f in (structure.get("flows")
+                         or structure.get("sequence_flows") or [])
+             if isinstance(f, Mapping)]
+    participants = [p for p in (structure.get("participants") or [])
+                    if isinstance(p, Mapping)]
+    per_pool = Counter()
+    for element in elements:
+        if str(element.get("kind") or element.get("type") or "") not in ACTIVITY_KINDS:
+            continue
+        holder = str(element.get("participant") or element.get("pool") or "")
+        per_pool[holder] += 1
+    work: List[int] = []
+    for pool in participants:
+        refs = {str(pool.get("id") or ""), str(pool.get("name") or "")} - {""}
+        work.append(sum(per_pool[r] for r in refs))
+    return {
+        "pools": len(participants),
+        "lanes": len(structure.get("lanes") or []),
+        "activities": sum(1 for k in kinds if k in ACTIVITY_KINDS),
+        "gateways": sum(1 for k in kinds if k in invariants.GATEWAY_KINDS),
+        "events": sum(1 for k in kinds if k in invariants.EVENT_KINDS),
+        "flows": len(flows),
+        "message_flows": sum(1 for f in flows
+                             if str(f.get("kind") or f.get("type") or "")
+                             .lower() == "message"),
+        "single_activity_pools": sum(1 for n in work if n == 1),
+        "pools_without_work": sum(1 for n in work if n == 0),
+    }
+
+
+def xml_facts(xml: str) -> Dict[str, int]:
+    """Те же факты, прочитанные из XML: пары `_before`/`_after` улучшения
+    существуют без плана, и sidecar обязан говорить, сколько работы в схеме, а
+    не только какой вердикт. Пустой разбор — пустой словарь, а не ноль-ответ:
+    «не разобрано» неотличимо от «в схеме нет задач».
+    """
+    if not xml:
+        return {}
+    parse = getattr(_module("core.bpmn_edits"), "parse_xml", None)
+    if parse is None:
+        return {}
+    try:
+        root = parse(xml)
+    except Exception:  # noqa: BLE001 — битый XML дампа не роняет прогон
+        return {}
+    tags = [str(el.tag).rsplit("}", 1)[-1] for el in root.iter()]
+    # Те же два числа, что и в плане, но прочитанные по дереву: пул без ссылки на
+    # процесс — чёрная коробка, белый пул без активностей — работа не поручена
+    # никому, и то и другое попадает в `pools_without_work`. Единственный
+    # признак — `processRef`, который пишут генератор и аплайер.
+    parts = [el for el in root.iter() if str(el.tag).rsplit("}", 1)[-1] == "participant"]
+    acts_of = Counter()
+    for proc in root.iter():
+        if str(proc.tag).rsplit("}", 1)[-1] != "process":
+            continue
+        acts_of[proc.get("id")] = sum(
+            1 for ch in proc
+            if str(ch.tag).rsplit("}", 1)[-1] in ACTIVITY_KINDS)
+    refs = [p.get("processRef") or "" for p in parts]
+    return {
+        "pools": tags.count("participant"),
+        "lanes": tags.count("lane"),
+        "activities": sum(1 for t in tags if t in ACTIVITY_KINDS),
+        "gateways": sum(1 for t in tags if t in invariants.GATEWAY_KINDS),
+        "events": sum(1 for t in tags if t in invariants.EVENT_KINDS),
+        "flows": tags.count("sequenceFlow"),
+        "message_flows": tags.count("messageFlow"),
+        "single_activity_pools": sum(1 for ref in refs
+                                     if ref and acts_of[ref] == 1),
+        "pools_without_work": sum(1 for ref in refs
+                                  if not ref or acts_of[ref] == 0),
+    }
+
+
+# ---------------------------------------------------------------------------
 # кейсы
 # ---------------------------------------------------------------------------
 
@@ -395,6 +508,10 @@ class GenCase:
     pools: int = 0
     elements: int = 0
     message_flows: int = 0
+    #: заявленный текстом минимум активностей (`Scenario.min_steps`): поле
+    #: заполняется ДО попытки сборки сцены, иначе несобравшийся кейс выпадал бы
+    #: из `generate/activity_share_of_expectation` — а именно так #74 и молчал.
+    min_steps_expected: int = 0
     latency_ms: float = 0.0
     llm_calls: int = 0
     #: вызовы этого кейса с размером входа: в live — записанные с транспорта,
@@ -551,6 +668,12 @@ class GenCase:
                 if isinstance(l, dict)]
         return [o for o in out if o]
 
+    @property
+    def facts(self) -> Dict[str, int]:
+        """Структурные факты починенной структуры этого кейса (задачи, шлюзы,
+        события, дорожки) — то, что видно в схеме без чтения id."""
+        return structure_facts(self.structure)
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "scenario": self.scenario, "fixture": self.fixture, "label": self.label,
@@ -563,6 +686,8 @@ class GenCase:
             "participants_named": self.participants_named,
             "pools": self.pools, "elements": self.elements,
             "message_flows": self.message_flows,
+            "min_steps_expected": self.min_steps_expected,
+            "structure_facts": dict(self.facts),
             "latency_ms": round(self.latency_ms, 1), "llm_calls": self.llm_calls,
             "stage_path": stage_path(self),
             "prompt_calls": list(self.prompt_calls),
@@ -1217,6 +1342,10 @@ def run_generation_case(scenario: Scenario, fixture: Optional[Mapping[str, Any]]
         mode=mode, repeat=repeat,
     )
     expectations = scenario.expectations()
+    # Ожидание живёт на кейсе до попытки сборки: несобравшаяся сцена обязана
+    # войти в `generate/activity_share_of_expectation` нулём, а не выпасть из
+    # знаменателя — по тому же правилу, что у `gate_share` и прогона #53–#54.
+    case.min_steps_expected = int(expectations.get("min_steps") or 0)
     started = time.perf_counter()
     try:
         if mode == "live":
@@ -1756,6 +1885,32 @@ def _not_worse_than_etalon(case: GenCase,
     return 1.0 if len(case.business_smells) <= base else 0.0
 
 
+def _activity_share(case: GenCase) -> Optional[float]:
+    """Доля АКТИВНОСТЕЙ (только задач) от заявленного текстом `min_steps`.
+
+    Строка заведена ровно потому, что `invariants._check_min_steps` считает
+    шаги по `STEP_KINDS` — задачи ПЛЮС шлюзы и промежуточные события, — и при
+    объявленных 8–10 схема, потерявшая половину работы, проходила гейт молча:
+    в живом прогоне #73→#74 первый ответ модели сжался
+    (`purchase_approval` 18→15 элементов, `vehicle_reservation` 20→14,
+    `support_ticket` 14→13), а `quality/scheme_checks_share` выросла
+    0.937 → 0.953, потому что у меньшей схемы меньше применимых проверок и
+    агрегат не монотонен по содержанию. Пользователь на схеме видит «мало
+    тасков» — здесь это единственное число, которое двигается вместе с
+    содержанием, а не вместе с долей формально применимых проверок.
+
+    `min(1, …)`: схема, давшая больше названных действий, чем требовалось,
+    не «лучше на 1.3» — переспрос текста не оплачивается. `None`, когда
+    ожидание не заявлено (тестовый кейс без сценария), несобравшаяся сцена
+    даёт 0.0 — та же дисциплина знаменателя, что у `gate_share`.
+    """
+    if case.min_steps_expected <= 0:
+        return None
+    if not case.ok:
+        return 0.0
+    return min(1.0, case.facts["activities"] / case.min_steps_expected)
+
+
 def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
     """Метрики генерации: доля пройденных гейт-проверок и они же поштучно,
     правки починки, балл, задержка и ретраи.
@@ -1770,6 +1925,12 @@ def build_generation_suite(names: Sequence[str]) -> metrics.EvaluationSuite:
     for name in names:
         suite.metric(f"pass@1/{name}", lambda case, n=name: _check_value(case, n),
                      description=f"инвариант «{name}» по итоговому XML")
+    suite.metric("generate/activity_share_of_expectation", _activity_share,
+                 description="доля активностей (только задач; шлюзы и события — "
+                             "не работа) от заявленного текстом min_steps; "
+                             "`pass@1/min_steps` считает шаги вместе со шлюзами "
+                             "(`STEP_KINDS`), и сжатие схемы #73→#74 через него "
+                             "не было видно")
     suite.metric("quality/scheme_checks_share", lambda case: case.gate_share,
                  description="доля пройденных гейт-проверок на схему (планка ≥0.8: "
                              "монотонно по каждому снятому нарушению; конъюнкция "
@@ -2498,9 +2659,15 @@ class RunReport:
         return {
             "items": list(MANUAL_REVIEW_ITEMS),
             "bar": QUALITY_BAR,
+            # Дорожки и задачи рядом с пулами и элементами: «элементов 21» не
+            # отличает схему, где 15 задач, от схемы, где 8 задач и 7 шлюзов, —
+            # а именно это различие и есть ответ на «мало тасков» (#73→#74).
             "cases": [{"case": c.key, "gate_share": round(c.gate_share, 3),
                        "business_smells": c.business_smells,
-                       "pools": c.pools, "elements": c.elements}
+                       "pools": c.pools, "elements": c.elements,
+                       "lanes": c.facts["lanes"],
+                       "activities": c.facts["activities"],
+                       "min_steps_expected": c.min_steps_expected}
                       for c in shown],
         }
 
@@ -2733,7 +2900,10 @@ def render_table(report: RunReport) -> str:
                      f"гейт-проверок), их и смотрят глазами:")
         for row in review["cases"]:
             lines.append(f"    {row['case']} — гейт {row['gate_share']:.0%}, "
-                         f"пулов {row['pools']}, элементов {row['elements']}"
+                         f"пулов {row['pools']}, дорожек {row['lanes']}, "
+                         f"задач {row['activities']} (текст требует "
+                         f"≥{row['min_steps_expected']}), элементов "
+                         f"{row['elements']}"
                          + (", узкие места: " + ", ".join(row["business_smells"])
                             if row["business_smells"] else ""))
     lines += ["", "ПРОВЕНАНС КЕЙСОВ"]
@@ -3031,6 +3201,12 @@ def dump_schemes(report: "RunReport", out_dir: Path) -> List[Path]:
                         ("id", "source", "target", "kind", "condition",
                          "default", "name", "attached_to")}
                        for f in (case.structure.get("flows") or [])],
+             # Структурные факты отдельным блоком: «элементов M» в сводке не
+             # отвечает на «мало тасков», а разбирать план построчно ради одного
+             # числа — тот самый отдельный прогон, которого дамп и должен
+             # избежать (#73→#74: схемы сжались, вердикт в имени файла — «pass»).
+             "structure_facts": dict(case.facts),
+             "min_steps_expected": case.min_steps_expected,
              "gaps": case.gaps},
             ensure_ascii=False, indent=1), encoding="utf-8")
         written.append(plan)
@@ -3052,9 +3228,14 @@ def dump_schemes(report: "RunReport", out_dir: Path) -> List[Path]:
             written.append(after)
         # Отчёт рядом со схемой: вердикт в имени файла говорит «что читать»,
         # файл ниже — «почему» (факты применения, отказы по стадиям и то, что
-        # харнесс не смог померить).
+        # харнесс не смог померить). Структурные факты прочитаны из самих XML:
+        # плана у пары before/after нет, а вопрос «сколько работы было и стало»
+        # — ровно тот, на который verdict в имени файла не отвечает.
         report_path = out_dir / f"{stem}_report.json"
-        report_path.write_text(json.dumps(case.as_dict(), ensure_ascii=False,
+        payload = case.as_dict()
+        payload["structure_facts"] = {"before": xml_facts(case.base_xml),
+                                      "after": xml_facts(case.xml_after)}
+        report_path.write_text(json.dumps(payload, ensure_ascii=False,
                                           indent=1), encoding="utf-8")
         written.append(report_path)
     return written

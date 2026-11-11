@@ -14,6 +14,7 @@ from .bpmn_edits import (
     SEQUENCE_FORBIDDEN_SOURCES,
     SEQUENCE_FORBIDDEN_TARGETS,
     is_bpmn_tag,
+    is_black_box,
     parse_xml,
     timer_schedule,
 )
@@ -203,6 +204,24 @@ class _Schema:
         self.participants = [
             p for coll in self.collaborations for p in _children(coll, "participant")
         ]
+        # «Чёрная коробка» — участник без `processRef`: внешний контрагент
+        # (Поставщик, Клиент, Система мониторинга), чью внутреннюю работу модельер
+        # не описывает, а обмен ведёт пулом целиком. Внутреннего процесса у него
+        # нет по определению, поэтому правила «пул что-то делает», «у пула есть
+        # старт» и «у пула есть финиш» для него неприменимы: проверять нечего.
+        # Замер по корпусу (367 рукописных схем, 346 участников): чёрных коробок 31
+        # (9,0%), белых пулов ровно с одной активностью 14 (4,0%), белых пулов без
+        # единого шага 8 (2,3%). Живые дампы `--dump-schemes` прогона #74: 9 белых
+        # пулов из 21 держат по одной активности плюс выдуманные старт и финиш,
+        # которые туда поставила починка, — вот это нарушение и остаётся, а
+        # процесс без процесс-ссылки наказывать нечем. Отличает легального
+        # контрагента от раздутой роли только корзина стадии состава (организация
+        # против роли), и она в генераторе, а не здесь: `role_pools` ругает чёрную
+        # коробку с именем дорожки по-прежнему.
+        self.black_box_participants = [p for p in self.participants
+                                       if is_black_box(p)]
+        self.white_participants = [p for p in self.participants
+                                   if not is_black_box(p)]
         # Узлы процесса по его id + обратная ссылка «процесс -> участники».
         # Только верхний уровень: вложенные в subProcess узлы принадлежат
         # шагу, а не пулу, иначе пул из «старт -> подпроцесс -> финиш»
@@ -232,18 +251,40 @@ class _Schema:
         # он считает, кого поток затронул, а сломанный конец ни кого не
         # затрагивает и выглядит просто «мало обменов». Замер по корпусу:
         # 8 таких дуг в 6 схемах из 367.
-        ends_known = set(self.node_by_id) | {p.get("id") or ""
-                                             for p in self.participants}
+        # Правило по концу — id, а не имя: тем же адресом оперирует
+        # `validate_and_repair` (`pool_ids` из `index.participants`), тем же
+        # адресом пул показывает инвентарь аплайера, и ни один из 625 обменов
+        # корпуса не называет конец словом, которое стоит в `name`. Именованные
+        # концы при этом не молчат: `participant_ids_by_name` даёт отказу id
+        # участника, иначе «конца нет в схеме» модель лечит вторым выдуманным
+        # адресом (тот же класс, что живые прогоны лечили `_missing_id_hint`).
+        participant_ids = {p.get("id") or "" for p in self.participants}
+        named_participant_ids = {p.get("id") for p in self.participants if p.get("id")}
+        ends_known = set(self.node_by_id) | participant_ids
+        self.participant_ids_by_name: Dict[str, List[str]] = {}
+        for participant in self.participants:
+            name = (participant.get("name") or "").strip()
+            pid = participant.get("id") or ""
+            if name and pid:
+                self.participant_ids_by_name.setdefault(name, []).append(pid)
         self.dangling_messages: List[_Flow] = []
         # Конец обмена, прицепленный к развилке: отдельный список, а не общее
         # «битый конец», потому что причина и правка у класса разные — конец
         # существует, но узел такого типа сообщением не связывается.
         self.gateway_messages: List[_Flow] = []
+        # Оба конца — один и тот же участник: обмен сам с собой. Отдельный
+        # список, а не «не найденный конец», потому что концы на месте и
+        # отказывать надо по другой причине (аплайер за такую дугу отвечает
+        # «messageFlow внутри одного пула»). В корпусе таких дуг 0 из 625.
+        self.self_messages: List[_Flow] = []
         for element in self.by_tag["messageFlow"]:
             flow = _Flow(element.get("id") or "", element.get("sourceRef") or "",
                          element.get("targetRef") or "", False)
             if flow.source not in ends_known or flow.target not in ends_known:
                 self.dangling_messages.append(flow)
+                continue
+            if flow.source == flow.target and flow.source in named_participant_ids:
+                self.self_messages.append(flow)
                 continue
             # Развилка не бывает концом потока-сообщения: у обмена концом стоит
             # участник или узел, но не шлюз. Корпус это подтверждает молча — из
@@ -289,8 +330,16 @@ class _Schema:
         return [f.target for f in self.outgoing.get(node_id, []) if f.target]
 
     def nodes_of_participant(self, participant: ET.Element) -> List[ET.Element]:
-        """Узлы процесса, на который ссылается участник; [] — ссылки нет или она
-        битая (такой пул не может ни что-то делать, ни завершаться)."""
+        """Узлы процесса, на который ссылается участник.
+
+        `[]` здесь означает два РАЗНЫХ факта, и путать их нельзя:
+        • ссылки нет вовсе — чёрная коробка коллаборации (`is_black_box`), у
+          которой внутренних узлов не бывает по определению, и правилу про
+          шаги/старт/финиш там проверять нечего;
+        • ссылка есть и ведёт в никуда — битая ссылка, то есть нарушение.
+        Поэтому вызывающее правило обязано сначала спросить `is_black_box`, а не
+        выводиться из пустоты списка: пустой список сам по себе ничего не
+        различает (такой пул не может ни что-то делать, ни завершаться)."""
         return self.nodes_by_process.get(participant.get("processRef") or "", [])
 
     def participants_of_node(self, node_id: str) -> List[ET.Element]:
@@ -364,20 +413,61 @@ def _participant_label(participant: ET.Element) -> str:
     return (participant.get("name") or participant.get("id") or "?").strip()
 
 
-def _lane_host_operand(s: _Schema, node_id: str) -> str:
-    """Адрес пула для `add_lane(participant=…)` — тот, который аплайер примет.
+def _rus_forms(count: int, forms: Tuple[str, str, str]) -> str:
+    """Русская форма числительного: «1 участник», «2 участника», «5 участников».
 
-    Имя участника, а где коллаборации нет — id процесса (`resolve_process`
-    принимает и то и другое). Пустой операнд рецепт печатать не вправе: его
-    запрещает корпусный `test_no_advice_prints_an_empty_operand`, и вызывающий
-    код опускает `participant=` там, где адреса нет, — однопроцессному документу
-    аплайер заводит дорожку и без него.
+    Текст правила читает человек в панели скоринга и модель в промпте
+    улучшения: «1 участников» первое отталкивает, а второе читается как два
+    разных объекта в одном предложении."""
+    one, few, many = forms
+    tens, hundreds = count % 10, count % 100
+    if tens == 1 and hundreds != 11:
+        return one
+    if tens in (2, 3, 4) and hundreds not in (12, 13, 14):
+        return few
+    return many
+
+
+def _black_box_skipped(s: _Schema) -> str:
+    """Сколько участников правило оставило без проверки и почему.
+
+    Чёрная коробка (`participant` без `processRef`) не обязана ни иметь шагов,
+    ни стартовать, ни завершаться: внутреннего процесса у неё нет по замыслу
+    автора, и прежний текст ругал её на каждой схеме корпуса с внешним
+    контрагентом — 31 участник из 346 (9,0%), из них нарушителями `pool_has_steps`
+    считались 31 из 37, `start_event` — 31 из 49, `end_event` — 31 из 69. Совет при
+    этом звал модель наполнять контрагента выдуманной работой (`add_task`,
+    `add_event`), то есть оплачивал обращением правку, которая схеме не нужна.
+
+    Формулировка словами и без вызова операции: перепись `eval/advice.py` читает
+    строку вида `add_task(...)` как рецепт и требует, чтобы он применялся, а здесь
+    операнда нет по существу — проверять нечего.
     """
-    for participant in s.participants_of_node(node_id):
-        label = _participant_label(participant)
-        if label != "?":
-            return label
-    return s.owner_of_node.get(node_id) or ""
+    black = s.black_box_participants
+    if not black:
+        return ""
+    listed = ", ".join(f"'{p.get('id') or '?'}'"
+                       for p in black[:IDS_IN_MESSAGE])
+    more = f" и ещё {len(black) - IDS_IN_MESSAGE}" if len(black) > IDS_IN_MESSAGE else ""
+    head = _rus_forms(len(black), ("участник без процесса",
+                                   "участника без процесса",
+                                   "участников без процесса"))
+    word = _rus_forms(len(black), ("чёрная коробка", "чёрные коробки",
+                                   "чёрные коробки"))
+    where = _rus_forms(len(black), ("у такого пула", "у таких пулов",
+                                    "у таких пулов"))
+    whom = _rus_forms(len(black), ("его", "их", "их"))
+    return (f"; {len(black)} {head} — {word} ({listed}{more}): шагов, старта и "
+            f"финиша {where} нет по определению, поэтому правило {whom} не "
+            "проверяет")
+
+
+def _black_box_only_note(s: _Schema) -> str:
+    """Вердикт для схемы, где ВСЕ участники — чёрные коробки."""
+    return (f"всех участников ({len(s.participants)}) нельзя проверить по "
+            "внутреннему маршруту: ни один не ссылается на процесс, это чёрные "
+            "коробки коллаборации, и правка не выражается операцией — "
+            "наполнять контрагента выдуманной работой схеме нечем")
 
 
 def _free_new_id(s: _Schema, base: str) -> str:
@@ -466,20 +556,33 @@ def _check_start_event(s: _Schema) -> _Check:
     прежнюю цепочку, — и `start_event` (−10) наказывал за то, что скоринг же и
     предложил. Симметрично `end_event`: штрафует участника без старта, а не
     лишние входы в процесс.
+
+    Чёрная коробка (участник без `processRef`) из проверки выпадает: стартовое
+    событие живёт в процессе, а процесса у контрагента нет, и требование старта
+    было бы советом завести внутреннюю работу там, где автор её не описывает.
+    Замер до правки: 31 чёрная коробка из 49 нарушителей правила на корпусе.
     """
     if not s.participants:
-        return _Check(PASSED) if s.root_start_events else _Check(
+        if s.root_start_events:
+            return _Check(PASSED)
+        dangling = ", ".join(_ids(s.root_start_events)) or "висячих узлов нет"
+        return _Check(
             FAILED, _ids(s.root_start_events),
-            "в схеме нет ни одного стартового события")
-    headless = [p for p in s.participants
+            "в схеме нет ни одного стартового события: с чего стартует "
+            "процесс — называет автор процесса, правило знает только концы "
+            f"без входа ({dangling})")
+    if not s.white_participants:
+        return _Check(NOT_APPLICABLE, note=_black_box_only_note(s))
+    headless = [p for p in s.white_participants
                 if not any(_local(n.tag) == "startEvent"
                            for n in s.nodes_of_participant(p))]
     if not headless:
         return _Check(PASSED)
     return _Check(FAILED, _ids(headless),
                   f"без события старта {len(headless)} из "
-                  f"{len(s.participants)} участников: "
-                  + "; ".join(_route_ops_hint(s, headless, "start")))
+                  f"{len(s.white_participants)} участников: "
+                  + "; ".join(_route_ops_hint(s, headless, "start"))
+                  + _black_box_skipped(s))
 
 
 def _check_end_event(s: _Schema) -> _Check:
@@ -488,25 +591,54 @@ def _check_end_event(s: _Schema) -> _Check:
     За «пул что-то делает» отвечает `pool_has_steps`, и границы между ними
     выдержаны намеренно: схема `startEvent → endEvent` формально завершается
     корректно и наказывается один раз — отсутствием шагов. Иначе за одну и ту
-    же пустую декорацию снимались бы веса двух правил сразу."""
+    же пустую декорацию снимались бы веса двух правил сразу.
+
+    Чёрная коробка без процесса не завершается внутренним финишем: её обмен
+    заканчивается на самом пуле, и правило для неё неприменимо (до правки на
+    корпусе это было 31 нарушитель из 69)."""
     if not s.participants:
-        return _Check(PASSED) if s.end_events else _Check(FAILED)
-    tailless = [p for p in s.participants
+        if s.end_events:
+            return _Check(PASSED)
+        tailless = [n.get("id") or "?" for n in s.flow_nodes
+                    if not s.outgoing.get(n.get("id") or "")]
+        return _Check(
+            FAILED, tuple(tailless[:6]),
+            "в схеме нет ни одного конечного события: чем заканчивается "
+            "процесс — называет автор процесса, правило знает только концы "
+            f"без выхода ({', '.join(tailless[:6]) or 'таких нет'})")
+    if not s.white_participants:
+        return _Check(NOT_APPLICABLE, note=_black_box_only_note(s))
+    tailless = [p for p in s.white_participants
                 if not any(_local(n.tag) == "endEvent" for n in s.nodes_of_participant(p))]
     if not tailless:
         return _Check(PASSED)
     return _Check(FAILED, _ids(tailless),
                   note=f"без события завершения {len(tailless)} из "
-                  f"{len(s.participants)} участников: "
-                  + "; ".join(_route_ops_hint(s, tailless, "end")))
+                  f"{len(s.white_participants)} участников: "
+                  + "; ".join(_route_ops_hint(s, tailless, "end"))
+                  + _black_box_skipped(s))
 
 
 def _check_pool_has_steps(s: _Schema) -> _Check:
     """Пул без шагов — декорация: `startEvent → endEvent` связен по BPMN, но
-    процесса как работы в нём нет, и скоринг обязан это отличать."""
+    процесса как работы в нём нет, и скоринг обязан это отличать.
+
+    Отличать обязан в обе стороны. Белый пул с процессом и без активности —
+    нарушение, и оно остаётся (по корпусу таких 8 из 346, а по живым дампам #74 —
+    9 белых пулов из 21, куда починка дорисовала старт и финиш). Пул без
+    `processRef` — чёрная коробка внешнего контрагента, и шагов у неё нет не
+    потому, что работу не описали, а потому, что описывать её не кому: процесса
+    в схеме нет. До правки это правило ругало 31 чёрную коробку из 37 нарушителей
+    и советовало `add_task` в пул, который аплайер наполнил бы выдуманным
+    маршрутом. Живые дампы #74 дали 9 белых пулов из 21 ровно с одной активностью
+    (по корпусу таких 4,0%) — вот их и надо лечить, а не контрагентов; что
+    отличает легального контрагента от раздутой роли решает состав действующих
+    лиц (организация против роли), а не наличие шагов."""
     if not s.participants:
         return _Check(NOT_APPLICABLE)
-    stepless = [p for p in s.participants
+    if not s.white_participants:
+        return _Check(NOT_APPLICABLE, note=_black_box_only_note(s))
+    stepless = [p for p in s.white_participants
                 if not any(_local(n.tag) in STEP_TAGS for n in s.nodes_of_participant(p))]
     if not stepless:
         return _Check(PASSED)
@@ -544,7 +676,8 @@ def _check_pool_has_steps(s: _Schema) -> _Check:
                      "та же форма")
     return _Check(FAILED, _ids(stepless),
                   note=f"без шагов {len(stepless)} из "
-                  f"{len(s.participants)} участников: " + "; ".join(notes))
+                  f"{len(s.white_participants)} участников: " + "; ".join(notes)
+                  + _black_box_skipped(s))
 
 
 def _check_participant_interacts(s: _Schema) -> _Check:
@@ -848,10 +981,23 @@ def _check_message_flow_ends(s: _Schema) -> _Check:
     `cross_pool_flow` переводил межпуловую дугу из развилки в
     `connect(source='<шлюз>', …, flow_type='message')`. В 625 обменах корпуса к
     шлюзу не подходит ни одно, то есть правка заводила дефект, которого живые
-    модельеры не допускают, а перепись считала её чистым снятием нарушения."""
+    модельеры не допускают, а перепись считала её чистым снятием нарушения.
+
+    Третий подкласс — оба конца названы одним и тем же участником: обмен сам с
+    собой нарушает смысл правила, а не существование адресата (в корпусе таких
+    дуг 0 из 625, заносит их только правка контура). Списком отдельно, потому что
+    совет у него свой: снимать его надо не вторым концом, а выбором контрагента.
+
+    Конец обмена называется id участника, а не его именем: тем же адресом меряет
+    `validate_and_repair` (у messageFlow концами считаются `pool_ids` участников),
+    тем же адресом пул показывает инвентарь аплайера, и на нём же держится
+    `connect`. Имя в конце — то же нарушение, что выдуманный id, но у отказа есть
+    исполнимый операнд: `participant_ids_by_name` называет id, которого не хватало,
+    иначе корректирующий повтор приносит ровно то же слово (тот же класс, что в
+    живых прогонах лечила `_missing_id_hint`)."""
     if not s.by_tag["messageFlow"]:
         return _Check(NOT_APPLICABLE)
-    if not s.dangling_messages and not s.gateway_messages:
+    if not (s.dangling_messages or s.gateway_messages or s.self_messages):
         return _Check(PASSED)
     known = set(s.node_by_id) | {p.get("id") or "" for p in s.participants}
     notes: List[str] = []
@@ -864,9 +1010,18 @@ def _check_message_flow_ends(s: _Schema) -> _Check:
         why = ("у обмена нет " + " и ".join(missing) if missing else
                f"конец обмена указывает на узел {', '.join(unknown)}, которого в "
                "схеме нет")
+        # Имя участника вместо его id — случай «конца нет в схеме» на легальной
+        # схеме: пул в обмене есть, назван не тем адресом. На корпусе таких
+        # концов 0 из 625, поэтому подсказка словами, но с настоящим id.
+        by_name = [f"конец '{ref}' назван именем участника, а не его id "
+                   f"'{', '.join(s.participant_ids_by_name[ref])}'"
+                   for ref in (flow.source, flow.target)
+                   if ref in s.participant_ids_by_name]
+        hint = ("; " + "; ".join(by_name)
+                + "; пул в конце обмена называется id из инвентаря" if by_name else "")
         notes.append(
-            f"'{ident}': {why}; поток сообщения приставляется к шагу или пулу, "
-            "а какой именно — называется только по смыслу процесса")
+            f"'{ident}': {why}{hint}; поток сообщения приставляется к шагу или "
+            "пулу, а какой именно — называется только по смыслу процесса")
     for flow in s.gateway_messages[:max(0, RECIPES_IN_MESSAGE - len(notes))]:
         ident = flow.id or f"{flow.source}->{flow.target}"
         ends = [(ref, _local(s.node_by_id[ref].tag))
@@ -879,7 +1034,13 @@ def _check_message_flow_ends(s: _Schema) -> _Check:
             "концом обмена не бывает — сообщением обмениваются шаг и шаг или пул "
             "целиком, а какой шаг пула отправляет и принимает, называет автор "
             "процесса (развилка остаётся внутри своего процесса)")
-    broken = s.dangling_messages + s.gateway_messages
+    for flow in s.self_messages[:max(0, RECIPES_IN_MESSAGE - len(notes))]:
+        ident = flow.id or f"{flow.source}->{flow.target}"
+        notes.append(
+            f"'{ident}': оба конца обмена названы участником '{flow.source}' — "
+            "сам с собой обмен не ведётся, приёмником ставит другого участника, "
+            "а кого именно — называется по смыслу процесса")
+    broken = s.dangling_messages + s.gateway_messages + s.self_messages
     if len(broken) > RECIPES_IN_MESSAGE:
         notes.append(f"и ещё {len(broken) - RECIPES_IN_MESSAGE} "
                      "обменов той же формой")
@@ -1659,6 +1820,67 @@ def _pingpong_repair(s: _Schema, edges: Dict[Tuple[str, str], List[str]],
             "flow_type='message')")
 
 
+def _approval_fork_exit(s: _Schema, line: List[str]) -> str:
+    """Законный второй выход развилки: конечное событие того же процесса.
+
+    Ветка обязана куда-то уходить, иначе единственная нога и остаётся. Ближайший
+    конец маршрута взят из схемы, а не выдуман, — совет обязан называть адрес,
+    который аплайер найдёт. Если процесса с конечным событием в схеме нет,
+    возвращается пустая строка, и рецепт сам заведёт конец своим id.
+    """
+    for node_id in reversed(line):
+        for part in s.participants_of_node(node_id):
+            for node in s.nodes_of_participant(part):
+                if _local(node.tag) == "endEvent" and node.get("id"):
+                    return node.get("id")
+    for end in s.end_events:
+        if end.get("id"):
+            return end.get("id")
+    return ""
+
+
+def _approval_fork_ops(s: _Schema, line: List[str]) -> str:
+    """Рецепт, которым совет `approval_chain` РВЁТ линию согласований.
+
+    Одиночная нога не годится, и это долго было незаметно: `add_gateway(after=X,
+    to=Y)` с одним исходом гарант понижает до задачи
+    (`core/bpmn_edits.py:_demote_single_branch_gateways`), а задача — ещё одна
+    ручная подпись, то есть линия из `APPROVAL_CHAIN_MIN` не рвётся, а
+    удлиняется. Перепись `eval/advice.py` стояла на этом вчистую: 8/8 рецептов
+    названы, 8/8 применены, 0 снято. Пряталось это потому, что созданный узел не
+    был подписан дорожкой, а правило считает подписей только размеченные узлы;
+    как только аплайер начал ставить `flowNodeRef` каждому новому узлу, подмена
+    «шлюз, ставший задачей» перестала быть невидимой.
+
+    Поэтому в совете обязано быть ДВЕ ноги и признак выбора: вторая нога уходит
+    на конечное событие того же процесса (`connect` с `condition`), а прежняя
+    ветка X → Y, которую вставка `after` отдаёт шлюзу, помечается `set_default` —
+    id этого потока правило знает, он в схеме уже есть. Без этого развилка
+    снимает `approval_chain` и тут же ловит `gateway_conditions`.
+
+    Дорожки нарушением не лечатся: `move_to_lane` концы потока не трогает, и
+    линия остаётся ровно такой же длины — прежняя ветка совета (развести по
+    дорожкам) потому и не снимала ничего.
+    """
+    mid = len(line) // 2
+    anchor, nxt = line[mid - 1], line[mid]
+    gate = _free_new_id(s, "new_gate")
+    leg = next((f.id for f in s.flows
+                if f.source == anchor and f.target == nxt and f.id), "")
+    exit_id = _approval_fork_exit(s, line)
+    ops = [f"add_gateway(id='{gate}', name='Достаточно согласования?', "
+           f"gateway_type='exclusive', after='{anchor}', to='{nxt}')"]
+    if not exit_id:
+        exit_id = _free_new_id(s, "new_end")
+        ops.append(f"add_event(id='{exit_id}', name='Согласование закрыто', "
+                   f"event_type='end', participant='{_pool_hint(s, anchor)}')")
+    ops.append(f"connect(source='{gate}', target='{exit_id}', "
+               "condition='Согласований достаточно')")
+    if leg:
+        ops.append(f"set_default(gateway='{gate}', flow='{leg}')")
+    return "; ".join(ops)
+
+
 def _check_approval_chain(s: _Schema) -> _Check:
     """Цепочка согласований: `APPROVAL_CHAIN_MIN` ручных задач подряд в одной
     дорожке и ни одного шлюза между ними.
@@ -1674,8 +1896,7 @@ def _check_approval_chain(s: _Schema) -> _Check:
     согласований только там, где разделение уже нарисовали, — то есть ровно
     никогда. Между тем цепочка из четырёх подписей в одном пуле без дорожек —
     худший случай (исполнители не различимы вовсе), так что бездорожный процесс
-    считается по всем своим `userTask`, а совет говорит «заведите дорожки», а не
-    «перенесите в существующие».
+    считается по всем своим `userTask`, а совет рвёт линию развилкой.
     """
     tracked: List[str] = []
     notes: List[str] = []
@@ -1695,13 +1916,9 @@ def _check_approval_chain(s: _Schema) -> _Check:
             # Развилка ставится между двумя соседними подписями той же линии:
             # `add_gateway` требует `after` и `to`, и без пары id совет
             # «добавьте шлюз» нечем заполнить (перепись `eval/advice.py`).
-            mid = len(line) // 2
-            notes.append(
-                f"«{s.lane_name(lane_id)}»: {_join_ids(tuple(line))} — "
-                f"add_gateway(id='{_free_new_id(s, 'new_gate')}', "
-                f"name='Нужен второй согласующий?', "
-                f"gateway_type='exclusive', "
-                f"after='{line[mid - 1]}', to='{line[mid]}')")
+            notes.append(f"«{s.lane_name(lane_id)}»: {_join_ids(tuple(line))} — "
+                         f"линию рвёт только развилка с ДВУМЯ ногами: "
+                         f"{_approval_fork_ops(s, line)}")
     if not lanes:
         users = {e.get("id") for tag in HUMAN_TASK_TAGS for e in s.by_tag[tag]
                  if e.get("id")}
@@ -1710,19 +1927,9 @@ def _check_approval_chain(s: _Schema) -> _Check:
             line = _longest_user_task_line(s, users)
             if len(line) >= APPROVAL_CHAIN_MIN:
                 offenders.extend(line)
-                # Литерал `new_lane` здесь был второй копией того же дефекта, из-за
-                # которого `wait_without_sla` стопорил перепись: первый круг создал
-                # дорожку с этим id, подсказка второго круга зовёт его же, а
-                # `_require_new_id` отвечает «уже занят» — и нарушение не снимается
-                # ни одним кругом.
-                lane_new = _free_new_id(s, "new_lane")
-                host = _lane_host_operand(s, line[0])
-                notes.append(f"дорожек в процессе нет, четыре подписи идут одной "
-                             f"линией: {_join_ids(tuple(line))} — заведите "
-                             f"add_lane(id='{lane_new}', name='Второй согласующий'"
-                             f"{f', participant={host!r}' if host else ''})"
-                             f" и перенесите move_to_lane(id='{line[0]}', "
-                             f"lane='{lane_new}')")
+                notes.append("дорожек в процессе нет, четыре подписи идут одной "
+                             f"линией: {_join_ids(tuple(line))} — "
+                             f"{_approval_fork_ops(s, line)}")
     if not tracked:
         return _Check(NOT_APPLICABLE, note="дорожек с четырьмя задачами нет")
     if not notes:
@@ -2151,7 +2358,7 @@ class BPMNScorer:
             'documentation': {'weight': 7, 'message': 'Не менее половины шагов (задач) должны содержать документацию', 'action': ['add_documentation']},
             'rework_loop': {'weight': 8, 'message': 'Повтор по кругу допустим только с названным критерием выхода: условие или выход по умолчанию на дуге, уходящей из цикла', 'action': ['add_condition', 'set_default']},
             'handoff_pingpong': {'weight': 8, 'message': 'Ответ пула обязан приходить следующему шагу, а не тому же, который запрашивал: возврат в тот же шаг — работа без одного хозяина', 'action': ['disconnect', 'connect', 'merge_participants']},
-            'approval_chain': {'weight': 6, 'message': 'Четыре ручных шага (task, userTask, manualTask) подряд без развилки — цепочка согласований: разнесите её по дорожкам или добавьте шлюз; в процессе без дорожек это то же нарушение, и дорожки надо завести', 'action': ['move_to_lane', 'add_lane', 'add_gateway']},
+            'approval_chain': {'weight': 6, 'message': 'Четыре ручных шага (task, userTask, manualTask) подряд без развилки — цепочка согласований: линию рвёт только развилка с ДВУМЯ ногами (одну ногу гарант понижает до задачи, и подписей становится больше), а дорожки длину линии не меняют', 'action': ['add_gateway', 'connect', 'set_default']},
             'lane_overload': {'weight': 6, 'message': 'Одна дорожка не должна держать больше 60% работ процесса (при двух дорожках — больше 75%)', 'action': ['move_to_lane', 'add_lane']},
             'wait_without_sla': {'weight': 8, 'message': 'У ожидания (catch-событие без таймера или receiveTask) должен быть срок в модели: таймер-определение в нём самом, граничный таймер на активности либо развилка «ответ или срок» с таймером, иначе маршрут висит', 'action': ['add_boundary_event', 'add_gateway', 'add_event']},
         }

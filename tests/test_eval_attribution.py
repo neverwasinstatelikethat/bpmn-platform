@@ -458,7 +458,9 @@ class TestHarnessIntegration:
         table = harness.render_table(report)
         _, rest = table.split("ГЕНЕРАЦИЯ: КТО ПОРОДИЛ ДЕФЕКТЫ", 1)
         generation, rest = rest.split("УЛУЧШЕНИЕ: КТО ПОРОДИЛ ДЕФЕКТЫ", 1)
-        improvement = rest.split("ПРОВЕНАНС", 1)[0]
+        # Граница — «РУЧНАЯ ОЦЕНКА», а не «ПРОВЕНАНС»: сводка глаз тоже
+        # начинается с «<кейс> — …», и парсер читал бы её как владельцев.
+        improvement = rest.split("РУЧНАЯ ОЦЕНКА", 1)[0]
 
         def expected(cases):
             counts: Dict[str, int] = {}

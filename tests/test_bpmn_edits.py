@@ -16,6 +16,9 @@ import pytest
 from core import bpmn_edits
 from core.bpmn_edits import (
     BPMN_NS,
+    BPMNDI_NS,
+    DC_NS,
+    DI_NS,
     DEFAULT_TIMER_DURATION,
     FLOW_NODE_TAGS,
     INVENTORY_MAX_ELEMENTS,
@@ -5008,3 +5011,545 @@ def test_taken_lane_id_is_refused_with_a_usable_id(two_pool_xml):
     assert "уже занят" in row["reason"], row
     assert "new_Lane_Engineer" in row["hint"], row
     assert "move_to_lane(lane='new_Lane_Engineer')" in row["hint"], row
+
+
+# ---------------------------------------------------------------------------
+# Чёрная коробка: участник без процесса
+# ---------------------------------------------------------------------------
+
+BLACK_BOX_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_bb">
+  <collaboration id="Collaboration_bb">
+    <participant id="Pool_shop" name="Магазин" processRef="Process_shop"/>
+    <participant id="Pool_vendor" name="Поставщик"/>
+    <participant id="Pool_courier" name="Курьер"/>
+    <messageFlow id="MF1" sourceRef="S_accept" targetRef="Pool_vendor"/>
+  </collaboration>
+  <process id="Process_shop" name="Магазин" isExecutable="true">
+    <startEvent id="S_start" name="Заказ поступил"/>
+    <sequenceFlow id="SF1" sourceRef="S_start" targetRef="S_accept"/>
+    <serviceTask id="S_accept" name="Отбить заказ у поставщика"/>
+    <sequenceFlow id="SF2" sourceRef="S_accept" targetRef="S_end"/>
+    <endEvent id="S_end" name="Заказ подтверждён"/>
+  </process>
+</definitions>"""
+
+
+class TestBlackBoxParticipantIsAccepted:
+    """Внешний контрагент имеет право быть пулом без процесса — «чёрной
+    коробкой» коллаборации, а обмен тогда заканчивается на самом участнике.
+
+    Класс занёс не корпус (31 участник из 346, 9,0%, и все 625 его обменов
+    называют концы id), а неспособность контура его выразить: инвентарь
+    перечислял пулы ОТ процессов, поэтому коробки в нём не было, дуга на неё
+    считалась обрезанной (`limits.flows_omitted`), `connect` отвечал «источник
+    или цель не найдены», а `remove_participant` — «пул не найден». Модель
+    же, чтобы вообще куда-то поставить обмен, заводила контрагенту пустой
+    процесс, и починка наполняла его стартом и финишем: живые дампы #74 дали 9
+    белых пулов из 21 ровно с одной активностью плюс выдуманные события.
+    """
+
+    def test_inventory_lists_a_participant_without_a_process(self):
+        participants = build_inventory(BLACK_BOX_XML)["participants"]
+        by_id = {p["id"]: p for p in participants}
+        assert "Pool_vendor" in by_id, participants
+        assert by_id["Pool_vendor"]["black_box"] is True
+        assert "без процесса" in by_id["Pool_vendor"]["process"]
+        # белый пул помечен не бывает, и запись про него одна
+        assert "black_box" not in by_id["Pool_shop"]
+        assert sum(1 for p in participants if p["id"] == "Pool_shop") == 1
+
+    def test_inventory_keeps_the_message_flow_that_ends_on_a_pool(self):
+        """Дуга с концом на участника — не обрезанная: её концы показаны.
+
+        Прежний отбор `kept_flows` строил `shown_ids` из элементов и участников,
+        ВЫВЕДЕННЫХ из процессов, поэтому конец на коробку в список не попадал и
+        строка исчезала из инвентаря молча."""
+        inventory = build_inventory(BLACK_BOX_XML)
+        flows = {f["id"]: f for f in inventory["flows"]}
+        assert "MF1" in flows, inventory["flows"]
+        assert flows["MF1"]["target"] == "Pool_vendor"
+        assert inventory.get("limits", {}).get("flows_omitted", 0) == 0
+
+    def test_connect_accepts_a_participant_as_a_message_end(self):
+        """Узел → пул целиком и пул → пул: оба конца существует, обмен законен."""
+        _, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "connect", "source": "Pool_vendor", "target": "Pool_courier",
+             "flow_type": "message"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert report["applied"], report
+
+    def test_connect_from_a_black_box_into_a_white_pool_node(self):
+        out, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "connect", "source": "Pool_vendor", "target": "S_accept",
+             "flow_type": "message"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        root = _root(out)
+        added = [f for f in root.iter()
+                 if _tag(f) == "messageFlow"
+                 and f.get("sourceRef") == "Pool_vendor"
+                 and f.get("targetRef") == "S_accept"]
+        assert added, "поток сообщения с концом на участника не записан"
+
+    def test_connect_refuses_a_participant_as_a_sequence_end(self):
+        """Правило двустороннее: sequenceFlow через границу пула не проходит, и
+        целым участником концом его не бывает — отказ по существу, а не «не
+        найдено»."""
+        _, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "connect", "source": "S_accept", "target": "Pool_vendor"},
+        ])
+        skip = report["skipped"][0]
+        assert skip["reason"] == "пул (Pool_vendor) концом sequenceFlow не бывает"
+        assert "flow_type=message" in skip["hint"], skip
+
+    def test_connect_refuses_an_exchange_with_the_same_participant(self):
+        """Обмен сам с собой остаётся отказом: правка — выбрать второго."""
+        _, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "connect", "source": "Pool_vendor", "target": "Pool_vendor",
+             "flow_type": "message"},
+        ])
+        skip = report["skipped"][0]
+        assert "оба конца обмена названы одним участником" in skip["reason"], skip
+        assert "другого участника" in skip["hint"], skip
+
+    def test_message_inside_one_white_pool_is_still_refused(self):
+        """Ужесточение только про идентичность конца: пул, его процесс и его шаг
+        — один дом, и сообщение внутри него не имеет смысла (ряд был до правки)."""
+        _, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "connect", "source": "Pool_shop", "target": "S_accept",
+             "flow_type": "message"},
+        ])
+        assert (report["skipped"][0]["reason"]
+                == "messageFlow внутри одного пула не имеет смысла"), report
+
+    def test_empty_process_is_a_home_and_not_a_black_box(self):
+        """Пустой `<process/>` — белый пул без работы, а не чёрная коробка.
+
+        `ET.Element` ложный, когда у него нет детей, поэтому прежний `or pool`
+        превращал дом пустого процесса в участника.
+        """
+        empty_white_pool_xml = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_empty">
+  <collaboration id="Collaboration_empty">
+    <participant id="Pool_shop" name="Магазин" processRef="Process_shop"/>
+  </collaboration>
+  <process id="Process_shop" name="Магазин" isExecutable="true"/>
+</definitions>"""
+        root = bpmn_edits.parse_xml(empty_white_pool_xml)
+        index = bpmn_edits._Index(root)
+        pool = index.participants[0]
+        process = index.processes[0]
+
+        assert bpmn_edits._endpoint_home(index, None, pool) is process
+
+    def test_end_named_by_pool_name_gets_the_participant_id(self):
+        """Единый адрес конца обмена — id, и отказ обязан назвать настоящий id:
+        «используйте id из инвентаря» повтору не даёт операнда (тот же класс,
+        что живые прогоны лечила `_missing_id_hint`)."""
+        _, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "connect", "source": "S_accept", "target": "Поставщик",
+             "flow_type": "message"},
+        ])
+        hint = report["skipped"][0]["hint"]
+        assert "'Поставщик' — имя участника, а не его id ('Pool_vendor')" in hint
+        assert "Pool_vendor" in hint, hint
+
+    def test_add_participant_black_box_creates_no_process(self):
+        """Флаг из OP_SPEC: коробка без процесса, и `validate_and_repair` не
+        наполняет её стартом и финишем, потому что процесса нет."""
+        out, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "add_participant", "id": "new_Monitor",
+             "name": "Система мониторинга", "black_box": True},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert 'id="new_Monitor"' in out
+        assert "new_Monitor_proc" not in out, "чёрной коробке не заводят процесс"
+        assert _unresolved_refs(out) == []
+
+    def test_add_participant_black_box_reads_a_string_flag(self):
+        """`"true"` строкой — тот же флаг, что у `as_lane` и `default`."""
+        out, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "add_participant", "id": "new_Monitor",
+             "name": "Система мониторинга", "black_box": "true"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert "new_Monitor_proc" not in out
+
+    def test_add_participant_without_a_flag_keeps_the_process(self):
+        out, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "add_participant", "id": "new_Shop", "name": "Новый пул"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert "new_Shop_proc" in out, out
+
+    def test_black_box_operand_is_documented_in_the_spec(self):
+        """`core/llm_improve.py` печатает OP_SPEC дословно, а `improve/op_acceptance`
+        мерит расхождение двух словарей качеством модели: принятое поле обязано
+        быть в тексте."""
+        assert '"black_box":true' in OP_SPEC["add_participant"]
+        assert "без процесса" in OP_SPEC["add_participant"]
+        assert "концом бывает и пул" in OP_SPEC["connect"]
+
+    def test_remove_participant_finds_a_process_less_pool(self):
+        """Отказ «пул не найден» врал: участник в схеме есть (инвентарь его
+        показывает), процесса у него нет — снимать надо его самого."""
+        out, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "disconnect", "flow": "MF1"},
+            {"op": "remove_participant", "participant": "Pool_vendor"},
+        ])
+        assert report["skipped"] == [], report["skipped"]
+        assert 'id="Pool_vendor"' not in out
+        assert _unresolved_refs(out) == []
+
+    def test_remove_participant_refuses_while_exchanges_remain(self):
+        _, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "remove_participant", "participant": "Поставщик"},
+        ])
+        skip = report["skipped"][0]
+        assert "держит обмены MF1" in skip["reason"], skip
+        assert "disconnect" in skip["hint"], skip
+
+    def test_merge_participants_names_a_black_box_instead_of_denying_it(self):
+        """`merge_participants` коробку не сливает — переносить в дорожку нечего,
+        — но отказывает по причине, а не «пул не найден», и подсказка называет
+        законные операции."""
+        for role, field in (("источник", "source"), ("приёмник", "target")):
+            op = {"op": "merge_participants", "as_lane": True,
+                  "source": "Магазин", "target": "Магазин"}
+            op[field] = "Pool_vendor"
+            _, report = apply_operations(BLACK_BOX_XML, [op])
+            skip = report["skipped"][0]
+            assert "не найден" not in skip["reason"], (role, skip)
+            assert "чёрная коробка" in skip["reason"], (role, skip)
+            assert f"({role})" in skip["reason"], (role, skip)
+        _, report = apply_operations(BLACK_BOX_XML, [
+            {"op": "merge_participants", "source": "Pool_vendor",
+             "target": "Магазин", "as_lane": True}])
+        assert "remove_participant" in report["skipped"][0]["hint"], report
+
+
+# --- графика следует за правкой: BPMN DI для того, что создал аплайер -------
+
+DI_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+           xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+           xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+           xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+           id="Definitions_pack" targetNamespace="http://bpmn.io/schema/bpmn">
+  <process id="Process_pack" name="Сборка заказа" isExecutable="true">
+    <startEvent id="S1" name="Поступил заказ"/>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="A1"/>
+    <userTask id="A1" name="Собрать заказ"/>
+    <sequenceFlow id="F2" sourceRef="A1" targetRef="E1"/>
+    <endEvent id="E1" name="Заказ выдан"/>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Process_pack">
+      <bpmndi:BPMNShape id="BPMNShape_S1" bpmnElement="S1">
+        <dc:Bounds x="100" y="100" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_A1" bpmnElement="A1">
+        <dc:Bounds x="236" y="78" width="100" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_E1" bpmnElement="E1">
+        <dc:Bounds x="520" y="100" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="BPMNEdge_F1" bpmnElement="F1">
+        <di:waypoint x="136" y="118"/>
+        <di:waypoint x="236" y="118"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_F2" bpmnElement="F2">
+        <di:waypoint x="336" y="118"/>
+        <di:waypoint x="520" y="118"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>"""
+
+LANED_DI_XML = XML_DECLARATION + """<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+           xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+           xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+           xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+           id="Definitions_lanes" targetNamespace="http://bpmn.io/schema/bpmn">
+  <collaboration id="Collaboration_1">
+    <participant id="Pool_shop" name="Магазин" processRef="Process_shop"/>
+  </collaboration>
+  <process id="Process_shop" name="Магазин" isExecutable="true">
+    <laneSet>
+      <lane id="Lane_pick" name="Сборщик">
+        <flowNodeRef>S1</flowNodeRef>
+        <flowNodeRef>A1</flowNodeRef>
+      </lane>
+      <lane id="Lane_pack" name="Упаковщик">
+        <flowNodeRef>E1</flowNodeRef>
+      </lane>
+    </laneSet>
+    <startEvent id="S1" name="Поступил заказ"/>
+    <sequenceFlow id="F1" sourceRef="S1" targetRef="A1"/>
+    <userTask id="A1" name="Собрать заказ"/>
+    <sequenceFlow id="F2" sourceRef="A1" targetRef="E1"/>
+    <endEvent id="E1" name="Заказ выдан"/>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Collaboration_1">
+      <bpmndi:BPMNShape id="BPMNShape_Pool_shop" bpmnElement="Pool_shop" isHorizontal="true">
+        <dc:Bounds x="40" y="40" width="600" height="300"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Lane_pick" bpmnElement="Lane_pick" isHorizontal="true">
+        <dc:Bounds x="70" y="40" width="570" height="150"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_Lane_pack" bpmnElement="Lane_pack" isHorizontal="true">
+        <dc:Bounds x="70" y="190" width="570" height="150"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_S1" bpmnElement="S1">
+        <dc:Bounds x="100" y="97" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_A1" bpmnElement="A1">
+        <dc:Bounds x="236" y="75" width="100" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_E1" bpmnElement="E1">
+        <dc:Bounds x="420" y="247" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="BPMNEdge_F1" bpmnElement="F1">
+        <di:waypoint x="136" y="115"/>
+        <di:waypoint x="236" y="115"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_F2" bpmnElement="F2">
+        <di:waypoint x="336" y="115"/>
+        <di:waypoint x="420" y="265"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>"""
+
+
+# Ручная раскладка дуги: обход сверху, три лишних плеча. Сервер обязан оставить
+# его в покое — перерисовка конца касается только тех дуг, чьи концы ушли с
+# рамок своих фигур.
+DI_BEND_XML = DI_XML.replace(
+    '''      <bpmndi:BPMNEdge id="BPMNEdge_F1" bpmnElement="F1">
+        <di:waypoint x="136" y="118"/>
+        <di:waypoint x="236" y="118"/>
+      </bpmndi:BPMNEdge>''',
+    '''      <bpmndi:BPMNEdge id="BPMNEdge_F1" bpmnElement="F1">
+        <di:waypoint x="118" y="100"/>
+        <di:waypoint x="118" y="50"/>
+        <di:waypoint x="286" y="50"/>
+        <di:waypoint x="286" y="78"/>
+      </bpmndi:BPMNEdge>''')
+
+
+def _shapes(xml_text):
+    """`bpmnElement` фигуры → её границы."""
+    out = {}
+    for shape in _root(xml_text).iter(f"{{{BPMNDI_NS}}}BPMNShape"):
+        bounds = shape.find(f"{{{DC_NS}}}Bounds")
+        if bounds is None or not shape.get("bpmnElement"):
+            continue
+        out[shape.get("bpmnElement")] = tuple(
+            int(bounds.get(k) or 0) for k in ("x", "y", "width", "height"))
+    return out
+
+
+def _edges(xml_text):
+    """`bpmnElement` дуги → её точки."""
+    out = {}
+    for edge in _root(xml_text).iter(f"{{{BPMNDI_NS}}}BPMNEdge"):
+        points = [(int(w.get("x") or 0), int(w.get("y") or 0))
+                  for w in edge.iter(f"{{{DI_NS}}}waypoint")]
+        if edge.get("bpmnElement"):
+            out[edge.get("bpmnElement")] = points
+    return out
+
+
+def _di_defects(xml_text):
+    """Мера полноты графики — двойник `hasDiagramInterchange` из
+    `bpmn-constructor/src/bpmnLayout.js`: список того, из-за чего редактор
+    посчитал бы раскладку дырой и перерисовал всю схему.
+
+    Двойник живёт в тестах намеренно: контракт меряет фронтенд, а здесь
+    сверяется, что сервер ему соответствует. Расхождение — не «тесты зелёные»,
+    а сломанный рендер у пользователя.
+    """
+    root = _root(xml_text)
+    drawn = set(_shapes(xml_text)) | set(_edges(xml_text))
+    defects = []
+    for elem in root.iter():
+        if not isinstance(elem.tag, str):
+            continue
+        tag = _tag(elem)
+        elem_id = elem.get("id")
+        if not elem_id:
+            continue
+        if tag in FLOW_NODE_TAGS or tag in ("participant", "lane"):
+            if elem_id not in drawn:
+                defects.append(f"{tag} {elem_id} без фигуры")
+        elif tag in ("sequenceFlow", "messageFlow"):
+            if elem_id not in drawn:
+                defects.append(f"{tag} {elem_id} без дуги")
+            for ref in (elem.get("sourceRef"), elem.get("targetRef")):
+                if ref and ref not in drawn:
+                    defects.append(f"{tag} {elem_id}: конец {ref} не нарисован")
+    return defects
+
+
+class TestApplierDrawsWhatItCreates:
+    """Пакет операций создаёт узлы и дуги — графика обязана идти вместе с ними.
+
+    Генерация поставляет BPMN DI сама, аплайер — нет. Из-за этого улучшенная
+    схема приходила в редактор с дырой в раскладке: мера полноты графики видит
+    поток без `BPMNEdge` и приказывает перерисовать всё, а авто-layout не
+    читает `laneSet`, то есть дорожки пользователя теряются. Координаты
+    существующих узлов при дополнении не переписываются: правка не имеет права
+    отменять ручную раскладку, а контейнеры растут, чтобы накрыть то, что в
+    них поселила схема.
+    """
+
+    def test_a_new_task_gets_a_shape_and_its_flows_edges(self):
+        out, report = apply_and_guarantee(DI_XML, [
+            {"op": "add_task", "id": "A2", "name": "Упаковать",
+             "task_type": "userTask", "after": "A1", "to": "E1"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _di_defects(out) == []
+        shapes = _shapes(out)
+        a1, a2, e1 = shapes["A1"], shapes["A2"], shapes["E1"]
+        assert (a2[2], a2[3]) == (100, 80)
+        assert a1[0] + a1[2] < a2[0] and a2[0] + a2[2] <= e1[0], (a1, a2, e1)
+        assert a2[1] + a2[3] // 2 == a1[1] + a1[3] // 2
+
+    def test_new_flows_are_orthogonal_and_end_on_their_anchors(self):
+        out, _ = apply_and_guarantee(DI_XML, [
+            {"op": "add_task", "id": "A2", "name": "Упаковать",
+             "task_type": "userTask", "after": "A1", "to": "E1"}])
+        shapes, edges = _shapes(out), _edges(out)
+        for flow in _root(out).iter(f"{{{BPMN_NS}}}sequenceFlow"):
+            points = edges[flow.get("id")]
+            assert len(points) >= 2, flow.get("id")
+            for (x1, y1), (x2, y2) in zip(points, points[1:]):
+                assert x1 == x2 or y1 == y2, (flow.get("id"), points)
+            source, target = shapes[flow.get("sourceRef")], shapes[flow.get("targetRef")]
+            for point, box in ((points[0], source), (points[-1], target)):
+                on_border = (point[0] in (box[0], box[0] + box[2])
+                             and point[1] == box[1] + box[3] // 2) \
+                    or (point[1] in (box[1], box[1] + box[3])
+                        and point[0] == box[0] + box[2] // 2)
+                assert on_border, (flow.get("id"), point, box)
+
+    def test_a_new_boundary_event_sits_on_its_hosts_border(self):
+        out, report = apply_and_guarantee(DI_XML, [
+            {"op": "add_boundary_event", "id": "B1", "attached_to": "A1",
+             "event_type": "timer", "duration": "PT1H", "name": "Просрочка",
+             "to": "E1"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _di_defects(out) == []
+        host, box = _shapes(out)["A1"], _shapes(out)["B1"]
+        assert (box[2], box[3]) == (36, 36)
+        g = 18
+        on_border = (box[1] == host[1] - g or box[1] + box[3] == host[1] + host[3] + g
+                     or box[0] == host[0] - g or box[0] + box[2] == host[0] + host[2] + g)
+        assert on_border, (host, box)
+
+    def test_the_package_does_not_move_the_nodes_the_user_arranged(self):
+        before = _shapes(DI_XML)
+        out, _ = apply_and_guarantee(DI_XML, [
+            {"op": "add_task", "id": "A2", "name": "Упаковать",
+             "task_type": "userTask", "after": "A1", "to": "E1"}])
+        after = _shapes(out)
+        for elem_id in ("S1", "E1"):
+            assert after[elem_id] == before[elem_id], elem_id
+        assert _edges(out)["F1"] == _edges(DI_XML)["F1"]
+
+    def test_a_hand_routed_bend_survives_a_package_elsewhere(self):
+        """Дуга, обходящая фигуру руками пользователя, не трогаётся.
+
+        Основание не переписывать её точки — концы стоят на рамках своих
+        фигур: это корректная раскладка, а не остаток от старой.
+        """
+        bent = _edges(DI_BEND_XML)["F1"]
+        assert bent == [(118, 100), (118, 50), (286, 50), (286, 78)]
+        out, _ = apply_and_guarantee(DI_BEND_XML, [
+            {"op": "add_task", "id": "A2", "name": "Упаковать",
+             "task_type": "userTask", "after": "A1", "to": "E1"}])
+        assert _edges(out)["F1"] == bent
+        assert _di_defects(out) == []
+        again, notes = validate_and_repair(out)
+        assert notes == [], notes
+
+    def test_a_new_lane_gets_a_band_inside_its_pool(self):
+        out, report = apply_and_guarantee(LANED_DI_XML, [
+            {"op": "add_lane", "id": "Lane_courier", "name": "Курьер",
+             "participant": "Магазин"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _di_defects(out) == []
+        shapes = _shapes(out)
+        pool, pack, courier = (shapes["Pool_shop"], shapes["Lane_pack"],
+                               shapes["Lane_courier"])
+        assert courier[0] >= pool[0] + 30, (pool, courier)
+        assert courier[1] >= pack[1] + pack[3] - 1, (pack, courier)
+        assert courier[3] >= 120, courier
+        assert pool[1] + pool[3] >= courier[1] + courier[3], (pool, courier)
+
+    def test_a_black_box_pool_and_its_message_flow_are_drawn(self):
+        out, report = apply_and_guarantee(LANED_DI_XML, [
+            {"op": "add_participant", "id": "Pool_client", "name": "Клиент",
+             "black_box": True},
+            {"op": "connect", "source": "A1", "target": "Pool_client",
+             "flow_type": "message"}])
+        assert report["skipped"] == [], report["skipped"]
+        assert _di_defects(out) == []
+        shapes = _shapes(out)
+        assert "Pool_client" in shapes
+        assert shapes["Pool_client"][3] >= 120
+        message = _root(out).findall(f".//{{{BPMN_NS}}}messageFlow")[-1]
+        points = _edges(out)[message.get("id")]
+        assert len(points) >= 2
+        host = shapes["A1"]
+        assert points[0] in ((host[0] + host[2], host[1] + host[3] // 2),
+                             (host[0] + host[2] // 2, host[1]),
+                             (host[0] + host[2] // 2, host[1] + host[3])), points
+
+    def test_a_scheme_without_any_di_is_left_to_the_editor(self, two_pool_xml):
+        """Дополнение — не подмена авто-layout: документа без графики касаться
+        нельзя, иначе сервер выдал бы координаты там, где пользователь ждёт
+        привычной раскладки редактора."""
+        out, report = apply_and_guarantee(two_pool_xml, [
+            {"op": "add_task", "id": "A9", "name": "Проверить товар",
+             "task_type": "userTask", "after": "S_accept", "to": "S_end"}])
+        assert "BPMNShape" not in out
+        assert "BPMNEdge" not in out
+        assert report["skipped"] == [], report["skipped"]
+
+    def test_di_is_supplemented_once(self):
+        """Второй прогон починки не плодит фигур: цикл «починка до покоя»
+        держится на том, что пометки второго круга пустые."""
+        out, _ = apply_and_guarantee(DI_XML, [
+            {"op": "add_task", "id": "A2", "name": "Упаковать",
+             "task_type": "userTask", "after": "A1", "to": "E1"}])
+        shapes_before, edges_before = len(_shapes(out)), len(_edges(out))
+        again, notes = validate_and_repair(out)
+        assert len(_shapes(again)) == shapes_before
+        assert len(_edges(again)) == edges_before
+        assert notes == [], notes
+
+    def test_a_new_pool_with_content_is_supplemented_once(self):
+        """Пул, нарисованный вокруг своих шагов, обязан сразу накрыть их с
+        нижним полем: иначе второй круг починки растит контейнер и помечает
+        «расширен», хотя схема не менялась, — покой цикла не наступает."""
+        without_pool = LANED_DI_XML.replace(
+            '''      <bpmndi:BPMNShape id="BPMNShape_Pool_shop" bpmnElement="Pool_shop" isHorizontal="true">
+        <dc:Bounds x="40" y="40" width="600" height="300"/>
+      </bpmndi:BPMNShape>
+''', "")
+        out, _ = validate_and_repair(without_pool)
+        pool = _shapes(out)["Pool_shop"]
+        again, notes = validate_and_repair(out)
+        assert _shapes(again)["Pool_shop"] == pool
+        assert notes == [], notes
+
+    def test_the_geometry_note_says_what_was_drawn(self):
+        """Пометка в отчёте: пользователь вправе знать, что координаты его
+        схеме дорисовал сервер, а не редактор."""
+        _, report = apply_and_guarantee(DI_XML, [
+            {"op": "add_task", "id": "A2", "name": "Упаковать",
+             "task_type": "userTask", "after": "A1", "to": "E1"}])
+        notes = "; ".join(report["notes"])
+        assert "A2" in notes and "фигура" in notes, report["notes"]

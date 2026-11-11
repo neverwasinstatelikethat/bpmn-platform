@@ -24,7 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from core import bpmn_edits, bpmn_generator, bpmn_scoring, llm_improve, llm_client
+from core import (bpmn_edits, bpmn_generator, bpmn_layout, bpmn_scoring,
+                  llm_improve, llm_client)
 from core.llm_cache import LLMCache, sha256_of, source_fingerprint
 
 
@@ -247,9 +248,10 @@ class TestVersionFollowsThePromptSources:
     """
 
     PROMPT_SOURCES = {
-        "generate": (bpmn_generator, bpmn_edits, llm_client),
-        "improve": (llm_improve, bpmn_edits, bpmn_scoring, llm_client),
-        "score": (bpmn_scoring, bpmn_edits),
+        "generate": (bpmn_generator, bpmn_layout, bpmn_edits, llm_client),
+        "improve": (llm_improve, bpmn_edits, bpmn_layout, bpmn_scoring,
+                    llm_client),
+        "score": (bpmn_scoring, bpmn_edits, bpmn_layout),
     }
 
     @pytest.mark.parametrize("kind", sorted(PROMPT_SOURCES))
@@ -367,6 +369,7 @@ class TestPromptTableIsWiredToWhatThePromptReads:
         bpmn_edits: {"generate", "improve", "score"},
         bpmn_scoring: {"improve", "score"},
         bpmn_generator: {"generate"},
+        bpmn_layout: {"generate", "improve", "score"},
         llm_improve: {"improve"},
         llm_client: {"generate", "improve"},
     }
@@ -467,7 +470,7 @@ class TestStaleAnswerIsNotServedAfterASourceEdit:
     # Источники перечислены здесь независимо от таблицы сервиса: сверяет её
     # предыдущий класс, а этот проверяет следствие для уже записанных ответов.
     CONTOURS = {
-        "generate": (bpmn_generator, bpmn_edits, llm_client),
+        "generate": (bpmn_generator, bpmn_layout, bpmn_edits, llm_client),
         "improve": (llm_improve, bpmn_edits, bpmn_scoring, llm_client),
     }
 

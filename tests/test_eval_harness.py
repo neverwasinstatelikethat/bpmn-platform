@@ -45,21 +45,27 @@ EXPECTED_RAW_FAILS = {
     "warehouse_delivery.live.plan": {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
         "event_definitions", "has_branching", "no_unrouted",
-        "flows_within_pool"},
-    "purchase_approval.loop.bad.plan": {"has_branching", "loops_have_a_guard"},
-    "purchase_approval.signoffs.bad.plan": {"has_branching"},
+        "flows_within_pool",
+        # Требование пересчитано по тексту (13 названных действий) — живой
+        # ответ #73 несёт 11 шагов со шлюзами, то есть и подавно меньше работы,
+        # чем обещает описание.
+        "min_steps"},
+    "purchase_approval.loop.bad.plan": {"has_branching", "loops_have_a_guard",
+                                        "min_steps"},
+    "purchase_approval.signoffs.bad.plan": {"has_branching", "min_steps"},
     "purchase_approval.bad.plan": {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
-        "gateway_conditions_or_default", "no_unrouted"},
+        "gateway_conditions_or_default", "no_unrouted", "min_steps"},
     "production_incident.bad.plan": {
         "participant_interacts", "gateway_split_join", "event_definitions",
-        "boundary_handled", "no_unrouted", "has_timer", "expected_participants"},
+        "boundary_handled", "no_unrouted", "has_timer", "expected_participants",
+        "min_steps"},
     "employee_onboarding.bad.plan": {
         "pool_has_steps", "participant_interacts", "roles_as_lanes",
         "has_branching"},
     "vehicle_reservation.bad.plan": {
         "gateway_conditions_or_default", "event_definitions", "boundary_handled",
-        "no_unrouted", "has_timer"},
+        "no_unrouted", "has_timer", "min_steps"},
 }
 
 # Бизнес-дебит ЭТАЛОНА: узкие места процесса, которые есть у правильного ответа.
@@ -91,13 +97,19 @@ EXPECTED_ETALON_BUSINESS_DEBT = {
 # Формулировка держит то же правило, что и у таблиц выше: новое имя или другое
 # число здесь = заявленный дефект (или требование) changed, и объяснять его надо
 # в тексте сценария, а не в метрике.
+#
+# Числа `min_steps` пересобраны по тексту описаний — перечислением названных
+# действий (прогон #73→#74: схемы сжались на 3–6 элементов, а гейт молчал,
+# потому что прежние 8–10 добивались шлюзами и событиями). Живые планы-эталоны
+# новым числам удовлетворяют — это проверено таблицей ниже, и понизить мерку
+# ради цифры нельзя.
 EXPECTED_SCENARIO_EXPECTATIONS = {
     "warehouse_delivery": {
-        "min_steps": 10, "max_pools": 4, "must_branch": True,
+        "min_steps": 13, "max_pools": 4, "must_branch": True,
         "must_have_timer": False,
         "expected_participants": ("Склад", "WMS", "Перевозчик")},
     "purchase_approval": {
-        "min_steps": 9, "max_pools": 2, "must_branch": True,
+        "min_steps": 11, "max_pools": 2, "must_branch": True,
         "must_have_timer": False,
         "expected_participants": ("ВкусВилл", "Поставщик")},
     "product_return": {
@@ -105,7 +117,7 @@ EXPECTED_SCENARIO_EXPECTATIONS = {
         "must_have_timer": False,
         "expected_participants": ("ВкусВилл", "Покупатель")},
     "production_incident": {
-        "min_steps": 8, "max_pools": 3, "must_branch": True,
+        "min_steps": 10, "max_pools": 3, "must_branch": True,
         "must_have_timer": True,
         "expected_participants": ("Дежурный инженер", "Система мониторинга")},
     "employee_onboarding": {
@@ -113,15 +125,15 @@ EXPECTED_SCENARIO_EXPECTATIONS = {
         "must_have_timer": False,
         "expected_participants": ("HR", "ИТ")},
     "loan_application": {
-        "min_steps": 10, "max_pools": 4, "must_branch": True,
+        "min_steps": 13, "max_pools": 4, "must_branch": True,
         "must_have_timer": True,
         "expected_participants": ("Банк", "Клиент", "Бюро кредитных историй")},
     "support_ticket": {
-        "min_steps": 9, "max_pools": 3, "must_branch": True,
+        "min_steps": 11, "max_pools": 3, "must_branch": True,
         "must_have_timer": True,
         "expected_participants": ("Поддержка", "Клиент")},
     "vehicle_reservation": {
-        "min_steps": 9, "max_pools": 4, "must_branch": True,
+        "min_steps": 12, "max_pools": 4, "must_branch": True,
         "must_have_timer": True,
         "expected_participants": ("Диспетчер", "Перевозчик", "Клиент")},
 }
@@ -281,12 +293,14 @@ def test_unattached_boundary_and_open_split_are_detected():
     # причины: узлы лежат в одном пуле, а потоков сообщения в плане нет.
     # `signoffs_need_a_gate` — потому что ручных шагов три, а цепочка
     # согласований начинается с четырёх; `loops_have_a_guard` — потому что
-    # замкнутого обхода в этом маршруте нет.
+    # замкнутого обхода в этом маршруте нет; `nodes_have_a_lane` — потому что
+    # дорожек в плане нет вовсе, а не потому, что узлы размечены.
     assert summarize(results)["not_applicable"] == [
         "flows_within_pool", "loops_have_a_guard", "message_flow_ends",
         "no_blind_rework",
-        "no_overloaded_lane", "pools_not_pingpong", "roles_as_lanes",
-        "signoffs_need_a_gate", "timer_schedule", "waits_have_sla"]
+        "no_overloaded_lane", "nodes_have_a_lane", "pools_not_pingpong",
+        "roles_as_lanes", "signoffs_need_a_gate", "timer_schedule",
+        "waits_have_sla"]
 
 
 def test_default_flow_counts_as_condition():
@@ -505,6 +519,150 @@ def test_flow_without_id_is_reported_by_its_endpoints():
         {"kind": "sequence", "source": "E1", "target": "A1"}),
         {})["flow_ends_legal"]
     assert not check.ok and check.ids == ("E1->A1",)
+
+
+def _laned_plan(*, unsigned=(), lane_pool=None):
+    """Пул с двумя дорожками и маршрутом S1 → A1 → E1.
+
+    `unsigned` — id узлов, которых ни одна дорожка не подписывает (это и есть
+    «кривой layout» глазами: bpmn-js рисует такой узел поверх всех дорожек).
+    `lane_pool` — чем дорожка объявляет хозяина: именем пула (норма) или его id
+    (тоже законно, и проверка обязана понимать оба написания).
+    """
+    lanes_by_node = {"S1": "L_m", "A1": "L_m", "E1": "L_s"}
+    for node_id in unsigned:
+        lanes_by_node[node_id] = ""
+    owner = lane_pool or "ВкусВилл"
+    return {
+        "participants": [{"name": "ВкусВилл", "id": "Process_1"},
+                         {"name": "Курьер", "id": "Participant_2"}],
+        "lanes": [
+            {"id": "L_m", "name": "Менеджер", "participant": owner},
+            {"id": "L_s", "name": "Склад", "participant": owner},
+        ],
+        "elements": [
+            {"id": "S1", "kind": "startEvent", "name": "Заявка",
+             "participant": "ВкусВилл", "lane": lanes_by_node["S1"]},
+            {"id": "A1", "kind": "userTask", "name": "Собрать",
+             "participant": "ВкусВилл", "lane": lanes_by_node["A1"]},
+            {"id": "E1", "kind": "endEvent", "name": "Готово",
+             "participant": "ВкусВилл", "lane": lanes_by_node["E1"]},
+        ],
+        "flows": [
+            {"id": "F1", "kind": "sequence", "source": "S1", "target": "A1"},
+            {"id": "F2", "kind": "sequence", "source": "A1", "target": "E1"},
+        ],
+    }
+
+
+def test_node_without_a_lane_fails_the_gate():
+    """`nodes_have_a_lane` стоит в гейте: узел пула с дорожками, не подписанный
+    ни одной, — ровно тот «кривой layout», который человек видит, а узкие меры
+    линейки его не замечали."""
+    check = check_structure(_laned_plan(unsigned=("E1",)), {})["nodes_have_a_lane"]
+    assert check.applicable and not check.ok, check.reason
+    assert check.ids == ("E1",), check.ids
+
+    legal = check_structure(_laned_plan(), {})["nodes_have_a_lane"]
+    assert legal.applicable and legal.ok, legal.reason
+
+
+def test_a_lane_addressed_by_pool_id_still_catches_the_stray_node():
+    """Дорожка вправе назвать хозяина id процесса, а узел — именем пула: без
+    раскрытия алиаса множество «пулы с дорожками» не совпадало бы с пулами
+    узлов, и проверка пропускала бы узел молча, рапортуя «узлов вне их 0»."""
+    check = check_structure(_laned_plan(unsigned=("E1",), lane_pool="Process_1"),
+                            {})["nodes_have_a_lane"]
+    assert check.applicable and not check.ok, check.reason
+    assert check.ids == ("E1",), (check.ids, check.reason)
+
+
+def test_a_pool_without_lanes_is_not_applicable():
+    """Нечего сверять — не прохождение: без этой ветки схема без дорожек
+    получала бы балл за молчание."""
+    plan = _laned_plan()
+    plan["lanes"] = []
+    check = check_structure(plan, {})["nodes_have_a_lane"]
+    assert not check.applicable
+
+
+def _named_pools_plan(*, black_box, both_names_same=False):
+    """Два участника: один работает, второй держит только «Старт → Финиш».
+
+    Единственное основание снять второго из проверки — флаг чёрной коробки из
+    стадии состава; число активностей основанием быть не может (тот же закон,
+    что в генераторе).
+    """
+    return {
+        "participants": [
+            {"name": "ВкусВилл", "id": "Process_1"},
+            ({"name": "ВкусВилл", "id": "Participant_2", "black_box": True}
+             if both_names_same else
+             {"name": "Перевозчик", "id": "Participant_2",
+              **({"black_box": True} if black_box else {})}),
+        ],
+        "lanes": [],
+        "elements": [
+            {"id": "S1", "kind": "startEvent", "name": "Заказ",
+             "participant": "ВкусВилл"},
+            {"id": "A1", "kind": "userTask", "name": "Отгрузить",
+             "participant": "ВкусВилл"},
+            {"id": "E1", "kind": "endEvent", "name": "Готово",
+             "participant": "ВкусВилл"},
+            {"id": "S2", "kind": "startEvent", "name": "Заявка получена",
+             "participant": "Перевозчик"},
+            {"id": "E2", "kind": "endEvent", "name": "Ответ",
+             "participant": "Перевозчик"},
+        ],
+        "flows": [
+            {"id": "F1", "kind": "sequence", "source": "S1", "target": "A1"},
+            {"id": "F2", "kind": "sequence", "source": "A1", "target": "E1"},
+            {"id": "F3", "kind": "sequence", "source": "S2", "target": "E2"},
+        ],
+    }
+
+
+def test_black_box_participant_is_exempt_from_pool_has_steps():
+    """Льгота оракула обязана быть заперта с самой стороны оракула: скоринг её
+    уже меряет, а без этого теста прочтение флага можно было сломать незаметно —
+    неверное прочтение выглядит как молчаливое снятие нарушения."""
+    exempt = check_structure(_named_pools_plan(black_box=True),
+                             {})["pool_has_steps"]
+    assert exempt.ok, exempt.reason
+    assert "снято с проверки чёрных коробок" in exempt.reason, exempt.reason
+
+    strict = check_structure(_named_pools_plan(black_box=False),
+                             {})["pool_has_steps"]
+    assert strict.applicable and not strict.ok, strict.reason
+    assert strict.ids == ("Перевозчик",), strict.ids
+
+
+def test_a_white_namesake_pool_keeps_the_violation():
+    """Имя, под которым стоят и белый, и чёрный участник, спорное: льгота
+    снимается целиком, иначе пропуск одного закрывал бы нарушение другому.
+
+    Схема одна и та же пара событий без единого шага; различие только в
+    участниках под одним именем, и молчание здесь означало бы «пустой пул
+    принят» ровно там, где белый участник обязан зваться нарушением.
+    """
+    plan = {
+        "participants": [{"name": "Склад", "id": "Process_1"},
+                         {"name": "Склад", "id": "Participant_2",
+                          "black_box": True}],
+        "lanes": [],
+        "elements": [
+            {"id": "S2", "kind": "startEvent", "name": "Заявка",
+             "participant": "Склад"},
+            {"id": "E2", "kind": "endEvent", "name": "Ответ",
+             "participant": "Склад"},
+        ],
+        "flows": [{"id": "F3", "kind": "sequence", "source": "S2",
+                   "target": "E2"}],
+    }
+
+    check = check_structure(plan, {})["pool_has_steps"]
+    assert not check.ok, check.reason
+    assert check.ids == ("Склад", "Склад"), (check.ids, check.reason)
 
 
 def test_dangling_flow_endpoint_is_left_to_no_unrouted():
@@ -776,6 +934,184 @@ def test_plan_dump_carries_the_flows_that_explain_a_hidden_split(tmp_path):
     with_flows = next(d for d in dumps if d["flows"])
     assert {"id", "source", "target", "kind", "condition"} <= set(
         with_flows["flows"][0])
+
+
+# ---------------------------------------------------------------------------
+# активности: «мало тасков» как число, а не как глаз
+# ---------------------------------------------------------------------------
+
+
+SEVEN_ELEMENTS = [
+    {"id": "S1", "kind": "startEvent", "name": "Старт", "participant": "ВкусВилл"},
+    {"id": "A1", "kind": "userTask", "name": "Собрать", "participant": "ВкусВилл"},
+    {"id": "A2", "kind": "serviceTask", "name": "Проверить", "participant": "ВкусВилл"},
+    {"id": "A3", "kind": "businessRuleTask", "name": "Сверить", "participant": "ВкусВилл"},
+    {"id": "G1", "kind": "exclusiveGateway", "name": "Готово?", "participant": "ВкусВилл"},
+    {"id": "G2", "kind": "parallelGateway", "name": "И ещё", "participant": "ВкусВилл"},
+    {"id": "E1", "kind": "endEvent", "name": "Финиш", "participant": "ВкусВилл"},
+]
+
+
+def _share_case(elements, need, ok=True):
+    case = harness.GenCase(scenario="s", fixture="f", label="", quality="live",
+                           mode="replay", ok=ok)
+    case.structure = {"participants": [], "lanes": [], "elements": elements,
+                      "flows": []}
+    case.min_steps_expected = need
+    return case
+
+
+def test_activity_count_reads_tasks_not_gateways_or_events():
+    """3 задачи + 2 шлюза + 2 события читаются как ТРИ активности.
+
+    Без этой строки харнесс повторяет слепоту `pass@1/min_steps`: оракул
+    считает шаги по `STEP_KINDS` (задачи + шлюзы + промежуточные события), и
+    схема, потерявшую работу, но оставившую развилку, мерка не замечает —
+    прогон #73→#74 прошёл именно так (18→15 и 20→14 элементов при росте
+    сводной доли 0.937 → 0.953).
+    """
+    facts = harness.structure_facts({"elements": SEVEN_ELEMENTS, "lanes": [
+        {"id": "L1", "name": "Кладовщик", "refs": "A1"}],
+        "participants": [{"name": "ВкусВилл"}], "flows": [
+            {"id": "F1", "source": "A1", "target": "A2", "kind": "message"}]})
+    assert facts["activities"] == 3, facts
+    assert facts["gateways"] == 2 and facts["events"] == 2, facts
+    assert facts["pools"] == 1 and facts["lanes"] == 1, facts
+    assert facts["flows"] == 1 and facts["message_flows"] == 1, facts
+    # тот же счёт на кейсе — иначе метрика и дамп мерили бы разные прочтения
+    assert _share_case(SEVEN_ELEMENTS, 5).facts["activities"] == 3
+
+
+def test_pool_granularity_facts_count_pools_without_a_verdict():
+    """`single_activity_pools` и `pools_without_work` — масштаб класса, а не
+    оценка: по живым дампам #74 девять пулов из 21 держали ровно одну активность
+    вместе с выдуманными стартом и финишем, а по корпусу 367 рукописных схем
+    4.0% таких и 11.3% без работы вовсе.
+
+    Число не говорит «плохо»: пул из одной активности легален, когда это
+    контрагент (чёрная коробка или белый процесс из текста), и недопустимо, когда
+    это наша роль. Различие знает только корзина стадии состава, поэтому лечит
+    его генератор, а здесь — только видно, сколько таких пулов и не сдвинулся ли
+    класс после правок.
+    """
+    plan = {
+        "participants": [{"id": "P1", "name": "ВкусВилл"},
+                         {"id": "P2", "name": "Поставщик"},
+                         {"id": "P3", "name": "Система мониторинга"}],
+        "lanes": [],
+        "elements": [
+            {"id": "A1", "kind": "task", "participant": "ВкусВилл"},
+            {"id": "A2", "kind": "task", "participant": "P1"},
+            {"id": "A3", "kind": "task", "participant": "Поставщик"},
+            {"id": "S1", "kind": "startEvent", "participant": "Система мониторинга"},
+        ],
+        "flows": [],
+    }
+    facts = harness.structure_facts(plan)
+    assert facts["pools"] == 3, facts
+    # и по id, и по имени пула работа находится одинаково
+    assert facts["activities"] == 3, facts
+    assert facts["single_activity_pools"] == 1, facts
+    assert facts["pools_without_work"] == 1, facts
+
+    xml = ('<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" '
+           'id="D"><participant id="P1" name="ВкусВилл" processRef="Proc_1"/>'
+           '<participant id="P2" name="Поставщик" processRef="Proc_2"/>'
+           '<participant id="P3" name="Система" processRef="Proc_3"/>'
+           '<participant id="P4" name="Клиент"/>'
+           '<process id="Proc_1"><task id="A1" name="Оформить"/>'
+           '<task id="A2" name="Принять"/></process>'
+           '<process id="Proc_2"><task id="A3" name="Подтвердить"/>'
+           '<startEvent id="S2" name="Начало"/><endEvent id="E2" name="Конец"/>'
+           '</process><process id="Proc_3"><startEvent id="S3" name="Начало"/>'
+           '<endEvent id="E3" name="Конец"/></process></definitions>')
+    read = harness.xml_facts(xml)
+    assert read["pools"] == 4, read
+    assert read["single_activity_pools"] == 1, read
+    # пустой белый процесс и чёрная коробка (без `processRef`) — один счёт:
+    # работы в обоих случаях нет, а чем именно пул молчит, читает XML
+    assert read["pools_without_work"] == 2, read
+    assert set(read) == set(harness.structure_facts(plan)), (
+        "план и XML обязаны отвечать одними и теми же ключами, иначе дамп и "
+        "сводка прогона меряют разные прочтения одной схемы")
+
+
+def test_activity_share_metric_moves_with_content_not_with_shape():
+    """`generate/activity_share_of_expectation` двигается, когда схема теряет
+    задачи, даже если ЧИСЛО ЭЛЕМЕНТОВ не меняется: шлюз вместо задачи — это
+    та же галочка в `элементов M` и другая схема в глазах читателя.
+
+    Потолок `min(1, …)`: переработка expectation не покупает балл выше
+    «соответствует тексту» — иначе раздувание схемы стало бы способом поднять
+    число.
+    """
+    full = _share_case(SEVEN_ELEMENTS, 5)                      # 3 задачи / 5
+    shrunk_elements = [dict(SEVEN_ELEMENTS[1], kind="intermediateCatchEvent"),
+                       dict(SEVEN_ELEMENTS[2], kind="exclusiveGateway")]
+    shrunk = _share_case(SEVEN_ELEMENTS[:1] + shrunk_elements +
+                         SEVEN_ELEMENTS[3:], 5)                # 1 задача / 5
+    assert harness._activity_share(full) == pytest.approx(0.6), full.facts
+    assert harness._activity_share(shrunk) == pytest.approx(0.2), shrunk.facts
+    assert len(shrunk.structure["elements"]) == len(SEVEN_ELEMENTS), \
+        "сверка именно на равном числе элементов"
+    # перегруз expectation capped на 1.0
+    assert harness._activity_share(_share_case(SEVEN_ELEMENTS, 2)) == 1.0
+    # без заявленного ожидания — None, а не 0.0: «не требовали» ≠ «не сделали»
+    assert harness._activity_share(_share_case(SEVEN_ELEMENTS, 0)) is None
+    # несобравшаяся сцена остаётся в знаменателе нулём (тот же порядок, что у
+    # `gate_share` и прогона #53–#54, где потерянные кейсы прятали провал)
+    assert harness._activity_share(_share_case(SEVEN_ELEMENTS, 5, ok=False)) == 0.0
+    suite = harness.build_generation_suite(["pool_has_steps"])
+    result = suite.run([{"name": "a", "payload": full}, {"name": "b", "payload": shrunk}])
+    row = result.metrics["generate/activity_share_of_expectation"]
+    assert row.mean == pytest.approx((0.6 + 0.2) / 2)
+    assert row.direction == metrics.HIGHER      # «ниже — хуже»
+    assert row.min_n == metrics.MIN_GATED_N     # тот же порог, что у ряда генерации
+
+
+def test_activity_share_is_registered_and_reported():
+    """Метрика живёт в регистре прогона и в `directions()`: метрика вне
+    реестра — это `unverified_metrics` в сверке, а не измерение."""
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery")
+    assert "generate/activity_share_of_expectation" in report.generation.metrics
+    directions = report.directions()
+    assert directions["generate/activity_share_of_expectation"] == metrics.HIGHER
+    flat = report.metrics_flat()
+    value = flat["generate/activity_share_of_expectation"]
+    assert value is not None and 0.0 <= value <= 1.0
+    assert value < 1.0, ("живой план склада даёт 11 задач при 13 названных "
+                         "текстом — доля обязана быть меньше потолка, иначе "
+                         "метрика не видит потерю")
+    assert "generate/activity_share_of_expectation" in harness.render_table(report)
+
+
+def test_dump_sidecars_carry_the_structure_facts(tmp_path):
+    """Sidecar каждой выгруженной схемы несёт структурные факты: вопрос «мало
+    тасков» должен сниматься с файла рядом со схемой, а не новым прогоном или
+    построчным разбором плана. Именование файлов не трогается: по нему
+    разбирают сначала провалы."""
+    report = harness.run(mode="replay", scenarios_spec="warehouse_delivery")
+    written = harness.dump_schemes(report, tmp_path / "дампы")
+    plans = [p for p in written if p.name.endswith(".plan.json")]
+    assert plans
+    for case, plan in zip([c for c in report.cases if c.xml], plans):
+        dump = json.loads(plan.read_text(encoding="utf-8"))
+        facts = dump["structure_facts"]
+        assert {"pools", "lanes", "activities", "gateways", "events",
+                "flows", "message_flows"} <= set(facts), facts
+        assert facts == dict(case.facts), plan.name
+        assert facts["activities"] > 0, plan.name
+        assert dump["min_steps_expected"] == case.min_steps_expected
+    # пара before/after улучшения: плана нет, но факты читаются из самих XML,
+    # и «пакет добавил работу» обязана быть видна числом, а не diff-ом глазами
+    reports = [p for p in written if p.name.endswith("_report.json")]
+    assert reports
+    dump = json.loads(reports[0].read_text(encoding="utf-8"))
+    pair = dump["structure_facts"]
+    assert pair["before"] and pair["after"], pair
+    # счётчик читает документ, а не догадку о нём: в любой собранной схеме
+    # есть хотя бы одно стартовое и одно конечное событие
+    assert pair["before"]["events"] >= 2 and pair["after"]["events"] >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -1762,6 +2098,13 @@ def test_manual_review_lists_schemes_without_inventing_a_metric():
     rendered = harness.render_table(report)
     assert "РУЧНАЯ ОЦЕНКА" in rendered and "метрик здесь нет" in rendered
     assert report.as_dict()["manual_review"]["items"] == review["items"]
+    # Структура рядом с вердиктом: «пулов N, элементов M» не отвечает на «мало
+    # тасков» (#73→#74), поэтому список вручную оцениваемых схем печатает
+    # дорожки и задачи — то, что читатель видит на схеме.
+    for row in review["cases"]:
+        assert {"lanes", "activities", "min_steps_expected"} <= set(row), row
+    if review["cases"]:
+        assert "дорожек" in rendered and "задач" in rendered
 
 
 def test_scenarios_cover_every_process_and_fixture_is_wired():
@@ -2009,8 +2352,8 @@ class TestAbsoluteQualityBar:
 
     Проверка относительно baseline выпускает в master контур, который ровно
     удержал прошлое плохое число: 0.4 против 0.4 — регрессии нет, а продукта
-    нет. Планка `quality/scheme_checks_share ≥0.8` стоит в AGENTS.md как
-    требование, и до этого она жила только в тексте отчёта.
+    нет. Планка `quality/scheme_checks_share ≥0.8` — требование приёмки
+    контура, и до этого она жила только в тексте отчёта.
     """
 
     def test_below_the_bar_fails_the_gate(self):

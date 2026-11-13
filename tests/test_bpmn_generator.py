@@ -2323,6 +2323,61 @@ class TestDeclaredExternalBlackBox:
         assert xml_message.get("targetRef") == "Participant_2"
         assert len(list(root.iter(f"{BPMN}process"))) == 2
 
+    def test_orphan_black_box_is_connected_by_repair(self):
+        """Промпт состава велит модели направить messageFlow в чёрный ящик, но
+        живой прогон warehouse_delivery показал: модель иногда его не рисует.
+        Контур, объявивший участника чёрным ящиком, обязан соединить его с
+        процессом сам — иначе `participant_interacts` падает на немом
+        участнике, и вернуть его в схему можно только выдуманной работой, то
+        есть прежним дефектом, который чёрная коробка как раз убрала."""
+        plan = _plan_dict(
+            participants=["ВкусВилл", "Поставщик"], lanes=[],
+            external_pools=["Поставщик"],
+            elements=[
+                _e("S1", "startEvent", "Заказ создан", ""),
+                _e("T1", "userTask", "Оформить заказ", ""),
+                _e("E1", "endEvent", "Заказ передан", ""),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1")])
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        supplier = next(p for p in repaired["participants"]
+                        if p["name"] == "Поставщик")
+        assert supplier["black_box"] is True, notes
+        touching = [f for f in repaired["flows"]
+                    if f["kind"] == "message"
+                    and "Поставщик" in (f["source"], f["target"])]
+        assert touching, notes
+        assert any(f["source"] == "ВкусВилл" or f["target"] == "ВкусВилл"
+                   for f in touching), touching
+        root = ET.fromstring(BPMNGenerator()._generate_bpmn_xml(repaired))
+        assert any(f.get("targetRef") == "Participant_2"
+                   or f.get("sourceRef") == "Participant_2"
+                   for f in root.iter(f"{BPMN}messageFlow"))
+
+    def test_orphan_black_box_flow_id_is_readable_ascii(self):
+        """Id потока-сообщения уезжает в экспортированный XML. Кириллические
+        имена пулов `_sanitize_id` вычищает в сплошные подчёркивания, и читатель
+        схемы видит `Flow______` вместо адреса. База id обязана быть ASCII."""
+        plan = _plan_dict(
+            participants=["ВкусВилл", "Поставщик"], lanes=[],
+            external_pools=["Поставщик"],
+            elements=[
+                _e("S1", "startEvent", "Заказ создан", ""),
+                _e("T1", "userTask", "Оформить заказ", ""),
+                _e("E1", "endEvent", "Заказ передан", ""),
+            ],
+            flows=[_f("F1", "S1", "T1"), _f("F2", "T1", "E1")])
+        repaired, notes = repair_structure(plan, text=self.TEXT)
+
+        touching = [f for f in repaired["flows"]
+                    if f["kind"] == "message"
+                    and "Поставщик" in (f["source"], f["target"])]
+        assert touching, notes
+        for flow in touching:
+            assert "___" not in flow["id"], flow["id"]
+            assert flow["id"].isascii(), flow["id"]
+
     def test_internal_role_does_not_gain_black_box_immunity(self):
         plan = self._plan()
         plan["external_pools"] = []
@@ -3112,6 +3167,18 @@ class TestOwnershipClarification:
         # имени роли угадать нельзя, это остаётся вопросом к модели
         assert result["structure"]["lanes"] == []
 
+    def test_ownership_prompt_forbids_a_generic_host_word(self):
+        """Живой прогон: на роль «Служба логистики» модель ответила
+        inside=«Организация», страж отклонил родовое слово, и подразделение
+        осталось пулом сверх оправданных текстом (`roles_as_lanes`). Промпт
+        обязан заранее сказать то, что страж проверяет: родовое слово названием
+        не является, назови конкретную организацию из описания или из пулов
+        плана. Подставлять хозяина за модель контур не вправе (см.
+        test_generic_organization_name_is_not_made_into_a_pool)."""
+        prompt = bpmn_generator._OWNERSHIP_SYSTEM_PROMPT
+        assert "родовое слово" in prompt
+        assert "назови конкретную организацию" in prompt
+
     def test_role_question_asks_the_three_most_doomed_pools(self, monkeypatch):
         """Длинный список кандидатов модель закрывает в ~31% случаев, короткого —
         в ~70% (три живых прогона, 63 кейса с вопросом о ролях). Спрашиваем про
@@ -3614,6 +3681,32 @@ class TestOwnershipClarification:
                                              "остаток.")
         assert [g for g in gaps if "ни одного шлюза" in g and "раздваивает" in g]
 
+    def test_single_leg_gateway_gap_names_its_leg_operand(self):
+        """Шлюз с одной ногой — переспрос обязан назвать эту ногу (поток и шаг),
+        а не только шлюз. Без операнда модель переименовывает шлюз в задачу
+        вместо того, чтобы добавить вторую ветку: живой warehouse_delivery —
+        G1/G2 переименованы, ноги не добавлены, развилка потеряна. Починка не
+        вправе выбирать тип развилки и её вторую ветку, но существующую ногу
+        назвать обязана — по ней модель достраивает развилку, не удаляя её."""
+        raw = {"participants": ["ВкусВилл"],
+               "elements": [
+                   {"id": "A1", "kind": "userTask", "name": "Проверить",
+                    "participant": "ВкусВилл"},
+                   {"id": "G1", "kind": "exclusiveGateway", "name": "Хватает?",
+                    "participant": "ВкусВилл"},
+                   {"id": "A2", "kind": "userTask", "name": "Отгрузить",
+                    "participant": "ВкусВилл"}],
+               "flows": [{"id": "F1", "source": "A1", "target": "G1",
+                          "kind": "sequence"},
+                         {"id": "F2", "source": "G1", "target": "A2",
+                          "kind": "sequence"}]}
+        gaps = bpmn_generator.plan_gaps(raw, "Кладовщик проверяет заказ. Если "
+                                             "товара не хватает, он заказывает "
+                                             "остаток.")
+        single = next(g for g in gaps if "не раздваивает и не сливает" in g)
+        assert "G1" in single
+        assert "F2" in single and "A2" in single, single
+
     def test_plain_description_without_a_condition_is_not_blamed(self):
         raw = {"participants": ["ВкусВилл"],
                "elements": [{"id": "A1", "kind": "userTask", "name": "Отгрузить",
@@ -3935,6 +4028,98 @@ class TestOwnershipClarification:
         assert "ВкусВилл" not in block
         assert "Кладовщик" in block and "Бухгалтерия" in block
         assert result["status"] == "success"
+
+    def test_department_pool_with_a_sublane_is_a_role_candidate(self):
+        """Подразделение с собственной дорожкой — роль, а не организация: у
+        «Службы логистики» дорожка «Экспедитор», и признак «дорожки других имён
+        — организация» не давал спросить про неё, хотя живой прогон держал её
+        отдельным пулом сверх оправданных текстом (`roles_as_lanes`: 5 пулов при
+        четырёх). «Перевозчик» с дорожкой «Водитель» — самостоятельный
+        контрагент: то же правило обязано оставить его за рамками вопроса, а
+        «Склад» — организация-хозяин, ей ролью не быть."""
+        raw = {"participants": ["Склад", "Служба логистики", "Перевозчик"],
+               "lanes": [
+                   {"id": "L1", "name": "Оператор склада",
+                    "participant": "Склад"},
+                   {"id": "L6", "name": "Экспедитор",
+                    "participant": "Служба логистики"},
+                   {"id": "L5", "name": "Водитель",
+                    "participant": "Перевозчик"}],
+               "elements": [
+                   {"id": "A1", "kind": "userTask", "name": "Собрать груз",
+                    "participant": "Склад"},
+                   {"id": "A8", "kind": "userTask", "name": "Заказать транспорт",
+                    "participant": "Служба логистики"},
+                   {"id": "A10", "kind": "userTask", "name": "Забрать груз",
+                    "participant": "Перевозчик"}],
+               "flows": []}
+        text = ("Склад собирает груз. Служба логистики заказывает транспорт у "
+                "перевозчика, водитель забирает груз и доставляет его.")
+        candidates = bpmn_generator._role_candidate_pools(raw, text)
+        assert "Служба логистики" in candidates
+        assert "Перевозчик" not in candidates
+        assert "Склад" not in candidates
+
+    def test_department_declared_a_role_merges_even_when_roster_called_it_external(
+            self, monkeypatch):
+        """Стадия состава могла записать подразделение в контрагенты: тогда
+        корзина `external_pools` блокирует слияние даже после того, как модель
+        по описанию объявила его ролью. Явное объявление роли сильнее
+        первоначальной классификации: «Служба логистики» уезжает дорожкой в
+        «Склад», а «Перевозчик» — названный контрагент — остаётся пулом."""
+        structure = {
+            "participants": ["Склад", "Служба логистики", "Перевозчик"],
+            "organizations": ["Склад"],
+            "external_pools": ["Служба логистики", "Перевозчик"],
+            "actors": ["Склад", "Служба логистики", "Перевозчик"],
+            "lanes": [
+                {"id": "L1", "name": "Оператор склада", "participant": "Склад"},
+                {"id": "L6", "name": "Экспедитор",
+                 "participant": "Служба логистики"},
+                {"id": "L5", "name": "Водитель", "participant": "Перевозчик"}],
+            "elements": [
+                {"id": "S1", "kind": "startEvent", "name": "Заявка",
+                 "participant": "Склад", "lane": "L1"},
+                {"id": "A1", "kind": "userTask", "name": "Собрать груз",
+                 "participant": "Склад", "lane": "L1"},
+                {"id": "E1", "kind": "endEvent", "name": "Готово",
+                 "participant": "Склад", "lane": "L1"},
+                {"id": "A8", "kind": "userTask", "name": "Заказать транспорт",
+                 "participant": "Служба логистики", "lane": "L6"},
+                {"id": "A13", "kind": "userTask", "name": "Закрыть заявку",
+                 "participant": "Служба логистики", "lane": "L6"},
+                {"id": "P1", "kind": "startEvent", "name": "Старт",
+                 "participant": "Перевозчик", "lane": "L5"},
+                {"id": "A10", "kind": "userTask", "name": "Забрать груз",
+                 "participant": "Перевозчик", "lane": "L5"},
+                {"id": "P2", "kind": "endEvent", "name": "Финиш",
+                 "participant": "Перевозчик", "lane": "L5"}],
+            "flows": [
+                {"id": "F1", "source": "S1", "target": "A1",
+                 "kind": "sequence"},
+                {"id": "F2", "source": "A1", "target": "E1",
+                 "kind": "sequence"},
+                {"id": "F3", "source": "A8", "target": "A13",
+                 "kind": "sequence"},
+                {"id": "F4", "source": "P1", "target": "A10",
+                 "kind": "sequence"},
+                {"id": "F5", "source": "A10", "target": "P2",
+                 "kind": "sequence"}]}
+        text = ("Склад собирает груз. Служба логистики заказывает транспорт у "
+                "перевозчика, водитель забирает груз и доставляет его.")
+        monkeypatch.setattr(bpmn_generator, "call_json", lambda s, q, **kw: {
+            "moves": [],
+            "roles": [{"pool": "Служба логистики", "inside": "Склад"}],
+            "missing": []})
+        marked, notes = BPMNGenerator()._clarify_ownership(text, structure)
+        repaired, rep_notes = bpmn_generator.repair_structure(marked, trace=[],
+                                                              text=text)
+        pools = [p["name"] if isinstance(p, dict) else p
+                 for p in repaired["participants"]]
+        assert "Служба логистики" not in pools, (pools, notes, rep_notes)
+        assert "Склад" in pools and "Перевозчик" in pools, (pools, rep_notes)
+        moved = [e for e in repaired["elements"] if e["id"] in ("A8", "A13")]
+        assert moved and all(e["participant"] == "Склад" for e in moved), moved
 
 
 class TestDeadlineTimerGate:

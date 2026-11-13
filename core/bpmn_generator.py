@@ -1175,8 +1175,10 @@ moves — переносы шагов в пустые пулы: неси тол�
 выдумывай участников, не двигай startEvent и endEvent.
 roles — те перечисленные пулы, которые по описанию являются ролью, отделом или \
 подразделением организации: inside — название этой организации словами из \
-описания (самостоятельный участник, клиент или внешняя система ролью не \
-является). Посмотреть обязана каждый перечисленный кандидат: молчаливый пропуск \
+описания; родовое слово («организация», «служба», «отдел») названием не \
+является — назови конкретную организацию из описания или из пулов плана \
+(самостоятельный участник, клиент или внешняя система ролью не является). \
+Посмотреть обязана каждый перечисленный кандидат: молчаливый пропуск \
 — не «роль не найдена», а нерешённый случай. Пустым inside не оставляй: если пул \
 не роль, просто не включай его в roles.
 missing — участники, названные в описании, но отсутствующие среди пулов плана: \
@@ -2036,6 +2038,17 @@ class BPMNGenerator:
                     notes.append(f"пул «{inside}» — организация из описания: ей "
                                  "принадлежат объявленные роли")
             _mark_role(structure, canonical, inside)
+            # Явное объявление роли сильнее корзины состава: если стадия
+            # состава записала подразделение в контрагенты, её первоначальная
+            # классификация не должна блокировать слияние — `_merge_role_pools`
+            # охраняет именно `external_pools`. Контрагент, которого модель
+            # ролью не объявляла, в корзине остаётся.
+            external = structure.get("external_pools")
+            if isinstance(external, list):
+                structure["external_pools"] = [
+                    p for p in external
+                    if not (isinstance(p, str)
+                            and _norm_name(p) == _norm_name(canonical))]
             notes.append(f"пул «{canonical}» — роль «{inside}» по описанию: его "
                          "шаги станут дорожкой этого пула")
         # Что модель забрала себе как «участника, которого в плане не было»:
@@ -2911,14 +2924,35 @@ def _mark_role(structure: Dict[str, Any], canonical: str, inside: str) -> None:
             return
 
 
+# Основы имён подразделений: «Служба логистики», «ИТ-отдел», «Департамент
+# качества», «Управление снабжения». Такой пул вправе иметь собственную
+# дорожку-под роль («Экспедитор» внутри «Службы логистики»), поэтому признак
+# «дорожки других имён — организация» не должен вычёркивать его из вопроса о
+# роли. «Бюро кредитных историй» сюда не попадает: ни одной из основ в нём нет,
+# и названный контрагент остаётся пулом.
+_DEPARTMENT_STEMS = ("служб", "отдел", "департамент", "управлен")
+
+
+def _department_name(norm: str) -> bool:
+    """Нормализованное имя пула названо подразделением, а не организацией."""
+    return any(stem in norm for stem in _DEPARTMENT_STEMS)
+
+
 def _role_candidate_pools(raw: Dict[str, Any], text: str = "") -> List[str]:
-    """Пулы, которые могут оказаться ролью: без дорожек вообще или с дорожкой,
-    названной как сам пул. Пул с дорожками других имён — организация, и
+    """Пулы, которые могут оказаться ролью: без дорожек вообще, с дорожкой,
+    названной как сам пул, либо названные подразделением («Служба логистики»).
+    Пул с дорожками других имён и без имени-подразделения — организация, и
     спрашивать про неё незачем.
 
     Одних «самоимённых» дорожек для вопроса мало: живые прогоны показали роли
     («Бухгалтерия», «Отдел качества»), которые модель завела пулами вообще без
     дорожек — их тоже надо называть моделью, а не угадывать по коду.
+
+    Подразделение с собственной дорожкой — тот же случай: «Служба логистики»
+    держит «Экспедитора», и прежний признак вычёркивал её из кандидатов, хотя
+    живой прогон считал её отдельным пулом сверх оправданных текстом
+    (`roles_as_lanes`). Хозяина и самостоятельность решает модель по описанию,
+    а не список основ в коде: основы лишь называют, кого имеет смысл спросить.
 
     Пустой пул, названный в описании, — тот же случай: наполнить его нечем,
     убрать нельзя, и роль организации остаётся единственным выходом. Модель
@@ -2948,7 +2982,7 @@ def _role_candidate_pools(raw: Dict[str, Any], text: str = "") -> List[str]:
         if _receives_merged_steps(pool, pools, lanes):
             continue
         own = by_pool.get(norm, [])
-        if not own or all(n == norm for n in own):
+        if not own or all(n == norm for n in own) or _department_name(norm):
             out.append(pool)
     return out
 
@@ -3417,9 +3451,29 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
         if kind in GATEWAY_KINDS:
             incoming, outgoing = in_count.get(elem_id, 0), out_count.get(elem_id, 0)
             if incoming < 2 and outgoing < 2:
-                gaps.append(f"шлюз {elem_id} ({_raw_text(elem.get('name'))}) "
-                            "не раздваивает и не сливает маршруты — это обычный "
-                            "шаг")
+                # Существующая нога называется операндом: модель достраивает
+                # вторую ветку по id потока и шага, а не переименовывает шлюз в
+                # задачу (живой warehouse_delivery — G1/G2 переименованы, ноги
+                # не добавлены, развилка потеряна). Тип развилки и вторую ветку
+                # выбирает модель, контур их не выдумывает.
+                out_legs = [f for f in flows
+                            if _raw_text(f.get("source")) == elem_id
+                            and _raw_text(f.get("kind")).lower() != "message"]
+                if out_legs:
+                    named = ", ".join(
+                        f"`{_raw_text(f.get('id')) or '?'}` в "
+                        f"{_raw_text(f.get('target')) or '?'}"
+                        for f in out_legs)
+                    gaps.append(
+                        f"шлюз {elem_id} ({_raw_text(elem.get('name'))}) "
+                        "не раздваивает и не сливает маршруты: у него одна "
+                        f"нога — поток {named}. Добавь от этого шлюза вторую "
+                        "ногу в шаг другой ветки описания и сохрани названную, "
+                        "а не переименовывай шлюз в задачу и не удаляй ногу")
+                else:
+                    gaps.append(f"шлюз {elem_id} ({_raw_text(elem.get('name'))}) "
+                                "не раздваивает и не сливает маршруты — это "
+                                "обычный шаг")
             if kind == "exclusiveGateway" and outgoing >= 2:
                 unconditioned = [
                     _raw_text(f.get("id")) for f in flows
@@ -4244,6 +4298,12 @@ def repair_structure(raw: Dict[str, Any],
     _mark("покрытие дорожек", participants, lanes, elements, flows)
     _lanes_cover_nodes(elements, flows, lanes, notes)
     _close(participants, lanes, elements, flows)
+    # Немой чёрный ящик соединяем последним: к этому шагу все обмены, которые
+    # контур дорисовал сам (закрытие маршрутов, достижимость), уже на месте, и
+    # повторно соединять уже поддержанный ящик незачем.
+    _mark("связь чёрных ящиков", participants, lanes, elements, flows)
+    _connect_orphan_black_boxes(participants, elements, flows, used_ids, notes)
+    _close(participants, lanes, elements, flows)
 
     if trace is not None:
         trace.extend(steps)
@@ -4311,6 +4371,49 @@ def _canonicalize_black_boxes(participants: List[Dict[str, Any]],
                 if not ((flow["kind"], flow["source"], flow["target"]) in seen
                         or seen.add((flow["kind"], flow["source"],
                                      flow["target"])))]
+
+
+def _connect_orphan_black_boxes(participants: List[Dict[str, Any]],
+                                elements: List[Dict[str, Any]],
+                                flows: List[Dict[str, Any]],
+                                used_ids: Set[str],
+                                notes: List[str]) -> None:
+    """Немой чёрный ящик контур соединяет с рабочим пулом сам.
+
+    Внешний участник без описанной работы остаётся пулом без процесса, и
+    messageFlow — единственное, что делает его участником коллаборации, а не
+    немым прямоугольником. Промпт состава велит модели направить обмен в такой
+    пул, но живой прогон (warehouse_delivery: «Получатель») показал: модель
+    иногда его не рисует, и `participant_interacts` падает на немом участнике.
+    Вернуть его в схему выдуманной работой значило бы вернуть дефект, который
+    чёрная коробка как раз убрала, поэтому контур дорисовывает связь сам: шагов
+    у ящика не появляется, обмен идёт с пулом, который ведёт процесс.
+    """
+    black = [p["name"] for p in participants if p.get("black_box") is True]
+    if not black:
+        return
+    steps_by_pool: Dict[str, int] = {}
+    for e in elements:
+        if e["kind"] in STEP_KINDS:
+            steps_by_pool[e["participant"]] = \
+                steps_by_pool.get(e["participant"], 0) + 1
+    working = [p["name"] for p in participants
+               if p.get("black_box") is not True
+               and steps_by_pool.get(p["name"], 0)]
+    if not working:
+        return
+    host = max(working, key=lambda name: steps_by_pool[name])
+    for name in black:
+        if any(f["kind"] == "message" and name in (f["source"], f["target"])
+               for f in flows):
+            continue
+        flow_id = _unique_id(used_ids, "Flow_blackbox")
+        used_ids.add(flow_id)
+        flows.append({"id": flow_id, "kind": "message",
+                      "source": host, "target": name, "condition": ""})
+        notes.append(f"Чёрный ящик «{name}» соединён с пулом «{host}» потоком-"
+                     "сообщением: модель не направила в него обмен, а немой "
+                     "участник не проходит проверку взаимодействия")
 
 
 def _repair_participants(raw: Dict[str, Any],

@@ -3555,6 +3555,7 @@ def plan_gaps(raw: Dict[str, Any], text: str = "",
     # Порядок = важность: переспрос один, и на плане с десятком нарушений модель
     # доходила до подписей имён, оставляя на схеме меньше участников, чем в
     # описании. Потерянный участник — первое, что надо исправить.
+    gaps.extend(_rework_gaps(elements, flows))
     gaps.extend(_condition_gaps(raw, text))
     return sorted(gaps, key=_gap_priority)
 
@@ -3611,6 +3612,127 @@ def _condition_gaps(raw: Dict[str, Any], text: str) -> List[str]:
             " развилки в описании на самом деле нет, верни план без изменений"]
 
 
+def _rework_gaps(elements: List[Dict[str, Any]],
+                 flows: List[Dict[str, Any]]) -> List[str]:
+    """Безымянный возврат работы в уже сделанный шаг — слепой повтор.
+
+    Зеркало оракула `no_blind_rework` на плане: дуга, чей конец — задача и
+    откуда маршрут снова приходит к началу этой дуги, обязана быть названа
+    либо защищена развилкой с именованной ногой в петлю и именованной ногой из
+    петли. Иначе процесс крутится без записанной причины, и оракул бракует
+    итоговый XML, а план-гейт про это молчал (живой warehouse_delivery — F12 ->
+    A5 «Сборка груза»: гейт сказал только про G1 и таймер). Гейт называет
+    операнд — дугу и шаг, — а правку (имя возврата либо защищённый выход)
+    выбирает модель: контур не выдумывает ни условие, ни маршрут, тот же
+    принцип, что у переспроса про развилку.
+
+    Читаются только внутрипуловые sequence-дуги с легальными концами:
+    межпуловые починка превратит в сообщения, а незаконные концы и дугу шага
+    на себя снимет (`_repair_flows`), и в итоговом маршруте они петлю не
+    образуют — иначе гейт просил бы правку того, чего в схеме не будет.
+    Оракул петлю шага на себя формально числит возвратом, но до XML она не
+    доходит, поэтому гейт её пропускает, а не бракует вслед за оракулом.
+    """
+    kind_by_id: Dict[str, str] = {}
+    pool_by_id: Dict[str, str] = {}
+    name_by_id: Dict[str, str] = {}
+    for elem in elements:
+        eid = _raw_text(elem.get("id"))
+        if eid:
+            kind_by_id[eid] = _raw_text(elem.get("kind") or elem.get("type"))
+            pool_by_id[eid] = _raw_text(elem.get("participant"))
+            name_by_id[eid] = _raw_text(elem.get("name"))
+    seq: List[Dict[str, Any]] = []
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for flow in flows:
+        if _raw_text(flow.get("kind")).lower() == "message":
+            continue
+        source = _raw_text(flow.get("source"))
+        target = _raw_text(flow.get("target"))
+        if not source or not target:
+            continue
+        if pool_by_id.get(source) and pool_by_id.get(target) \
+                and pool_by_id[source] != pool_by_id[target]:
+            continue
+        if _illegal_flow_end(kind_by_id.get(source, ""),
+                             kind_by_id.get(target, "")):
+            continue
+        seq.append(flow)
+        out.setdefault(source, []).append(flow)
+
+    def reachable(start: str, skip: Optional[Dict[str, Any]] = None) -> Set[str]:
+        seen = {start}
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for edge in out.get(node, []):
+                if edge is skip:
+                    continue
+                tgt = _raw_text(edge.get("target"))
+                if tgt and tgt not in seen:
+                    seen.add(tgt)
+                    stack.append(tgt)
+        return seen
+
+    def ancestors(target: str) -> Set[str]:
+        seen: Set[str] = set()
+        stack = [target]
+        while stack:
+            node = stack.pop()
+            for edge in seq:
+                if _raw_text(edge.get("target")) == node:
+                    src = _raw_text(edge.get("source"))
+                    if src and src not in seen:
+                        seen.add(src)
+                        stack.append(src)
+        return seen
+
+    def leg_named(edge: Dict[str, Any]) -> bool:
+        return bool(_raw_text(edge.get("condition"))
+                    or _raw_text(edge.get("name"))
+                    or _raw_text(edge.get("label"))
+                    or edge.get("default"))
+
+    def distinguishes(node_id: str, loop: Set[str]) -> bool:
+        legs = out.get(node_id, [])
+        if len(legs) < 2:
+            return False
+        into = [e for e in legs if _raw_text(e.get("target")) in loop]
+        outl = [e for e in legs if _raw_text(e.get("target")) not in loop]
+        return bool(into) and bool(outl) and all(leg_named(e) for e in legs)
+
+    gaps: List[str] = []
+    reported: Set[frozenset] = set()
+    for edge in seq:
+        source = _raw_text(edge.get("source"))
+        target = _raw_text(edge.get("target"))
+        if kind_by_id.get(target) not in TASK_KINDS:
+            continue
+        if source == target or source not in reachable(target, skip=edge):
+            continue
+        if leg_named(edge):
+            continue
+        loop = (reachable(target) & ancestors(source)) | {target, source}
+        if any(distinguishes(nid, loop) for nid in out):
+            continue
+        # В замкнутом цикле каждая дуга — возврат (её конец сам доходит до её
+        # начала), поэтому оракул перечисляет их все в одном нарушении. Гейт
+        # даёт одну подсказку на петлю с представителем-дугой: иначе цикл из
+        # пяти шагов забил бы переспрос пятью одинаковыми просьбами.
+        key = frozenset(loop)
+        if key in reported:
+            continue
+        reported.add(key)
+        fid = _raw_text(edge.get("id")) or f"{source}->{target}"
+        gaps.append(
+            f"поток {fid} возвращает работу в {target} "
+            f"«{name_by_id.get(target, '')}» без записанной причины возврата: "
+            "назови дугу (condition или подпись) либо добавь из петли "
+            "защищённый выход — развилку с именованной ногой возврата и "
+            "именованной ногой, уходящей из петли")
+    return gaps
+
+
 _GAP_PRIORITY = (("действующим лицом", 0),
                  # Названный в описании участник, которого в схеме нет, — тот же
                  # потерянный контрагент, что и лицо без пула: без него схема
@@ -3632,7 +3754,12 @@ _GAP_PRIORITY = (("действующим лицом", 0),
                  # Нога развилки в чужом пуле — то же потерянное ветвление, но
                  # заметившееся только на выходе: ниже рангом она проиграла бы
                  # подписям имён, и повтор ушёл бы косметикой.
-                 ("ведёт в чужой пул", 1))
+                 ("ведёт в чужой пул", 1),
+                 # Слепой повтор — содержание процесса: без записанной причины
+                 # возврата маршрут крутится, пока не вмешаются извне. Ниже
+                 # ранга он проиграл бы подписям имён, и переспрос ушёл бы
+                 # косметикой вместо защиты петли (живой warehouse_delivery).
+                 ("возвращает работу", 1))
 # Последний класс — «остальное»: он никогда не выбирается иглой, а служит
 # приданым для сравнения профилей.
 _GAP_RANK_DEFAULT = 2
@@ -3663,6 +3790,7 @@ _GAP_CLASS_OF = (("действующим лицом", "лицо без пула
                  # отдавала бы починке без ссылки на то, что гейт про развилку
                  # знал.
                  ("не раздваивает и не сливает", "развилка"),
+                 ("возвращает работу", "слепой повтор"),
                  ("объявил дорожку с таким же именем", "роль-пул"))
 _GAP_CLASS_OTHER = "маршрут"
 

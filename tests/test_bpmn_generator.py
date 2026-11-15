@@ -3707,6 +3707,70 @@ class TestOwnershipClarification:
         assert "G1" in single
         assert "F2" in single and "A2" in single, single
 
+    def test_blind_rework_loop_gap_names_the_return_arc(self):
+        """Безымянный возврат в уже сделанный шаг — слепой повтор: процесс
+        крутится без записанной причины. План-гейт обязан назвать дугу возврата
+        и шаг, чтобы модель защитила петлю (имя дуги либо защищённый выход), а
+        не молчал, пока оракул бракует итоговый XML (живой warehouse_delivery —
+        F12 -> A5 «Сборка груза», гейт сказал только про G1 и таймер). Контур не
+        выдумывает условие возврата: он называет операнд, правку выбирает модель.
+        Форма живого дефекта: обе ноги развилки возвращаются в петлю, выхода нет,
+        дуга возврата в шаг безымянна. В замкнутом цикле оракул видит возвратом
+        каждую дугу, но гейт даёт одну подсказку на петлю, а не по одной на дугу."""
+        raw = {"participants": ["ВкусВилл"],
+               "elements": [
+                   {"id": "S1", "kind": "startEvent", "name": "Заказ поступил",
+                    "participant": "ВкусВилл"},
+                   {"id": "A1", "kind": "userTask", "name": "Сборка груза",
+                    "participant": "ВкусВилл"},
+                   {"id": "G1", "kind": "exclusiveGateway",
+                    "name": "Упаковка прошла?", "participant": "ВкусВилл"},
+                   {"id": "A2", "kind": "userTask", "name": "Проверка упаковки",
+                    "participant": "ВкусВилл"}],
+               "flows": [{"id": "F1", "source": "S1", "target": "A1",
+                          "kind": "sequence"},
+                         {"id": "F2", "source": "A1", "target": "G1",
+                          "kind": "sequence"},
+                         {"id": "F3", "source": "G1", "target": "A1",
+                          "kind": "sequence"},
+                         {"id": "F4", "source": "G1", "target": "A2",
+                          "kind": "sequence"},
+                         {"id": "F5", "source": "A2", "target": "G1",
+                          "kind": "sequence"}]}
+        gaps = bpmn_generator.plan_gaps(raw, "Кладовщик собирает груз и "
+                                             "проверяет упаковку.")
+        blind = [g for g in gaps if "возвращает работу" in g]
+        assert len(blind) == 1, blind
+        assert "F3" in blind[0] and "A1" in blind[0], blind
+
+    def test_guarded_rework_loop_is_not_blamed(self):
+        """Петля с названной дугой возврата и защищённым выходом — легитимный
+        rework «согласовать -> доработать -> снова согласовать». Гейт не должен
+        требовать правку там, где причина возврата записана и из петли есть
+        именованный выход."""
+        raw = {"participants": ["ВкусВилл"],
+               "elements": [
+                   {"id": "S1", "kind": "startEvent", "name": "Заказ поступил",
+                    "participant": "ВкусВилл"},
+                   {"id": "A1", "kind": "userTask", "name": "Сборка груза",
+                    "participant": "ВкусВилл"},
+                   {"id": "G1", "kind": "exclusiveGateway",
+                    "name": "Упаковка прошла?", "participant": "ВкусВилл"},
+                   {"id": "E1", "kind": "endEvent", "name": "Отгружен",
+                    "participant": "ВкусВилл"}],
+               "flows": [{"id": "F1", "source": "S1", "target": "A1",
+                          "kind": "sequence"},
+                         {"id": "F2", "source": "A1", "target": "G1",
+                          "kind": "sequence"},
+                         {"id": "F3", "source": "G1", "target": "A1",
+                          "kind": "sequence",
+                          "condition": "вернули на доработку"},
+                         {"id": "F4", "source": "G1", "target": "E1",
+                          "kind": "sequence", "condition": "согласовано"}]}
+        gaps = bpmn_generator.plan_gaps(raw, "Кладовщик собирает груз. Если "
+                                             "упаковка не прошла, он дорабатывает.")
+        assert not [g for g in gaps if "возвращает работу" in g], gaps
+
     def test_plain_description_without_a_condition_is_not_blamed(self):
         raw = {"participants": ["ВкусВилл"],
                "elements": [{"id": "A1", "kind": "userTask", "name": "Отгрузить",
